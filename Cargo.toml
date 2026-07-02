@@ -1,0 +1,19 @@
+[package]
+name = "aegis"
+version = "0.6.1"
+edition = "2021"
+description = "Policy, approval, and audit layer between AI agents and your tools"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+ureq = { version = "2.9", default-features = false, features = ["tls"] }
+
+[profile.release]
+lto = true
+strip = true

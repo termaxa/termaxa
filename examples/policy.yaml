@@ -1,0 +1,73 @@
+# Aegis policy — first matching rule wins; `*` is a wildcard.
+# Actions: allow (run silently) | ask (require approval) | deny (block)
+version: 1
+default: ask
+
+rules:
+  # ---- read-only operations: let the agent work ----
+  - match: "git status*"
+    action: allow
+  - match: "git diff*"
+    action: allow
+  - match: "git log*"
+    action: allow
+  - match: "git branch*"
+    action: allow
+  - match: "ls*"
+    action: allow
+  - match: "cat *"
+    action: allow
+  - match: "grep*"
+    action: allow
+  - match: "terraform plan*"
+    action: allow
+  - match: "kubectl get*"
+    action: allow
+  - match: "kubectl describe*"
+    action: allow
+  - match: "docker ps*"
+    action: allow
+
+  # ---- destructive: hard stops ----
+  - match: "git push*--force*"
+    action: deny
+    reason: "Force pushes are blocked by policy. Open a PR instead."
+  - match: "rm -rf /*"
+    action: deny
+    reason: "Recursive delete from root is blocked."
+  - match: "kubectl delete*"
+    action: deny
+    reason: "kubectl delete is blocked. Use a manifest change + apply."
+  - match: "*drop table*"
+    action: deny
+    reason: "DROP TABLE is blocked. Archive or rename instead."
+  - match: "*drop database*"
+    action: deny
+    reason: "DROP DATABASE is blocked."
+
+  # ---- consequential: human in the loop ----
+  - match: "git push*"
+    action: ask
+  - match: "git commit*"
+    action: allow
+  - match: "terraform apply*"
+    action: ask
+  - match: "terraform destroy*"
+    action: deny
+    reason: "terraform destroy is blocked by policy."
+  - match: "docker rm*"
+    action: ask
+  - match: "docker system prune*"
+    action: ask
+  - match: "npm publish*"
+    action: ask
+  - match: "cargo publish*"
+    action: ask
+  - match: "gh pr merge*"
+    action: ask
+  - match: "aws *"
+    action: ask
+  - match: "curl*"
+    action: ask
+  - match: "ssh *"
+    action: ask
