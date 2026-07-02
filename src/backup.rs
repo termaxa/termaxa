@@ -30,6 +30,10 @@ pub struct BackupRecord {
 
 /// What WOULD be backed up for this command — used by previews.
 pub fn plan(command: &str) -> Option<String> {
+    let segments = crate::shell::split_segments(command);
+    if segments.len() > 1 {
+        return segments.iter().find_map(|s| plan(s));
+    }
     let tokens = crate::pg::shell_tokens(command);
     if let Some((remote, branch)) = git_force_push_target(&tokens) {
         return Some(format!(
@@ -56,6 +60,15 @@ pub fn plan(command: &str) -> Option<String> {
 /// Take the backup. Returns the record on success, a printable error string
 /// on a failed attempt, or Ok(None) when the command needs no insurance.
 pub fn take(aegis_dir: &Path, command: &str) -> Result<Option<BackupRecord>> {
+    let segments = crate::shell::split_segments(command);
+    if segments.len() > 1 {
+        for s in &segments {
+            if let Some(rec) = take(aegis_dir, s)? {
+                return Ok(Some(rec)); // insure the first insurable segment
+            }
+        }
+        return Ok(None);
+    }
     let tokens = crate::pg::shell_tokens(command);
     let (ts_ms, ts) = now();
     let id = format!("b-{}", ts_ms);

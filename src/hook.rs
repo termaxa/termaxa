@@ -56,7 +56,7 @@ pub fn run(aegis_dir: &Path) -> Result<()> {
     let policy_path = aegis_dir.join("policy.yaml");
     let policy = Policy::load(&policy_path)?;
 
-    let base = policy.evaluate(&command);
+    let base = policy.evaluate_command(&command);
     let signals = context::gather(&command);
     let (decision, escalated) = context::apply(base, &signals);
 

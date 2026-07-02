@@ -17,6 +17,15 @@ pub struct Preview {
 }
 
 pub fn generate(command: &str) -> Option<Preview> {
+    // Compound commands: preview the first segment that has one.
+    let segments = crate::shell::split_segments(command);
+    if segments.len() > 1 {
+        return segments.iter().find_map(|s| generate_one(s));
+    }
+    generate_one(command)
+}
+
+fn generate_one(command: &str) -> Option<Preview> {
     let cmd = crate::policy::normalize(command);
     if cmd.starts_with("git push") {
         return git_push_preview(&cmd);

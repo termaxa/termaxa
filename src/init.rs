@@ -25,6 +25,12 @@ rules:
     action: allow
   - match: "grep*"
     action: allow
+  - match: "echo *"
+    action: allow
+  - match: "git remote -v"
+    action: allow
+  - match: "git fetch*"
+    action: allow
   - match: "terraform plan*"
     action: allow
   - match: "kubectl get*"

@@ -8,6 +8,7 @@ mod pg;
 mod policy;
 mod preview;
 mod runner;
+mod shell;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -99,7 +100,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             let aegis_dir = require_aegis_dir()?;
             let policy = Policy::load(&aegis_dir.join("policy.yaml"))?;
-            let base = policy.evaluate(&cmd);
+            let base = policy.evaluate_command(&cmd);
             let signals = context::gather(&cmd);
             let (decision, escalated) = context::apply(base, &signals);
 

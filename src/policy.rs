@@ -64,6 +64,14 @@ fn default_action() -> Action {
     Action::Ask
 }
 
+fn severity(a: Action) -> u8 {
+    match a {
+        Action::Allow => 0,
+        Action::Ask => 1,
+        Action::Deny => 2,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Decision {
     pub action: Action,
@@ -91,6 +99,42 @@ impl Policy {
             dir = d.parent().map(|p| p.to_path_buf());
         }
         None
+    }
+
+    /// Shell-aware evaluation: split into segments, judge each, and let the
+    /// MOST DANGEROUS segment govern the combined verdict (deny > ask > allow).
+    /// Closes the v0.6.1 field-report bypass where `git status && <anything>`
+    /// rode the `git status*` wildcard.
+    pub fn evaluate_command(&self, command: &str) -> Decision {
+        let segments = crate::shell::split_segments(command);
+        if segments.len() <= 1 {
+            return self.evaluate(command);
+        }
+        let total = segments.len();
+        let mut worst: Option<(usize, Decision)> = None;
+        for (i, seg) in segments.iter().enumerate() {
+            let d = self.evaluate(seg);
+            let replace = match &worst {
+                None => true,
+                // higher severity wins; on ties, an explicitly-matched rule
+                // out-ranks a default fallthrough — name the real threat.
+                Some((_, w)) => {
+                    severity(d.action) > severity(w.action)
+                        || (severity(d.action) == severity(w.action)
+                            && w.matched_rule.is_none()
+                            && d.matched_rule.is_some())
+                }
+            };
+            if replace {
+                worst = Some((i, d));
+            }
+        }
+        let (i, d) = worst.expect("segments nonempty");
+        Decision {
+            action: d.action,
+            matched_rule: d.matched_rule,
+            reason: format!("segment {}/{} `{}` — {}", i + 1, total, segments[i], d.reason),
+        }
     }
 
     pub fn evaluate(&self, command: &str) -> Decision {
@@ -222,5 +266,29 @@ rules:
             policy.evaluate("psql -c 'DROP TABLE users'").action,
             Action::Deny
         );
+    }
+
+    #[test]
+    fn compound_commands_cannot_hide_behind_prefixes() {
+        // v0.6.1 field report: `git status && <anything>` rode `git status*`.
+        let policy: Policy = serde_yaml::from_str(
+            r#"
+default: ask
+rules:
+  - match: "git status*"
+    action: allow
+  - match: "rm -rf /*"
+    action: deny
+"#,
+        )
+        .unwrap();
+        // the trench-coat attack: worst segment governs
+        let d = policy.evaluate_command("git status && rm -rf /");
+        assert_eq!(d.action, Action::Deny);
+        assert!(d.reason.contains("rm -rf /"));
+        // benign compound with an unmatched segment falls to default (ask)
+        assert_eq!(policy.evaluate_command("git status && echo hi").action, Action::Ask);
+        // single commands behave exactly as before
+        assert_eq!(policy.evaluate_command("git status").action, Action::Allow);
     }
 }

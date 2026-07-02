@@ -55,6 +55,15 @@ pub fn gather(command: &str) -> Vec<Signal> {
         }
     }
 
+    // Command substitution: contents cannot be statically analyzed, so the
+    // presence alone is a reason to put a human in the loop.
+    if crate::shell::has_substitution(command) {
+        signals.push(Signal {
+            label: "command substitution ($(...) or ``) — contents not analyzable".into(),
+            escalate: true,
+        });
+    }
+
     signals
 }
 
