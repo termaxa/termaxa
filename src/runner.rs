@@ -5,10 +5,10 @@ use anyhow::{bail, Result};
 use std::io::{self, Write};
 use std::process::Command;
 
-/// `aegis run -- <cmd...>`: gatekept execution from the CLI.
+/// `termaxa run -- <cmd...>`: gatekept execution from the CLI.
 pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     if argv.is_empty() {
-        bail!("nothing to run — usage: aegis run -- <command...>");
+        bail!("nothing to run — usage: termaxa run -- <command...>");
     }
     let command = shell_join(argv);
 
@@ -17,7 +17,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     let signals = context::gather(&command);
     let (decision, escalated) = context::apply(base, &signals);
 
-    println!("┌ aegis");
+    println!("┌ termaxa");
     println!("│ command : {}", command);
     println!("│ decision: {}", decision.action);
     println!("│ reason  : {}", decision.reason);
@@ -42,7 +42,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
                 *backup_id = Some(rec.id);
             }
             Ok(None) => {} // nothing to insure
-            Err(e) => eprintln!("aegis: backup failed ({}); proceeding — command was approved", e),
+            Err(e) => eprintln!("termaxa: backup failed ({}); proceeding — command was approved", e),
         }
     };
 
@@ -50,7 +50,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
 
     let (approved, exit_code) = match decision.action {
         Action::Deny => {
-            eprintln!("aegis: blocked by policy.");
+            eprintln!("termaxa: blocked by policy.");
             (Some(false), None)
         }
         Action::Ask => {
@@ -71,7 +71,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
                 let code = execute(argv)?;
                 (Some(true), Some(code))
             } else {
-                eprintln!("aegis: declined.");
+                eprintln!("termaxa: declined.");
                 (Some(false), None)
             }
         }

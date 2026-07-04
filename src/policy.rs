@@ -88,11 +88,11 @@ impl Policy {
         Ok(policy)
     }
 
-    /// Walk up from `start` looking for `.aegis/policy.yaml`.
+    /// Walk up from `start` looking for `.termaxa/policy.yaml`.
     pub fn find_policy_file(start: &Path) -> Option<PathBuf> {
         let mut dir = Some(start.to_path_buf());
         while let Some(d) = dir {
-            let candidate = d.join(".aegis").join("policy.yaml");
+            let candidate = d.join(".termaxa").join("policy.yaml");
             if candidate.is_file() {
                 return Some(candidate);
             }

@@ -131,7 +131,7 @@ fn compute(entries: &[AuditEntry], paths: &Paths) -> Result<Report> {
 }
 
 fn print_terminal(r: &Report, session: Option<&str>) {
-    println!("┌─ Aegis Execution Report ─────────────────────────");
+    println!("┌─ Termaxa Execution Report ─────────────────────────");
     println!("│ scope     : {}", session.map(short).unwrap_or_else(|| "all activity".into()));
     println!("│ window    : {} → {}  ({} min)", r.first_ts, r.last_ts, r.duration_min);
     println!("│ commands  : {}   ✓ {} allow · ? {} ask · ✗ {} deny", r.total, r.allow, r.ask, r.deny);
@@ -152,7 +152,7 @@ fn print_terminal(r: &Report, session: Option<&str>) {
     if r.backups.is_empty() {
         println!("│ backups   : none — no insured operations in scope");
     } else {
-        println!("│ backups   : {} — rollback available (`aegis backups`)", r.backups.len());
+        println!("│ backups   : {} — rollback available (`termaxa backups`)", r.backups.len());
         for (kind, note) in r.backups.iter().take(5) {
             println!("│   🛟 [{}] {}", kind, note);
         }
@@ -162,7 +162,7 @@ fn print_terminal(r: &Report, session: Option<&str>) {
 }
 
 fn print_markdown(r: &Report, session: Option<&str>) {
-    println!("# Aegis Execution Report\n");
+    println!("# Termaxa Execution Report\n");
     println!("- **Scope:** {}", session.map(short).unwrap_or_else(|| "all activity".into()));
     println!("- **Window:** {} → {} ({} min)", r.first_ts, r.last_ts, r.duration_min);
     println!("- **Commands:** {} — {} allow / {} ask / {} deny", r.total, r.allow, r.ask, r.deny);
@@ -187,7 +187,7 @@ fn print_markdown(r: &Report, session: Option<&str>) {
         for (kind, note) in &r.backups {
             println!("- **[{}]** {}", kind, note);
         }
-        println!("\nRollback available via `aegis rollback <id>`.");
+        println!("\nRollback available via `termaxa rollback <id>`.");
     }
     println!("\n## Risk: {}\n\nScore {} — transparent formula: deny×3 + escalation×2 + ask×1.", r.risk_label, r.risk_score);
 }

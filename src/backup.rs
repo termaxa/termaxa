@@ -50,7 +50,7 @@ pub fn plan(command: &str) -> Option<String> {
     }
     if let Some(paths) = rm_targets(&tokens) {
         return Some(format!(
-            "copy {} path(s) to .aegis/backups before deletion",
+            "copy {} path(s) to .termaxa/backups before deletion",
             paths.len()
         ));
     }
@@ -77,11 +77,11 @@ fn tf_state_target(tokens: &[String]) -> Option<PathBuf> {
 
 /// Take the backup. Returns the record on success, a printable error string
 /// on a failed attempt, or Ok(None) when the command needs no insurance.
-pub fn take(aegis_dir: &Path, command: &str) -> Result<Option<BackupRecord>> {
+pub fn take(termaxa_dir: &Path, command: &str) -> Result<Option<BackupRecord>> {
     let segments = crate::shell::split_segments(command);
     if segments.len() > 1 {
         for s in &segments {
-            if let Some(rec) = take(aegis_dir, s)? {
+            if let Some(rec) = take(termaxa_dir, s)? {
                 return Ok(Some(rec)); // insure the first insurable segment
             }
         }
@@ -94,16 +94,16 @@ pub fn take(aegis_dir: &Path, command: &str) -> Result<Option<BackupRecord>> {
     let record = if let Some((remote, branch)) = git_force_push_target(&tokens) {
         backup_git_ref(&id, &ts, command, &remote, &branch)?
     } else if let Some((tables, data_only)) = pg_backup_targets(command) {
-        backup_pg(aegis_dir, &id, &ts, command, &tokens, &tables, data_only)?
+        backup_pg(termaxa_dir, &id, &ts, command, &tokens, &tables, data_only)?
     } else if let Some(paths) = rm_targets(&tokens) {
-        backup_files(aegis_dir, &id, &ts, command, &paths)?
+        backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else if let Some(state) = tf_state_target(&tokens) {
-        backup_files(aegis_dir, &id, &ts, command, &[state])?
+        backup_files(termaxa_dir, &id, &ts, command, &[state])?
     } else {
         return Ok(None);
     };
 
-    append_manifest(aegis_dir, &record)?;
+    append_manifest(termaxa_dir, &record)?;
     Ok(Some(record))
 }
 
@@ -134,7 +134,7 @@ fn backup_git_ref(id: &str, ts: &str, command: &str, remote: &str, branch: &str)
     let _ = Command::new("git").args(["fetch", remote, branch]).output();
     let sha = git_out(&["rev-parse", &format!("{}/{}", remote, branch)])
         .context("cannot resolve remote branch — is it pushed?")?;
-    let backup_branch = format!("aegis/backup/{}", id);
+    let backup_branch = format!("termaxa/backup/{}", id);
     let out = Command::new("git").args(["branch", &backup_branch, &sha]).output()?;
     if !out.status.success() {
         bail!("git branch failed: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -195,7 +195,7 @@ fn pg_backup_targets(command: &str) -> Option<(Vec<String>, bool)> {
 }
 
 fn backup_pg(
-    aegis_dir: &Path,
+    termaxa_dir: &Path,
     id: &str,
     ts: &str,
     command: &str,
@@ -203,7 +203,7 @@ fn backup_pg(
     tables: &[String],
     data_only: bool,
 ) -> Result<BackupRecord> {
-    let dir = backups_dir(aegis_dir)?;
+    let dir = backups_dir(termaxa_dir)?;
     let file = dir.join(format!("{}-pg.sql", id));
 
     // Reuse the psql connection args verbatim; swap the binary for pg_dump.
@@ -260,8 +260,8 @@ fn rm_targets(tokens: &[String]) -> Option<Vec<PathBuf>> {
     }
 }
 
-fn backup_files(aegis_dir: &Path, id: &str, ts: &str, command: &str, paths: &[PathBuf]) -> Result<BackupRecord> {
-    let dir = backups_dir(aegis_dir)?.join(id);
+fn backup_files(termaxa_dir: &Path, id: &str, ts: &str, command: &str, paths: &[PathBuf]) -> Result<BackupRecord> {
+    let dir = backups_dir(termaxa_dir)?.join(id);
     fs::create_dir_all(&dir)?;
     let mut saved = Vec::new();
     for p in paths {
@@ -304,21 +304,21 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
 // manifest + restore
 // ---------------------------------------------------------------------------
 
-fn backups_dir(aegis_dir: &Path) -> Result<PathBuf> {
-    let dir = aegis_dir.join("backups");
+fn backups_dir(termaxa_dir: &Path) -> Result<PathBuf> {
+    let dir = termaxa_dir.join("backups");
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-fn append_manifest(aegis_dir: &Path, record: &BackupRecord) -> Result<()> {
-    let path = backups_dir(aegis_dir)?.join("manifest.jsonl");
+fn append_manifest(termaxa_dir: &Path, record: &BackupRecord) -> Result<()> {
+    let path = backups_dir(termaxa_dir)?.join("manifest.jsonl");
     let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{}", serde_json::to_string(record)?)?;
     Ok(())
 }
 
-pub fn list(aegis_dir: &Path) -> Result<Vec<BackupRecord>> {
-    let path = backups_dir(aegis_dir)?.join("manifest.jsonl");
+pub fn list(termaxa_dir: &Path) -> Result<Vec<BackupRecord>> {
+    let path = backups_dir(termaxa_dir)?.join("manifest.jsonl");
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -330,11 +330,11 @@ pub fn list(aegis_dir: &Path) -> Result<Vec<BackupRecord>> {
 
 /// Restore a backup by id. `confirm` is the caller's y/N gate result —
 /// restores are writes and get the same respect as any other write.
-pub fn restore(aegis_dir: &Path, id: &str) -> Result<String> {
-    let record = list(aegis_dir)?
+pub fn restore(termaxa_dir: &Path, id: &str) -> Result<String> {
+    let record = list(termaxa_dir)?
         .into_iter()
         .find(|r| r.id == id)
-        .with_context(|| format!("no backup with id `{}` — see `aegis backups`", id))?;
+        .with_context(|| format!("no backup with id `{}` — see `termaxa backups`", id))?;
 
     match record.kind.as_str() {
         "git-ref" => {

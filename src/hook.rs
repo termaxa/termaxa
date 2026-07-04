@@ -97,7 +97,7 @@ pub fn run(paths: &crate::paths::Paths) -> Result<()> {
         Action::Deny => "deny",
     };
 
-    let mut reason = format!("[aegis] {}", decision.reason);
+    let mut reason = format!("[termaxa] {}", decision.reason);
     if escalated {
         reason.push_str(" (context-escalated)");
     }

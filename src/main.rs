@@ -18,9 +18,10 @@ use policy::Policy;
 
 #[derive(Parser)]
 #[command(
-    name = "aegis",
+    name = "termaxa",
     version,
-    about = "Policy, approval, and audit layer between AI agents and your tools"
+    about = "Execution gate for AI coding agents: policy, previews, automatic backups, audit",
+    after_help = "EXAMPLES:\n  termaxa init --claude-code        wire up a project (policy + Claude Code hook)\n  termaxa check \"git push --force\"  dry-run a command against policy\n  termaxa run -- terraform apply     gated execution with preview + backup\n  termaxa log --decision deny        what got blocked\n  termaxa report                     summarize the last AI session\n\nDOCS: https://github.com/termaxa/termaxa"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,7 +30,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Scaffold .aegis/ in the current directory and detect agents & tools
+    /// Scaffold .termaxa/ in the current directory and detect agents & tools
     Init {
         /// Also install the PreToolUse hook into .claude/settings.json
         #[arg(long = "claude-code")]
@@ -42,7 +43,7 @@ enum Cmd {
     },
     /// Claude Code PreToolUse hook mode (reads hook JSON on stdin)
     Hook,
-    /// Execute a command through the policy gate: aegis run -- git push
+    /// Execute a command through the policy gate: termaxa run -- git push
     Run {
         #[arg(last = true)]
         argv: Vec<String>,
@@ -72,7 +73,7 @@ enum Cmd {
     Stats,
     /// List backups taken by the insurance engine
     Backups,
-    /// Restore a backup by id (see `aegis backups`)
+    /// Restore a backup by id (see `termaxa backups`)
     Rollback { id: String },
     /// Show where policy and state live for this project
     Paths,
@@ -91,11 +92,19 @@ enum Cmd {
 }
 
 fn main() {
+    // Piping to `head`/`less` closes stdout early; without this, println!
+    // panics with "Broken pipe". Restore the default SIGPIPE disposition so
+    // termaxa dies quietly like every other CLI. (Windows has no SIGPIPE.)
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
     let code = match dispatch(cli) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("aegis: {:#}", e);
+            eprintln!("termaxa: {:#}", e);
             2
         }
     };
@@ -111,7 +120,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Cmd::Check { command } => {
             let cmd = command.join(" ");
             if cmd.trim().is_empty() {
-                bail!("usage: aegis check \"<command>\"");
+                bail!("usage: termaxa check \"<command>\"");
             }
             let p = paths::resolve()?;
             let policy = Policy::load(&p.policy_file())?;
@@ -162,7 +171,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     .unwrap_or_default(),
             })?;
 
-            // Exit codes make `aegis check` scriptable: 0 allow, 3 ask, 4 deny.
+            // Exit codes make `termaxa check` scriptable: 0 allow, 3 ask, 4 deny.
             Ok(match decision.action {
                 policy::Action::Allow => 0,
                 policy::Action::Ask => 3,
@@ -237,7 +246,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if test {
                 notify::test(&policy)
             } else {
-                println!("usage: aegis notify --test");
+                println!("usage: termaxa notify --test");
                 Ok(1)
             }
         }
@@ -306,7 +315,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let p = paths::resolve()?;
             let records = backup::list(&p.state_dir)?;
             let Some(rec) = records.iter().find(|r| r.id == id) else {
-                bail!("no backup with id `{}` — see `aegis backups`", id);
+                bail!("no backup with id `{}` — see `termaxa backups`", id);
             };
             println!("restore  : {} [{}]", rec.id, rec.kind);
             println!("saved    : {}", rec.note);
@@ -317,7 +326,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
             if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
-                eprintln!("aegis: rollback declined.");
+                eprintln!("termaxa: rollback declined.");
                 return Ok(1);
             }
             let msg = backup::restore(&p.state_dir, &id)?;

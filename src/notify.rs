@@ -5,7 +5,7 @@ use std::time::Duration;
 ///
 /// Doctrine (same as previews): this layer must NEVER delay or break
 /// enforcement. Hard 3-second timeout, every error swallowed. Slack being
-/// down cannot make Aegis hang or fail a decision that was already made.
+/// down cannot make Termaxa hang or fail a decision that was already made.
 pub fn maybe_send(policy: &Policy, decision: &str, command: &str, reason: &str, source: &str) {
     let Some(cfg) = &policy.notify else { return };
     if !cfg.on.iter().any(|d| d.eq_ignore_ascii_case(decision)) {
@@ -24,7 +24,7 @@ fn send(cfg: &Notify, decision: &str, command: &str, reason: &str, source: &str)
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let text = format!(
-        "{} *aegis {}* [{}]\n`{}`\n{}\n_{}_",
+        "{} *termaxa {}* [{}]\n`{}`\n{}\n_{}_",
         emoji,
         decision.to_uppercase(),
         source,
@@ -44,21 +44,21 @@ fn send(cfg: &Notify, decision: &str, command: &str, reason: &str, source: &str)
         .send_string(&body);
 }
 
-/// `aegis notify --test`: send a probe and report LOUDLY.
+/// `termaxa notify --test`: send a probe and report LOUDLY.
 ///
 /// The normal notification path is fire-and-forget by design, which means a
 /// misconfigured webhook fails silently. This command is the counterweight:
 /// explicit, verbose, and honest about what happened.
 pub fn test(policy: &Policy) -> anyhow::Result<i32> {
     let Some(cfg) = &policy.notify else {
-        eprintln!("no `notify:` section found in .aegis/policy.yaml — nothing to test");
+        eprintln!("no `notify:` section found in .termaxa/policy.yaml — nothing to test");
         return Ok(1);
     };
     println!("webhook : {}", cfg.webhook);
     println!("on      : {:?}", cfg.on);
 
     let body = serde_json::json!({
-        "text": "✅ *aegis notify --test* — if you can read this, notifications work."
+        "text": "✅ *termaxa notify --test* — if you can read this, notifications work."
     })
     .to_string();
 

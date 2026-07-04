@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-const STARTER_POLICY: &str = r#"# Aegis policy — first matching rule wins; `*` is a wildcard.
+const STARTER_POLICY: &str = r#"# Termaxa policy — first matching rule wins; `*` is a wildcard.
 # Actions: allow (run silently) | ask (require approval) | deny (block)
 version: 1
 default: ask
@@ -95,15 +95,15 @@ rules:
 "#;
 
 pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
-    let aegis_dir = dir.join(".aegis");
-    fs::create_dir_all(&aegis_dir)?;
+    let termaxa_dir = dir.join(".termaxa");
+    fs::create_dir_all(&termaxa_dir)?;
 
-    let policy_path = aegis_dir.join("policy.yaml");
+    let policy_path = termaxa_dir.join("policy.yaml");
     if policy_path.exists() {
-        println!("• .aegis/policy.yaml already exists — leaving it untouched");
+        println!("• .termaxa/policy.yaml already exists — leaving it untouched");
     } else {
         fs::write(&policy_path, STARTER_POLICY)?;
-        println!("✓ wrote .aegis/policy.yaml (starter policy)");
+        println!("✓ wrote .termaxa/policy.yaml (starter policy)");
     }
 
     // --- detect agent harnesses ---
@@ -138,7 +138,7 @@ pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
     if write_claude_hook {
         install_claude_hook(dir)?;
     } else {
-        println!("\nTo wire Aegis into Claude Code, run: aegis init --claude-code");
+        println!("\nTo wire Termaxa into Claude Code, run: termaxa init --claude-code");
         print_hook_snippet();
     }
 
@@ -147,7 +147,7 @@ pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
         println!("  {}", p.state_dir.display());
     }
 
-    println!("\nDone. Try:  aegis check \"git push --force origin main\"");
+    println!("\nDone. Try:  termaxa check \"git push --force origin main\"");
     Ok(())
 }
 
@@ -165,7 +165,7 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
 
     let hook_entry = json!({
         "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "aegis hook" }]
+        "hooks": [{ "type": "command", "command": "termaxa hook" }]
     });
 
     let hooks = settings
@@ -183,7 +183,7 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
     let already = arr.iter().any(|e| {
         e.pointer("/hooks/0/command")
             .and_then(|c| c.as_str())
-            .map(|c| c.contains("aegis hook"))
+            .map(|c| c.contains("termaxa hook"))
             .unwrap_or(false)
     });
     if already {
@@ -205,7 +205,7 @@ fn print_hook_snippet() {
       "PreToolUse": [
         {{
           "matcher": "Bash",
-          "hooks": [{{ "type": "command", "command": "aegis hook" }}]
+          "hooks": [{{ "type": "command", "command": "termaxa hook" }}]
         }}
       ]
     }}

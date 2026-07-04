@@ -5,16 +5,16 @@ use std::path::{Path, PathBuf};
 
 /// Where things live — the v0.8 split, written in scar tissue.
 ///
-/// Field report, v0.6: `.aegis/` lived inside the governed repo, so a
+/// Field report, v0.6: `.termaxa/` lived inside the governed repo, so a
 /// `git reset --hard` reverted the policy and ATE THE AUDIT LOG — twice.
 /// Runtime state has no business living inside the repo it protects.
 ///
-///   - `policy.yaml`  → stays in-repo (`<project>/.aegis/`): it is
+///   - `policy.yaml`  → stays in-repo (`<project>/.termaxa/`): it is
 ///     configuration, reviewable in PRs, policy-as-code.
-///   - logs + backups → `~/.aegis/projects/<name>-<hash8>/`: runtime state,
+///   - logs + backups → `~/.termaxa/projects/<name>-<hash8>/`: runtime state,
 ///     outside every repo, untouchable by any git operation BY CONSTRUCTION.
 pub struct Paths {
-    /// The in-repo `.aegis/` directory (holds policy.yaml).
+    /// The in-repo `.termaxa/` directory (holds policy.yaml).
     pub project_dir: PathBuf,
     /// Home-directory state root for this project (holds logs/, backups/).
     pub state_dir: PathBuf,
@@ -31,7 +31,7 @@ impl Paths {
 pub fn resolve() -> Result<Paths> {
     let cwd = std::env::current_dir()?;
     let Some(policy_file) = Policy::find_policy_file(&cwd) else {
-        bail!("no .aegis/policy.yaml found in this directory or any parent — run `aegis init` first");
+        bail!("no .termaxa/policy.yaml found in this directory or any parent — run `termaxa init` first");
     };
     let project_dir = policy_file.parent().unwrap().to_path_buf();
     let project_root = project_dir.parent().unwrap_or(&project_dir).to_path_buf();
@@ -45,9 +45,9 @@ pub fn resolve() -> Result<Paths> {
     Ok(Paths { project_dir, state_dir })
 }
 
-/// `$AEGIS_HOME` (tests, custom setups) or `~/.aegis`.
+/// `$TERMAXA_HOME` (tests, custom setups) or `~/.termaxa`.
 fn home_base() -> Result<PathBuf> {
-    if let Ok(custom) = std::env::var("AEGIS_HOME") {
+    if let Ok(custom) = std::env::var("TERMAXA_HOME") {
         if !custom.trim().is_empty() {
             return Ok(PathBuf::from(custom));
         }
@@ -55,7 +55,7 @@ fn home_base() -> Result<PathBuf> {
     let home = std::env::var("USERPROFILE") // Windows
         .or_else(|_| std::env::var("HOME")) // Unix
         .context("cannot locate home directory (USERPROFILE/HOME unset)")?;
-    Ok(PathBuf::from(home).join(".aegis"))
+    Ok(PathBuf::from(home).join(".termaxa"))
 }
 
 fn state_dir_for(project_root: &Path) -> Result<PathBuf> {
@@ -91,7 +91,7 @@ fn fnv1a_hex8(s: &str) -> String {
 ///
 /// Backup manifest records contain ABSOLUTE paths to their payloads
 /// (pg_dump files, saved file copies). Moving payloads without rewriting
-/// those paths would make `aegis rollback` a liar — so every string in
+/// those paths would make `termaxa rollback` a liar — so every string in
 /// every record gets the old-prefix → new-prefix rewrite.
 fn migrate_legacy_state(project_dir: &Path, state_dir: &Path) -> Result<()> {
     let mut migrated = false;
@@ -152,7 +152,7 @@ fn migrate_legacy_state(project_dir: &Path, state_dir: &Path) -> Result<()> {
     }
 
     if migrated {
-        eprintln!("aegis: migrated legacy in-repo state to {}", state_dir.display());
+        eprintln!("termaxa: migrated legacy in-repo state to {}", state_dir.display());
     }
     Ok(())
 }
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn sanitize_keeps_names_readable() {
-        assert_eq!(sanitize("aegis-demo"), "aegis-demo");
+        assert_eq!(sanitize("termaxa-demo"), "termaxa-demo");
         assert_eq!(sanitize("my proj (v2)"), "my_proj__v2_");
     }
 

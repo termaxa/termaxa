@@ -1,4 +1,4 @@
-# Aegis policy — first matching rule wins; `*` is a wildcard.
+# Termaxa policy — first matching rule wins; `*` is a wildcard.
 # Actions: allow (run silently) | ask (require approval) | deny (block)
 version: 1
 default: ask

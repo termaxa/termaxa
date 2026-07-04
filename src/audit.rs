@@ -25,7 +25,7 @@ pub struct AuditEntry {
     /// Agent session that caused this entry (from Claude Code hook events).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// Backup taken before execution, if any (see `aegis backups`).
+    /// Backup taken before execution, if any (see `termaxa backups`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<String>,
     /// Preview summary at decision time (e.g. "DELETE ALL from sessions
@@ -45,9 +45,9 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
-    /// Log lives at `<aegis_dir>/logs/audit.jsonl`.
-    pub fn new(aegis_dir: &Path) -> Result<Self> {
-        let dir = aegis_dir.join("logs");
+    /// Log lives at `<termaxa_dir>/logs/audit.jsonl`.
+    pub fn new(termaxa_dir: &Path) -> Result<Self> {
+        let dir = termaxa_dir.join("logs");
         fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
         Ok(Self {
             path: dir.join("audit.jsonl"),

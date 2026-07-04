@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      # Advisory on first push; flip to `-D warnings` once it passes green.
+      # (Developed in an environment without clippy; rustc build is warning-clean.)
+      - name: Clippy
+        run: cargo clippy --all-targets
+      - name: Test
+        run: cargo test --all
+      - name: Build release
+        run: cargo build --release
+      - name: Smoke test (the gate actually gates)
+        shell: bash
+        run: |
+          cd "$(mktemp -d)"
+          BIN="$GITHUB_WORKSPACE/target/release/termaxa"
+          "$BIN" init
+          # a benign command is allowed
+          "$BIN" check "git status"
+          # the trench-coat bypass is denied (exit 4)
+          set +e
+          "$BIN" check "git status && rm -rf /"
+          code=$?
+          set -e
+          if [ "$code" != "4" ]; then
+            echo "expected deny (exit 4) for compound destructive command, got $code"
+            exit 1
+          fi
+          echo "smoke test passed: benign allowed, destructive denied"
