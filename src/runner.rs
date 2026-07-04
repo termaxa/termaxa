@@ -46,6 +46,8 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         }
     };
 
+    let preview_summary = crate::preview::generate(&command).map(|p| p.summary);
+
     let (approved, exit_code) = match decision.action {
         Action::Deny => {
             eprintln!("aegis: blocked by policy.");
@@ -94,6 +96,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         escalated,
         session: None,
         backup: backup_id,
+        preview: preview_summary,
         approved,
         exit_code,
         cwd: std::env::current_dir()

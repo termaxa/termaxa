@@ -28,6 +28,10 @@ pub struct AuditEntry {
     /// Backup taken before execution, if any (see `aegis backups`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<String>,
+    /// Preview summary at decision time (e.g. "DELETE ALL from sessions
+    /// ~120,000 rows") — persisted so reports can aggregate impact as fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
     /// For "run": did the human approve an `ask`? For hook mode this is None
     /// (the agent harness owns the approval UI).
     pub approved: Option<bool>,

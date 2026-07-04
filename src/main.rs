@@ -8,6 +8,7 @@ mod paths;
 mod pg;
 mod policy;
 mod preview;
+mod report;
 mod runner;
 mod shell;
 
@@ -75,6 +76,18 @@ enum Cmd {
     Rollback { id: String },
     /// Show where policy and state live for this project
     Paths,
+    /// Generate an execution report from the audit trail
+    Report {
+        /// Report on a specific session id (default: most recent session)
+        #[arg(long)]
+        session: Option<String>,
+        /// Report over all activity, not just the latest session
+        #[arg(long)]
+        all: bool,
+        /// Emit markdown instead of the terminal box
+        #[arg(long)]
+        md: bool,
+    },
 }
 
 fn main() {
@@ -118,11 +131,13 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if escalated {
                 println!("note    : context escalated allow → ask");
             }
+            let mut preview_summary = None;
             if let Some(pv) = preview::generate(&cmd) {
                 println!("\npreview : {}", pv.title);
                 for l in &pv.lines {
                     println!("{}", l);
                 }
+                preview_summary = Some(pv.summary);
             }
             // Record the dry-run in the audit trail with source "check".
             let log = audit::AuditLog::new(&p.state_dir)?;
@@ -139,6 +154,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 escalated,
                 session: None,
                 backup: None,
+                preview: preview_summary,
                 approved: None,
                 exit_code: None,
                 cwd: std::env::current_dir()
@@ -273,6 +289,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 println!("{}  {}  [{}]  {}\n    insures: {}", r.id, r.ts, r.kind, r.note, r.command);
             }
             Ok(0)
+        }
+        Cmd::Report { session, all, md } => {
+            let p = paths::resolve()?;
+            report::run(&p, report::Scope { session, all }, md)
         }
         Cmd::Paths => {
             let p = paths::resolve()?;

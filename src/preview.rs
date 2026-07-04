@@ -33,6 +33,11 @@ fn generate_one(command: &str) -> Option<Preview> {
     if cmd.starts_with("psql") || cmd.contains(" psql ") {
         return crate::pg::preview_for(command);
     }
+    for bin in ["terraform", "tofu"] {
+        if cmd.starts_with(&format!("{} apply", bin)) || cmd.starts_with(&format!("{} destroy", bin)) {
+            return terraform_preview(bin, cmd.starts_with(&format!("{} destroy", bin)));
+        }
+    }
     None
 }
 
@@ -150,5 +155,95 @@ fn git(args: &[&str]) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// terraform / tofu: what would `apply` actually do?
+// ---------------------------------------------------------------------------
+
+/// Run `plan` and surface add/change/destroy counts before an apply.
+/// -input=false and -lock=false are load-bearing: a preview must never hang
+/// the hook waiting for interactive input or a state lock.
+fn terraform_preview(bin: &str, destroy: bool) -> Option<Preview> {
+    let mut args = vec!["plan", "-no-color", "-input=false", "-lock=false"];
+    if destroy {
+        args.push("-destroy");
+    }
+    let out = std::process::Command::new(bin).args(&args).output().ok()?;
+    if !out.status.success() {
+        return None; // uninitialized dir, bad config — best effort, stay silent
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (add, change, del, resources) = parse_tf_plan(&text)?;
+
+    let mut lines = Vec::new();
+    if del > 0 {
+        lines.push(format!("  ⚠ {} resource(s) will be DESTROYED", del));
+    }
+    for r in resources.iter().take(6) {
+        lines.push(format!("  {}", r));
+    }
+    lines.push(format!("  plan: {} to add, {} to change, {} to destroy", add, change, del));
+
+    Some(Preview {
+        title: format!("{} plan preview", bin),
+        lines,
+        summary: format!("plan: +{} ~{} -{}", add, change, del),
+    })
+}
+
+/// Pure parser: extract counts + resource action lines from plan output.
+pub fn parse_tf_plan(text: &str) -> Option<(u32, u32, u32, Vec<String>)> {
+    let mut resources = Vec::new();
+    let mut counts = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("# ") && t.contains(" will be ") {
+            resources.push(t.trim_start_matches("# ").to_string());
+        }
+        if let Some(rest) = t.strip_prefix("Plan: ") {
+            // "3 to add, 1 to change, 2 to destroy."
+            let nums: Vec<u32> = rest
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if nums.len() >= 3 {
+                counts = Some((nums[0], nums[1], nums[2]));
+            }
+        }
+        if t.starts_with("Destroy complete") || t.starts_with("No changes.") {
+            counts = counts.or(Some((0, 0, 0)));
+        }
+    }
+    counts.map(|(a, c, d)| (a, c, d, resources))
+}
+
+#[cfg(test)]
+mod tf_tests {
+    use super::*;
+
+    #[test]
+    fn parses_plan_summary_and_resources() {
+        let out = r#"
+Terraform will perform the following actions:
+
+  # terraform_data.web[0] will be created
+  # terraform_data.web[1] will be created
+  # aws_instance.old will be destroyed
+
+Plan: 2 to add, 0 to change, 1 to destroy.
+"#;
+        let (a, c, d, res) = parse_tf_plan(out).unwrap();
+        assert_eq!((a, c, d), (2, 0, 1));
+        assert_eq!(res.len(), 3);
+        assert!(res[2].contains("will be destroyed"));
+    }
+
+    #[test]
+    fn no_changes_is_zeroes() {
+        let (a, c, d, _) = parse_tf_plan("No changes. Your infrastructure matches.").unwrap();
+        assert_eq!((a, c, d), (0, 0, 0));
     }
 }

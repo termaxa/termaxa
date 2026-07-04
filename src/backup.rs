@@ -54,7 +54,25 @@ pub fn plan(command: &str) -> Option<String> {
             paths.len()
         ));
     }
+    if tf_state_target(&tokens).is_some() {
+        return Some("copy local terraform.tfstate before apply/destroy (remote state not covered)".into());
+    }
     None
+}
+
+/// Local terraform state worth insuring? (Remote backends — S3 etc. — are
+/// versioned by their own backend and out of scope; we say so in the note.)
+fn tf_state_target(tokens: &[String]) -> Option<PathBuf> {
+    let bin = tokens.first()?;
+    if bin != "terraform" && bin != "tofu" {
+        return None;
+    }
+    let sub = tokens.get(1)?;
+    if sub != "apply" && sub != "destroy" {
+        return None;
+    }
+    let state = PathBuf::from("terraform.tfstate");
+    if state.exists() { Some(state) } else { None }
 }
 
 /// Take the backup. Returns the record on success, a printable error string
@@ -79,6 +97,8 @@ pub fn take(aegis_dir: &Path, command: &str) -> Result<Option<BackupRecord>> {
         backup_pg(aegis_dir, &id, &ts, command, &tokens, &tables, data_only)?
     } else if let Some(paths) = rm_targets(&tokens) {
         backup_files(aegis_dir, &id, &ts, command, &paths)?
+    } else if let Some(state) = tf_state_target(&tokens) {
+        backup_files(aegis_dir, &id, &ts, command, &[state])?
     } else {
         return Ok(None);
     };

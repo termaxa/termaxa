@@ -58,6 +58,8 @@ pub fn run(paths: &crate::paths::Paths) -> Result<()> {
     let signals = context::gather(&command);
     let (decision, escalated) = context::apply(base, &signals);
 
+    let preview_summary = crate::preview::generate(&command).map(|p| p.summary);
+
     // Insure before allowing: PreToolUse runs before execution, so a backup
     // taken here is guaranteed to predate the command. Never for deny.
     let mut backup_id: Option<String> = None;
@@ -82,6 +84,7 @@ pub fn run(paths: &crate::paths::Paths) -> Result<()> {
             escalated,
             session: input.session_id.clone(),
             backup: backup_id.clone(),
+            preview: preview_summary.clone(),
             approved: None,
             exit_code: None,
             cwd: input.cwd.unwrap_or_default(),
@@ -99,8 +102,8 @@ pub fn run(paths: &crate::paths::Paths) -> Result<()> {
         reason.push_str(" (context-escalated)");
     }
     if matches!(decision.action, Action::Ask | Action::Deny) {
-        if let Some(pv) = crate::preview::generate(&command) {
-            reason.push_str(&format!(" | {}", pv.summary));
+        if let Some(s) = &preview_summary {
+            reason.push_str(&format!(" | {}", s));
         }
     }
     if let Some(id) = &backup_id {

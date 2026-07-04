@@ -33,6 +33,15 @@ rules:
     action: allow
   - match: "terraform plan*"
     action: allow
+  - match: "terraform init*"
+    action: allow
+  - match: "tofu plan*"
+    action: allow
+  - match: "tofu apply*"
+    action: ask
+  - match: "tofu destroy*"
+    action: deny
+    reason: "tofu destroy is blocked by policy."
   - match: "kubectl get*"
     action: allow
   - match: "kubectl describe*"
