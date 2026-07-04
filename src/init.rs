@@ -87,7 +87,7 @@ rules:
 
 pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
     let aegis_dir = dir.join(".aegis");
-    fs::create_dir_all(aegis_dir.join("logs"))?;
+    fs::create_dir_all(&aegis_dir)?;
 
     let policy_path = aegis_dir.join("policy.yaml");
     if policy_path.exists() {
@@ -131,6 +131,11 @@ pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
     } else {
         println!("\nTo wire Aegis into Claude Code, run: aegis init --claude-code");
         print_hook_snippet();
+    }
+
+    if let Ok(p) = crate::paths::resolve() {
+        println!("\nRuntime state (logs, backups) lives OUTSIDE the repo:");
+        println!("  {}", p.state_dir.display());
     }
 
     println!("\nDone. Try:  aegis check \"git push --force origin main\"");

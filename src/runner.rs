@@ -3,17 +3,16 @@ use crate::context;
 use crate::policy::{Action, Policy};
 use anyhow::{bail, Result};
 use std::io::{self, Write};
-use std::path::Path;
 use std::process::Command;
 
 /// `aegis run -- <cmd...>`: gatekept execution from the CLI.
-pub fn run(aegis_dir: &Path, argv: &[String]) -> Result<i32> {
+pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     if argv.is_empty() {
         bail!("nothing to run — usage: aegis run -- <command...>");
     }
     let command = shell_join(argv);
 
-    let policy = Policy::load(&aegis_dir.join("policy.yaml"))?;
+    let policy = Policy::load(&paths.policy_file())?;
     let base = policy.evaluate_command(&command);
     let signals = context::gather(&command);
     let (decision, escalated) = context::apply(base, &signals);
@@ -37,7 +36,7 @@ pub fn run(aegis_dir: &Path, argv: &[String]) -> Result<i32> {
 
     let mut backup_id: Option<String> = None;
     let insure = |backup_id: &mut Option<String>| {
-        match crate::backup::take(aegis_dir, &command) {
+        match crate::backup::take(&paths.state_dir, &command) {
             Ok(Some(rec)) => {
                 println!("🛟 backup {} — {}", rec.id, rec.note);
                 *backup_id = Some(rec.id);
@@ -81,7 +80,7 @@ pub fn run(aegis_dir: &Path, argv: &[String]) -> Result<i32> {
         }
     };
 
-    let log = AuditLog::new(aegis_dir)?;
+    let log = AuditLog::new(&paths.state_dir)?;
     let (ts_ms, ts) = now();
     log.append(&AuditEntry {
         ts_ms,

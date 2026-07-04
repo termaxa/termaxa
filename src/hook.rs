@@ -5,7 +5,6 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
 use std::io::Read;
-use std::path::Path;
 
 /// Subset of the Claude Code PreToolUse hook input we care about.
 /// See: https://docs.claude.com/en/docs/claude-code/hooks
@@ -30,7 +29,7 @@ struct HookInput {
 ///
 /// Non-Bash tools and unparsable input fall through with no decision
 /// (exit 0, no output), leaving Claude Code's normal permission flow intact.
-pub fn run(aegis_dir: &Path) -> Result<()> {
+pub fn run(paths: &crate::paths::Paths) -> Result<()> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
 
@@ -53,8 +52,7 @@ pub fn run(aegis_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let policy_path = aegis_dir.join("policy.yaml");
-    let policy = Policy::load(&policy_path)?;
+    let policy = Policy::load(&paths.policy_file())?;
 
     let base = policy.evaluate_command(&command);
     let signals = context::gather(&command);
@@ -64,13 +62,13 @@ pub fn run(aegis_dir: &Path) -> Result<()> {
     // taken here is guaranteed to predate the command. Never for deny.
     let mut backup_id: Option<String> = None;
     if decision.action != Action::Deny {
-        if let Ok(Some(rec)) = crate::backup::take(aegis_dir, &command) {
+        if let Ok(Some(rec)) = crate::backup::take(&paths.state_dir, &command) {
             backup_id = Some(rec.id);
         }
     }
 
     // Audit first, decide second: even denied attempts are part of the record.
-    if let Ok(log) = AuditLog::new(aegis_dir) {
+    if let Ok(log) = AuditLog::new(&paths.state_dir) {
         let (ts_ms, ts) = now();
         let _ = log.append(&AuditEntry {
             ts_ms,

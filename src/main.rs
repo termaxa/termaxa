@@ -4,6 +4,7 @@ mod context;
 mod hook;
 mod init;
 mod notify;
+mod paths;
 mod pg;
 mod policy;
 mod preview;
@@ -13,7 +14,6 @@ mod shell;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use policy::Policy;
-use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -73,6 +73,8 @@ enum Cmd {
     Backups,
     /// Restore a backup by id (see `aegis backups`)
     Rollback { id: String },
+    /// Show where policy and state live for this project
+    Paths,
 }
 
 fn main() {
@@ -98,8 +100,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if cmd.trim().is_empty() {
                 bail!("usage: aegis check \"<command>\"");
             }
-            let aegis_dir = require_aegis_dir()?;
-            let policy = Policy::load(&aegis_dir.join("policy.yaml"))?;
+            let p = paths::resolve()?;
+            let policy = Policy::load(&p.policy_file())?;
             let base = policy.evaluate_command(&cmd);
             let signals = context::gather(&cmd);
             let (decision, escalated) = context::apply(base, &signals);
@@ -123,7 +125,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 }
             }
             // Record the dry-run in the audit trail with source "check".
-            let log = audit::AuditLog::new(&aegis_dir)?;
+            let log = audit::AuditLog::new(&p.state_dir)?;
             let (ts_ms, ts) = audit::now();
             log.append(&audit::AuditEntry {
                 ts_ms,
@@ -152,17 +154,17 @@ fn dispatch(cli: Cli) -> Result<i32> {
             })
         }
         Cmd::Hook => {
-            let aegis_dir = require_aegis_dir()?;
-            hook::run(&aegis_dir)?;
+            let p = paths::resolve()?;
+            hook::run(&p)?;
             Ok(0)
         }
         Cmd::Run { argv } => {
-            let aegis_dir = require_aegis_dir()?;
-            runner::run(&aegis_dir, &argv)
+            let p = paths::resolve()?;
+            runner::run(&p, &argv)
         }
         Cmd::Log { n, decision, source, json } => {
-            let aegis_dir = require_aegis_dir()?;
-            let log = audit::AuditLog::new(&aegis_dir)?;
+            let p = paths::resolve()?;
+            let log = audit::AuditLog::new(&p.state_dir)?;
             // Read generously, filter, then trim to n — so filters don't starve.
             let entries: Vec<_> = log
                 .read_last(100_000)?
@@ -214,8 +216,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Cmd::Notify { test } => {
-            let aegis_dir = require_aegis_dir()?;
-            let policy = Policy::load(&aegis_dir.join("policy.yaml"))?;
+            let p = paths::resolve()?;
+            let policy = Policy::load(&p.policy_file())?;
             if test {
                 notify::test(&policy)
             } else {
@@ -224,8 +226,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Stats => {
-            let aegis_dir = require_aegis_dir()?;
-            let log = audit::AuditLog::new(&aegis_dir)?;
+            let p = paths::resolve()?;
+            let log = audit::AuditLog::new(&p.state_dir)?;
             let entries = log.read_last(1_000_000)?;
             if entries.is_empty() {
                 println!("(audit log is empty)");
@@ -261,8 +263,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Cmd::Backups => {
-            let aegis_dir = require_aegis_dir()?;
-            let records = backup::list(&aegis_dir)?;
+            let p = paths::resolve()?;
+            let records = backup::list(&p.state_dir)?;
             if records.is_empty() {
                 println!("(no backups yet)");
                 return Ok(0);
@@ -272,9 +274,17 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Paths => {
+            let p = paths::resolve()?;
+            println!("policy : {}", p.policy_file().display());
+            println!("state  : {}", p.state_dir.display());
+            println!("logs   : {}", p.state_dir.join("logs").join("audit.jsonl").display());
+            println!("backups: {}", p.state_dir.join("backups").display());
+            Ok(0)
+        }
         Cmd::Rollback { id } => {
-            let aegis_dir = require_aegis_dir()?;
-            let records = backup::list(&aegis_dir)?;
+            let p = paths::resolve()?;
+            let records = backup::list(&p.state_dir)?;
             let Some(rec) = records.iter().find(|r| r.id == id) else {
                 bail!("no backup with id `{}` — see `aegis backups`", id);
             };
@@ -290,18 +300,11 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 eprintln!("aegis: rollback declined.");
                 return Ok(1);
             }
-            let msg = backup::restore(&aegis_dir, &id)?;
+            let msg = backup::restore(&p.state_dir, &id)?;
             println!("✓ {}", msg);
             Ok(0)
         }
     }
 }
 
-/// Find .aegis/ by walking up from cwd; error with a helpful hint if absent.
-fn require_aegis_dir() -> Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
-    match Policy::find_policy_file(&cwd) {
-        Some(policy_file) => Ok(policy_file.parent().unwrap().to_path_buf()),
-        None => bail!("no .aegis/policy.yaml found in this directory or any parent — run `aegis init` first"),
-    }
-}
+
