@@ -42,7 +42,10 @@ pub fn resolve() -> Result<Paths> {
 
     migrate_legacy_state(&project_dir, &state_dir)?;
 
-    Ok(Paths { project_dir, state_dir })
+    Ok(Paths {
+        project_dir,
+        state_dir,
+    })
 }
 
 /// `$TERMAXA_HOME` (tests, custom setups) or `~/.termaxa`.
@@ -72,7 +75,13 @@ fn state_dir_for(project_root: &Path) -> Result<PathBuf> {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -101,7 +110,10 @@ fn migrate_legacy_state(project_dir: &Path, state_dir: &Path) -> Result<()> {
     if old_log.is_file() {
         let content = fs::read_to_string(&old_log)?;
         let new_log = state_dir.join("logs").join("audit.jsonl");
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(&new_log)?;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&new_log)?;
         use std::io::Write;
         f.write_all(content.as_bytes())?;
         fs::remove_file(&old_log)?;
@@ -143,7 +155,10 @@ fn migrate_legacy_state(project_dir: &Path, state_dir: &Path) -> Result<()> {
                 }
             }
             use std::io::Write;
-            let mut f = fs::OpenOptions::new().create(true).append(true).open(&new_manifest)?;
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&new_manifest)?;
             f.write_all(out.as_bytes())?;
             fs::remove_file(&old_manifest)?;
         }
@@ -152,7 +167,10 @@ fn migrate_legacy_state(project_dir: &Path, state_dir: &Path) -> Result<()> {
     }
 
     if migrated {
-        eprintln!("termaxa: migrated legacy in-repo state to {}", state_dir.display());
+        eprintln!(
+            "termaxa: migrated legacy in-repo state to {}",
+            state_dir.display()
+        );
     }
     Ok(())
 }

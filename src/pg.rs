@@ -46,9 +46,15 @@ pub fn preview_for(command: &str) -> Option<Preview> {
 
     for stmt in stmts.iter().take(3) {
         match stmt {
-            Destructive::DropTable { tables, cascade, .. } => {
+            Destructive::DropTable {
+                tables, cascade, ..
+            } => {
                 for t in tables {
-                    lines.push(format!("  DROP TABLE {}{}", t, if *cascade { " CASCADE" } else { "" }));
+                    lines.push(format!(
+                        "  DROP TABLE {}{}",
+                        t,
+                        if *cascade { " CASCADE" } else { "" }
+                    ));
                     let info = introspect(command, t);
                     if let Some(info) = &info {
                         live_reached = true;
@@ -65,12 +71,17 @@ pub fn preview_for(command: &str) -> Option<Preview> {
                             if *cascade {
                                 lines.push("    CASCADE effect  : drops the FK constraints in those tables".into());
                             } else {
-                                lines.push("    without CASCADE : this DROP will FAIL (dependents exist)".into());
+                                lines.push(
+                                    "    without CASCADE : this DROP will FAIL (dependents exist)"
+                                        .into(),
+                                );
                             }
                         }
                         summary_parts.push(format!(
                             "DROP {} ~{} rows, {} dependent(s)",
-                            t, info.rows_display(), info.dependents.len()
+                            t,
+                            info.rows_display(),
+                            info.dependents.len()
                         ));
                     } else {
                         summary_parts.push(format!("DROP {}", t));
@@ -79,10 +90,17 @@ pub fn preview_for(command: &str) -> Option<Preview> {
             }
             Destructive::Truncate { tables, cascade } => {
                 for t in tables {
-                    lines.push(format!("  TRUNCATE {}{}", t, if *cascade { " CASCADE" } else { "" }));
+                    lines.push(format!(
+                        "  TRUNCATE {}{}",
+                        t,
+                        if *cascade { " CASCADE" } else { "" }
+                    ));
                     if let Some(info) = introspect(command, t) {
                         live_reached = true;
-                        lines.push(format!("    rows to erase (estimate) : {}", info.rows_display()));
+                        lines.push(format!(
+                            "    rows to erase (estimate) : {}",
+                            info.rows_display()
+                        ));
                         if !info.dependents.is_empty() && !*cascade {
                             lines.push(format!(
                                 "    without CASCADE : will FAIL — referenced by {}",
@@ -98,14 +116,26 @@ pub fn preview_for(command: &str) -> Option<Preview> {
             Destructive::DeleteFrom { table, has_where } => {
                 if *has_where {
                     lines.push(format!("  DELETE FROM {} (filtered by WHERE)", table));
-                    lines.push("    affected rows depend on the filter — cannot estimate cheaply".into());
+                    lines.push(
+                        "    affected rows depend on the filter — cannot estimate cheaply".into(),
+                    );
                     summary_parts.push(format!("DELETE FROM {} (filtered)", table));
                 } else {
-                    lines.push(format!("  DELETE FROM {} — NO WHERE CLAUSE (deletes every row)", table));
+                    lines.push(format!(
+                        "  DELETE FROM {} — NO WHERE CLAUSE (deletes every row)",
+                        table
+                    ));
                     if let Some(info) = introspect(command, table) {
                         live_reached = true;
-                        lines.push(format!("    rows to delete (estimate) : {}", info.rows_display()));
-                        summary_parts.push(format!("DELETE ALL from {} ~{} rows", table, info.rows_display()));
+                        lines.push(format!(
+                            "    rows to delete (estimate) : {}",
+                            info.rows_display()
+                        ));
+                        summary_parts.push(format!(
+                            "DELETE ALL from {} ~{} rows",
+                            table,
+                            info.rows_display()
+                        ));
                     } else {
                         summary_parts.push(format!("DELETE ALL from {}", table));
                     }
@@ -272,16 +302,11 @@ fn extract_sql(tokens: &[String]) -> Option<String> {
 /// Deliberately conservative: recognizes common shapes, returns nothing
 /// when unsure. A missing preview is safe; the policy layer still applies.
 pub fn parse_destructive(sql: &str) -> Vec<Destructive> {
-    sql.split(';')
-        .filter_map(|stmt| parse_one(stmt))
-        .collect()
+    sql.split(';').filter_map(|stmt| parse_one(stmt)).collect()
 }
 
 fn parse_one(stmt: &str) -> Option<Destructive> {
-    let words: Vec<String> = stmt
-        .split_whitespace()
-        .map(|w| w.to_string())
-        .collect();
+    let words: Vec<String> = stmt.split_whitespace().map(|w| w.to_string()).collect();
     if words.is_empty() {
         return None;
     }
@@ -299,7 +324,11 @@ fn parse_one(stmt: &str) -> Option<Destructive> {
         if tables.is_empty() {
             return None;
         }
-        return Some(Destructive::DropTable { tables, cascade, if_exists });
+        return Some(Destructive::DropTable {
+            tables,
+            cascade,
+            if_exists,
+        });
     }
 
     if kw(0) == "TRUNCATE" {
@@ -395,7 +424,10 @@ mod tests {
     #[test]
     fn tokenizer_respects_quotes() {
         let t = shell_tokens(r#"psql -h prod -c "DROP TABLE users CASCADE""#);
-        assert_eq!(t, vec!["psql", "-h", "prod", "-c", "DROP TABLE users CASCADE"]);
+        assert_eq!(
+            t,
+            vec!["psql", "-h", "prod", "-c", "DROP TABLE users CASCADE"]
+        );
         let t = shell_tokens("psql -c 'DELETE FROM orders'");
         assert_eq!(t[2], "DELETE FROM orders");
     }
@@ -411,21 +443,48 @@ mod tests {
     #[test]
     fn parses_drop_variants() {
         let d = parse_destructive("DROP TABLE users CASCADE");
-        assert_eq!(d, vec![Destructive::DropTable {
-            tables: vec!["users".into()], cascade: true, if_exists: false }]);
+        assert_eq!(
+            d,
+            vec![Destructive::DropTable {
+                tables: vec!["users".into()],
+                cascade: true,
+                if_exists: false
+            }]
+        );
         let d = parse_destructive("drop table if exists a, b");
-        assert_eq!(d, vec![Destructive::DropTable {
-            tables: vec!["a".into(), "b".into()], cascade: false, if_exists: true }]);
+        assert_eq!(
+            d,
+            vec![Destructive::DropTable {
+                tables: vec!["a".into(), "b".into()],
+                cascade: false,
+                if_exists: true
+            }]
+        );
     }
 
     #[test]
     fn parses_truncate_and_delete() {
-        assert_eq!(parse_destructive("TRUNCATE TABLE audit_log"), vec![
-            Destructive::Truncate { tables: vec!["audit_log".into()], cascade: false }]);
-        assert_eq!(parse_destructive("DELETE FROM users"), vec![
-            Destructive::DeleteFrom { table: "users".into(), has_where: false }]);
-        assert_eq!(parse_destructive("DELETE FROM users WHERE id = 5"), vec![
-            Destructive::DeleteFrom { table: "users".into(), has_where: true }]);
+        assert_eq!(
+            parse_destructive("TRUNCATE TABLE audit_log"),
+            vec![Destructive::Truncate {
+                tables: vec!["audit_log".into()],
+                cascade: false
+            }]
+        );
+        assert_eq!(
+            parse_destructive("DELETE FROM users"),
+            vec![Destructive::DeleteFrom {
+                table: "users".into(),
+                has_where: false
+            }]
+        );
+        assert_eq!(
+            parse_destructive("DELETE FROM users WHERE id = 5"),
+            vec![Destructive::DeleteFrom {
+                table: "users".into(),
+                has_where: true
+            }]
+        );
     }
 
     #[test]
@@ -439,6 +498,9 @@ mod tests {
     fn strip_command_flag_keeps_connection_args() {
         let t = shell_tokens("psql -h db.prod -U app -d shop -c 'DROP TABLE x'");
         let stripped = strip_command_flag(&t);
-        assert_eq!(stripped, vec!["psql", "-h", "db.prod", "-U", "app", "-d", "shop"]);
+        assert_eq!(
+            stripped,
+            vec!["psql", "-h", "db.prod", "-U", "app", "-d", "shop"]
+        );
     }
 }

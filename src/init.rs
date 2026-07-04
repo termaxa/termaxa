@@ -110,7 +110,10 @@ pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
     println!("\nAgent harnesses detected:");
     let mut found_any = false;
     for (label, probe) in [
-        ("Claude Code", dir.join(".claude").exists() || which("claude")),
+        (
+            "Claude Code",
+            dir.join(".claude").exists() || which("claude"),
+        ),
         ("Cursor", dir.join(".cursor").exists()),
         ("OpenHands", which("openhands")),
         ("Codex CLI", which("codex")),
@@ -127,7 +130,16 @@ pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
     // --- detect tools worth governing ---
     println!("\nTools detected on PATH:");
     for tool in [
-        "git", "docker", "terraform", "kubectl", "aws", "psql", "npm", "cargo", "gh", "ssh",
+        "git",
+        "docker",
+        "terraform",
+        "kubectl",
+        "aws",
+        "psql",
+        "npm",
+        "cargo",
+        "gh",
+        "ssh",
     ] {
         if which(tool) {
             println!("  ✓ {}", tool);

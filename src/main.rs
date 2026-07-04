@@ -135,7 +135,11 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             println!("reason  : {}", decision.reason);
             for s in &signals {
-                println!("context : {}{}", s.label, if s.escalate { "  ⚠" } else { "" });
+                println!(
+                    "context : {}{}",
+                    s.label,
+                    if s.escalate { "  ⚠" } else { "" }
+                );
             }
             if escalated {
                 println!("note    : context escalated allow → ask");
@@ -187,7 +191,12 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let p = paths::resolve()?;
             runner::run(&p, &argv)
         }
-        Cmd::Log { n, decision, source, json } => {
+        Cmd::Log {
+            n,
+            decision,
+            source,
+            json,
+        } => {
             let p = paths::resolve()?;
             let log = audit::AuditLog::new(&p.state_dir)?;
             // Read generously, filter, then trim to n — so filters don't starve.
@@ -259,21 +268,27 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 return Ok(0);
             }
             let total = entries.len();
-            let count = |f: &dyn Fn(&audit::AuditEntry) -> bool| entries.iter().filter(|e| f(e)).count();
+            let count =
+                |f: &dyn Fn(&audit::AuditEntry) -> bool| entries.iter().filter(|e| f(e)).count();
             println!("entries    : {}", total);
             println!("  allow    : {}", count(&|e| e.decision == "allow"));
             println!("  ask      : {}", count(&|e| e.decision == "ask"));
             println!("  deny     : {}", count(&|e| e.decision == "deny"));
-            println!("by source  : hook {} / run {} / check {}",
+            println!(
+                "by source  : hook {} / run {} / check {}",
                 count(&|e| e.source == "hook"),
                 count(&|e| e.source == "run"),
-                count(&|e| e.source == "check"));
+                count(&|e| e.source == "check")
+            );
             println!("escalated  : {}", count(&|e| e.escalated));
-            let sessions: std::collections::HashSet<_> =
-                entries.iter().filter_map(|e| e.session.as_deref()).collect();
+            let sessions: std::collections::HashSet<_> = entries
+                .iter()
+                .filter_map(|e| e.session.as_deref())
+                .collect();
             println!("sessions   : {}", sessions.len());
 
-            let mut denied: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            let mut denied: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
             for e in entries.iter().filter(|e| e.decision == "deny") {
                 *denied.entry(e.command.as_str()).or_default() += 1;
             }
@@ -295,7 +310,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 return Ok(0);
             }
             for r in records {
-                println!("{}  {}  [{}]  {}\n    insures: {}", r.id, r.ts, r.kind, r.note, r.command);
+                println!(
+                    "{}  {}  [{}]  {}\n    insures: {}",
+                    r.id, r.ts, r.kind, r.note, r.command
+                );
             }
             Ok(0)
         }
@@ -307,7 +325,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let p = paths::resolve()?;
             println!("policy : {}", p.policy_file().display());
             println!("state  : {}", p.state_dir.display());
-            println!("logs   : {}", p.state_dir.join("logs").join("audit.jsonl").display());
+            println!(
+                "logs   : {}",
+                p.state_dir.join("logs").join("audit.jsonl").display()
+            );
             println!("backups: {}", p.state_dir.join("backups").display());
             Ok(0)
         }
@@ -335,5 +356,3 @@ fn dispatch(cli: Cli) -> Result<i32> {
         }
     }
 }
-
-
