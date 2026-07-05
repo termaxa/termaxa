@@ -26,6 +26,13 @@ Termaxa is a third option: a gate the agent's commands pass through. It reads a 
                     +- insure    automatic backup before destructive ops
                     +- record    every attempt, with an execution report
 ```
+<div align="center">
+
+![Termaxa stopping a real Claude Code agent](demos/hero-claude-code.gif)
+
+*A real Claude Code agent attempts a command — Termaxa intercepts it, live, in the agent's own prompt.*
+
+</div>
 
 ## Quick start (5 minutes)
 
@@ -62,6 +69,9 @@ reason  : segment 2/2 `rm -rf /` — Recursive delete from root is blocked.
 
 Termaxa splits compound commands and judges each part. `git status &&` buys nothing.
 
+![compound command blocked](demos/1-trench-coat.gif)
+
+
 ### 2 - Blast radius, before you commit to it
 
 ```console
@@ -94,6 +104,9 @@ $ termaxa rollback b-1783006590625
 ```
 
 Force push measures what the remote will *lose*, not just gain — and pins it to a backup branch first.
+
+![destroy and rollback](demos/3-rollback.gif)
+
 
 ### After a session: the report
 
