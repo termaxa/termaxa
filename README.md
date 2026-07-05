@@ -71,7 +71,6 @@ Termaxa splits compound commands and judges each part. `git status &&` buys noth
 
 ![compound command blocked](demos/1-trench-coat.gif)
 
-
 ### 2 - Blast radius, before you commit to it
 
 ```console
@@ -106,7 +105,6 @@ $ termaxa rollback b-1783006590625
 Force push measures what the remote will *lose*, not just gain — and pins it to a backup branch first.
 
 ![destroy and rollback](demos/3-rollback.gif)
-
 
 ### After a session: the report
 
