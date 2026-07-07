@@ -1,6 +1,6 @@
 [package]
 name = "termaxa"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "Policy, approval, and audit layer between AI agents and your tools"
 license = "MIT OR Apache-2.0"

@@ -45,11 +45,7 @@ pub fn plan(command: &str) -> Option<String> {
         return Some(format!(
             "pg_dump {}{} before execution",
             tables.join(", "),
-            if data_only {
-                " (data)"
-            } else {
-                " (schema+data)"
-            }
+            if data_only { " (data)" } else { " (schema+data)" }
         ));
     }
     if let Some(paths) = rm_targets(&tokens) {
@@ -59,9 +55,7 @@ pub fn plan(command: &str) -> Option<String> {
         ));
     }
     if tf_state_target(&tokens).is_some() {
-        return Some(
-            "copy local terraform.tfstate before apply/destroy (remote state not covered)".into(),
-        );
+        return Some("copy local terraform.tfstate before apply/destroy (remote state not covered)".into());
     }
     None
 }
@@ -78,11 +72,7 @@ fn tf_state_target(tokens: &[String]) -> Option<PathBuf> {
         return None;
     }
     let state = PathBuf::from("terraform.tfstate");
-    if state.exists() {
-        Some(state)
-    } else {
-        None
-    }
+    if state.exists() { Some(state) } else { None }
 }
 
 /// Take the backup. Returns the record on success, a printable error string
@@ -122,22 +112,15 @@ pub fn take(termaxa_dir: &Path, command: &str) -> Result<Option<BackupRecord>> {
 // ---------------------------------------------------------------------------
 
 fn git_force_push_target(tokens: &[String]) -> Option<(String, String)> {
-    if tokens.first().map(|t| t.as_str()) != Some("git")
-        || tokens.get(1).map(|t| t.as_str()) != Some("push")
-    {
+    if tokens.first().map(|t| t.as_str()) != Some("git") || tokens.get(1).map(|t| t.as_str()) != Some("push") {
         return None;
     }
-    let force = tokens
-        .iter()
-        .any(|t| t == "--force" || t == "-f" || t == "--force-with-lease");
+    let force = tokens.iter().any(|t| t == "--force" || t == "-f" || t == "--force-with-lease");
     if !force {
         return None;
     }
     let positional: Vec<&String> = tokens[2..].iter().filter(|t| !t.starts_with('-')).collect();
-    let remote = positional
-        .first()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "origin".into());
+    let remote = positional.first().map(|s| s.to_string()).unwrap_or_else(|| "origin".into());
     let branch = positional
         .get(1)
         .map(|s| s.to_string())
@@ -146,26 +129,15 @@ fn git_force_push_target(tokens: &[String]) -> Option<(String, String)> {
     Some((remote, branch))
 }
 
-fn backup_git_ref(
-    id: &str,
-    ts: &str,
-    command: &str,
-    remote: &str,
-    branch: &str,
-) -> Result<BackupRecord> {
+fn backup_git_ref(id: &str, ts: &str, command: &str, remote: &str, branch: &str) -> Result<BackupRecord> {
     // Best effort: refresh our view of the remote first.
     let _ = Command::new("git").args(["fetch", remote, branch]).output();
     let sha = git_out(&["rev-parse", &format!("{}/{}", remote, branch)])
         .context("cannot resolve remote branch — is it pushed?")?;
     let backup_branch = format!("termaxa/backup/{}", id);
-    let out = Command::new("git")
-        .args(["branch", &backup_branch, &sha])
-        .output()?;
+    let out = Command::new("git").args(["branch", &backup_branch, &sha]).output()?;
     if !out.status.success() {
-        bail!(
-            "git branch failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        bail!("git branch failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(BackupRecord {
         id: id.into(),
@@ -173,13 +145,7 @@ fn backup_git_ref(
         kind: "git-ref".into(),
         command: command.into(),
         data: serde_json::json!({ "branch": backup_branch, "sha": sha, "remote": remote, "target": branch }),
-        note: format!(
-            "{}/{} @ {} pinned to {}",
-            remote,
-            branch,
-            &sha[..8.min(sha.len())],
-            backup_branch
-        ),
+        note: format!("{}/{} @ {} pinned to {}", remote, branch, &sha[..8.min(sha.len())], backup_branch),
     })
 }
 
@@ -260,10 +226,7 @@ fn backup_pg(
         .output()
         .context("pg_dump not found on PATH — cannot insure this operation")?;
     if !out.status.success() {
-        bail!(
-            "pg_dump failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        bail!("pg_dump failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     let conn: Vec<String> = crate::pg::strip_command_flag(tokens);
     Ok(BackupRecord {
@@ -297,20 +260,12 @@ fn rm_targets(tokens: &[String]) -> Option<Vec<PathBuf>> {
     }
 }
 
-fn backup_files(
-    termaxa_dir: &Path,
-    id: &str,
-    ts: &str,
-    command: &str,
-    paths: &[PathBuf],
-) -> Result<BackupRecord> {
+fn backup_files(termaxa_dir: &Path, id: &str, ts: &str, command: &str, paths: &[PathBuf]) -> Result<BackupRecord> {
     let dir = backups_dir(termaxa_dir)?.join(id);
     fs::create_dir_all(&dir)?;
     let mut saved = Vec::new();
     for p in paths {
-        let name = p
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "item".into());
         let dest = dir.join(&name);
         copy_recursive(p, &dest)?;
@@ -357,10 +312,7 @@ fn backups_dir(termaxa_dir: &Path) -> Result<PathBuf> {
 
 fn append_manifest(termaxa_dir: &Path, record: &BackupRecord) -> Result<()> {
     let path = backups_dir(termaxa_dir)?.join("manifest.jsonl");
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{}", serde_json::to_string(record)?)?;
     Ok(())
 }
@@ -394,17 +346,9 @@ pub fn restore(termaxa_dir: &Path, id: &str) -> Result<String> {
                 .args(["push", "--force", remote, &refspec])
                 .output()?;
             if !out.status.success() {
-                bail!(
-                    "restore push failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
+                bail!("restore push failed: {}", String::from_utf8_lossy(&out.stderr).trim());
             }
-            Ok(format!(
-                "{}/{} restored to {}",
-                remote,
-                target,
-                &sha[..8.min(sha.len())]
-            ))
+            Ok(format!("{}/{} restored to {}", remote, target, &sha[..8.min(sha.len())]))
         }
         "pg-dump" => {
             let file = record.data["file"].as_str().context("bad record")?;
@@ -415,18 +359,11 @@ pub fn restore(termaxa_dir: &Path, id: &str) -> Result<String> {
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
             let mut args: Vec<String> = conn[1..].to_vec();
-            args.extend(
-                ["-v", "ON_ERROR_STOP=1", "-f"]
-                    .iter()
-                    .map(|s| s.to_string()),
-            );
+            args.extend(["-v", "ON_ERROR_STOP=1", "-f"].iter().map(|s| s.to_string()));
             args.push(file.to_string());
             let out = Command::new(&conn[0]).args(&args).output()?;
             if !out.status.success() {
-                bail!(
-                    "psql restore failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
+                bail!("psql restore failed: {}", String::from_utf8_lossy(&out.stderr).trim());
             }
             Ok(format!("restored from {}", file))
         }
@@ -455,9 +392,5 @@ fn git_out(args: &[&str]) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }

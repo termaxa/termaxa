@@ -29,9 +29,12 @@ pub fn run(paths: &Paths, scope: Scope, markdown: bool) -> Result<i32> {
     let session = if scope.all {
         None
     } else {
-        scope
-            .session
-            .or_else(|| entries.iter().rev().find_map(|e| e.session.clone()))
+        scope.session.or_else(|| {
+            entries
+                .iter()
+                .rev()
+                .find_map(|e| e.session.clone())
+        })
     };
     if let Some(s) = &session {
         entries.retain(|e| e.session.as_deref() == Some(s));
@@ -61,7 +64,7 @@ struct Report {
     escalated: usize,
     auto_flow: usize, // allowed without any human interruption
     blocked: Vec<String>,
-    impacts: Vec<String>,           // persisted preview summaries on ask/deny
+    impacts: Vec<String>, // persisted preview summaries on ask/deny
     backups: Vec<(String, String)>, // (kind, note)
     risk_score: u32,
     risk_label: &'static str,
@@ -129,23 +132,11 @@ fn compute(entries: &[AuditEntry], paths: &Paths) -> Result<Report> {
 
 fn print_terminal(r: &Report, session: Option<&str>) {
     println!("┌─ Termaxa Execution Report ─────────────────────────");
-    println!(
-        "│ scope     : {}",
-        session.map(short).unwrap_or_else(|| "all activity".into())
-    );
-    println!(
-        "│ window    : {} → {}  ({} min)",
-        r.first_ts, r.last_ts, r.duration_min
-    );
-    println!(
-        "│ commands  : {}   ✓ {} allow · ? {} ask · ✗ {} deny",
-        r.total, r.allow, r.ask, r.deny
-    );
+    println!("│ scope     : {}", session.map(short).unwrap_or_else(|| "all activity".into()));
+    println!("│ window    : {} → {}  ({} min)", r.first_ts, r.last_ts, r.duration_min);
+    println!("│ commands  : {}   ✓ {} allow · ? {} ask · ✗ {} deny", r.total, r.allow, r.ask, r.deny);
     println!("│ escalated : {}", r.escalated);
-    println!(
-        "│ auto-flow : {} command(s) ran without interruption",
-        r.auto_flow
-    );
+    println!("│ auto-flow : {} command(s) ran without interruption", r.auto_flow);
     if !r.blocked.is_empty() {
         println!("│ blocked   :");
         for b in r.blocked.iter().take(5) {
@@ -161,40 +152,22 @@ fn print_terminal(r: &Report, session: Option<&str>) {
     if r.backups.is_empty() {
         println!("│ backups   : none — no insured operations in scope");
     } else {
-        println!(
-            "│ backups   : {} — rollback available (`termaxa backups`)",
-            r.backups.len()
-        );
+        println!("│ backups   : {} — rollback available (`termaxa backups`)", r.backups.len());
         for (kind, note) in r.backups.iter().take(5) {
             println!("│   🛟 [{}] {}", kind, note);
         }
     }
-    println!(
-        "│ risk      : {}  (deny×3 + escalation×2 + ask×1 = {})",
-        r.risk_label, r.risk_score
-    );
+    println!("│ risk      : {}  (deny×3 + escalation×2 + ask×1 = {})", r.risk_label, r.risk_score);
     println!("└──────────────────────────────────────────────────");
 }
 
 fn print_markdown(r: &Report, session: Option<&str>) {
     println!("# Termaxa Execution Report\n");
-    println!(
-        "- **Scope:** {}",
-        session.map(short).unwrap_or_else(|| "all activity".into())
-    );
-    println!(
-        "- **Window:** {} → {} ({} min)",
-        r.first_ts, r.last_ts, r.duration_min
-    );
-    println!(
-        "- **Commands:** {} — {} allow / {} ask / {} deny",
-        r.total, r.allow, r.ask, r.deny
-    );
+    println!("- **Scope:** {}", session.map(short).unwrap_or_else(|| "all activity".into()));
+    println!("- **Window:** {} → {} ({} min)", r.first_ts, r.last_ts, r.duration_min);
+    println!("- **Commands:** {} — {} allow / {} ask / {} deny", r.total, r.allow, r.ask, r.deny);
     println!("- **Escalated by context:** {}", r.escalated);
-    println!(
-        "- **Auto-flow:** {} command(s) without interruption",
-        r.auto_flow
-    );
+    println!("- **Auto-flow:** {} command(s) without interruption", r.auto_flow);
     if !r.blocked.is_empty() {
         println!("\n## Blocked\n");
         for b in &r.blocked {
@@ -216,10 +189,7 @@ fn print_markdown(r: &Report, session: Option<&str>) {
         }
         println!("\nRollback available via `termaxa rollback <id>`.");
     }
-    println!(
-        "\n## Risk: {}\n\nScore {} — transparent formula: deny×3 + escalation×2 + ask×1.",
-        r.risk_label, r.risk_score
-    );
+    println!("\n## Risk: {}\n\nScore {} — transparent formula: deny×3 + escalation×2 + ask×1.", r.risk_label, r.risk_score);
 }
 
 fn short(s: &str) -> String {

@@ -41,6 +41,6 @@ If your threat model includes an agent *actively trying to evade you*, you need 
 If you find a way to bypass a policy that *should* hold (e.g. a compound-command or quoting trick that sneaks a destructive command past a matching `deny` rule), please report it.
 
 - Open a GitHub issue for non-sensitive reports, or
-- Email **security@termaxa.com** for anything you'd rather disclose privately.
+- Email **SECURITY-CONTACT@EXAMPLE.COM** for anything you'd rather disclose privately.
 
 Bypass reports are the most valuable contribution you can make. The compound-command splitting in v0.7 exists because the first live agent found exactly such a bypass within minutes — that finding is now a named regression test. We'd rather have yours the same way.

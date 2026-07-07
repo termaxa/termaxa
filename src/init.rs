@@ -94,7 +94,7 @@ rules:
     action: ask
 "#;
 
-pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
+pub fn run(dir: &Path, write_claude_hook: bool, write_cursor_hook: bool, write_codex_hook: bool, write_copilot_hook: bool) -> Result<()> {
     let termaxa_dir = dir.join(".termaxa");
     fs::create_dir_all(&termaxa_dir)?;
 
@@ -110,10 +110,7 @@ pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
     println!("\nAgent harnesses detected:");
     let mut found_any = false;
     for (label, probe) in [
-        (
-            "Claude Code",
-            dir.join(".claude").exists() || which("claude"),
-        ),
+        ("Claude Code", dir.join(".claude").exists() || which("claude")),
         ("Cursor", dir.join(".cursor").exists()),
         ("OpenHands", which("openhands")),
         ("Codex CLI", which("codex")),
@@ -130,16 +127,7 @@ pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
     // --- detect tools worth governing ---
     println!("\nTools detected on PATH:");
     for tool in [
-        "git",
-        "docker",
-        "terraform",
-        "kubectl",
-        "aws",
-        "psql",
-        "npm",
-        "cargo",
-        "gh",
-        "ssh",
+        "git", "docker", "terraform", "kubectl", "aws", "psql", "npm", "cargo", "gh", "ssh",
     ] {
         if which(tool) {
             println!("  ✓ {}", tool);
@@ -150,7 +138,54 @@ pub fn run(dir: &Path, write_claude_hook: bool) -> Result<()> {
     if write_claude_hook {
         install_claude_hook(dir)?;
     } else {
-        println!("\nTo wire Termaxa into Claude Code, run: termaxa init --claude-code");
+        if write_cursor_hook {
+        let dir_c = dir.join(".cursor");
+        fs::create_dir_all(&dir_c)?;
+        let hooks_path = dir_c.join("hooks.json");
+        let hooks = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "beforeShellExecution": [ { "command": "termaxa hook" } ]
+            }
+        });
+        fs::write(&hooks_path, serde_json::to_string_pretty(&hooks)?)?;
+        println!("✓ wrote .cursor/hooks.json (Cursor beforeShellExecution -> termaxa hook)");
+    }
+
+    println!("\nTo wire Termaxa into Claude Code, run: termaxa init --claude-code");
+    println!("To wire Termaxa into Cursor (v1.7+), run: termaxa init --cursor");
+
+    if write_codex_hook {
+        // Codex uses the same PreToolUse contract as Claude Code.
+        let dir_x = dir.join(".codex");
+        fs::create_dir_all(&dir_x)?;
+        let hooks_path = dir_x.join("hooks.json");
+        let hooks = serde_json::json!({
+            "version": 1,
+            "hooks": { "PreToolUse": [ { "command": "termaxa hook" } ] }
+        });
+        fs::write(&hooks_path, serde_json::to_string_pretty(&hooks)?)?;
+        println!("✓ wrote .codex/hooks.json (Codex PreToolUse -> termaxa hook)");
+    }
+
+    if write_copilot_hook {
+        let dir_h = dir.join(".github").join("hooks");
+        fs::create_dir_all(&dir_h)?;
+        let hooks_path = dir_h.join("hooks.json");
+        // Copilot CLI: preToolUse hook, fail-closed on deny.
+        let hooks = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "preToolUse": [
+                    { "type": "command", "command": "termaxa hook", "failClosed": true }
+                ]
+            }
+        });
+        fs::write(&hooks_path, serde_json::to_string_pretty(&hooks)?)?;
+        println!("✓ wrote .github/hooks/hooks.json (Copilot preToolUse -> termaxa hook, fail-closed)");
+    }
+
+    println!("Other agents: termaxa init --codex | --copilot");
         print_hook_snippet();
     }
 
