@@ -2,6 +2,18 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.10.5 — 2026-07-09
+- Formatting cleanup (`cargo fmt`); no functional changes from v0.10.4.
+
+## v0.10.4 — 2026-07-08
+- Fixed audit-path hash mismatch that caused empty audit logs.
+- Documented honest enforcement limits; removed internal build notes.
+- Multi-agent hook support (Cursor, Codex, Copilot dialects) and
+  `termaxa init` flags landed in this series.
+- Note: version numbers v0.10.0–v0.10.3 were internal iteration
+  numbers and were never published; v0.10.4 is the first release
+  of the 0.10 series.
+  
 ## [0.9.0] — Launch
 
 ### Added
