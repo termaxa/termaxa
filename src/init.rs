@@ -56,6 +56,22 @@ rules:
   - match: "rm -rf /*"
     action: deny
     reason: "Recursive delete from root is blocked."
+  # Broad recursive-force deletes (any target), Unix + PowerShell forms.
+  - match: "*rm -rf*"
+    action: ask
+    reason: "Recursive force delete — confirm the target before running."
+  - match: "*rm -fr*"
+    action: ask
+    reason: "Recursive force delete — confirm the target before running."
+  - match: "*Remove-Item*-Recurse*-Force*"
+    action: ask
+    reason: "Recursive force delete (PowerShell) — confirm the target."
+  - match: "*Remove-Item*-Force*-Recurse*"
+    action: ask
+    reason: "Recursive force delete (PowerShell) — confirm the target."
+  - match: "*Get-ChildItem*Remove-Item*"
+    action: ask
+    reason: "Bulk delete pipeline (PowerShell) — confirm before running."
   - match: "kubectl delete*"
     action: deny
     reason: "kubectl delete is blocked. Use a manifest change + apply."
@@ -142,14 +158,23 @@ pub fn run(dir: &Path, write_claude_hook: bool, write_cursor_hook: bool, write_c
         let dir_c = dir.join(".cursor");
         fs::create_dir_all(&dir_c)?;
         let hooks_path = dir_c.join("hooks.json");
+        // Use the absolute path to THIS binary. On Windows, a bare "termaxa hook"
+        // can fail PATH/quoting resolution inside Cursor's hook runner; an
+        // absolute exe path is the documented fix.
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "termaxa".to_string());
+        let cmd = format!("{} hook", exe);
         let hooks = serde_json::json!({
             "version": 1,
             "hooks": {
-                "beforeShellExecution": [ { "command": "termaxa hook" } ]
+                "beforeShellExecution": [ { "command": cmd } ]
             }
         });
         fs::write(&hooks_path, serde_json::to_string_pretty(&hooks)?)?;
-        println!("✓ wrote .cursor/hooks.json (Cursor beforeShellExecution -> termaxa hook)");
+        println!("✓ wrote .cursor/hooks.json (absolute path -> termaxa hook)");
+        println!("  NOTE: restart Cursor after this so it reloads hook config.");
     }
 
     println!("\nTo wire Termaxa into Claude Code, run: termaxa init --claude-code");

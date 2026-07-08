@@ -31,7 +31,24 @@ pub struct ParsedHook {
 }
 
 /// Raw JSON in -> normalized hook event out. None = not for us; step aside.
+
+/// Normalize a URI-style path to a native one.
+/// Cursor emits workspace roots like "/c:/Users/User/code/proj" on Windows;
+/// convert to "c:/Users/User/code/proj" (which Rust's Path handles fine).
+/// On Unix, a leading-slash path is already native, so leave it alone.
+fn normalize_uri_path(p: &str) -> String {
+    // "/c:/..." -> "c:/..."  (strip the leading slash before a drive letter)
+    let bytes = p.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' && bytes[1].is_ascii_alphabetic() {
+        return p[1..].to_string();
+    }
+    p.to_string()
+}
+
 pub fn parse_input(raw: &str) -> Option<ParsedHook> {
+    // Cursor (and some Windows shells) prepend a UTF-8 BOM; strip it or the
+    // JSON parse fails on the leading bytes.
+    let raw = raw.trim_start_matches('\u{feff}').trim();
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
 
@@ -41,10 +58,26 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
         if command.is_empty() {
             return None;
         }
+        // Cursor sends an empty "cwd" and puts the project path in
+        // "workspace_roots" (URI-style, e.g. "/c:/Users/..."). Use cwd if
+        // present, else the first workspace root, normalized to a native path.
+        let cwd = {
+            let raw_cwd = s("cwd").unwrap_or_default();
+            if !raw_cwd.is_empty() {
+                raw_cwd
+            } else {
+                v.get("workspace_roots")
+                    .and_then(|w| w.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|x| x.as_str())
+                    .map(normalize_uri_path)
+                    .unwrap_or_default()
+            }
+        };
         return Some(ParsedHook {
             dialect: Dialect::Cursor,
             command,
-            cwd: s("cwd").unwrap_or_default(),
+            cwd,
             session: s("conversation_id"),
         });
     }
@@ -152,15 +185,58 @@ pub fn render_response(dialect: Dialect, permission: &str, reason: &str) -> Stri
 ///
 /// Non-Bash tools and unparsable input fall through with no decision
 /// (exit 0, no output), leaving Claude Code's normal permission flow intact.
-pub fn run(paths: &crate::paths::Paths) -> Result<()> {
+pub fn run() -> Result<()> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
+
+    // Diagnostic: set TERMAXA_HOOK_DEBUG=<path> to capture exactly what the
+    // agent delivered (raw stdin + argv). Invaluable for debugging Windows
+    // hook invocation where stdin delivery varies by agent.
+    if let Ok(dbg) = std::env::var("TERMAXA_HOOK_DEBUG") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&dbg) {
+            let argv: Vec<String> = std::env::args().collect();
+            let _ = writeln!(f, "--- {} ---\nARGV: {:?}\nSTDIN_LEN: {}\nSTDIN: {}\n",
+                now().1, argv, buf.len(), buf);
+        }
+    }
 
     let input = match parse_input(&buf) {
         Some(p) => p,
         None => return Ok(()), // not for us; stay out of the way
     };
     let command = input.command.clone();
+
+    // Agents spawn the hook with an arbitrary working directory, but they tell us
+    // the real project dir in the payload's `cwd`. Resolve the policy explicitly
+    // from THAT path rather than mutating the global process cwd (which would make
+    // any later relative-path logic ambiguous). This bug affected every agent; it
+    // only surfaced with Cursor because Claude Code happened to spawn hooks inside
+    // the project dir, masking the incorrect assumption.
+    let start_dir = if !input.cwd.is_empty() && std::path::Path::new(&input.cwd).is_dir() {
+        std::path::PathBuf::from(&input.cwd)
+    } else {
+        std::env::current_dir().unwrap_or_default()
+    };
+    let paths = crate::paths::resolve_from(&start_dir)?;
+
+    // One-line resolution trace (reviewer request): set TERMAXA_HOOK_DEBUG to a
+    // file path and this records exactly what got resolved, so future debugging
+    // is minutes not hours.
+    if let Ok(dbg) = std::env::var("TERMAXA_HOOK_DEBUG") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&dbg) {
+            let _ = writeln!(
+                f,
+                "[{}] dialect={:?} process_cwd={:?} payload_cwd={:?} resolved_policy={}",
+                now().1,
+                input.dialect,
+                std::env::current_dir().ok(),
+                input.cwd,
+                paths.policy_file().display()
+            );
+        }
+    }
 
     let policy = Policy::load(&paths.policy_file())?;
 
@@ -229,12 +305,46 @@ pub fn run(paths: &crate::paths::Paths) -> Result<()> {
     );
 
     println!("{}", render_response(input.dialect, permission, &reason));
+
+    // Belt and suspenders: Cursor and Copilot also honor the process exit code
+    // (2 = block). On Windows especially, stdout JSON delivery can be finicky,
+    // so a denied command exits non-zero to guarantee the block lands.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    if decision.action == Action::Deny {
+        std::process::exit(2);
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_real_payload_uses_workspace_roots_when_cwd_empty() {
+        // The EXACT shape Cursor 3.10 sends on Windows: empty cwd, path in
+        // workspace_roots as a URI, plus a UTF-8 BOM prefix.
+        let raw = "\u{feff}{\"command\":\"rm -rf .cursor .git\",\"cwd\":\"\",\"hook_event_name\":\"beforeShellExecution\",\"workspace_roots\":[\"/c:/Users/User/code/proj\"],\"conversation_id\":\"c9\"}";
+        let p = parse_input(raw).expect("must parse Cursor payload with BOM + empty cwd");
+        assert_eq!(p.dialect, Dialect::Cursor);
+        assert_eq!(p.command, "rm -rf .cursor .git");
+        // cwd must be recovered from workspace_roots, normalized off the URI slash
+        assert_eq!(p.cwd, "c:/Users/User/code/proj");
+    }
+
+    #[test]
+    fn normalize_uri_path_handles_windows_and_unix() {
+        assert_eq!(normalize_uri_path("/c:/Users/x"), "c:/Users/x");
+        assert_eq!(normalize_uri_path("/home/user/proj"), "/home/user/proj"); // unix untouched
+        assert_eq!(normalize_uri_path("c:/already/native"), "c:/already/native");
+    }
+
+    #[test]
+    fn bom_prefixed_json_still_parses() {
+        let raw = "\u{feff}{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}}";
+        assert_eq!(parse_input(raw).unwrap().command, "ls");
+    }
 
     #[test]
     fn detects_cursor_dialect() {

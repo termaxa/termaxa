@@ -188,8 +188,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             })
         }
         Cmd::Hook => {
-            let p = paths::resolve()?;
-            hook::run(&p)?;
+            hook::run()?;
             Ok(0)
         }
         Cmd::Run { argv } => {
