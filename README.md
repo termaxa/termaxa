@@ -76,7 +76,7 @@ preview : postgres impact
   insurance : pg_dump users before execution (automatic on run/hook)
 ```
 
-Row estimates come from the planner (`pg_class.reltuples`) — Termaxa never scans your tables.
+Row estimates come from the planner (`pg_class.reltuples`, stale between `ANALYZE`s) — Termaxa never scans your tables.
 
 ### 3 - Destroy, then un-destroy
 
@@ -190,13 +190,15 @@ notify:                          # optional
 
 ## Honest limitations
 
-Termaxa is v0.9. It's real and tested, and it is not magic. Specifically:
+Termaxa is pre-1.0. It's real and tested, and it is not magic. Specifically:
 
+- **Hooks advise; they don't enforce.** Termaxa gates commands an agent submits through the Claude Code hook. Claude Code is *cooperative* — it respects a `deny` and proposes an alternative, which is what makes the gate work. An agent running in full-auto mode could, in principle, retry a blocked action through a different command or shell; a hook is an *integration* point for visibility and policy, not an *enforcement* boundary. True enforcement means owning the execution path — that's **Termaxa Runtime**, on the roadmap. For hard guarantees today, pair Termaxa with OS-level sandboxing.
 - **Cooperative, not a sandbox.** Termaxa governs commands that flow through the Claude Code hook or `termaxa run`. An agent with raw, unhooked shell access is *not* contained — that needs OS-level sandboxing, a complementary layer. The threat model is *agents making expensive mistakes*, not a malicious agent actively evading you.
 - **Shell parsing is good, not perfect.** It splits on `&&`, `||`, `;`, `|` and flags `$(...)`. Subshells `( )`, deeply nested quoting, and variable-expanded commands are judged conservatively, not deeply understood.
 - **Previews are best-effort.** No database connection → static analysis only. Terraform previews shell out to `terraform plan`. Remote Terraform state is versioned by its backend, not by Termaxa.
 - **Backups have edges.** `rm` insurance keys on the literal `rm` command. Postgres backups use `pg_dump`/`psql` and must be on your PATH. No retention/pruning yet — backups accumulate.
 - **The format may still change.** Pre-1.0 means the policy schema and CLI can shift between minor versions. Pin a release.
+- **Claude Code is the supported integration.** The codebase includes experimental hook dialects for Cursor, Codex, and Copilot — they parse each agent's format but aren't verified end-to-end yet. Claude Code is the tested, supported path. Help validating the others is welcome.
 
 See [SECURITY.md](SECURITY.md) for the full threat model.
 
