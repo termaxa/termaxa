@@ -75,7 +75,10 @@ pub fn test(policy: &Policy) -> anyhow::Result<i32> {
             Ok(0)
         }
         Err(ureq::Error::Status(code, _)) => {
-            eprintln!("result  : HTTP {} — endpoint reachable but rejected the probe", code);
+            eprintln!(
+                "result  : HTTP {} — endpoint reachable but rejected the probe",
+                code
+            );
             Ok(1)
         }
         Err(e) => {

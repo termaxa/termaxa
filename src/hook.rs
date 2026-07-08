@@ -104,7 +104,9 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
             return Some(ParsedHook {
                 dialect: Dialect::Copilot,
                 command,
-                cwd: s("cwd").or_else(|| s("workingDirectory")).unwrap_or_default(),
+                cwd: s("cwd")
+                    .or_else(|| s("workingDirectory"))
+                    .unwrap_or_default(),
                 session: s("sessionId").or_else(|| s("session_id")),
             });
         }
@@ -125,10 +127,18 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
             return None;
         }
         // Codex self-identifies via an `agent`/`source` field or codex-prefixed session.
-        let looks_codex = s("agent").map(|a| a.to_lowercase().contains("codex")).unwrap_or(false)
-            || s("source").map(|a| a.to_lowercase().contains("codex")).unwrap_or(false);
+        let looks_codex = s("agent")
+            .map(|a| a.to_lowercase().contains("codex"))
+            .unwrap_or(false)
+            || s("source")
+                .map(|a| a.to_lowercase().contains("codex"))
+                .unwrap_or(false);
         return Some(ParsedHook {
-            dialect: if looks_codex { Dialect::Codex } else { Dialect::ClaudeCode },
+            dialect: if looks_codex {
+                Dialect::Codex
+            } else {
+                Dialect::ClaudeCode
+            },
             command,
             cwd: s("cwd").unwrap_or_default(),
             session: s("session_id").or_else(|| s("conversation_id")),
@@ -194,10 +204,20 @@ pub fn run() -> Result<()> {
     // hook invocation where stdin delivery varies by agent.
     if let Ok(dbg) = std::env::var("TERMAXA_HOOK_DEBUG") {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&dbg) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&dbg)
+        {
             let argv: Vec<String> = std::env::args().collect();
-            let _ = writeln!(f, "--- {} ---\nARGV: {:?}\nSTDIN_LEN: {}\nSTDIN: {}\n",
-                now().1, argv, buf.len(), buf);
+            let _ = writeln!(
+                f,
+                "--- {} ---\nARGV: {:?}\nSTDIN_LEN: {}\nSTDIN: {}\n",
+                now().1,
+                argv,
+                buf.len(),
+                buf
+            );
         }
     }
 
@@ -225,7 +245,11 @@ pub fn run() -> Result<()> {
     // is minutes not hours.
     if let Ok(dbg) = std::env::var("TERMAXA_HOOK_DEBUG") {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&dbg) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&dbg)
+        {
             let _ = writeln!(
                 f,
                 "[{}] dialect={:?} process_cwd={:?} payload_cwd={:?} resolved_policy={}",
@@ -379,7 +403,8 @@ mod tests {
 
     #[test]
     fn detects_copilot_dialect() {
-        let raw = r#"{"toolName":"shell","toolArgs":"{\"command\":\"rm -rf /\"}","sessionId":"cop-1"}"#;
+        let raw =
+            r#"{"toolName":"shell","toolArgs":"{\"command\":\"rm -rf /\"}","sessionId":"cop-1"}"#;
         let p = parse_input(raw).unwrap();
         assert_eq!(p.dialect, Dialect::Copilot);
         assert_eq!(p.command, "rm -rf /");

@@ -104,7 +104,10 @@ mod tests {
 
     #[test]
     fn splits_all_operators() {
-        assert_eq!(split_segments("a; b | c || d && e"), vec!["a", "b", "c", "d", "e"]);
+        assert_eq!(
+            split_segments("a; b | c || d && e"),
+            vec!["a", "b", "c", "d", "e"]
+        );
     }
 
     #[test]

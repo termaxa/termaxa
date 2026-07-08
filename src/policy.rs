@@ -133,7 +133,13 @@ impl Policy {
         Decision {
             action: d.action,
             matched_rule: d.matched_rule,
-            reason: format!("segment {}/{} `{}` — {}", i + 1, total, segments[i], d.reason),
+            reason: format!(
+                "segment {}/{} `{}` — {}",
+                i + 1,
+                total,
+                segments[i],
+                d.reason
+            ),
         }
     }
 
@@ -228,7 +234,10 @@ rules:
 "#,
         )
         .unwrap();
-        assert_eq!(policy.evaluate("git push origin main").action, Action::Allow);
+        assert_eq!(
+            policy.evaluate("git push origin main").action,
+            Action::Allow
+        );
         assert_eq!(
             policy.evaluate("git push --force origin main").action,
             Action::Deny
@@ -287,7 +296,10 @@ rules:
         assert_eq!(d.action, Action::Deny);
         assert!(d.reason.contains("rm -rf /"));
         // benign compound with an unmatched segment falls to default (ask)
-        assert_eq!(policy.evaluate_command("git status && echo hi").action, Action::Ask);
+        assert_eq!(
+            policy.evaluate_command("git status && echo hi").action,
+            Action::Ask
+        );
         // single commands behave exactly as before
         assert_eq!(policy.evaluate_command("git status").action, Action::Allow);
     }

@@ -16,7 +16,10 @@ pub fn gather(command: &str) -> Vec<Signal> {
     // Git branch awareness: pushing/committing while on a protected branch.
     if cmd_lc.starts_with("git push") || cmd_lc.starts_with("git commit") {
         if let Some(branch) = current_git_branch() {
-            let protected = matches!(branch.as_str(), "main" | "master" | "production" | "release");
+            let protected = matches!(
+                branch.as_str(),
+                "main" | "master" | "production" | "release"
+            );
             signals.push(Signal {
                 label: format!("current branch: {}", branch),
                 escalate: protected && cmd_lc.starts_with("git push"),

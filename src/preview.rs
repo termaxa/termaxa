@@ -34,7 +34,9 @@ fn generate_one(command: &str) -> Option<Preview> {
         return crate::pg::preview_for(command);
     }
     for bin in ["terraform", "tofu"] {
-        if cmd.starts_with(&format!("{} apply", bin)) || cmd.starts_with(&format!("{} destroy", bin)) {
+        if cmd.starts_with(&format!("{} apply", bin))
+            || cmd.starts_with(&format!("{} destroy", bin))
+        {
             return terraform_preview(bin, cmd.starts_with(&format!("{} destroy", bin)));
         }
     }
@@ -184,7 +186,10 @@ fn terraform_preview(bin: &str, destroy: bool) -> Option<Preview> {
     for r in resources.iter().take(6) {
         lines.push(format!("  {}", r));
     }
-    lines.push(format!("  plan: {} to add, {} to change, {} to destroy", add, change, del));
+    lines.push(format!(
+        "  plan: {} to add, {} to change, {} to destroy",
+        add, change, del
+    ));
 
     Some(Preview {
         title: format!("{} plan preview", bin),

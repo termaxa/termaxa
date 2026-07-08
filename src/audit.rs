@@ -87,6 +87,8 @@ pub fn now() -> (u128, String) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    (ms, chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    (
+        ms,
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    )
 }
-

@@ -49,7 +49,10 @@ pub fn resolve_from(start: &std::path::Path) -> Result<Paths> {
 
     migrate_legacy_state(&project_dir, &state_dir)?;
 
-    Ok(Paths { project_dir, state_dir })
+    Ok(Paths {
+        project_dir,
+        state_dir,
+    })
 }
 
 /// `$TERMAXA_HOME` (tests, custom setups) or `~/.termaxa`.
@@ -73,7 +76,11 @@ fn state_dir_for(project_root: &Path) -> Result<PathBuf> {
         .file_name()
         .map(|n| sanitize(&n.to_string_lossy()))
         .unwrap_or_else(|| "project".into());
-    let key = format!("{}-{}", name, fnv1a_hex8(&hash_key(&canonical.to_string_lossy())));
+    let key = format!(
+        "{}-{}",
+        name,
+        fnv1a_hex8(&hash_key(&canonical.to_string_lossy()))
+    );
     Ok(home_base()?.join("projects").join(key))
 }
 
@@ -99,7 +106,13 @@ fn hash_key(s: &str) -> String {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -128,7 +141,10 @@ fn migrate_legacy_state(project_dir: &Path, state_dir: &Path) -> Result<()> {
     if old_log.is_file() {
         let content = fs::read_to_string(&old_log)?;
         let new_log = state_dir.join("logs").join("audit.jsonl");
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(&new_log)?;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&new_log)?;
         use std::io::Write;
         f.write_all(content.as_bytes())?;
         fs::remove_file(&old_log)?;
@@ -170,7 +186,10 @@ fn migrate_legacy_state(project_dir: &Path, state_dir: &Path) -> Result<()> {
                 }
             }
             use std::io::Write;
-            let mut f = fs::OpenOptions::new().create(true).append(true).open(&new_manifest)?;
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&new_manifest)?;
             f.write_all(out.as_bytes())?;
             fs::remove_file(&old_manifest)?;
         }
@@ -179,7 +198,10 @@ fn migrate_legacy_state(project_dir: &Path, state_dir: &Path) -> Result<()> {
     }
 
     if migrated {
-        eprintln!("termaxa: migrated legacy in-repo state to {}", state_dir.display());
+        eprintln!(
+            "termaxa: migrated legacy in-repo state to {}",
+            state_dir.display()
+        );
     }
     Ok(())
 }
@@ -246,7 +268,11 @@ mod tests {
         let base = std::env::temp_dir().join(format!("tmx-cwdtest-{}", std::process::id()));
         let proj = base.join("proj");
         fs::create_dir_all(proj.join(".termaxa")).unwrap();
-        fs::write(proj.join(".termaxa").join("policy.yaml"), "version: 1\ndefault: ask\nrules: []\n").unwrap();
+        fs::write(
+            proj.join(".termaxa").join("policy.yaml"),
+            "version: 1\ndefault: ask\nrules: []\n",
+        )
+        .unwrap();
 
         // Resolve FROM the project dir explicitly (simulating payload.cwd),
         // while the actual process cwd is elsewhere.
@@ -256,7 +282,10 @@ mod tests {
             "policy must resolve under the given root, got {}",
             paths.policy_file().display()
         );
-        assert!(paths.policy_file().is_file(), "policy file should exist at resolved path");
+        assert!(
+            paths.policy_file().is_file(),
+            "policy file should exist at resolved path"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -285,7 +314,11 @@ mod tests {
         let proj = tmp.join("proj");
         let aegis = proj.join(".termaxa");
         fs::create_dir_all(&aegis).unwrap();
-        fs::write(aegis.join("policy.yaml"), "version: 1\ndefault: ask\nrules: []\n").unwrap();
+        fs::write(
+            aegis.join("policy.yaml"),
+            "version: 1\ndefault: ask\nrules: []\n",
+        )
+        .unwrap();
         std::env::set_var("TERMAXA_HOME", tmp.join("home"));
 
         // Simulate the agent spawning us from somewhere unrelated:
@@ -294,10 +327,16 @@ mod tests {
         std::env::set_current_dir(&elsewhere).unwrap();
 
         // resolve() (process cwd = elsewhere) must FAIL to find the policy...
-        assert!(resolve().is_err(), "process-cwd resolve should not find the policy");
+        assert!(
+            resolve().is_err(),
+            "process-cwd resolve should not find the policy"
+        );
         // ...but resolve_from(project) must SUCCEED.
         let r = resolve_from(&proj);
-        assert!(r.is_ok(), "explicit resolve_from(project cwd) must find the policy");
+        assert!(
+            r.is_ok(),
+            "explicit resolve_from(project cwd) must find the policy"
+        );
         assert_eq!(r.unwrap().policy_file(), aegis.join("policy.yaml"));
 
         let _ = fs::remove_dir_all(&tmp);

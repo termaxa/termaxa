@@ -22,7 +22,11 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     println!("│ decision: {}", decision.action);
     println!("│ reason  : {}", decision.reason);
     for s in &signals {
-        println!("│ context : {}{}", s.label, if s.escalate { "  ⚠" } else { "" });
+        println!(
+            "│ context : {}{}",
+            s.label,
+            if s.escalate { "  ⚠" } else { "" }
+        );
     }
     println!("└");
 
@@ -42,7 +46,10 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
                 *backup_id = Some(rec.id);
             }
             Ok(None) => {} // nothing to insure
-            Err(e) => eprintln!("termaxa: backup failed ({}); proceeding — command was approved", e),
+            Err(e) => eprintln!(
+                "termaxa: backup failed ({}); proceeding — command was approved",
+                e
+            ),
         }
     };
 
@@ -115,7 +122,10 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
 fn shell_join(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
-            if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'') {
+            if a.is_empty()
+                || a.chars()
+                    .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+            {
                 format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\""))
             } else {
                 a.clone()
