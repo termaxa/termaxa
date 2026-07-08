@@ -1,6 +1,6 @@
 name: Release
 
-# Tag a version to cut a release:  git tag v0.9.0 && git push --tags
+# Tag a version to cut a release:  git tag v0.10.6 && git push origin v0.10.6
 on:
   push:
     tags: ["v*"]
@@ -9,8 +9,27 @@ permissions:
   contents: write
 
 jobs:
+  # Gate: a tag on a commit that can't pass checks must never publish.
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true   # matches CI: clippy non-fatal (for now)
+      - name: Tests
+        run: cargo test
+
   build:
     name: ${{ matrix.target }}
+    needs: check
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -44,9 +63,28 @@ jobs:
       - name: Stage binary (windows)
         if: runner.os == 'Windows'
         run: cp target/${{ matrix.target }}/release/termaxa.exe ${{ matrix.name }}
-      - name: Upload to release
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+          if-no-files-found: error
+
+  # Runs exactly once: creates the release, attaches all binaries,
+  # generates notes a single time.
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.name }}
+          files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
