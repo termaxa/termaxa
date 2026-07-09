@@ -2,6 +2,12 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## [0.11.1] — Classifier: delete indirection
+- The intent classifier now recognizes deletes hidden behind command
+  indirection: `find -exec/-execdir <rm>`, `find -delete`, `xargs rm`,
+  `unlink`, and `shred -u`. Closes a bypass found in live agent testing
+  where `find . -exec rm -rf {} +` slipped past the circuit breaker.
+
 ## [0.11.0] — Session circuit breaker
 - When the same destructive intent (file delete, DB destroy, git force-op,
   infra destroy) is asked or denied twice in one agent session, further
