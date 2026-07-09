@@ -89,6 +89,8 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         }
     };
 
+    let intent_label = crate::intent::classify_command(&command).map(|i| i.label().to_string());
+
     let log = AuditLog::new(&paths.state_dir)?;
     let (ts_ms, ts) = now();
     log.append(&AuditEntry {
@@ -104,6 +106,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         session: None,
         backup: backup_id,
         preview: preview_summary,
+        intent: intent_label,
         approved,
         exit_code,
         cwd: std::env::current_dir()

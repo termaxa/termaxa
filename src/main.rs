@@ -3,6 +3,7 @@ mod backup;
 mod context;
 mod hook;
 mod init;
+mod intent;
 mod notify;
 mod paths;
 mod pg;
@@ -188,6 +189,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 session: None,
                 backup: None,
                 preview: preview_summary,
+                intent: intent::classify_command(&cmd).map(|i| i.label().to_string()),
                 approved: None,
                 exit_code: None,
                 cwd: std::env::current_dir()

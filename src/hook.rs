@@ -266,7 +266,31 @@ pub fn run() -> Result<()> {
 
     let base = policy.evaluate_command(&command);
     let signals = context::gather(&command);
-    let (decision, escalated) = context::apply(base, &signals);
+    let (mut decision, escalated) = context::apply(base, &signals);
+
+    // Destructive-intent classification (v0.11) — recorded on every entry so
+    // the breaker can count attempts without re-parsing history.
+    let intent_label = crate::intent::classify_command(&command).map(|i| i.label().to_string());
+
+    // Session circuit breaker: repeated destructive intent in one session
+    // escalates ask -> deny. Only ASK is ever touched — explicit allow/deny
+    // rules are deliberate user policy. Runs BEFORE the backup step so a
+    // breaker-denied command never triggers insurance (nothing will run).
+    if decision.action == Action::Ask {
+        let log_path = paths.state_dir.join("logs").join("audit.jsonl");
+        if let Some((_intent, _prior, reason)) = crate::intent::maybe_trip(
+            &paths.policy_file(),
+            &log_path,
+            input.session.as_deref(),
+            &command,
+        ) {
+            decision = crate::policy::Decision {
+                action: Action::Deny,
+                matched_rule: Some("circuit-breaker".to_string()),
+                reason,
+            };
+        }
+    }
 
     let preview_summary = crate::preview::generate(&command).map(|p| p.summary);
 
@@ -295,6 +319,7 @@ pub fn run() -> Result<()> {
             session: input.session.clone(),
             backup: backup_id.clone(),
             preview: preview_summary.clone(),
+            intent: intent_label.clone(),
             approved: None,
             exit_code: None,
             cwd: input.cwd.clone(),

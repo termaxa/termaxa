@@ -32,6 +32,11 @@ pub struct AuditEntry {
     /// ~120,000 rows") — persisted so reports can aggregate impact as fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// Destructive-intent classification (v0.11+): file-delete | db-destroy
+    /// | git-destructive | infra-destroy. Serde-defaulted so pre-v0.11 log
+    /// lines parse as None (decision #7: backward-compatible audit schema).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
     /// For "run": did the human approve an `ask`? For hook mode this is None
     /// (the agent harness owns the approval UI).
     pub approved: Option<bool>,

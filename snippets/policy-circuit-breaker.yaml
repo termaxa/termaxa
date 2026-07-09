@@ -1,0 +1,22 @@
+# Drop-in snippet for an EXISTING project's .termaxa/policy.yaml
+# (new projects get this from `termaxa init` after the Step 5 edit).
+
+# --- add at top level ---
+circuit_breaker:
+  enabled: true
+  threshold: 2   # prior counted attempts before tripping; trip on 3rd
+
+# --- add/replace under rules: (hard-deny bulk deletes) ---
+#  - match: "*rm -rf*"
+#    action: deny
+#    reason: "Recursive force delete blocked by default policy."
+#  - match: "*rm -fr*"
+#    action: deny
+#  - match: "*Remove-Item*-Recurse*"
+#    action: deny
+#  - match: "*Get-ChildItem*Remove-Item*"
+#    action: deny
+#  - match: "*del /s*"
+#    action: deny
+#  - match: "*rmdir /s*"
+#    action: deny

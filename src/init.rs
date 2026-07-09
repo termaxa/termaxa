@@ -56,22 +56,33 @@ rules:
   - match: "rm -rf /*"
     action: deny
     reason: "Recursive delete from root is blocked."
-  # Broad recursive-force deletes (any target), Unix + PowerShell forms.
+  # Broad recursive-force deletes (any target), Unix + PowerShell + cmd
+  # forms. DENY by default: with auto-approving agent UIs, `ask` silently
+  # degrades to `allow`. Relax deliberately, per project, if you need to.
   - match: "*rm -rf*"
-    action: ask
-    reason: "Recursive force delete — confirm the target before running."
+    action: deny
+    reason: "Recursive force delete blocked by default policy."
   - match: "*rm -fr*"
-    action: ask
-    reason: "Recursive force delete — confirm the target before running."
-  - match: "*Remove-Item*-Recurse*-Force*"
-    action: ask
-    reason: "Recursive force delete (PowerShell) — confirm the target."
-  - match: "*Remove-Item*-Force*-Recurse*"
-    action: ask
-    reason: "Recursive force delete (PowerShell) — confirm the target."
+    action: deny
+    reason: "Recursive force delete blocked by default policy."
+  - match: "*Remove-Item*-Recurse*"
+    action: deny
+    reason: "Recursive delete (PowerShell) blocked by default policy."
+  - match: "*Remove-Item*-Force*"
+    action: deny
+    reason: "Forced delete (PowerShell) blocked by default policy."
   - match: "*Get-ChildItem*Remove-Item*"
-    action: ask
-    reason: "Bulk delete pipeline (PowerShell) — confirm before running."
+    action: deny
+    reason: "Bulk delete pipeline (PowerShell) blocked by default policy."
+  - match: "*del /s*"
+    action: deny
+    reason: "Recursive delete (cmd) blocked by default policy."
+  - match: "*rmdir /s*"
+    action: deny
+    reason: "Recursive delete (cmd) blocked by default policy."
+  - match: "*rd /s*"
+    action: deny
+    reason: "Recursive delete (cmd) blocked by default policy."
   - match: "kubectl delete*"
     action: deny
     reason: "kubectl delete is blocked. Use a manifest change + apply."
@@ -108,6 +119,14 @@ rules:
     action: ask
   - match: "ssh *"
     action: ask
+
+# Session circuit breaker (v0.11): if the same destructive intent
+# (file delete / db destroy / git force / infra destroy) is asked or
+# denied `threshold` times in one agent session, further variants are
+# DENIED automatically. Human-approved commands don't count.
+circuit_breaker:
+  enabled: true
+  threshold: 2   # trip on the 3rd attempt
 "#;
 
 pub fn run(
