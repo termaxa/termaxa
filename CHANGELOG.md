@@ -2,6 +2,17 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## [0.11.0] — Session circuit breaker
+- When the same destructive intent (file delete, DB destroy, git force-op,
+  infra destroy) is asked or denied twice in one agent session, further
+  variants are automatically DENIED — closing the retry-with-different-syntax
+  gap found in live Cursor testing. Configurable via `circuit_breaker:` in
+  policy.yaml (enabled by default, threshold 2).
+- Starter policy now DENIES bulk deletes by default (Unix, PowerShell, cmd
+  forms): with auto-approving agent UIs, `ask` silently degrades to `allow`.
+- Audit entries carry an `intent` classification (backward compatible;
+  old log lines parse unchanged).
+
 ## v0.10.5 — 2026-07-09
 - Formatting cleanup (`cargo fmt`); no functional changes from v0.10.4.
 
