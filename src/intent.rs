@@ -122,6 +122,46 @@ pub fn classify_segment(segment: &str) -> Option<Intent> {
     // PowerShell full form spelled with any casing is covered by lowercase
     // compare above ("remove-item").
 
+    // --- delete via command indirection: find / xargs -----------------------
+    // A live agent bypassed the direct-delete check with
+    //   find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    // because the first token is `find`, not a delete command. Catch the
+    // common wrapper forms without pretending to fully parse find/xargs.
+    if first == "find" {
+        // `find ... -delete` erases matched entries directly.
+        if lc.iter().any(|t| t == "-delete") {
+            return Some(Intent::FileDelete);
+        }
+        // `find ... -exec/-execdir/-ok/-okdir <deletecmd> ...` runs a delete
+        // per match. Look for a delete command anywhere after such a flag.
+        let exec_flags = ["-exec", "-execdir", "-ok", "-okdir"];
+        if lc.iter().any(|t| exec_flags.contains(&t.as_str()))
+            && lc
+                .iter()
+                .any(|t| delete_cmds.contains(&t.as_str()) || t == "unlink")
+        {
+            return Some(Intent::FileDelete);
+        }
+    }
+    // `... | xargs rm ...` or `xargs rm` as a segment (the pipe splitter feeds
+    // us `xargs rm -rf` on its own). If xargs is invoking a delete command,
+    // that's a bulk delete.
+    if first == "xargs"
+        && lc
+            .iter()
+            .skip(1)
+            .any(|t| delete_cmds.contains(&t.as_str()) || t == "unlink")
+    {
+        return Some(Intent::FileDelete);
+    }
+    // Bare `unlink <file>` and GNU `shred -u` (delete-after-overwrite).
+    if first == "unlink" && toks.len() > 1 {
+        return Some(Intent::FileDelete);
+    }
+    if first == "shred" && lc.iter().any(|t| t == "-u" || t == "--remove") {
+        return Some(Intent::FileDelete);
+    }
+
     // --- git destructive ---
     if first == "git" {
         let sub = lc.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -415,6 +455,48 @@ mod tests {
             classify_command("Get-ChildItem -Force . | Remove-Item -Recurse -Force"),
             Some(Intent::FileDelete)
         );
+    }
+
+    #[test]
+    fn classifies_delete_indirection_find_and_xargs() {
+        // The EXACT command a live agent used to bypass the classifier
+        // (v0.11.0 breaker-test session 59ef759a, 12:58).
+        assert_eq!(
+            classify_command("find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +"),
+            Some(Intent::FileDelete)
+        );
+        // find -delete (no external command)
+        assert_eq!(
+            classify_command("find /tmp/cache -type f -delete"),
+            Some(Intent::FileDelete)
+        );
+        // find -execdir / -okdir variants
+        assert_eq!(
+            classify_command("find . -name '*.log' -execdir rm {} ;"),
+            Some(Intent::FileDelete)
+        );
+        // xargs-fed delete (pipe splitter hands us the xargs segment alone)
+        assert_eq!(
+            classify_command("find . -name '*.tmp' | xargs rm -f"),
+            Some(Intent::FileDelete)
+        );
+        assert_eq!(classify_command("xargs rm -rf"), Some(Intent::FileDelete));
+        // unlink and shred -u
+        assert_eq!(
+            classify_command("unlink important.db"),
+            Some(Intent::FileDelete)
+        );
+        assert_eq!(
+            classify_command("shred -u secret.key"),
+            Some(Intent::FileDelete)
+        );
+        // find WITHOUT a delete action must NOT classify (no false positives)
+        assert_eq!(classify_command("find . -name '*.rs' -print"), None);
+        assert_eq!(classify_command("find . -type d"), None);
+        // xargs feeding a benign command must NOT classify
+        assert_eq!(classify_command("find . -name '*.rs' | xargs wc -l"), None);
+        // bare unlink with no target is a syscall-y edge; treat as non-delete
+        assert_eq!(classify_command("unlink"), None);
     }
 
     #[test]
