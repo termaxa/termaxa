@@ -2,8 +2,13 @@
 name = "termaxa"
 version = "0.11.1"
 edition = "2021"
-description = "Policy, approval, and audit layer between AI agents and your tools"
+description = "A cooperative gate for the shell commands AI coding agents run — command previews, automatic backups, allow/ask/deny policy, and audit logging."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/termaxa/termaxa"
+homepage = "https://termaxa.com"
+readme = "README.md"
+keywords = ["ai", "agents", "cli", "security", "claude-code"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
