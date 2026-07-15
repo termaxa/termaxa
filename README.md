@@ -33,7 +33,7 @@ Termaxa is a third option: a gate the agent's commands pass through. It reads a 
 **1. Install.** Download a prebuilt binary from [Releases](https://github.com/termaxa/termaxa/releases) and put it on your PATH — or, with a Rust toolchain:
 
 ```bash
-cargo install --git https://github.com/termaxa/termaxa
+cargo install termaxa
 ```
 
 **2. Wire up a project.**
