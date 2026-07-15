@@ -31,6 +31,11 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+/// The matched_rule value the hook sets when the circuit breaker escalates.
+/// report.rs counts trips by this exact string — the shared const keeps them
+/// in sync via the compiler instead of a magic string in two files.
+pub const BREAKER_RULE: &str = "circuit-breaker";
+
 // ---------------------------------------------------------------------------
 // Intent taxonomy
 // ---------------------------------------------------------------------------

@@ -286,7 +286,7 @@ pub fn run() -> Result<()> {
         ) {
             decision = crate::policy::Decision {
                 action: Action::Deny,
-                matched_rule: Some("circuit-breaker".to_string()),
+                matched_rule: Some(crate::intent::BREAKER_RULE.to_string()),
                 reason,
             };
         }

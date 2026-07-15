@@ -63,6 +63,7 @@ struct Report {
     blocked: Vec<String>,
     impacts: Vec<String>,           // persisted preview summaries on ask/deny
     backups: Vec<(String, String)>, // (kind, note)
+    breaker_trips: usize,           // deny entries from the circuit breaker
     risk_score: u32,
     risk_label: &'static str,
 }
@@ -98,6 +99,12 @@ fn compute(entries: &[AuditEntry], paths: &Paths) -> Result<Report> {
         .collect();
     backups.dedup();
 
+    // Circuit-breaker trips: denies whose rule is the breaker (v0.11).
+    let breaker_trips = entries
+        .iter()
+        .filter(|e| e.matched_rule.as_deref() == Some(crate::intent::BREAKER_RULE))
+        .count();
+
     // Transparent risk arithmetic: deny×3 + escalation×2 + ask×1.
     let risk_score = (deny as u32) * 3 + (escalated as u32) * 2 + (ask as u32);
     let risk_label = match risk_score {
@@ -122,6 +129,7 @@ fn compute(entries: &[AuditEntry], paths: &Paths) -> Result<Report> {
         blocked,
         impacts,
         backups,
+        breaker_trips,
         risk_score,
         risk_label,
     })
@@ -169,6 +177,12 @@ fn print_terminal(r: &Report, session: Option<&str>) {
             println!("│   🛟 [{}] {}", kind, note);
         }
     }
+    if r.breaker_trips > 0 {
+        println!(
+            "│ breaker   : tripped {}× — repeated destructive intent auto-denied",
+            r.breaker_trips
+        );
+    }
     println!(
         "│ risk      : {}  (deny×3 + escalation×2 + ask×1 = {})",
         r.risk_label, r.risk_score
@@ -215,6 +229,12 @@ fn print_markdown(r: &Report, session: Option<&str>) {
             println!("- **[{}]** {}", kind, note);
         }
         println!("\nRollback available via `termaxa rollback <id>`.");
+    }
+    if r.breaker_trips > 0 {
+        println!(
+            "\n## Circuit breaker\n\nTripped {}× — repeated destructive intent auto-denied this scope.",
+            r.breaker_trips
+        );
     }
     println!(
         "\n## Risk: {}\n\nScore {} — transparent formula: deny×3 + escalation×2 + ask×1.",
