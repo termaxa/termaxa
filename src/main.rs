@@ -143,10 +143,21 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if cmd.trim().is_empty() {
                 bail!("usage: termaxa check \"<command>\"");
             }
-            let p = paths::resolve()?;
-            let policy = Policy::load(&p.policy_file())?;
-            let base = policy.evaluate_command(&cmd);
-            let signals = context::gather(&cmd);
+            // `check` is a read-only dry run, so it works with zero setup.
+            // If there's no project .termaxa/, fall back to the built-in
+            // starter policy (demo mode). run/hook require an explicit
+            // project policy (decision #19).
+            let resolved = paths::resolve().ok();
+            let (policy, state_dir) = match &resolved {
+                Some(p) => (Policy::load(&p.policy_file())?, p.state_dir.clone()),
+                None => {
+                    eprintln!("ℹ Demo mode — no project policy found.");
+                    eprintln!("ℹ Using Termaxa's built-in starter policy (read-only).");
+                    eprintln!("ℹ Run `termaxa init` to create a policy you can review and customize.\n");
+                    (Policy::builtin()?, paths::demo_state_dir()?)
+                }
+            };
+            let base = policy.evaluate_command(&cmd);            let signals = context::gather(&cmd);
             let (decision, escalated) = context::apply(base, &signals);
 
             println!("command : {}", cmd);
@@ -174,7 +185,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 preview_summary = Some(pv.summary);
             }
             // Record the dry-run in the audit trail with source "check".
-            let log = audit::AuditLog::new(&p.state_dir)?;
+            let log = audit::AuditLog::new(&state_dir)?;
             let (ts_ms, ts) = audit::now();
             log.append(&audit::AuditEntry {
                 ts_ms,

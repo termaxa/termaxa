@@ -2,6 +2,13 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## [0.11.2] — Zero-setup `check`
+- `termaxa check` now works with no project setup: when no `.termaxa/policy.yaml`
+  exists it evaluates against the built-in starter policy (read-only "demo mode"),
+  so `cargo install termaxa && termaxa check "rm -rf /"` works immediately.
+  `run` and `hook` still require an explicit project policy — enforcement stays
+  deliberate.
+  
 ## [0.11.1] — Classifier: delete indirection
 - The intent classifier now recognizes deletes hidden behind command
   indirection: `find -exec/-execdir <rm>`, `find -delete`, `xargs rm`,

@@ -68,6 +68,16 @@ fn home_base() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".termaxa"))
 }
 
+/// State dir for `check` demo mode (no project policy). Audit logs for
+/// zero-setup demo checks land in a shared bucket under ~/.termaxa, so demo
+/// runs are still recorded without requiring `termaxa init`.
+pub fn demo_state_dir() -> Result<PathBuf> {
+    let dir = home_base()?.join("demo");
+    fs::create_dir_all(dir.join("logs"))?;
+    fs::create_dir_all(dir.join("backups"))?;
+    Ok(dir)
+}
+
 fn state_dir_for(project_root: &Path) -> Result<PathBuf> {
     let canonical = project_root
         .canonicalize()

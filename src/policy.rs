@@ -88,6 +88,15 @@ impl Policy {
         Ok(policy)
     }
 
+    /// The built-in starter policy, parsed from the embedded template that
+    /// `init` writes. Used by `check` when no project `.termaxa/policy.yaml`
+    /// exists, so evaluation works with zero setup. Read-only surfaces only —
+    /// `run` and `hook` require an explicit project policy (decision #19).
+    pub fn builtin() -> Result<Self> {
+        serde_yaml::from_str(crate::init::STARTER_POLICY)
+            .context("failed to parse built-in starter policy")
+    }
+
     /// Walk up from `start` looking for `.termaxa/policy.yaml`.
     pub fn find_policy_file(start: &Path) -> Option<PathBuf> {
         let mut dir = Some(start.to_path_buf());
@@ -302,5 +311,22 @@ rules:
         );
         // single commands behave exactly as before
         assert_eq!(policy.evaluate_command("git status").action, Action::Allow);
+    }
+
+    #[test]
+    fn builtin_policy_parses_and_gates() {
+        // The embedded starter policy must always parse (it backs `check`'s
+        // zero-setup demo mode) and must classify the headline cases.
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        assert_eq!(p.evaluate_command("rm -rf /").action, Action::Deny);
+        assert_eq!(
+            p.evaluate_command("psql -c 'DROP TABLE users'").action,
+            Action::Deny
+        );
+        assert_eq!(p.evaluate_command("git status").action, Action::Allow);
+        assert_eq!(
+            p.evaluate_command("git push --force origin main").action,
+            Action::Deny
+        );
     }
 }
