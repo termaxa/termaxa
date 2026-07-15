@@ -153,11 +153,14 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 None => {
                     eprintln!("ℹ Demo mode — no project policy found.");
                     eprintln!("ℹ Using Termaxa's built-in starter policy (read-only).");
-                    eprintln!("ℹ Run `termaxa init` to create a policy you can review and customize.\n");
+                    eprintln!(
+                        "ℹ Run `termaxa init` to create a policy you can review and customize.\n"
+                    );
                     (Policy::builtin()?, paths::demo_state_dir()?)
                 }
             };
-            let base = policy.evaluate_command(&cmd);            let signals = context::gather(&cmd);
+            let base = policy.evaluate_command(&cmd);
+            let signals = context::gather(&cmd);
             let (decision, escalated) = context::apply(base, &signals);
 
             println!("command : {}", cmd);
