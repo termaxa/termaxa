@@ -17,3 +17,4 @@
    one Full Changelog line.
 6. Tags are immutable. A bad release is superseded by the next
    patch version, never retagged or deleted.
+7. After the GitHub release publishes, run cargo publish — otherwise cargo install termaxa lags behind the GitHub release.
