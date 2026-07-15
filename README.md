@@ -34,6 +34,7 @@ Termaxa is a third option: a gate the agent's commands pass through. It reads a 
 
 ```bash
 cargo install termaxa
+termaxa check "rm -rf /"     # works immediately — no setup, no project config
 ```
 
 **2. Wire up a project.**
