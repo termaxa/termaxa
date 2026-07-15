@@ -9,6 +9,7 @@ homepage = "https://termaxa.com"
 readme = "README.md"
 keywords = ["ai", "agents", "cli", "security", "claude-code"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["demos/", "*.tape"]
 
 [dependencies]
 anyhow = "1"
