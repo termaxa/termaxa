@@ -28,6 +28,9 @@ pub struct ParsedHook {
     pub command: String,
     pub cwd: String,
     pub session: Option<String>,
+    /// True for post-execution events (afterShellExecution / postToolUse /
+    /// PostToolUse): the command already ran, so this is a receipt, not a gate.
+    pub is_post: bool,
 }
 
 /// Raw JSON in -> normalized hook event out. None = not for us; step aside.
@@ -52,40 +55,87 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
 
-    // Cursor: hook_event_name + top-level command
-    if s("hook_event_name").as_deref() == Some("beforeShellExecution") {
-        let command = s("command")?;
+    // Event name, lowercased for version-tolerant matching. Cursor renamed its
+    // hooks between versions: older builds sent `beforeShellExecution` /
+    // `afterShellExecution`; Cursor 3.11+ sends `preToolUse` / `postToolUse`
+    // (camelCase) with `tool_name:"Shell"`. Claude Code sends `PreToolUse` /
+    // `PostToolUse`. Match all of them case-insensitively.
+    let event = s("hook_event_name").map(|e| e.to_lowercase());
+    let is_pre = matches!(
+        event.as_deref(),
+        Some("pretooluse") | Some("beforeshellexecution")
+    );
+    let is_post = matches!(
+        event.as_deref(),
+        Some("posttooluse") | Some("aftershellexecution")
+    );
+
+    // Cursor identifies itself several ways across versions: `cursor_version`
+    // (3.11+), `tool_name:"Shell"` + `conversation_id` (3.11+), OR the legacy
+    // `beforeShellExecution`/`afterShellExecution` event names (older builds,
+    // which no other agent uses). Detect all so every Cursor version routes here.
+    let is_cursor = v.get("cursor_version").is_some()
+        || matches!(
+            event.as_deref(),
+            Some("beforeshellexecution") | Some("aftershellexecution")
+        )
+        || (s("tool_name").as_deref() == Some("Shell") && v.get("conversation_id").is_some());
+
+    // Command from either top-level `command` (old Cursor) or
+    // `tool_input.command` (Claude/Codex/Cursor 3.11).
+    let command_from = || -> String {
+        if let Some(c) = s("command") {
+            return c;
+        }
+        v.get("tool_input")
+            .and_then(|t| t.get("command"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    // cwd: prefer explicit non-empty top-level cwd, then tool_input.cwd, then
+    // the first workspace root (URI-normalized for Windows drive paths).
+    let resolve_cwd = || -> String {
+        let top = s("cwd").unwrap_or_default();
+        if !top.is_empty() {
+            return top;
+        }
+        let ti = v
+            .get("tool_input")
+            .and_then(|t| t.get("cwd"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !ti.is_empty() {
+            return ti;
+        }
+        v.get("workspace_roots")
+            .and_then(|w| w.as_array())
+            .and_then(|a| a.first())
+            .and_then(|x| x.as_str())
+            .map(normalize_uri_path)
+            .unwrap_or_default()
+    };
+
+    // ---- Cursor (any version): pre gates, post is a receipt ----
+    if is_cursor && (is_pre || is_post) {
+        let command = command_from();
         if command.is_empty() {
             return None;
         }
-        // Cursor sends an empty "cwd" and puts the project path in
-        // "workspace_roots" (URI-style, e.g. "/c:/Users/..."). Use cwd if
-        // present, else the first workspace root, normalized to a native path.
-        let cwd = {
-            let raw_cwd = s("cwd").unwrap_or_default();
-            if !raw_cwd.is_empty() {
-                raw_cwd
-            } else {
-                v.get("workspace_roots")
-                    .and_then(|w| w.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|x| x.as_str())
-                    .map(normalize_uri_path)
-                    .unwrap_or_default()
-            }
-        };
         return Some(ParsedHook {
             dialect: Dialect::Cursor,
             command,
-            cwd,
-            session: s("conversation_id"),
+            cwd: resolve_cwd(),
+            session: s("conversation_id").or_else(|| s("session_id")),
+            is_post,
         });
     }
 
-    // Copilot CLI: toolName + toolArgs (a JSON *string* holding the args)
+    // ---- Copilot CLI: toolName + toolArgs (a JSON *string* holding the args) ----
     if let Some(tool) = s("toolName") {
         if tool == "shell" || tool == "bash" || tool == "run_in_terminal" {
-            // toolArgs may arrive as a JSON string OR an inline object.
             let args_val = match v.get("toolArgs") {
                 Some(serde_json::Value::String(st)) => {
                     serde_json::from_str::<serde_json::Value>(st).unwrap_or(serde_json::Value::Null)
@@ -108,15 +158,14 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
                     .or_else(|| s("workingDirectory"))
                     .unwrap_or_default(),
                 session: s("sessionId").or_else(|| s("session_id")),
+                is_post,
             });
         }
     }
 
-    // Claude Code & Codex share the PreToolUse/tool_input.command shape.
-    // Distinguish by any explicit agent tag; default the shared shape to Claude Code.
-    if s("tool_name").as_deref() == Some("Bash")
-        || s("hook_event_name").as_deref() == Some("PreToolUse")
-    {
+    // ---- Claude Code & Codex: PreToolUse/PostToolUse + tool_input.command ----
+    // (Cursor already handled above, so a bare tool_name:"Bash" here is Claude/Codex.)
+    if s("tool_name").as_deref() == Some("Bash") || is_pre || is_post {
         let command = v
             .get("tool_input")
             .and_then(|t| t.get("command"))
@@ -126,7 +175,6 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
         if command.is_empty() {
             return None;
         }
-        // Codex self-identifies via an `agent`/`source` field or codex-prefixed session.
         let looks_codex = s("agent")
             .map(|a| a.to_lowercase().contains("codex"))
             .unwrap_or(false)
@@ -142,8 +190,10 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
             command,
             cwd: s("cwd").unwrap_or_default(),
             session: s("session_id").or_else(|| s("conversation_id")),
+            is_post,
         });
     }
+
     None
 }
 
@@ -226,6 +276,80 @@ pub fn run() -> Result<()> {
         None => return Ok(()), // not for us; stay out of the way
     };
     let command = input.command.clone();
+
+    // Post-execution event: the command already ran. Record a receipt
+    // (source "post") so the circuit breaker can exclude human-approved
+    // commands from the retry threshold (decision #13). No policy eval, no
+    // gating, no output — append and exit.
+    if input.is_post {
+        let start_dir = if !input.cwd.is_empty() && std::path::Path::new(&input.cwd).is_dir() {
+            std::path::PathBuf::from(&input.cwd)
+        } else {
+            std::env::current_dir().unwrap_or_default()
+        };
+        if let Ok(paths) = crate::paths::resolve_from(&start_dir) {
+            if let Ok(log) = AuditLog::new(&paths.state_dir) {
+                let (ts_ms, ts) = now();
+                let _ = log.append(&AuditEntry {
+                    ts_ms,
+                    ts,
+                    source: "post".into(),
+                    command: command.clone(),
+                    decision: "executed".into(),
+                    matched_rule: None,
+                    reason: "post-execution receipt".into(),
+                    signals: vec![],
+                    escalated: false,
+                    session: input.session.clone(),
+                    backup: None,
+                    preview: None,
+                    intent: crate::intent::classify_command(&command)
+                        .map(|i| i.label().to_string()),
+                    approved: Some(true),
+                    exit_code: None,
+                    cwd: input.cwd.clone(),
+                });
+            }
+        }
+        return Ok(());
+    }
+
+    // Post-execution event: the command already ran. Record a receipt
+    // (source "post") so the circuit breaker can exclude human-approved
+    // commands from the retry threshold (decision #13). No policy eval, no
+    // gating, no output — just append and exit.
+    if input.is_post {
+        let start_dir = if !input.cwd.is_empty() && std::path::Path::new(&input.cwd).is_dir() {
+            std::path::PathBuf::from(&input.cwd)
+        } else {
+            std::env::current_dir().unwrap_or_default()
+        };
+        if let Ok(paths) = crate::paths::resolve_from(&start_dir) {
+            if let Ok(log) = AuditLog::new(&paths.state_dir) {
+                let (ts_ms, ts) = now();
+                let _ = log.append(&AuditEntry {
+                    ts_ms,
+                    ts,
+                    source: "post".into(),
+                    command: command.clone(),
+                    decision: "executed".into(),
+                    matched_rule: None,
+                    reason: "post-execution receipt".into(),
+                    signals: vec![],
+                    escalated: false,
+                    session: input.session.clone(),
+                    backup: None,
+                    preview: None,
+                    intent: crate::intent::classify_command(&command)
+                        .map(|i| i.label().to_string()),
+                    approved: Some(true),
+                    exit_code: None,
+                    cwd: input.cwd.clone(),
+                });
+            }
+        }
+        return Ok(());
+    }
 
     // Agents spawn the hook with an arbitrary working directory, but they tell us
     // the real project dir in the payload's `cwd`. Resolve the policy explicitly
@@ -405,11 +529,74 @@ mod tests {
     }
 
     #[test]
+    fn cursor_311_pretooluse_is_gated() {
+        // The EXACT shape Cursor 3.11.25 sends on Windows (captured live).
+        // Old parse_input matched none of this -> Termaxa silently no-op'd.
+        let raw = r#"{"conversation_id":"758","tool_name":"Shell","tool_input":{"command":"git status","cwd":"C:\\Users\\User\\code\\p","timeout":30000},"cwd":"C:\\Users\\User\\code\\p","session_id":"758","hook_event_name":"preToolUse","cursor_version":"3.11.25","workspace_roots":["/C:/Users/User/code/p"]}"#;
+        let p = parse_input(raw).expect("Cursor 3.11 preToolUse must be recognized");
+        assert_eq!(p.dialect, Dialect::Cursor);
+        assert_eq!(p.command, "git status");
+        assert!(!p.is_post, "preToolUse must gate, not receipt");
+        assert_eq!(p.session.as_deref(), Some("758"));
+    }
+
+    #[test]
+    fn cursor_311_posttooluse_is_receipt() {
+        let raw = r#"{"conversation_id":"758","tool_name":"Shell","tool_input":{"command":"git status","cwd":"C:\\Users\\User\\code\\p"},"tool_output":"{\"output\":\"\",\"exitCode\":0}","duration":174.96,"cwd":"C:\\Users\\User\\code\\p","session_id":"758","hook_event_name":"postToolUse","cursor_version":"3.11.25","workspace_roots":["/C:/Users/User/code/p"]}"#;
+        let p = parse_input(raw).expect("Cursor 3.11 postToolUse must be recognized");
+        assert_eq!(p.dialect, Dialect::Cursor);
+        assert_eq!(p.command, "git status");
+        assert!(p.is_post, "postToolUse must be a receipt");
+    }
+
+    #[test]
+    fn cursor_311_empty_cwd_recovers_from_tool_input_or_roots() {
+        // 3.11 sometimes sends empty top-level cwd; recover from tool_input.cwd
+        // or workspace_roots.
+        let raw = r#"{"conversation_id":"758","tool_name":"Shell","tool_input":{"command":"where.exe git","cwd":""},"cwd":"","session_id":"758","hook_event_name":"preToolUse","cursor_version":"3.11.25","workspace_roots":["/C:/Users/User/code/p"]}"#;
+        let p = parse_input(raw).unwrap();
+        assert_eq!(
+            p.cwd, "C:/Users/User/code/p",
+            "must recover cwd from workspace_roots"
+        );
+    }
+
+    #[test]
+    fn old_cursor_beforeshellexecution_still_works() {
+        // Backward-compat: pre-3.11 Cursor must still be gated.
+        let raw = "\u{feff}{\"command\":\"rm -rf .cursor .git\",\"cwd\":\"\",\"hook_event_name\":\"beforeShellExecution\",\"workspace_roots\":[\"/c:/Users/User/code/proj\"],\"conversation_id\":\"c9\"}";
+        let p = parse_input(raw).unwrap();
+        assert_eq!(p.dialect, Dialect::Cursor);
+        assert_eq!(p.command, "rm -rf .cursor .git");
+        assert!(!p.is_post);
+    }
+
+    #[test]
     fn detects_claude_dialect() {
         let raw = r#"{"tool_name":"Bash","tool_input":{"command":"git status"},"session_id":"s-1","cwd":"/w"}"#;
         let p = parse_input(raw).unwrap();
         assert_eq!(p.dialect, Dialect::ClaudeCode);
         assert_eq!(p.command, "git status");
+    }
+
+    #[test]
+    fn detects_post_execution_events() {
+        // Cursor afterShellExecution → receipt
+        let cur = r#"{"hook_event_name":"afterShellExecution","command":"rm -rf ./cache","cwd":"/w","conversation_id":"c1"}"#;
+        let p = parse_input(cur).unwrap();
+        assert!(p.is_post);
+        assert_eq!(p.dialect, Dialect::Cursor);
+        assert_eq!(p.command, "rm -rf ./cache");
+
+        // Claude PostToolUse → receipt
+        let cc = r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"git commit -m x"},"session_id":"s1"}"#;
+        let p = parse_input(cc).unwrap();
+        assert!(p.is_post);
+        assert_eq!(p.dialect, Dialect::ClaudeCode);
+
+        // Pre-events are NOT post
+        let pre = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+        assert!(!parse_input(pre).unwrap().is_post);
     }
 
     #[test]

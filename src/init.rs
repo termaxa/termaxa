@@ -206,11 +206,12 @@ pub fn run(
             let hooks = serde_json::json!({
                 "version": 1,
                 "hooks": {
-                    "beforeShellExecution": [ { "command": cmd } ]
+                    "beforeShellExecution": [ { "command": cmd } ],
+                    "afterShellExecution": [ { "command": cmd } ]
                 }
             });
             fs::write(&hooks_path, serde_json::to_string_pretty(&hooks)?)?;
-            println!("✓ wrote .cursor/hooks.json (absolute path -> termaxa hook)");
+            println!("✓ wrote .cursor/hooks.json (before + after ShellExecution -> termaxa hook)");
             println!("  NOTE: restart Cursor after this so it reloads hook config.");
         }
 
@@ -299,9 +300,38 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
         println!("\n• Claude Code hook already installed in .claude/settings.json");
     } else {
         arr.push(hook_entry);
-        fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
         println!("\n✓ installed PreToolUse hook in .claude/settings.json");
     }
+
+    // PostToolUse receipt hook (feeds the breaker's approved-ask exclusion).
+    // Same command; Termaxa branches on the event name internally.
+    let post_entry = json!({
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "termaxa hook" }]
+    });
+    let post = settings
+        .as_object_mut()
+        .context("settings.json root must be an object")?
+        .get_mut("hooks")
+        .and_then(|h| h.as_object_mut())
+        .context("hooks must be an object")?
+        .entry("PostToolUse")
+        .or_insert(json!([]));
+    let post_arr = post
+        .as_array_mut()
+        .context("PostToolUse must be an array")?;
+    let post_already = post_arr.iter().any(|e| {
+        e.pointer("/hooks/0/command")
+            .and_then(|c| c.as_str())
+            .map(|c| c.contains("termaxa hook"))
+            .unwrap_or(false)
+    });
+    if !post_already {
+        post_arr.push(post_entry);
+        println!("✓ installed PostToolUse hook in .claude/settings.json");
+    }
+
+    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
     Ok(())
 }
 
