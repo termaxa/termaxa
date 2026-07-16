@@ -18,3 +18,4 @@
 6. Tags are immutable. A bad release is superseded by the next
    patch version, never retagged or deleted.
 7. After the GitHub release publishes, run cargo publish — otherwise cargo install termaxa lags behind the GitHub release.
+8. After bumping Cargo.toml: run cargo build (updates Cargo.lock), then commit both Cargo.toml and Cargo.lock together in the release-prep commit, before tagging. Then tag → push → CI green → cargo publish.
