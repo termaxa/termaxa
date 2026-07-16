@@ -12,7 +12,7 @@ This is the common, real, daily failure mode. It is the one Termaxa addresses we
 
 **It is not a sandbox, and not a defense against a malicious or adversarial agent.**
 
-Termaxa works by *cooperative interception*: it sees commands that flow through the Claude Code `PreToolUse` hook (or the Cursor `beforeShellExecution` hook), or that you run via `termaxa run --`. That covers the normal path an agent takes. It does **not** cover:
+Termaxa works by *cooperative interception*: it sees commands that flow through the agent's shell hook (Claude Code `PreToolUse`/`PostToolUse`; Cursor `beforeShellExecution`/`afterShellExecution` and, on 3.11+, `preToolUse`/`postToolUse`), or that you run via `termaxa run --`. That covers the normal path an agent takes. It does **not** cover:
 
 - An agent (or process) that calls the real binary directly (`/usr/bin/git`), bypassing the hook.
 - Commands run through a language runtime, a subshell Termaxa didn't parse, or an execution path outside the harness.
@@ -29,6 +29,15 @@ If your threat model includes an agent *actively trying to evade you*, you need 
 - **Policy is only as good as you write it.** The starter policy is a sensible default, not a guarantee. Review it. `default: ask` fails closed, which is the safe direction, but an over-broad `allow` rule can still wave through something you'd rather catch.
 - **Fail-open on plumbing.** If the hook receives malformed input, Termaxa steps aside rather than breaking your session. This is deliberate (a gate that bricks sessions gets uninstalled) but means a sufficiently broken invocation is ungoverned.
 - **The circuit breaker is per-session, and the session id can rotate.** The breaker counts repeated destructive intent within one agent session and escalates further variants to `deny`. If the harness rotates its session id mid-run (observed with both Claude Code and Cursor), the counter resets. It classifies command *intent* (file-delete, db-destroy, git-force, infra-destroy), including deletes hidden behind `find -exec`, `xargs`, and `unlink` — but it is a speed bump against retry-flailing, not a guaranteed cap, and it only sees commands that reach the shell hook.
+- **Hook dialects can drift.** Agents change their hook APIs between versions —
+  observed live: Cursor 3.11 renamed its events (`preToolUse`/`postToolUse`) and
+  Termaxa silently stopped gating it until v0.11.4, while every unit test stayed
+  green (the fixtures used the old shape). When a dialect drifts, the gate fails
+  *open and silent*, not loud. Mitigations: regression tests now use real
+  captured payloads per agent version, and `TERMAXA_HOOK_DEBUG` records exactly
+  what an agent sends so drift is diagnosable in minutes. If you upgrade your
+  agent and Termaxa goes quiet (`termaxa log` shows no new hook entries), suspect
+  dialect drift and file an issue with a debug capture.
 
 ## Design choices that support safety
 
@@ -45,4 +54,4 @@ If you find a way to bypass a policy that *should* hold (e.g. a compound-command
 - Open a GitHub issue for non-sensitive reports, or
 - Email **security@termaxa.com** for anything you'd rather disclose privately.
 
-Bypass reports are the most valuable contribution you can make. The compound-command splitting in v0.7 exists because the first live agent found exactly such a bypass within minutes — that finding is now a named regression test. The v0.11.1 intent classifier for `find -exec`/`xargs` deletes exists for the same reason: a live Cursor agent found the gap. We'd rather have yours the same way.
+Bypass reports are the most valuable contribution you can make. The compound-command splitting in v0.7 exists because the first live agent found exactly such a bypass within minutes — that finding is now a named regression test. The v0.11.1 intent classifier for `find -exec`/`xargs` deletes exists for the same reason: a live Cursor agent found the gap. And the v0.11.4 Cursor 3.11 fix exists because a live payload capture showed the gate had gone silent. We'd rather have yours the same way.
