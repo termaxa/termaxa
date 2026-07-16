@@ -2,10 +2,22 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## [0.11.4] — Cursor 3.11 hook compatibility + post-execution receipts
+- **Fix (important): restore gating for Cursor 3.11+.** Cursor renamed its hook
+  API (`preToolUse`/`postToolUse`, `tool_name:"Shell"`); Termaxa only knew the
+  older `beforeShellExecution`/`afterShellExecution` shape, so on current Cursor
+  it silently stopped intercepting commands. Now handles both. Verified live on
+  Cursor 3.11.25. Old Cursor, Claude Code, Codex, Copilot unchanged.
+- **Post-execution receipts.** Records a receipt when a command finishes (Claude
+  Code `PostToolUse` and Cursor `postToolUse`, both verified live on Windows).
+  The circuit breaker excludes human-approved commands from the retry threshold,
+  so approving a legitimate command no longer nudges the agent toward an auto-deny.
+  `termaxa init` now registers both pre- and post-execution hooks.
+  
 ## [0.11.3] — Report surfaces breaker trips
 - `termaxa report` now shows a `breaker` line counting circuit-breaker trips
   in scope, so auto-denied retry-storms are visible in the session summary.
-  
+
 ## [0.11.2] — Zero-setup `check`
 - `termaxa check` now works with no project setup: when no `.termaxa/policy.yaml`
   exists it evaluates against the built-in starter policy (read-only "demo mode"),
