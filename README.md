@@ -125,7 +125,34 @@ $ termaxa report
 
 Every line is a fact with a source in the audit log. Nothing invented.
 
-## Why Termaxa?
+## Why SigmaShake?
+
+Funny how this article says exactly what sigmashake.com SSG product does. "allow/ask/deny policy"
+
+The original creator build this product in public:
+https://youtube.com/@sigmashakeinc
+https://twitch.tv/sigmashake
+https://sigmashake.com
+
+However, their product supports several harnesses (Claude Code, Codex, OpenCode, Antigravity, Cursor, Pi Agent, etc.)
+
+They also got it published on the Apple App Store and Microsoft Store
+https://apps.apple.com/us/app/sigmashake-desktop/id6769901150?mt=12
+https://apps.microsoft.com/detail/9n2chv3stgs4?hl=en-US&gl=US
+
+They have a CLI, Desktop, and Docker version all support Linux, MacOS , and Windows
+https://sigmashake.com/#install
+
+Theirs Enterprise support to manage over 100,000 installations of SSG/Sigmahshake Desktop
+
+They even do a benchmark to block all dangerous attack patterns in the scenario your AI Agent Configuration gets compromised
+https://bench.sigmashake.com/#results
+
+They work on it every day (over 4 months) and have a 10+ Security Engineering background and take Security compliance requirements seriously.
+Check out:
+https://trust.sigmashake.com
+https://security.sigmashake.com
+
 
 **"Claude Code already asks permission — why do I need this?"**
 
