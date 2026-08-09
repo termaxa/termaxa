@@ -3,6 +3,7 @@ mod backup;
 mod context;
 mod delete;
 mod doctor;
+mod fingerprint;
 mod hook;
 mod init;
 mod intent;

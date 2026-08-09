@@ -171,9 +171,12 @@ pub fn classify_segment(segment: &str) -> Option<Intent> {
     if first == "git" {
         let sub = lc.get(1).map(|s| s.as_str()).unwrap_or("");
         let hit = match sub {
-            "push" => lc
-                .iter()
-                .any(|t| t == "--force" || t == "-f" || t == "--force-with-lease"),
+            // A leading `+` on a refspec IS a force push — `git push origin
+            // +main` and `git push origin --force main` do the same thing,
+            // and `+` is the only meaning `git push` gives that character.
+            "push" => lc.iter().any(|t| {
+                t == "--force" || t == "-f" || t == "--force-with-lease" || t.starts_with('+')
+            }),
             "reset" => lc.iter().any(|t| t == "--hard"),
             "clean" => lc
                 .iter()
@@ -509,6 +512,25 @@ mod tests {
             classify_command("git branch -D feature"),
             Some(Intent::GitDestructive)
         );
+    }
+
+    #[test]
+    fn a_plus_refspec_is_a_force_push() {
+        // `git push origin +main` overwrites the remote branch exactly as
+        // `--force` does; the flag spelling was the only one the breaker
+        // could see.
+        for cmd in [
+            "git push origin +main",
+            "git push origin +main:main",
+            "git push origin +refs/heads/main:refs/heads/main",
+            "git push origin +HEAD:production",
+        ] {
+            assert_eq!(classify_command(cmd), Some(Intent::GitDestructive), "{cmd}");
+        }
+        // A plain push is still a plain push, and `+` outside `git push`
+        // means nothing here.
+        assert_eq!(classify_command("git push origin main:main"), None);
+        assert_eq!(classify_command("git log --format=+%h"), None);
     }
 
     #[test]

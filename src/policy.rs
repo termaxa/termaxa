@@ -329,4 +329,89 @@ rules:
             Action::Deny
         );
     }
+
+    #[test]
+    fn the_starter_policy_defends_its_own_configuration() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+
+        // The command from the review: `echo *` sat below the denies and
+        // allowed this outright, and everything after it was judged by a
+        // policy the agent had written.
+        let d = p.evaluate_command("echo 'default: allow' > .termaxa/policy.yaml");
+        assert_eq!(d.action, Action::Deny);
+        assert_eq!(d.matched_rule.as_deref(), Some("*.termaxa*"));
+
+        for cmd in [
+            "cat /tmp/mine.yaml > .termaxa/policy.yaml",
+            "rm -f .termaxa/policy.yaml",
+            "sed -i 's/deny/allow/g' .termaxa/policy.yaml",
+            "mv /tmp/mine.yaml .termaxa/policy.yaml",
+            "copy C:\\tmp\\mine.yaml .termaxa\\policy.yaml",
+            "echo '{}' > .claude/settings.json",
+            "rm .cursor/hooks.json",
+            "mv .codex/hooks.json /tmp/",
+            "rm .github/hooks/hooks.json",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Deny,
+                "must not be able to edit the gate: {cmd}"
+            );
+        }
+
+        // The self-defence block has to sit ABOVE the read-only allows, or
+        // first-match-wins hands it back. Prove the ordering, not just the
+        // verdict, by checking a command that both blocks match.
+        let idx_self = p
+            .rules
+            .iter()
+            .position(|r| r.r#match == "*.termaxa*")
+            .expect("self-defence rule must exist");
+        let idx_echo = p
+            .rules
+            .iter()
+            .position(|r| r.r#match == "echo *")
+            .expect("echo rule must exist");
+        assert!(
+            idx_self < idx_echo,
+            "self-defence must be reachable: it sits at {idx_self}, `echo *` at {idx_echo}"
+        );
+    }
+
+    #[test]
+    fn no_preserve_root_is_denied_by_name() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        // GNU rm refuses a bare `rm -rf /`. This is the spelling it obeys,
+        // and it does not contain the substring `rm -rf` that the famous
+        // rule matches on.
+        assert!(!"rm --no-preserve-root -rf /".contains("rm -rf"));
+        for cmd in [
+            "rm --no-preserve-root -rf /",
+            "sudo rm --no-preserve-root -rf /",
+            "rm -r --no-preserve-root /",
+        ] {
+            assert_eq!(p.evaluate_command(cmd).action, Action::Deny, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn read_only_prefixes_do_not_swallow_neighbouring_commands() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+
+        // Still allowed — including bare `ls`, which needs its own rule
+        // because `ls *` requires the space.
+        for cmd in ["ls", "ls -la src", "grep -rn fn src", "cat Cargo.toml"] {
+            assert_eq!(p.evaluate_command(cmd).action, Action::Allow, "{cmd}");
+        }
+
+        // Different programs that merely start with the same letters. `ls*`
+        // and `grep*` used to allow all of these.
+        for cmd in ["lsof -i :5432", "lsblk", "lsattr -R /", "grepdiff --help"] {
+            assert_ne!(
+                p.evaluate_command(cmd).action,
+                Action::Allow,
+                "a prefix is not a command: {cmd}"
+            );
+        }
+    }
 }

@@ -15,6 +15,43 @@ version: 1
 default: ask
 
 rules:
+  # ---- self-defence: the gate's own configuration ----
+  # A gate that will happily rewrite its own rules is a suggestion. These
+  # come FIRST because first-match-wins: `echo *` at the bottom of this file
+  # would otherwise allow
+  #     echo 'default: allow' > .termaxa/policy.yaml
+  # and every command after it is judged by the agent's own policy.
+  #
+  # `*` matches any run of characters, so one rule covers both path
+  # separators: `.termaxa/policy.yaml` and `.termaxa\policy.yaml`.
+  #
+  # This closes the SHELL path only. An agent's file-writing tool (Write,
+  # Edit, the editor's apply-patch) never reaches the hook — the Claude Code
+  # hook is registered with `"matcher": "Bash"` — so no rule here can see it.
+  # `termaxa doctor` fingerprints the policy for exactly that reason: what
+  # cannot be blocked can at least be noticed.
+  #
+  # Reads are denied too, because separating them from writes would mean
+  # enumerating every read command. If you want one back, put it ABOVE this
+  # block — e.g. `- match: "cat .termaxa/*"` / `action: allow`. `termaxa
+  # doctor` prints the rule count, the default and the fingerprint without
+  # touching the file.
+  - match: "*.termaxa*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+  - match: "*.claude*settings*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+  - match: "*.cursor*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+  - match: "*.codex*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+  - match: "*.github*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+
   # ---- destructive: hard stops ----
   - match: "git push*--force*"
     action: deny
@@ -22,6 +59,12 @@ rules:
   - match: "rm -rf /*"
     action: deny
     reason: "Recursive delete from root is blocked."
+  # GNU rm refuses `rm -rf /` on its own; --no-preserve-root is the one
+  # spelling it obeys. The rule above is named for the command everybody
+  # quotes, this one is named for the command that actually works.
+  - match: "*--no-preserve-root*"
+    action: deny
+    reason: "--no-preserve-root is the only spelling `rm` obeys at `/`. Blocked."
   # Broad recursive-force deletes (any target), Unix + PowerShell + cmd
   # forms. DENY by default: with auto-approving agent UIs, `ask` silently
   # degrades to `allow`. Relax deliberately, per project, if you need to.
@@ -106,11 +149,18 @@ rules:
     action: allow
   - match: "git commit*"
     action: allow
-  - match: "ls*"
+  # A prefix without its trailing space is a prefix, not a command: `ls*`
+  # also matched `lsof` and `lsblk`, `grep*` also matched `grepdiff`.
+  # `cat *` and `echo *` below always had this right. Bare `ls` needs its own
+  # rule because `ls *` requires the space; bare `cat`/`grep` just read stdin,
+  # so they stay on the default.
+  - match: "ls"
+    action: allow
+  - match: "ls *"
     action: allow
   - match: "cat *"
     action: allow
-  - match: "grep*"
+  - match: "grep *"
     action: allow
   - match: "echo *"
     action: allow

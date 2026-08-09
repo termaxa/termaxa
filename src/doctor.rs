@@ -58,6 +58,7 @@ pub fn run(dir: &Path) -> Result<i32> {
                     problems.push("fix .termaxa/policy.yaml (it does not parse)".into());
                 }
             }
+            report_fingerprint(&pf, &p.state_dir, &mut problems);
         }
         None => {
             println!(
@@ -226,6 +227,62 @@ pub fn run(dir: &Path) -> Result<i32> {
     }
 }
 
+/// Compare the policy on disk against the baseline `termaxa init` recorded.
+///
+/// Read-only, like everything else in `doctor`: it never records a baseline,
+/// because a diagnostic that writes the value it is checking always reports
+/// "unchanged". Re-recording is `termaxa init`'s job.
+///
+/// What this can and cannot say, stated plainly because the distinction is
+/// the whole feature: it can say the bytes differ from the ones last
+/// recorded. It cannot say who changed them, and it cannot see a change made
+/// before the first baseline existed.
+fn report_fingerprint(policy_file: &Path, state_dir: &Path, problems: &mut Vec<String>) {
+    use crate::fingerprint;
+    use crate::ui::{amber, cyan, dim, green};
+
+    let Some(current) = fingerprint::of_file(policy_file) else {
+        return; // unreadable policy is already reported above
+    };
+    println!("  fingerprint {}", dim(&fingerprint::short(&current)));
+
+    match fingerprint::read_baseline(state_dir) {
+        None => {
+            println!(
+                "  {} no baseline recorded — a change to this file would be invisible",
+                amber("!")
+            );
+            println!("    {}", cyan("termaxa init"));
+            problems.push("record a policy baseline — `termaxa init`".into());
+        }
+        Some(base) if base.sha256 == current => {
+            println!("  {} unchanged since {}", green("✓"), dim(&base.recorded));
+        }
+        Some(base) => {
+            println!(
+                "  {} CHANGED since {} (was {})",
+                amber("!"),
+                base.recorded,
+                fingerprint::short(&base.sha256)
+            );
+            println!(
+                "    {}",
+                dim("if you made this change, re-record it: `termaxa init`")
+            );
+            println!(
+                "    {}",
+                dim("if you did not, something edited the gate's own rules —")
+            );
+            println!(
+                "    {}",
+                dim("agent file-writing tools bypass the hook entirely (matcher: Bash)")
+            );
+            problems
+                .push("review .termaxa/policy.yaml — it changed since the last baseline".into());
+        }
+    }
+}
+
 fn report_agent(name: &str, wired: bool, fix: &str, problems: &mut Vec<String>) {
     use crate::ui::{amber, cyan, dim, green};
     if wired {
@@ -305,6 +362,48 @@ mod tests {
         let (total, hooks) = count_log(&f);
         assert_eq!(total, 3, "junk lines still count as entries that happened");
         assert_eq!(hooks, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_policy_edited_behind_the_gate_becomes_a_reported_problem() {
+        let dir = std::env::temp_dir().join(format!("tmx-doc-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let policy = dir.join("policy.yaml");
+        std::fs::write(&policy, "version: 1\ndefault: ask\nrules: []\n").unwrap();
+
+        // 1. No baseline: say so, and do NOT quietly create one — a
+        //    diagnostic that records the value it checks always reports
+        //    "unchanged".
+        let mut problems: Vec<String> = Vec::new();
+        report_fingerprint(&policy, &state, &mut problems);
+        assert_eq!(problems.len(), 1, "a missing baseline is a real gap");
+        assert!(
+            !crate::fingerprint::baseline_file(&state).exists(),
+            "doctor must observe, never record"
+        );
+
+        // 2. Baseline matches: nothing to fix.
+        let hash = crate::fingerprint::of_file(&policy).unwrap();
+        crate::fingerprint::record(&state, &hash).unwrap();
+        let mut problems: Vec<String> = Vec::new();
+        report_fingerprint(&policy, &state, &mut problems);
+        assert!(problems.is_empty(), "unchanged policy is not a problem");
+
+        // 3. The edit from the review — the one no deny rule can stop,
+        //    because an agent's file-writing tool never reaches the hook.
+        std::fs::write(&policy, "version: 1\ndefault: allow\nrules: []\n").unwrap();
+        let mut problems: Vec<String> = Vec::new();
+        report_fingerprint(&policy, &state, &mut problems);
+        assert_eq!(problems.len(), 1);
+        assert!(
+            problems[0].contains("changed"),
+            "the problem must name what happened: {}",
+            problems[0]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
