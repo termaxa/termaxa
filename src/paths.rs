@@ -287,24 +287,25 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// `TERMAXA_HOME` and the process working directory are per-PROCESS, and
-    /// cargo runs tests as threads inside one process. Three tests below set
-    /// them and then delete the trees they point at; anything resolving a path
-    /// concurrently could observe a half-deleted tree and fail with ENOENT
-    /// mid-`create_dir_all`.
+    /// `TERMAXA_HOME` and the process cwd are per-PROCESS, and cargo runs the
+    /// tests in one process on several threads. Three tests here mutate one or
+    /// both, so without a lock they interleave: a test that never sets
+    /// `TERMAXA_HOME` picks up a sibling's value, resolves its state dir inside
+    /// the sibling's temp tree, and `create_dir_all` races the sibling's
+    /// `remove_dir_all` of that tree. The failure surfaces as
     ///
-    /// This surfaced as a macOS-only CI failure of
-    /// `resolve_from_uses_given_root_not_process_cwd` after an unrelated PR
-    /// added tests and changed the scheduling. It was never a macOS bug and
-    /// never that test's bug — it was a race that had been latent since these
-    /// tests were written.
-    static GLOBAL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ///   resolve_from should find the project policy: No such file or
+    ///   directory (os error 2)
+    ///
+    /// which reads like a missing policy and is really a torn directory.
+    /// It went red on macOS first only because that runner lost the race first.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Take the lock, tolerating poisoning: if another test panicked while
-    /// holding it, every later test would fail with `PoisonError` and hide
-    /// the real failure.
-    fn lock_global_env() -> std::sync::MutexGuard<'static, ()> {
-        GLOBAL_ENV.lock().unwrap_or_else(|e| e.into_inner())
+    /// Take the lock for a test that touches process-global state. Poison is
+    /// deliberately ignored: if one test panics while holding it, the others
+    /// should report their own verdicts rather than all fail as collateral.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -319,7 +320,7 @@ mod tests {
     #[test]
     fn resolve_from_uses_given_root_not_process_cwd() {
         use std::fs;
-        let _guard = lock_global_env();
+        let _lock = env_guard();
         // Build a temp project with a policy, in a dir that is NOT the process cwd.
         let base = std::env::temp_dir().join(format!("tmx-cwdtest-{}", std::process::id()));
         let proj = base.join("proj");
@@ -329,8 +330,10 @@ mod tests {
             "version: 1\ndefault: ask\nrules: []\n",
         )
         .unwrap();
-        // Own the state dir rather than inheriting whatever another test left
-        // in TERMAXA_HOME — that dependency is what made this fail.
+        // Point at this test's own tree. Without it the state dir lands in the
+        // developer's real ~/.termaxa (verified: the run creates
+        // ~/.termaxa/projects/proj-<hash>/logs there), or in a sibling test's
+        // temp tree if one has already exported the variable.
         std::env::set_var("TERMAXA_HOME", base.join("home"));
 
         // Resolve FROM the project dir explicitly (simulating payload.cwd),
@@ -344,6 +347,15 @@ mod tests {
         assert!(
             paths.policy_file().is_file(),
             "policy file should exist at resolved path"
+        );
+        // The regression guard for the flake: if `TERMAXA_HOME` is ever unset
+        // or inherited from elsewhere, the state dir lands outside this test's
+        // tree and this fails the same way every run, instead of failing once
+        // in a hundred on whichever runner happens to lose the race.
+        assert!(
+            paths.state_dir.starts_with(&base),
+            "state must resolve under this test's own TERMAXA_HOME, got {}",
+            paths.state_dir.display()
         );
 
         let _ = fs::remove_dir_all(&base);
@@ -367,6 +379,7 @@ mod tests {
         // project's policy via the explicit start dir (the agent's payload cwd).
         // This is the exact Cursor failure mode: process cwd != project dir.
         use std::fs;
+        let _lock = env_guard();
         let tmp = std::env::temp_dir().join(format!("tmx-cwd-test-{}", std::process::id()));
         let proj = tmp.join("proj");
         let aegis = proj.join(".termaxa");
@@ -381,7 +394,7 @@ mod tests {
         // Simulate the agent spawning us from somewhere unrelated:
         let elsewhere = tmp.join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
-        let original_cwd = std::env::current_dir().ok();
+        let previous_cwd = std::env::current_dir().ok();
         std::env::set_current_dir(&elsewhere).unwrap();
 
         // resolve() (process cwd = elsewhere) must FAIL to find the policy...
@@ -397,9 +410,10 @@ mod tests {
         );
         assert_eq!(r.unwrap().policy_file(), aegis.join("policy.yaml"));
 
-        // Restore the cwd BEFORE deleting the tree it points into. Leaving the
-        // process sitting in a deleted directory breaks unrelated tests.
-        if let Some(cwd) = original_cwd {
+        // Step out before deleting the tree. Leaving the process cwd inside a
+        // directory that no longer exists is a landmine for every test that
+        // runs after this one: on Unix `getcwd` then fails outright.
+        if let Some(cwd) = previous_cwd {
             let _ = std::env::set_current_dir(cwd);
         }
         let _ = fs::remove_dir_all(&tmp);
@@ -407,12 +421,12 @@ mod tests {
 
     #[test]
     fn resolve_readonly_creates_nothing() {
-        let _guard = lock_global_env();
         // A diagnostic must not manufacture the state it reports on.
         // `termaxa doctor` runs on projects that have never executed anything;
         // if resolving created logs/ and backups/, the report would describe
         // directories it had just invented.
         use std::fs;
+        let _lock = env_guard();
         let tmp = std::env::temp_dir().join(format!("tmx-ro-{}", std::process::id()));
         let proj = tmp.join("proj");
         fs::create_dir_all(proj.join(".termaxa")).unwrap();
