@@ -15,6 +15,8 @@ mod preview;
 mod report;
 mod runner;
 mod shell;
+#[cfg(test)]
+mod testutil;
 mod ui;
 
 use anyhow::{bail, Result};

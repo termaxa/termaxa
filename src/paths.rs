@@ -287,26 +287,7 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// `TERMAXA_HOME` and the process cwd are per-PROCESS, and cargo runs the
-    /// tests in one process on several threads. Three tests here mutate one or
-    /// both, so without a lock they interleave: a test that never sets
-    /// `TERMAXA_HOME` picks up a sibling's value, resolves its state dir inside
-    /// the sibling's temp tree, and `create_dir_all` races the sibling's
-    /// `remove_dir_all` of that tree. The failure surfaces as
-    ///
-    ///   resolve_from should find the project policy: No such file or
-    ///   directory (os error 2)
-    ///
-    /// which reads like a missing policy and is really a torn directory.
-    /// It went red on macOS first only because that runner lost the race first.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Take the lock for a test that touches process-global state. Poison is
-    /// deliberately ignored: if one test panics while holding it, the others
-    /// should report their own verdicts rather than all fail as collateral.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use crate::testutil::TestEnv;
 
     #[test]
     fn hash_key_stable_across_path_representations() {
@@ -319,22 +300,9 @@ mod tests {
 
     #[test]
     fn resolve_from_uses_given_root_not_process_cwd() {
-        use std::fs;
-        let _lock = env_guard();
-        // Build a temp project with a policy, in a dir that is NOT the process cwd.
-        let base = std::env::temp_dir().join(format!("tmx-cwdtest-{}", std::process::id()));
-        let proj = base.join("proj");
-        fs::create_dir_all(proj.join(".termaxa")).unwrap();
-        fs::write(
-            proj.join(".termaxa").join("policy.yaml"),
-            "version: 1\ndefault: ask\nrules: []\n",
-        )
-        .unwrap();
-        // Point at this test's own tree. Without it the state dir lands in the
-        // developer's real ~/.termaxa (verified: the run creates
-        // ~/.termaxa/projects/proj-<hash>/logs there), or in a sibling test's
-        // temp tree if one has already exported the variable.
-        std::env::set_var("TERMAXA_HOME", base.join("home"));
+        let env = TestEnv::new("cwdtest");
+        // A project with a policy, in a dir that is NOT the process cwd.
+        let proj = env.project("proj");
 
         // Resolve FROM the project dir explicitly (simulating payload.cwd),
         // while the actual process cwd is elsewhere.
@@ -353,12 +321,10 @@ mod tests {
         // tree and this fails the same way every run, instead of failing once
         // in a hundred on whichever runner happens to lose the race.
         assert!(
-            paths.state_dir.starts_with(&base),
+            paths.state_dir.starts_with(env.home()),
             "state must resolve under this test's own TERMAXA_HOME, got {}",
             paths.state_dir.display()
         );
-
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -378,24 +344,16 @@ mod tests {
         // Regression: a hook spawned from the WRONG directory must still find the
         // project's policy via the explicit start dir (the agent's payload cwd).
         // This is the exact Cursor failure mode: process cwd != project dir.
-        use std::fs;
-        let _lock = env_guard();
-        let tmp = std::env::temp_dir().join(format!("tmx-cwd-test-{}", std::process::id()));
-        let proj = tmp.join("proj");
+        let mut env = TestEnv::new("cwd-test");
+        let proj = env.project("proj");
         let aegis = proj.join(".termaxa");
-        fs::create_dir_all(&aegis).unwrap();
-        fs::write(
-            aegis.join("policy.yaml"),
-            "version: 1\ndefault: ask\nrules: []\n",
-        )
-        .unwrap();
-        std::env::set_var("TERMAXA_HOME", tmp.join("home"));
 
-        // Simulate the agent spawning us from somewhere unrelated:
-        let elsewhere = tmp.join("elsewhere");
-        fs::create_dir_all(&elsewhere).unwrap();
-        let previous_cwd = std::env::current_dir().ok();
-        std::env::set_current_dir(&elsewhere).unwrap();
+        // Simulate the agent spawning us from somewhere unrelated. The guard
+        // remembers where the process was and steps back out before it deletes
+        // the tree, so nothing after this test inherits a deleted cwd.
+        let elsewhere = env.root().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        env.chdir(&elsewhere);
 
         // resolve() (process cwd = elsewhere) must FAIL to find the policy...
         assert!(
@@ -409,14 +367,6 @@ mod tests {
             "explicit resolve_from(project cwd) must find the policy"
         );
         assert_eq!(r.unwrap().policy_file(), aegis.join("policy.yaml"));
-
-        // Step out before deleting the tree. Leaving the process cwd inside a
-        // directory that no longer exists is a landmine for every test that
-        // runs after this one: on Unix `getcwd` then fails outright.
-        if let Some(cwd) = previous_cwd {
-            let _ = std::env::set_current_dir(cwd);
-        }
-        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -425,17 +375,8 @@ mod tests {
         // `termaxa doctor` runs on projects that have never executed anything;
         // if resolving created logs/ and backups/, the report would describe
         // directories it had just invented.
-        use std::fs;
-        let _lock = env_guard();
-        let tmp = std::env::temp_dir().join(format!("tmx-ro-{}", std::process::id()));
-        let proj = tmp.join("proj");
-        fs::create_dir_all(proj.join(".termaxa")).unwrap();
-        fs::write(
-            proj.join(".termaxa").join("policy.yaml"),
-            "version: 1\ndefault: ask\nrules: []\n",
-        )
-        .unwrap();
-        std::env::set_var("TERMAXA_HOME", tmp.join("home"));
+        let env = TestEnv::new("ro");
+        let proj = env.project("proj");
 
         let p = resolve_readonly(&proj).expect("must resolve without creating anything");
         assert!(
@@ -451,8 +392,6 @@ mod tests {
         let p2 = resolve_from(&proj).expect("resolve_from must succeed");
         assert!(p2.state_dir.join("logs").is_dir());
         assert!(p2.state_dir.join("backups").is_dir());
-
-        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
