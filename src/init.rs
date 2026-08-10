@@ -37,14 +37,9 @@ rules:
   # `termaxa doctor` fingerprints the policy for exactly that reason: what
   # cannot be blocked can at least be noticed.
   #
-  # Reads are denied too, because separating them from writes would mean
-  # enumerating every read command. If you want one back, put it ABOVE this
-  # block — e.g. `- match: "cat .termaxa/*"` / `action: allow`. `termaxa
-  # doctor` prints the rule count, the default and the fingerprint without
-  # touching the file.
-  - match: "*.termaxa*"
-    action: deny
-    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+  # Reads are denied too, except for the handful listed below, because
+  # separating reads from writes in general would mean enumerating every read
+  # command. To add one, put it in that group — NOT at the top of the file.
   - match: "*.claude*settings*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
@@ -57,6 +52,46 @@ rules:
   - match: "*.github*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+
+  # The policy is an in-repo artifact, reviewable in PRs, and the deny below
+  # would otherwise make that workflow impossible: `git add .termaxa/…`,
+  # `git diff .termaxa/…` and `cp .termaxa/policy.yaml backup.yaml` are all
+  # blocked by it. These exceptions give the workflow back.
+  #
+  # The test for inclusion is that the `.termaxa` path can only be READ, never
+  # written. diff/status/log/show/cat read it; add/commit stage what is
+  # already on disk. `checkout`, `restore` and `config` are absent on purpose
+  # — overwriting the working tree from a ref is exactly what the deny is for,
+  # so restoring a clobbered policy stays a thing you do yourself.
+  #
+  # `cat` and `cp` are anchored on the SOURCE path so the copy can only go the
+  # safe way: `cp .termaxa/policy.yaml backup.yaml` matches,
+  # `cp backup.yaml .termaxa/policy.yaml` does not.
+  #
+  # Position matters twice over. Above the deny, or these never fire. Below
+  # the four denies above, because a trailing `*` swallows a redirect —
+  #     cat .termaxa/policy.yaml > .claude/settings.json
+  # matches `cat .termaxa*` too, and at the top of the file it would allow
+  # that and shadow the rule that exists to stop it.
+  - match: "git diff *.termaxa*"
+    action: allow
+  - match: "git status *.termaxa*"
+    action: allow
+  - match: "git log *.termaxa*"
+    action: allow
+  - match: "git show *.termaxa*"
+    action: allow
+  - match: "git add *.termaxa*"
+    action: allow
+  - match: "git commit *.termaxa*"
+    action: allow
+  - match: "cat .termaxa*"
+    action: allow
+  - match: "cp .termaxa*"
+    action: allow
+  - match: "*.termaxa*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
 
   # ---- destructive: hard stops ----
   - match: "git push*--force*"
@@ -488,23 +523,34 @@ mod tests {
 
     /// Schipper review, finding 3: order is load-bearing, so assert the shape
     /// rather than trusting a comment to hold.
+    ///
+    /// The shape is not "every deny precedes every allow". First-match-wins
+    /// exists so an exception can sit above the deny it excepts, and the
+    /// review-workflow allows do exactly that. What must never happen again is
+    /// a BROAD allow above a deny — `git branch*` above `*git branch -D*` was
+    /// the v0.14.1 bug. So an allow that sits above a deny has to be anchored
+    /// at the start of the command AND scoped to the path it is excepting;
+    /// anything looser can swallow the deny below it.
     #[test]
     fn hard_stops_are_reachable_before_the_read_only_allows() {
         let p: crate::policy::Policy = serde_yaml::from_str(STARTER_POLICY).unwrap();
-        let first_allow = p
-            .rules
-            .iter()
-            .position(|r| r.action == crate::policy::Action::Allow)
-            .expect("starter policy has allow rules");
         let last_deny = p
             .rules
             .iter()
             .rposition(|r| r.action == crate::policy::Action::Deny)
             .expect("starter policy has deny rules");
-        assert!(
-            last_deny < first_allow,
-            "a deny rule sits below an allow prefix and can never be reached"
-        );
+        for (i, r) in p.rules.iter().enumerate().take(last_deny) {
+            if r.action != crate::policy::Action::Allow {
+                continue;
+            }
+            assert!(
+                !r.r#match.starts_with('*') && r.r#match.contains(".termaxa"),
+                "rule {i} `{}` is an unanchored allow sitting above a deny — \
+                 it can shadow the rule below it and can never be audited by \
+                 reading the denies alone",
+                r.r#match
+            );
+        }
     }
 
     #[test]

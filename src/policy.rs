@@ -379,6 +379,93 @@ rules:
     }
 
     #[test]
+    fn reviewing_the_policy_in_a_pr_still_works() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        // The README calls the policy an in-repo artifact, "reviewable in
+        // PRs". These are the commands that workflow is made of; a blanket
+        // deny on `*.termaxa*` made every one of them impossible.
+        for cmd in [
+            "git add .termaxa/policy.yaml",
+            "git diff .termaxa/policy.yaml",
+            "git diff --cached .termaxa/policy.yaml",
+            "git status .termaxa/",
+            "git log --oneline .termaxa/policy.yaml",
+            "git show HEAD:.termaxa/policy.yaml",
+            "git commit -m \"tighten the policy\" .termaxa/policy.yaml",
+            "cat .termaxa/policy.yaml",
+            "cp .termaxa/policy.yaml backup.yaml",
+            // One pattern covers both separators, same as the deny it excepts.
+            "git diff .termaxa\\policy.yaml",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Allow,
+                "the documented review workflow must not be blocked: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_review_exceptions_only_go_one_direction() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        // Every exception above the deny is a read. Anything that can put
+        // bytes INTO the policy stays denied, including the git verbs whose
+        // job is to overwrite the working tree from a ref.
+        for cmd in [
+            "git checkout .termaxa/policy.yaml",
+            "git checkout evil-branch -- .termaxa/policy.yaml",
+            "git restore .termaxa/policy.yaml",
+            "git config core.hooksPath .termaxa/evil",
+            "cp backup.yaml .termaxa/policy.yaml",
+            "cat backup.yaml > .termaxa/policy.yaml",
+            "tee .termaxa/policy.yaml",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Deny,
+                "writes into the gate's config must stay denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_review_exception_cannot_shadow_the_hook_config_denies() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        // A trailing `*` swallows a redirect, so `cat .termaxa*` matches
+        // `cat .termaxa/policy.yaml > .claude/settings.json` as well. At the
+        // top of the file these allows would shadow the denies that exist to
+        // stop exactly that. They sit below them instead.
+        for cmd in [
+            "cat .termaxa/policy.yaml > .claude/settings.json",
+            "git diff .termaxa/policy.yaml > .claude/settings.json",
+            "git add .termaxa/policy.yaml > .cursor/hooks.json",
+            "cp .termaxa/policy.yaml .codex/hooks.json",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Deny,
+                "an exception must not become a way through: {cmd}"
+            );
+        }
+
+        // Prove the ordering, not just the verdict.
+        let idx = |pat: &str| {
+            p.rules
+                .iter()
+                .position(|r| r.r#match == pat)
+                .unwrap_or_else(|| panic!("rule `{pat}` must exist"))
+        };
+        assert!(
+            idx("*.claude*settings*") < idx("cat .termaxa*"),
+            "the hook-config denies must outrank the review exceptions"
+        );
+        assert!(
+            idx("cat .termaxa*") < idx("*.termaxa*"),
+            "the review exceptions must outrank the deny they except"
+        );
+    }
+
+    #[test]
     fn no_preserve_root_is_denied_by_name() {
         let p = Policy::builtin().expect("built-in starter policy must parse");
         // GNU rm refuses a bare `rm -rf /`. This is the spelling it obeys,

@@ -31,14 +31,9 @@ rules:
   # `termaxa doctor` fingerprints the policy for exactly that reason: what
   # cannot be blocked can at least be noticed.
   #
-  # Reads are denied too, because separating them from writes would mean
-  # enumerating every read command. If you want one back, put it ABOVE this
-  # block — e.g. `- match: "cat .termaxa/*"` / `action: allow`. `termaxa
-  # doctor` prints the rule count, the default and the fingerprint without
-  # touching the file.
-  - match: "*.termaxa*"
-    action: deny
-    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+  # Reads are denied too, except for the handful listed below, because
+  # separating reads from writes in general would mean enumerating every read
+  # command. To add one, put it in that group — NOT at the top of the file.
   - match: "*.claude*settings*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
@@ -51,6 +46,46 @@ rules:
   - match: "*.github*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+
+  # The policy is an in-repo artifact, reviewable in PRs, and the deny below
+  # would otherwise make that workflow impossible: `git add .termaxa/…`,
+  # `git diff .termaxa/…` and `cp .termaxa/policy.yaml backup.yaml` are all
+  # blocked by it. These exceptions give the workflow back.
+  #
+  # The test for inclusion is that the `.termaxa` path can only be READ, never
+  # written. diff/status/log/show/cat read it; add/commit stage what is
+  # already on disk. `checkout`, `restore` and `config` are absent on purpose
+  # — overwriting the working tree from a ref is exactly what the deny is for,
+  # so restoring a clobbered policy stays a thing you do yourself.
+  #
+  # `cat` and `cp` are anchored on the SOURCE path so the copy can only go the
+  # safe way: `cp .termaxa/policy.yaml backup.yaml` matches,
+  # `cp backup.yaml .termaxa/policy.yaml` does not.
+  #
+  # Position matters twice over. Above the deny, or these never fire. Below
+  # the four denies above, because a trailing `*` swallows a redirect —
+  #     cat .termaxa/policy.yaml > .claude/settings.json
+  # matches `cat .termaxa*` too, and at the top of the file it would allow
+  # that and shadow the rule that exists to stop it.
+  - match: "git diff *.termaxa*"
+    action: allow
+  - match: "git status *.termaxa*"
+    action: allow
+  - match: "git log *.termaxa*"
+    action: allow
+  - match: "git show *.termaxa*"
+    action: allow
+  - match: "git add *.termaxa*"
+    action: allow
+  - match: "git commit *.termaxa*"
+    action: allow
+  - match: "cat .termaxa*"
+    action: allow
+  - match: "cp .termaxa*"
+    action: allow
+  - match: "*.termaxa*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
 
   # ---- destructive: hard stops ----
   - match: "git push*--force*"
