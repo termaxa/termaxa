@@ -500,6 +500,7 @@ pub(crate) fn which(bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempTree;
 
     /// `examples/policy.yaml` is the file people copy. It had drifted to 28
     /// rules against the starter's 44 — missing every broad delete deny and
@@ -555,14 +556,9 @@ mod tests {
 
     #[test]
     fn init_records_a_baseline_the_policy_directory_cannot_erase() {
-        let dir = std::env::temp_dir().join(format!("tmx-init-fp-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let project = dir.join("proj");
-        let state = dir.join("home").join("projects").join("proj-abc12345");
-        fs::create_dir_all(project.join(".termaxa")).unwrap();
-        fs::create_dir_all(&state).unwrap();
-        let policy = project.join(".termaxa").join("policy.yaml");
-        fs::write(&policy, STARTER_POLICY).unwrap();
+        let tmp = TempTree::new("init-fp");
+        let state = tmp.dir("home/projects/proj-abc12345");
+        let policy = tmp.file("proj/.termaxa/policy.yaml", STARTER_POLICY);
 
         let short = record_fingerprint(&state, &policy)
             .unwrap()
@@ -574,7 +570,7 @@ mod tests {
         let baseline = crate::fingerprint::baseline_file(&state);
         assert!(baseline.is_file());
         assert!(
-            !baseline.starts_with(&project),
+            !baseline.starts_with(policy.parent().unwrap()),
             "baseline must not live in the project: {}",
             baseline.display()
         );
@@ -582,8 +578,6 @@ mod tests {
         // Re-running init on an unchanged policy records the same hash.
         let again = record_fingerprint(&state, &policy).unwrap().unwrap();
         assert_eq!(short, again);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

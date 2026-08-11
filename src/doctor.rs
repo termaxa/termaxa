@@ -338,15 +338,16 @@ fn hook_configured(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempTree;
     use std::io::Write;
 
     #[test]
     fn count_log_reads_without_creating_and_tolerates_junk() {
-        let dir = std::env::temp_dir().join(format!("tmx-doc-log-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = TempTree::new("doc-log");
+        let dir = tmp.path().to_path_buf();
 
         // Missing file: zero, and nothing created.
-        let missing = dir.join("nope.jsonl");
+        let missing = tmp.absent("nope.jsonl");
         assert_eq!(count_log(&missing), (0, 0));
         assert!(!missing.exists(), "count_log must not create the log file");
 
@@ -362,18 +363,13 @@ mod tests {
         let (total, hooks) = count_log(&f);
         assert_eq!(total, 3, "junk lines still count as entries that happened");
         assert_eq!(hooks, 1);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_policy_edited_behind_the_gate_becomes_a_reported_problem() {
-        let dir = std::env::temp_dir().join(format!("tmx-doc-fp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let state = dir.join("state");
-        std::fs::create_dir_all(&state).unwrap();
-        let policy = dir.join("policy.yaml");
-        std::fs::write(&policy, "version: 1\ndefault: ask\nrules: []\n").unwrap();
+        let tmp = TempTree::new("doc-fp");
+        let state = tmp.dir("state");
+        let policy = tmp.file("policy.yaml", "version: 1\ndefault: ask\nrules: []\n");
 
         // 1. No baseline: say so, and do NOT quietly create one — a
         //    diagnostic that records the value it checks always reports
@@ -404,14 +400,12 @@ mod tests {
             "the problem must name what happened: {}",
             problems[0]
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn hook_configured_detects_plain_and_absolute_forms() {
-        let dir = std::env::temp_dir().join(format!("tmx-doctor-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = TempTree::new("doctor");
+        let dir = tmp.path().to_path_buf();
 
         let plain = dir.join("plain.json");
         let mut f = std::fs::File::create(&plain).unwrap();
@@ -437,6 +431,5 @@ mod tests {
         assert!(!hook_configured(&empty));
 
         assert!(!hook_configured(&dir.join("does-not-exist.json")));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

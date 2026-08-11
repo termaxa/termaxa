@@ -155,6 +155,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempTree;
 
     #[test]
     fn sha256_matches_the_published_vectors() {
@@ -192,9 +193,8 @@ mod tests {
 
     #[test]
     fn baseline_roundtrips_through_the_state_dir() {
-        let dir = std::env::temp_dir().join(format!("tmx-fp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = TempTree::new("fp");
+        let dir = tmp.path().to_path_buf();
 
         assert!(
             read_baseline(&dir).is_none(),
@@ -225,8 +225,8 @@ mod tests {
 
     #[test]
     fn of_file_reports_absence_rather_than_guessing() {
-        let missing = std::env::temp_dir().join("tmx-fp-definitely-not-here.yaml");
-        let _ = std::fs::remove_file(&missing);
+        let tmp = TempTree::new("fp-absent");
+        let missing = tmp.absent("definitely-not-here.yaml");
         assert!(of_file(&missing).is_none());
     }
 }

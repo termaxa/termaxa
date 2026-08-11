@@ -8,18 +8,35 @@
 //!
 //! Both halves of that came from the same thing: setting up a test correctly
 //! took knowledge the test itself did not carry. So the safe path is the only
-//! path here. `TestEnv::new` takes the lock, points `TERMAXA_HOME` at a tree
-//! this test alone owns, and on drop puts the cwd and the variable back,
-//! removes the tree, and fails the test if state landed anywhere else.
+//! path here.
+//!
+//! Two guards, because the costs differ:
+//!
+//! - [`TempTree`] is a scratch directory that removes itself. It touches
+//!   nothing process-global, takes no lock, and tests using only it still run
+//!   in parallel. Most tests want this one.
+//! - [`TestEnv`] is a `TempTree` plus the lock, `TERMAXA_HOME` pointed into
+//!   the tree, and the cwd restored on the way out. Only tests that need the
+//!   environment redirected should pay for the serialisation.
 //!
 //! ```ignore
-//! let env = TestEnv::new("my-case");
+//! let tmp = TempTree::new("my-case");
+//! let log = tmp.file("audit.jsonl", "{}\n");
+//!
+//! let env = TestEnv::new("my-case");     // when TERMAXA_HOME matters
 //! let proj = env.project("proj");        // <root>/proj/.termaxa/policy.yaml
-//! let paths = crate::paths::resolve_from(&proj)?;
 //! ```
 //!
-//! One guard per test. `std::sync::Mutex` is not reentrant, so a second
-//! `TestEnv::new` while one is alive deadlocks rather than failing.
+//! Both fail the test that leaves something behind: every guard asserts its
+//! own tree is gone, and `TestEnv` additionally watches the real `~/.termaxa`.
+//! A helper nobody is obliged to use stops being used, so
+//! `no_module_builds_a_temp_path_by_hand` reads the source and fails on a
+//! `temp_dir()` call outside this module. That is what keeps this the only
+//! obvious way rather than merely an available one.
+//!
+//! One `TestEnv` per test. `std::sync::Mutex` is not reentrant, so a second
+//! `TestEnv::new` while one is alive deadlocks rather than failing. `TempTree`
+//! takes no lock and nests freely.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -35,6 +52,82 @@ static SEQ: AtomicUsize = AtomicUsize::new(0);
 /// and hiding which one actually broke.
 fn lock() -> MutexGuard<'static, ()> {
     GLOBAL_ENV.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Claim a fresh tree. The pid keeps two concurrent `cargo test` runs apart
+/// and the counter keeps two guards sharing a label apart.
+fn claim(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "tmx-{}-{}-{}",
+        label,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("test root must be creatable");
+    root
+}
+
+/// Remove a tree, reporting whether it is actually gone.
+///
+/// A cleanup that silently failed is how litter accumulates in the first
+/// place, so the guard says so rather than shrugging.
+fn release(root: &Path) -> bool {
+    let _ = std::fs::remove_dir_all(root);
+    !root.exists()
+}
+
+/// A scratch directory that removes itself, with no lock and no environment
+/// changes. The default way to get a path to write to in a test.
+pub struct TempTree {
+    root: PathBuf,
+}
+
+impl TempTree {
+    pub fn new(label: &str) -> Self {
+        Self { root: claim(label) }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// A subdirectory, created.
+    pub fn dir(&self, name: &str) -> PathBuf {
+        let dir = self.root.join(name);
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        dir
+    }
+
+    /// A file with `contents`, parents created. `name` may be nested.
+    pub fn file(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.root.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("scratch parent must be creatable");
+        }
+        std::fs::write(&path, contents).expect("scratch file must be writable");
+        path
+    }
+
+    /// A path inside the tree that deliberately does NOT exist, for the tests
+    /// that check a missing file is reported rather than guessed at.
+    pub fn absent(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let gone = release(&self.root);
+        if std::thread::panicking() {
+            return;
+        }
+        assert!(
+            gone,
+            "the guard failed to remove {} — the tree it owns must not outlive it",
+            self.root.display()
+        );
+    }
 }
 
 /// The real `~/.termaxa/projects`, ignoring any `TERMAXA_HOME` override.
@@ -66,7 +159,10 @@ pub struct TestEnv {
     /// `None` only for the tests in this module that already hold the lock in
     /// order to observe the guard without racing it.
     _lock: Option<MutexGuard<'static, ()>>,
-    root: PathBuf,
+    /// The tree and its cleanup. Dropped after this struct's own `Drop` runs,
+    /// so the environment is already back to normal by the time the directory
+    /// goes.
+    tree: TempTree,
     previous_home: Option<OsString>,
     previous_cwd: Option<PathBuf>,
     watch: Option<(PathBuf, BTreeSet<OsString>)>,
@@ -83,17 +179,10 @@ impl TestEnv {
     }
 
     fn build(guard: Option<MutexGuard<'static, ()>>, label: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "tmx-{}-{}-{}",
-            label,
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("test root must be creatable");
+        let tree = TempTree::new(label);
 
         let previous_home = std::env::var_os("TERMAXA_HOME");
-        std::env::set_var("TERMAXA_HOME", root.join("home"));
+        std::env::set_var("TERMAXA_HOME", tree.path().join("home"));
 
         let watch = real_state_root().map(|dir| {
             let before = listing(&dir);
@@ -102,7 +191,7 @@ impl TestEnv {
 
         Self {
             _lock: guard,
-            root,
+            tree,
             previous_home,
             previous_cwd: None,
             watch,
@@ -111,17 +200,17 @@ impl TestEnv {
 
     /// The tree this test owns. Everything it writes belongs under here.
     pub fn root(&self) -> &Path {
-        &self.root
+        self.tree.path()
     }
 
     /// Where `TERMAXA_HOME` points for the life of this guard.
     pub fn home(&self) -> PathBuf {
-        self.root.join("home")
+        self.tree.path().join("home")
     }
 
     /// A project directory with a minimal policy, ready for `resolve_from`.
     pub fn project(&self, name: &str) -> PathBuf {
-        let proj = self.root.join(name);
+        let proj = self.tree.path().join(name);
         std::fs::create_dir_all(proj.join(".termaxa")).expect("project dir must be creatable");
         std::fs::write(
             proj.join(".termaxa").join("policy.yaml"),
@@ -169,7 +258,8 @@ impl Drop for TestEnv {
             let found = arrivals(&before, &listing(&dir));
             (dir, found)
         });
-        let _ = std::fs::remove_dir_all(&self.root);
+        // The tree itself goes with `self.tree`'s own Drop, immediately
+        // after this one.
 
         // Never assert into an unwind: a panicking Drop during a panic aborts
         // the process, and the test's own failure is the one worth reading.
@@ -242,19 +332,28 @@ mod tests {
         assert_eq!(std::env::current_dir().ok(), Some(cwd_before));
     }
 
+    /// Run `f` with panic output silenced, and report whether it panicked.
+    ///
+    /// The guard reports by panicking, so a test that proves the guard works
+    /// would otherwise print a wall of backtrace-looking text on a PASSING
+    /// run, which is how people learn to ignore their own test output.
+    fn panics_quietly(f: impl FnOnce() + std::panic::UnwindSafe) -> bool {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(f);
+        std::panic::set_hook(hook);
+        outcome.is_err()
+    }
+
     #[test]
     fn the_guard_fails_loudly_when_state_lands_outside_its_tree() {
         let _outer = lock();
-        let decoy = std::env::temp_dir().join(format!("tmx-decoy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&decoy);
-        std::fs::create_dir_all(&decoy).expect("decoy must be creatable");
+        // The stand-in lives inside a guard of its own, so proving the check
+        // works does not itself leave anything behind.
+        let holder = TempTree::new("decoy-holder");
+        let decoy = holder.dir("home-projects");
 
-        // The guard reports by panicking, so the expected failure would print
-        // a backtrace-looking wall of text on a passing run. Silence just this
-        // one, and put the real hook back.
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let outcome = std::panic::catch_unwind({
+        let caught = panics_quietly({
             let decoy = decoy.clone();
             move || {
                 let mut env = TestEnv::build(None, "stray");
@@ -264,12 +363,65 @@ mod tests {
                 drop(env);
             }
         });
-        std::panic::set_hook(hook);
 
-        let _ = std::fs::remove_dir_all(&decoy);
         assert!(
-            outcome.is_err(),
+            caught,
             "a test that writes outside its own tree must fail, not pass quietly"
+        );
+    }
+
+    /// The check that keeps this the only obvious way.
+    ///
+    /// A guard that merely exists gets ignored: the six modules swept up in
+    /// this PR each built temp paths by hand, and the pile in /tmp was the
+    /// result. This fails at the moment somebody writes the line, naming the
+    /// file, instead of months later when a stranger counts the directories.
+    ///
+    /// The earlier version of this check scanned the temp directory at every
+    /// guard drop. It worked, and it cost 46ms per scan on a machine with
+    /// 250k entries in /tmp: two seconds on a suite that otherwise runs in
+    /// 0.06, paid only by developers, since CI runners start with an empty
+    /// /tmp. Reading the source costs nothing and catches it earlier.
+    #[test]
+    fn no_module_builds_a_temp_path_by_hand() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders: Vec<String> = Vec::new();
+        // Recursive, because a check that only reads the top level passes
+        // silently the day src/ grows a subdirectory, and passing silently is
+        // the failure mode this whole module exists to end.
+        let mut queue = vec![src.clone()];
+        while let Some(dir) = queue.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("{} must be readable: {e}", dir.display()))
+                .flatten()
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    queue.push(path);
+                    continue;
+                }
+                if path.file_name() == Some(std::ffi::OsStr::new("testutil.rs"))
+                    || path.extension() != Some(std::ffi::OsStr::new("rs"))
+                {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).expect("source must be readable");
+                for (i, line) in body.lines().enumerate() {
+                    if line.contains("temp_dir()") {
+                        let shown = path.strip_prefix(&src).unwrap_or(&path);
+                        offenders.push(format!("{}:{}", shown.display(), i + 1));
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "these build a temp path by hand: {:?}\n\
+             Use TempTree (or TestEnv, when TERMAXA_HOME matters) instead. \
+             They clean up on their own, and a path nobody removes is how \
+             /tmp filled up with 8,000 directories.",
+            offenders
         );
     }
 

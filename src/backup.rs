@@ -488,14 +488,16 @@ fn git_out(args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempTree;
 
-    /// A real temp directory containing one file.
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tmx-bk-{}-{}", tag, std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("f.txt"), "x").unwrap();
-        dir
+    /// A real temp directory containing one file. The guard is returned with
+    /// it: dropping it removes the tree, so the caller has to keep it alive
+    /// for as long as the path is used.
+    fn scratch(tag: &str) -> (TempTree, PathBuf) {
+        let tmp = TempTree::new(&format!("bk-{tag}"));
+        tmp.file("f.txt", "x");
+        let dir = tmp.path().to_path_buf();
+        (tmp, dir)
     }
 
     #[test]
@@ -503,7 +505,7 @@ mod tests {
         // The v0.14 bug: `/c/Users/x/Desktop` got no backup while the
         // identical target written `C:\Users\x\Desktop` did. The case where
         // insurance mattered most was the one silently without it.
-        let dir = scratch("syntax");
+        let (_tmp, dir) = scratch("syntax");
         let win = dir.display().to_string();
         let planned_win = plan(&format!("rm -rf {}", win)).is_some();
         assert!(planned_win, "an existing path must be insurable: {win}");
@@ -526,7 +528,7 @@ mod tests {
     fn powershell_and_cmd_deletes_are_insurable_too() {
         // Previously only `rm` was matched, so every PowerShell and cmd delete
         // ran uninsured even though policy and the classifier both gate them.
-        let dir = scratch("shells");
+        let (_tmp, dir) = scratch("shells");
         let p = dir.display().to_string();
 
         assert!(plan(&format!("Remove-Item -Recurse -Force {}", p)).is_some());

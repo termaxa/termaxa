@@ -407,7 +407,7 @@ fn tokens(segment: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use crate::testutil::TempTree;
 
     // --- classification ---
 
@@ -581,19 +581,15 @@ mod tests {
 
     // --- counting + breaker ---
 
-    fn write_log(lines: &[serde_json::Value]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tmx-intent-test-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("audit.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
+    /// The tree must outlive the path it hands back, so the caller holds it.
+    /// Before the guard existed this wrote to a pid+thread path that nothing
+    /// ever removed, which is where most of the /tmp litter came from.
+    fn write_log(tmp: &TempTree, lines: &[serde_json::Value]) -> std::path::PathBuf {
+        let mut body = String::new();
         for l in lines {
-            writeln!(f, "{}", l).unwrap();
+            body.push_str(&format!("{}\n", l));
         }
-        path
+        tmp.file("audit.jsonl", &body)
     }
 
     fn entry(session: &str, decision: &str, intent: &str, command: &str) -> serde_json::Value {
@@ -609,11 +605,15 @@ mod tests {
 
     #[test]
     fn counts_asks_and_denies_for_same_session_and_intent() {
-        let log = write_log(&[
-            entry("s1", "ask", "file-delete", "rm -rf ."),
-            entry("s1", "ask", "file-delete", "Remove-Item -Recurse -Force ."),
-            entry("s1", "allow", "file-delete", "rm -rf /tmp/scratch"),
-        ]);
+        let tmp = TempTree::new("intent");
+        let log = write_log(
+            &tmp,
+            &[
+                entry("s1", "ask", "file-delete", "rm -rf ."),
+                entry("s1", "ask", "file-delete", "Remove-Item -Recurse -Force ."),
+                entry("s1", "allow", "file-delete", "rm -rf /tmp/scratch"),
+            ],
+        );
         assert_eq!(
             recent_intent_count(&log, "s1", Intent::FileDelete, 64 * 1024),
             2
@@ -622,10 +622,14 @@ mod tests {
 
     #[test]
     fn session_isolation() {
-        let log = write_log(&[
-            entry("s1", "ask", "file-delete", "rm -rf ."),
-            entry("s1", "deny", "file-delete", "del /s /q ."),
-        ]);
+        let tmp = TempTree::new("intent");
+        let log = write_log(
+            &tmp,
+            &[
+                entry("s1", "ask", "file-delete", "rm -rf ."),
+                entry("s1", "deny", "file-delete", "del /s /q ."),
+            ],
+        );
         assert_eq!(
             recent_intent_count(&log, "s2", Intent::FileDelete, 64 * 1024),
             0
@@ -634,10 +638,14 @@ mod tests {
 
     #[test]
     fn intent_isolation() {
-        let log = write_log(&[
-            entry("s1", "ask", "file-delete", "rm -rf ."),
-            entry("s1", "ask", "file-delete", "del /s /q ."),
-        ]);
+        let tmp = TempTree::new("intent");
+        let log = write_log(
+            &tmp,
+            &[
+                entry("s1", "ask", "file-delete", "rm -rf ."),
+                entry("s1", "ask", "file-delete", "del /s /q ."),
+            ],
+        );
         assert_eq!(
             recent_intent_count(&log, "s1", Intent::GitDestructive, 64 * 1024),
             0
@@ -647,10 +655,14 @@ mod tests {
     #[test]
     fn approved_ask_is_excluded() {
         // ask -> human approved -> post execution record exists
-        let log = write_log(&[
-            entry("s1", "ask", "file-delete", "rm -rf ./node_modules"),
-            entry("s1", "executed", "file-delete", "rm -rf ./node_modules"),
-        ]);
+        let tmp = TempTree::new("intent");
+        let log = write_log(
+            &tmp,
+            &[
+                entry("s1", "ask", "file-delete", "rm -rf ./node_modules"),
+                entry("s1", "executed", "file-delete", "rm -rf ./node_modules"),
+            ],
+        );
         // patch the second entry's source to "post"
         let text = std::fs::read_to_string(&log).unwrap();
         let patched: Vec<String> = text
@@ -673,14 +685,18 @@ mod tests {
 
     #[test]
     fn old_log_lines_without_intent_are_ignored_not_fatal() {
-        let log = write_log(&[
-            serde_json::json!({
-                "ts": "2026-01-01T00:00:00Z", "source": "hook",
-                "session": "s1", "decision": "ask", "command": "rm -rf ."
-                // no "intent" field — pre-v0.11 line
-            }),
-            entry("s1", "ask", "file-delete", "del /s /q ."),
-        ]);
+        let tmp = TempTree::new("intent");
+        let log = write_log(
+            &tmp,
+            &[
+                serde_json::json!({
+                    "ts": "2026-01-01T00:00:00Z", "source": "hook",
+                    "session": "s1", "decision": "ask", "command": "rm -rf ."
+                    // no "intent" field — pre-v0.11 line
+                }),
+                entry("s1", "ask", "file-delete", "del /s /q ."),
+            ],
+        );
         assert_eq!(
             recent_intent_count(&log, "s1", Intent::FileDelete, 64 * 1024),
             1
@@ -689,7 +705,8 @@ mod tests {
 
     #[test]
     fn missing_log_fails_open() {
-        let ghost = std::env::temp_dir().join("tmx-intent-no-such-dir/audit.jsonl");
+        let tmp = TempTree::new("intent-ghost");
+        let ghost = tmp.absent("no-such-dir/audit.jsonl");
         assert_eq!(
             recent_intent_count(&ghost, "s1", Intent::FileDelete, 64 * 1024),
             0
@@ -699,16 +716,15 @@ mod tests {
     #[test]
     fn breaker_trips_on_third_variant() {
         // the money test: the live Cursor whack-a-mole scenario
-        let log = write_log(&[
-            entry("s1", "ask", "file-delete", "rm -rf ."),
-            entry("s1", "ask", "file-delete", "Remove-Item -Recurse -Force ."),
-        ]);
-        let policy = std::env::temp_dir().join(format!(
-            "tmx-intent-pol-{}-{:?}.yaml",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::write(&policy, "version: 1\ndefault: ask\nrules: []\n").unwrap();
+        let tmp = TempTree::new("intent");
+        let log = write_log(
+            &tmp,
+            &[
+                entry("s1", "ask", "file-delete", "rm -rf ."),
+                entry("s1", "ask", "file-delete", "Remove-Item -Recurse -Force ."),
+            ],
+        );
+        let policy = tmp.file("policy.yaml", "version: 1\ndefault: ask\nrules: []\n");
 
         let tripped = maybe_trip(&policy, &log, Some("s1"), "del /s /q .");
         assert!(
@@ -728,21 +744,19 @@ mod tests {
 
     #[test]
     fn breaker_respects_config() {
-        let log = write_log(&[
-            entry("s1", "ask", "file-delete", "rm -rf ."),
-            entry("s1", "ask", "file-delete", "del /s /q ."),
-        ]);
-        let policy = std::env::temp_dir().join(format!(
-            "tmx-intent-pol-off-{}-{:?}.yaml",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let tmp = TempTree::new("intent");
+        let log = write_log(
+            &tmp,
+            &[
+                entry("s1", "ask", "file-delete", "rm -rf ."),
+                entry("s1", "ask", "file-delete", "del /s /q ."),
+            ],
+        );
         // disabled
-        std::fs::write(
-            &policy,
+        let policy = tmp.file(
+            "policy.yaml",
             "version: 1\ndefault: ask\nrules: []\ncircuit_breaker:\n  enabled: false\n",
-        )
-        .unwrap();
+        );
         assert!(maybe_trip(&policy, &log, Some("s1"), "rd /s /q .").is_none());
 
         // higher threshold
@@ -756,8 +770,8 @@ mod tests {
 
     #[test]
     fn config_defaults_when_block_missing_or_file_absent() {
-        let policy = std::env::temp_dir().join("tmx-intent-nopolicy.yaml");
-        let _ = std::fs::remove_file(&policy);
+        let tmp = TempTree::new("intent-nopolicy");
+        let policy = tmp.absent("policy.yaml");
         let c = breaker_config(&policy);
         assert!(c.enabled);
         assert_eq!(c.threshold, 2);

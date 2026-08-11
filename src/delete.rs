@@ -586,6 +586,7 @@ fn short(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempTree;
 
     /// Schipper review, finding 2. Sweeps every length across non-ASCII
     /// prefixes so the truncation point lands mid-codepoint; the old byte
@@ -807,9 +808,9 @@ mod tests {
 
     #[test]
     fn budgeted_scan_counts_and_reports_capping_honestly() {
-        let dir = std::env::temp_dir().join(format!("tmx-scan-{}", std::process::id()));
-        let sub = dir.join("nested");
-        std::fs::create_dir_all(&sub).unwrap();
+        let tmp = TempTree::new("scan");
+        let dir = tmp.path().to_path_buf();
+        let sub = tmp.dir("nested");
         for i in 0..12 {
             std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
         }
