@@ -3,9 +3,13 @@
 //!
 //! Why this exists: policy rules gate **shell commands**. An agent's
 //! file-writing tool (Claude Code's `Write`/`Edit`, Cursor's edit apply)
-//! never reaches the hook at all — the Claude Code hook is registered with
-//! `"matcher": "Bash"` — so no deny rule can stop `.termaxa/policy.yaml`
-//! being rewritten that way. Blocking it is out of reach. Noticing it is not.
+//! produces no command, so no deny rule can stop `.termaxa/policy.yaml` being
+//! rewritten that way. Since v0.15 a second matcher on the write tools blocks
+//! it directly (see `protect`), which leaves this covering what that matcher
+//! cannot reach: a hook wired by hand from an older snippet, a dialect whose
+//! registration has no write half, a tool named outside the vocabulary the
+//! matcher lists, and any change made before Termaxa was installed at all.
+//! Blocking is now mostly in reach. Noticing is what covers the rest.
 //!
 //! Where the baseline lives is load-bearing: the per-project state dir under
 //! `$TERMAXA_HOME` (`~/.termaxa/projects/<key>/`), deliberately NOT inside

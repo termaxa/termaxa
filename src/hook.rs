@@ -196,6 +196,181 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
     None
 }
 
+/// A file-write tool call: the agent is about to write to `path`.
+///
+/// Kept separate from [`ParsedHook`] rather than folded into it. The shell
+/// path is command-shaped the whole way down — policy, classifier, preview and
+/// insurance all take a command string — and a write event has no command.
+/// Widening `ParsedHook` would thread an empty `command` through five engines
+/// that have nothing to say about it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileWrite {
+    pub dialect: Dialect,
+    pub tool: String,
+    pub path: String,
+    pub cwd: String,
+    pub session: Option<String>,
+}
+
+/// Names that mean the tool writes. Matched as substrings, case-folded, so a
+/// rename within the same vocabulary (`Write`, `write_file`, `MultiEdit`,
+/// `edit_file`, `create_file`, `apply_patch`, `str_replace_editor`,
+/// `NotebookEdit`) keeps its coverage.
+///
+/// Coarse on purpose. An exact list of tool names is the shape that broke when
+/// Cursor renamed its hook events between 3.10 and 3.11, and a rename here
+/// would remove the gate without removing the registration, which is the quiet
+/// direction. Read-shaped tools carry none of these verbs, which is what keeps
+/// `Read` on `.termaxa/policy.yaml` from being refused — reading the policy is
+/// allowed on the shell path too.
+const WRITE_VERBS: [&str; 7] = [
+    "write", "edit", "create", "patch", "replace", "notebook", "save",
+];
+
+/// Field names that carry the target path, across dialects.
+const PATH_FIELDS: [&str; 6] = [
+    "file_path",
+    "notebook_path",
+    "filePath",
+    "target_file",
+    "path",
+    "abs_path",
+];
+
+/// Raw JSON in -> a file-write event out. `None` = not one; step aside.
+///
+/// Only called after [`parse_input`] has declined, so anything command-shaped
+/// has already been handled by the shell path.
+pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
+    let raw = raw.trim_start_matches('\u{feff}').trim();
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+
+    // Pre only. A write that already happened cannot be gated, and a receipt
+    // for it would give the circuit breaker nothing it can count.
+    let event = s("hook_event_name").map(|e| e.to_lowercase());
+    if matches!(
+        event.as_deref(),
+        Some("posttooluse") | Some("aftershellexecution")
+    ) {
+        return None;
+    }
+
+    let tool = s("tool_name").or_else(|| s("toolName"))?;
+    let folded = tool.to_lowercase();
+    if !WRITE_VERBS.iter().any(|v| folded.contains(v)) {
+        return None;
+    }
+
+    // Copilot delivers its arguments as a JSON *string*; everyone else as an
+    // object under `tool_input`.
+    let args = match v.get("toolArgs") {
+        Some(serde_json::Value::String(st)) => serde_json::from_str(st).ok()?,
+        Some(other) => other.clone(),
+        None => v.get("tool_input")?.clone(),
+    };
+
+    let path = PATH_FIELDS
+        .iter()
+        .find_map(|k| args.get(k).and_then(|p| p.as_str()))
+        .filter(|p| !p.is_empty())?;
+
+    let is_cursor = v.get("cursor_version").is_some() || v.get("conversation_id").is_some();
+    let looks_codex = s("agent")
+        .or_else(|| s("source"))
+        .map(|a| a.to_lowercase().contains("codex"))
+        .unwrap_or(false);
+    let dialect = if v.get("toolName").is_some() {
+        Dialect::Copilot
+    } else if is_cursor {
+        Dialect::Cursor
+    } else if looks_codex {
+        Dialect::Codex
+    } else {
+        Dialect::ClaudeCode
+    };
+
+    Some(FileWrite {
+        dialect,
+        tool,
+        path: path.to_string(),
+        cwd: s("cwd")
+            .or_else(|| s("workingDirectory"))
+            .or_else(|| {
+                v.get("workspace_roots")
+                    .and_then(|w| w.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|x| x.as_str())
+                    .map(normalize_uri_path)
+            })
+            .unwrap_or_default(),
+        session: s("session_id")
+            .or_else(|| s("conversation_id"))
+            .or_else(|| s("sessionId")),
+    })
+}
+
+/// Gate a file-write tool call.
+///
+/// Deny if the target is one of the gate's own files, and say nothing at all
+/// otherwise. Saying nothing is the point: an `allow` here would be Termaxa
+/// asserting a verdict on every file the agent writes, which it has no opinion
+/// about and no way to form one. Where the policy merely does not object, the
+/// harness's own permission flow is left exactly as it was.
+///
+/// The decision does not depend on the policy, so it survives a project with
+/// no `.termaxa/` at all and a policy that will not parse. Both are states in
+/// which the shell path has nothing to say, and both are states in which
+/// "do not overwrite the hook config" is still the right answer.
+fn gate_file_write(w: &FileWrite) {
+    let Some(protected) = crate::protect::classify(&w.cwd, &w.path) else {
+        return;
+    };
+
+    let subject = format!("{} {}", w.tool, w.path);
+    let reason = format!("[termaxa] {}", protected.reason);
+
+    // Audit best-effort, and never at the cost of the block: if the state dir
+    // cannot be resolved there is nowhere to write the record, and a deny that
+    // went unrecorded is still a deny.
+    let start_dir = if !w.cwd.is_empty() && std::path::Path::new(&w.cwd).is_dir() {
+        std::path::PathBuf::from(&w.cwd)
+    } else {
+        std::env::current_dir().unwrap_or_default()
+    };
+    if let Ok(paths) = crate::paths::resolve_from(&start_dir) {
+        if let Ok(log) = AuditLog::new(&paths.state_dir) {
+            let (ts_ms, ts) = now();
+            let _ = log.append(&AuditEntry {
+                ts_ms,
+                ts,
+                source: "hook".into(),
+                command: subject.clone(),
+                decision: "deny".into(),
+                matched_rule: Some(protected.what.to_string()),
+                reason: protected.reason.to_string(),
+                signals: vec![],
+                escalated: false,
+                session: w.session.clone(),
+                backup: None,
+                preview: None,
+                intent: None,
+                approved: None,
+                exit_code: None,
+                cwd: w.cwd.clone(),
+            });
+        }
+        if let Ok(policy) = Policy::load(&paths.policy_file()) {
+            crate::notify::maybe_send(&policy, "deny", &subject, protected.reason, "hook");
+        }
+    }
+
+    println!("{}", render_response(w.dialect, "deny", &reason));
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    std::process::exit(2);
+}
+
 /// Decision -> the JSON each agent expects on stdout.
 pub fn render_response(dialect: Dialect, permission: &str, reason: &str) -> String {
     match dialect {
@@ -272,7 +447,16 @@ pub fn run() -> Result<()> {
 
     let input = match parse_input(&buf) {
         Some(p) => p,
-        None => return Ok(()), // not for us; stay out of the way
+        None => {
+            // Not command-shaped. It may still be a file-write tool call, and
+            // the one thing a write tool must not do is rewrite the gate's own
+            // configuration. Anything else here stays out of the way, exactly
+            // as before.
+            if let Some(w) = parse_file_write(&buf) {
+                gate_file_write(&w);
+            }
+            return Ok(());
+        }
     };
     let command = input.command.clone();
 
@@ -656,5 +840,187 @@ mod tests {
     fn copilot_render_is_unwrapped() {
         let r = render_response(Dialect::Copilot, "deny", "[termaxa] no");
         assert!(r.contains("permissionDecision") && !r.contains("hookSpecificOutput"));
+    }
+
+    // ---- file-write tools ----------------------------------------------
+    //
+    // The half of self-defence the shell rules cannot reach. Every case here
+    // is named for the situation it came from rather than for the function it
+    // calls.
+
+    /// What Termaxa would decide, given a raw payload: the deny reason, or
+    /// `None` for "no decision, leave the harness alone".
+    fn verdict(raw: &str) -> Option<&'static str> {
+        let w = parse_file_write(raw)?;
+        crate::protect::classify(&w.cwd, &w.path).map(|p| p.what)
+    }
+
+    fn write_payload(tool: &str, path: &str) -> String {
+        json!({
+            "session_id": "s-1",
+            "cwd": "/repo",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": { "file_path": path, "content": "default: allow\n" }
+        })
+        .to_string()
+    }
+
+    /// Field report, 2026-08-12: an agent hit the `rm -rf` deny, reasoned five
+    /// seconds later that dropping `-rf` made the command equivalent, and
+    /// retried. Same instinct one tool over is a `Write` at the policy that
+    /// denied it, and until this matcher existed the shell rules could not see
+    /// it.
+    #[test]
+    fn the_write_tool_no_longer_routes_around_a_shell_deny() {
+        assert_eq!(
+            verdict(&write_payload("Write", "/repo/.termaxa/policy.yaml")),
+            Some("termaxa-state")
+        );
+        assert_eq!(
+            verdict(&write_payload("Edit", "/repo/.claude/settings.json")),
+            Some("agent-hook-config")
+        );
+    }
+
+    /// The tools Claude Code ships, including the one whose path field is
+    /// spelled differently.
+    #[test]
+    fn every_write_tool_is_recognised_including_notebooks() {
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            assert_eq!(
+                verdict(&write_payload(tool, "/repo/.termaxa/policy.yaml")),
+                Some("termaxa-state"),
+                "{tool}"
+            );
+        }
+        let nb = json!({
+            "cwd": "/repo",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "NotebookEdit",
+            "tool_input": { "notebook_path": "/repo/.termaxa/policy.yaml" }
+        })
+        .to_string();
+        assert_eq!(verdict(&nb), Some("termaxa-state"));
+    }
+
+    /// An ordinary edit must produce no decision at all, not an `allow`.
+    /// Asserting `allow` on every file an agent writes would be Termaxa
+    /// answering a question it has no way to form an opinion about, and at the
+    /// harness boundary an `allow` is an answer, not a shrug.
+    #[test]
+    fn an_ordinary_edit_gets_no_decision_rather_than_an_allow() {
+        let raw = write_payload("Edit", "/repo/src/main.rs");
+        let w = parse_file_write(&raw).expect("still parses as a write event");
+        assert_eq!(crate::protect::classify(&w.cwd, &w.path), None);
+    }
+
+    /// Reading the policy is allowed on the shell path (`cat .termaxa*` is an
+    /// explicit allow in the starter policy), so a read tool must not be
+    /// caught here either. `Read` carries the same `file_path` field as
+    /// `Write`, so only the verb separates them.
+    #[test]
+    fn read_tools_are_left_alone_even_on_a_protected_path() {
+        let raw = json!({
+            "cwd": "/repo",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": { "file_path": "/repo/.termaxa/policy.yaml" }
+        })
+        .to_string();
+        assert!(parse_file_write(&raw).is_none());
+    }
+
+    /// A rename within the same vocabulary keeps its coverage. This is the
+    /// failure Cursor 3.11 caused on the shell side, where an exact-name check
+    /// stopped matching and the gate went quiet.
+    #[test]
+    fn a_renamed_write_tool_still_matches_by_verb() {
+        for tool in [
+            "write_file",
+            "edit_file",
+            "create_file",
+            "apply_patch",
+            "str_replace_editor",
+        ] {
+            assert_eq!(
+                verdict(&write_payload(tool, "/repo/.termaxa/policy.yaml")),
+                Some("termaxa-state"),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_payload_stays_on_the_shell_path() {
+        // `parse_input` handles it, and `parse_file_write` must not also claim
+        // it — the write path has no policy engine behind it.
+        let raw = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf .termaxa"}}"#;
+        assert!(parse_input(raw).is_some());
+        assert!(parse_file_write(raw).is_none());
+    }
+
+    #[test]
+    fn a_write_that_already_happened_is_not_gated() {
+        let raw = json!({
+            "cwd": "/repo",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/repo/.termaxa/policy.yaml" }
+        })
+        .to_string();
+        assert!(parse_file_write(&raw).is_none());
+    }
+
+    #[test]
+    fn a_write_event_with_no_target_path_is_not_one() {
+        let raw =
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"content":"x"}}"#;
+        assert!(parse_file_write(raw).is_none());
+        let empty =
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":""}}"#;
+        assert!(parse_file_write(empty).is_none());
+    }
+
+    /// Copilot delivers tool arguments as a JSON string rather than an object,
+    /// the same shape the shell path already has to unwrap.
+    #[test]
+    fn copilot_string_encoded_arguments_are_unwrapped() {
+        let raw = json!({
+            "toolName": "create_file",
+            "toolArgs": r#"{"path":"/repo/.github/hooks/hooks.json"}"#,
+            "workingDirectory": "/repo"
+        })
+        .to_string();
+        let w = parse_file_write(&raw).expect("copilot write must parse");
+        assert_eq!(w.dialect, Dialect::Copilot);
+        assert_eq!(
+            crate::protect::classify(&w.cwd, &w.path).map(|p| p.what),
+            Some("agent-hook-config")
+        );
+    }
+
+    /// A payload with a BOM and a relative path, which is the combination the
+    /// Cursor field reports arrive in.
+    #[test]
+    fn a_bom_prefixed_write_with_a_relative_path_still_resolves() {
+        let raw = format!(
+            "\u{feff}{}",
+            json!({
+                "hook_event_name": "preToolUse",
+                "cursor_version": "3.11.25",
+                "conversation_id": "c-9",
+                "tool_name": "Edit",
+                "tool_input": { "file_path": ".termaxa/policy.yaml" },
+                "workspace_roots": ["/c:/Users/User/code/proj"]
+            })
+        );
+        let w = parse_file_write(&raw).expect("cursor write must parse");
+        assert_eq!(w.dialect, Dialect::Cursor);
+        assert_eq!(w.cwd, "c:/Users/User/code/proj");
+        assert_eq!(
+            crate::protect::classify(&w.cwd, &w.path).map(|p| p.what),
+            Some("termaxa-state")
+        );
     }
 }

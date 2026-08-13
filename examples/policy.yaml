@@ -25,11 +25,16 @@ rules:
   # `*` matches any run of characters, so one rule covers both path
   # separators: `.termaxa/policy.yaml` and `.termaxa\policy.yaml`.
   #
-  # This closes the SHELL path only. An agent's file-writing tool (Write,
-  # Edit, the editor's apply-patch) never reaches the hook — the Claude Code
-  # hook is registered with `"matcher": "Bash"` — so no rule here can see it.
-  # `termaxa doctor` fingerprints the policy for exactly that reason: what
-  # cannot be blocked can at least be noticed.
+  # These are SHELL rules, and an agent's file-writing tool (Write, Edit, the
+  # editor's apply-patch) produces no command for them to match. The same
+  # files are therefore defended a second way: `termaxa init` also registers
+  # a PreToolUse hook on the write tools, which reads the target path and
+  # denies a write landing in `.termaxa/` or an agent hook config. It reads
+  # nothing else and has no opinion about any other file — see src/protect.rs.
+  #
+  # A project wired by hand from a pre-v0.15 snippet has the shell half only.
+  # `termaxa doctor` fingerprints the policy for that case: what was not
+  # blocked can at least be noticed.
   #
   # Reads are denied too, except for the handful listed below, because
   # separating reads from writes in general would mean enumerating every read

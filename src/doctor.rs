@@ -275,7 +275,7 @@ fn report_fingerprint(policy_file: &Path, state_dir: &Path, problems: &mut Vec<S
             );
             println!(
                 "    {}",
-                dim("agent file-writing tools bypass the hook entirely (matcher: Bash)")
+                dim("a hook wired by hand may be missing the write-tool matcher")
             );
             problems
                 .push("review .termaxa/policy.yaml — it changed since the last baseline".into());
@@ -389,8 +389,9 @@ mod tests {
         report_fingerprint(&policy, &state, &mut problems);
         assert!(problems.is_empty(), "unchanged policy is not a problem");
 
-        // 3. The edit from the review — the one no deny rule can stop,
-        //    because an agent's file-writing tool never reaches the hook.
+        // 3. The edit from the review. The write-tool matcher denies this one
+        //    now, but only where it is registered, so the baseline is still
+        //    what catches the change that got through.
         std::fs::write(&policy, "version: 1\ndefault: allow\nrules: []\n").unwrap();
         let mut problems: Vec<String> = Vec::new();
         report_fingerprint(&policy, &state, &mut problems);

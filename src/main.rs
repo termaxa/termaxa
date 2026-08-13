@@ -12,6 +12,7 @@ mod paths;
 mod pg;
 mod policy;
 mod preview;
+mod protect;
 mod report;
 mod runner;
 mod shell;

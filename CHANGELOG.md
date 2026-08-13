@@ -2,6 +2,40 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## Unreleased
+
+### Added
+
+- **A write-tool matcher, so a shell deny cannot be routed around one tool over.**
+  Contributed by **Tim Schipper** ([@AraneaDev](https://github.com/AraneaDev)),
+  closing the half of his finding 1 that v0.14.2 left open.
+
+  The self-defence rules added in v0.14.2 are shell rules, and an agent's
+  file-writing tool produces no command for them to match. So an agent that hit
+  the `rm -rf` deny on `.termaxa/policy.yaml` could reach for `Write` and get
+  there anyway, without evading anything: routing around an obstacle is the most
+  ordinary thing an agent does. By the decision rule in `SECURITY.md` that makes
+  it a bug rather than a documented limit.
+
+  `termaxa init` now registers a second `PreToolUse` entry with the matcher
+  `Write|Edit|MultiEdit|NotebookEdit`. It reads the target path and nothing
+  else, and denies a write that lands in `.termaxa/` or an agent hook config.
+
+  Two properties worth stating, because both were deliberate:
+
+  - **It does not gate file writes.** A path it does not recognise gets no
+    decision at all, not an `allow`. Asserting `allow` on every file an agent
+    writes would be Termaxa answering a question it has no way to form an
+    opinion about, and at the harness boundary an `allow` is an answer rather
+    than a shrug.
+  - **The decision does not consult the policy.** It holds in a project with no
+    `.termaxa/` and one whose policy will not parse, which are exactly the
+    states where the shell path has nothing to say.
+
+  Running `termaxa init --claude-code` again adds the new entry next to the
+  existing `Bash` one; the idempotence check is keyed on the matcher, so an
+  install that predates this release is upgraded rather than read as complete.
+
 ## v0.14.2 — the preview no longer runs anything on a denied command
 
 Second review round from **Tim Schipper** ([@AraneaDev](https://github.com/AraneaDev)), who this time stopped reviewing and started attacking: 22 commands against the v0.14.1 starter policy, each destructive or gate-disabling. His first PR to this repo is in this release.

@@ -31,11 +31,16 @@ rules:
   # `*` matches any run of characters, so one rule covers both path
   # separators: `.termaxa/policy.yaml` and `.termaxa\policy.yaml`.
   #
-  # This closes the SHELL path only. An agent's file-writing tool (Write,
-  # Edit, the editor's apply-patch) never reaches the hook — the Claude Code
-  # hook is registered with `"matcher": "Bash"` — so no rule here can see it.
-  # `termaxa doctor` fingerprints the policy for exactly that reason: what
-  # cannot be blocked can at least be noticed.
+  # These are SHELL rules, and an agent's file-writing tool (Write, Edit, the
+  # editor's apply-patch) produces no command for them to match. The same
+  # files are therefore defended a second way: `termaxa init` also registers
+  # a PreToolUse hook on the write tools, which reads the target path and
+  # denies a write landing in `.termaxa/` or an agent hook config. It reads
+  # nothing else and has no opinion about any other file — see src/protect.rs.
+  #
+  # A project wired by hand from a pre-v0.15 snippet has the shell half only.
+  # `termaxa doctor` fingerprints the policy for that case: what was not
+  # blocked can at least be noticed.
   #
   # Reads are denied too, except for the handful listed below, because
   # separating reads from writes in general would mean enumerating every read
@@ -408,11 +413,6 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
         json!({})
     };
 
-    let hook_entry = json!({
-        "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "termaxa hook" }]
-    });
-
     let hooks = settings
         .as_object_mut()
         .context("settings.json root must be an object")?
@@ -425,25 +425,30 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
         .or_insert(json!([]));
     let arr = pre.as_array_mut().context("PreToolUse must be an array")?;
 
-    let already = arr.iter().any(|e| {
-        e.pointer("/hooks/0/command")
-            .and_then(|c| c.as_str())
-            .map(|c| c.contains("termaxa hook"))
-            .unwrap_or(false)
-    });
-    if already {
-        println!("\n• Claude Code hook already installed in .claude/settings.json");
-    } else {
-        arr.push(hook_entry);
+    if ensure_hook(arr, BASH_MATCHER) {
         println!("\n✓ installed PreToolUse hook in .claude/settings.json");
+    } else {
+        println!("\n• Claude Code hook already installed in .claude/settings.json");
+    }
+    // Second matcher, on the tools that write files without going near a
+    // shell. It reads the target path and nothing else: a write that lands in
+    // `.termaxa/` or an agent hook config is denied, and every other write
+    // gets no decision at all. This is not a general file-write gate and is
+    // not trying to be one — see `protect`.
+    //
+    // A separate entry rather than a widened `"Bash|Write|…"` because the two
+    // are different jobs. The Bash matcher runs the policy engine, the
+    // classifier, the preview and insurance; this one compares a path.
+    if ensure_hook(arr, WRITE_MATCHER) {
+        println!("✓ installed PreToolUse write-tool hook in .claude/settings.json");
     }
 
     // PostToolUse receipt hook (feeds the breaker's approved-ask exclusion).
     // Same command; Termaxa branches on the event name internally.
-    let post_entry = json!({
-        "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "termaxa hook" }]
-    });
+    //
+    // Bash only. A receipt for a file write would record something the circuit
+    // breaker cannot count and the report cannot rank, so registering it would
+    // buy a log line and a process spawn per edit.
     let post = settings
         .as_object_mut()
         .context("settings.json root must be an object")?
@@ -455,14 +460,7 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
     let post_arr = post
         .as_array_mut()
         .context("PostToolUse must be an array")?;
-    let post_already = post_arr.iter().any(|e| {
-        e.pointer("/hooks/0/command")
-            .and_then(|c| c.as_str())
-            .map(|c| c.contains("termaxa hook"))
-            .unwrap_or(false)
-    });
-    if !post_already {
-        post_arr.push(post_entry);
+    if ensure_hook(post_arr, BASH_MATCHER) {
         println!("✓ installed PostToolUse hook in .claude/settings.json");
     }
 
@@ -470,21 +468,68 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Claude Code matches shell calls on the tool name `Bash`.
+const BASH_MATCHER: &str = "Bash";
+
+/// Claude Code treats `matcher` as a regex over the tool name, so the write
+/// tools are one entry rather than four.
+///
+/// A tool whose name is not in here never reaches the hook, and that is a
+/// coverage gap by construction: the matcher is the harness's filter and
+/// Termaxa cannot widen it after the fact. `parse_file_write` therefore
+/// recognises write tools by verb rather than by exact name, so this list is
+/// the only place a rename can cost coverage, and `doctor`'s policy
+/// fingerprint still notices a change that got through.
+const WRITE_MATCHER: &str = "Write|Edit|MultiEdit|NotebookEdit";
+
+/// Add the Termaxa hook for `matcher` if it is not already there. Returns
+/// whether it inserted.
+///
+/// Keyed on the matcher as well as the command, because a settings file
+/// written by an earlier version already contains a `Bash` entry, and an
+/// upgrade has to be able to add the write-tool entry next to it rather than
+/// reading the first one as "already installed".
+fn ensure_hook(arr: &mut Vec<Value>, matcher: &str) -> bool {
+    let present = arr.iter().any(|e| {
+        e.get("matcher").and_then(|m| m.as_str()) == Some(matcher)
+            && e.pointer("/hooks/0/command")
+                .and_then(|c| c.as_str())
+                .map(|c| c.contains("termaxa hook"))
+                .unwrap_or(false)
+    });
+    if present {
+        return false;
+    }
+    arr.push(json!({
+        "matcher": matcher,
+        "hooks": [{ "type": "command", "command": "termaxa hook" }]
+    }));
+    true
+}
+
 fn print_hook_snippet() {
-    println!(
-        r#"
-  .claude/settings.json snippet:
-  {{
-    "hooks": {{
-      "PreToolUse": [
-        {{
-          "matcher": "Bash",
-          "hooks": [{{ "type": "command", "command": "termaxa hook" }}]
-        }}
-      ]
-    }}
-  }}"#
-    );
+    println!("{}", print_hook_snippet_text());
+}
+
+/// The hand-wiring snippet, built from the same matcher constants `init`
+/// installs, so the two cannot drift apart.
+fn print_hook_snippet_text() -> String {
+    let entry = |matcher: &str| {
+        json!({
+            "matcher": matcher,
+            "hooks": [{ "type": "command", "command": "termaxa hook" }]
+        })
+    };
+    let snippet = json!({
+        "hooks": {
+            "PreToolUse": [entry(BASH_MATCHER), entry(WRITE_MATCHER)],
+            "PostToolUse": [entry(BASH_MATCHER)],
+        }
+    });
+    format!(
+        "\n  .claude/settings.json snippet:\n{}",
+        serde_json::to_string_pretty(&snippet).unwrap_or_default()
+    )
 }
 
 pub(crate) fn which(bin: &str) -> bool {
@@ -578,6 +623,82 @@ mod tests {
         // Re-running init on an unchanged policy records the same hash.
         let again = record_fingerprint(&state, &policy).unwrap().unwrap();
         assert_eq!(short, again);
+    }
+
+    /// Read the PreToolUse matchers out of a settings file, in order.
+    fn pre_matchers(settings: &Path) -> Vec<String> {
+        let v: Value = serde_json::from_str(&fs::read_to_string(settings).unwrap()).unwrap();
+        v["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["matcher"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn init_registers_the_write_tools_as_well_as_bash() {
+        let tmp = TempTree::new("init-write-matcher");
+        let proj = tmp.dir("proj");
+        install_claude_hook(&proj).unwrap();
+
+        let settings = proj.join(".claude").join("settings.json");
+        assert_eq!(pre_matchers(&settings), vec![BASH_MATCHER, WRITE_MATCHER]);
+
+        // The write matcher is a gate, not a receipt: a file write that already
+        // happened tells the breaker nothing, so PostToolUse stays Bash-only.
+        let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        let post: Vec<&str> = v["hooks"]["PostToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["matcher"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(post, vec![BASH_MATCHER]);
+    }
+
+    /// The upgrade case. A settings file written before the write matcher
+    /// existed already has a `Bash` entry, and an idempotence check keyed only
+    /// on the command reads that as "already installed" and never adds the
+    /// second one — leaving the gap open on exactly the machines that have
+    /// been running Termaxa longest.
+    #[test]
+    fn init_adds_the_write_matcher_to_a_settings_file_that_predates_it() {
+        let tmp = TempTree::new("init-write-matcher-upgrade");
+        let proj = tmp.dir("proj");
+        tmp.file(
+            "proj/.claude/settings.json",
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"termaxa hook"}]}]}}"#,
+        );
+
+        install_claude_hook(&proj).unwrap();
+        assert_eq!(
+            pre_matchers(&proj.join(".claude").join("settings.json")),
+            vec![BASH_MATCHER, WRITE_MATCHER]
+        );
+    }
+
+    #[test]
+    fn running_init_twice_does_not_duplicate_either_matcher() {
+        let tmp = TempTree::new("init-write-matcher-twice");
+        let proj = tmp.dir("proj");
+        install_claude_hook(&proj).unwrap();
+        install_claude_hook(&proj).unwrap();
+
+        assert_eq!(
+            pre_matchers(&proj.join(".claude").join("settings.json")),
+            vec![BASH_MATCHER, WRITE_MATCHER]
+        );
+    }
+
+    /// The snippet is what someone wires by hand when `init` cannot write the
+    /// file for them. If it only shows the Bash matcher, a hand-wired install
+    /// is missing the half this PR adds and nothing says so.
+    #[test]
+    fn the_printed_snippet_shows_both_matchers() {
+        let snippet = print_hook_snippet_text();
+        assert!(snippet.contains(BASH_MATCHER));
+        assert!(snippet.contains(WRITE_MATCHER));
     }
 
     #[test]
