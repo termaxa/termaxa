@@ -457,6 +457,33 @@ mod tests {
         assert_eq!(segs[0].redirects[0].target, "a");
     }
 
+    /// Kills predicted survivors 1-3 from the suppressions-retirement
+    /// commit, before the mutation pass runs. Each leg names its mutant.
+    #[test]
+    fn the_predicted_survivors_are_killed() {
+        // 1. `i > 0` -> `i >= 0` in prev_is_amp / prev_is_lt: a command
+        // BEGINNING with `>` must extract its target without underflowing.
+        let r = redirects("> x");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].target, "x");
+        assert!(r[0].truncates);
+        assert!(!redirects(">> log").is_empty());
+        // 2. `truncates &&` -> `||` in the clobber check: `>>|` is not an
+        // operator anywhere - bash rejects it and nothing runs, so any
+        // segmentation is safe. The walk splits at the `|` (only `>|`
+        // consumes one), extracting no target; the mutant would merge the
+        // segments and invent a redirect on `x`.
+        let segs = split_segments("cmd >>| x");
+        assert_eq!(segs, vec!["cmd >>", "x"]);
+        assert!(segs.iter().all(|s| s.redirects.is_empty()));
+        // 3. `j + 1 < len` -> `<=` in the target escape arm: a trailing
+        // backslash in TARGET position is a literal, kept in the target as
+        // backslashes always are, and must not read past the end.
+        let r = redirects(r"cmd > a\");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].target, r"a\");
+    }
+
     /// The empty-target guard, exercised: a trailing redirect names nothing
     /// and must push nothing. The last of the five predicted survivors; the
     /// other four died to `every_sink_spelling_is_a_sink` above.
