@@ -344,11 +344,14 @@ fn overwrite_paths(redirects: &[crate::shell::Overwrite], cwd: &Path) -> Option<
 }
 
 fn rm_targets(tokens: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
-    let head = crate::delete::command_head(tokens.first()?);
+    // Same head resolution the classifier and the preview use. When these
+    // disagreed, a command could be CLASSIFIED destructive and take no
+    // insurance - gated without a net, which is worse than missing both.
+    let (head, at) = crate::delete::resolve_head(tokens)?;
     if !crate::delete::is_delete_command(&head) {
         return None;
     }
-    let paths: Vec<PathBuf> = tokens[1..]
+    let paths: Vec<PathBuf> = tokens[at + 1..]
         .iter()
         .filter(|t| !crate::delete::is_flag(&head, t))
         .map(|t| crate::delete::resolve_path_in(t, cwd))

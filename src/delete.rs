@@ -190,12 +190,17 @@ pub fn extract_targets(command: &str) -> Vec<String> {
         if tokens.is_empty() {
             continue;
         }
-        let head = command_head(&tokens[0]);
+        let Some((head, at)) = resolve_head(&tokens) else {
+            continue;
+        };
         if !is_delete_command(&head) {
             continue;
         }
 
-        for t in tokens.iter().skip(1) {
+        // Targets start after the command, not after token zero: with a
+        // wrapper present those are different positions, and reading from
+        // token zero would take the wrapper's own arguments as targets.
+        for t in tokens.iter().skip(at + 1) {
             if is_flag(&head, t) {
                 continue;
             }
@@ -261,6 +266,95 @@ pub fn command_head(token: &str) -> String {
         .unwrap_or(&lower)
         .trim_end_matches(".exe")
         .to_string()
+}
+
+/// Wrapper programs that run another command, with the real command's name
+/// somewhere after their own arguments. Until v0.16 every consumer read
+/// token zero as the command, so `sudo rm -rf x` classified as nothing at
+/// all: the classifier saw `sudo`, the delete extractor saw `sudo`, and
+/// `backup` took no insurance. The gap was not specific to deletes — measured
+/// on the previous commit, `sudo terraform destroy -auto-approve` also
+/// classified as `None`. A wrapper blanked the whole engine.
+///
+/// HAND-WALKED LIST (decision #56: a membership list that sizes a decision
+/// gets walked by a person and says so). Each entry runs an arbitrary command
+/// and is common in agent output. Being on this list is NOT a claim that the
+/// wrapper is dangerous — `sudo` precedes plenty of harmless work. It says
+/// only "the real command name is further along."
+///
+/// Deliberately NOT here: `xargs` and `find -exec`, which take a command but
+/// are already handled where their own semantics matter; shell builtins
+/// (`exec`, `eval`), which do not appear as token zero of a segment the
+/// splitter produced; and `time` / `strace` / `watch`, which are diagnostic
+/// wrappers no agent has been observed reaching for in this codebase's field
+/// reports. Add them when something observes one, not before.
+const COMMAND_WRAPPERS: [&str; 6] = ["sudo", "doas", "env", "command", "nohup", "nice"];
+
+/// Flags on a wrapper that consume the FOLLOWING token as their value. Without
+/// this, `sudo -u alice rm -rf x` reads `alice` as the command name and the
+/// delete is invisible again — the same miss in a different spelling.
+fn wrapper_flag_takes_value(wrapper: &str, flag: &str) -> bool {
+    match wrapper {
+        "sudo" | "doas" => matches!(
+            flag,
+            "-u" | "-g" | "-p" | "-C" | "-D" | "-h" | "-R" | "-T" | "--user" | "--group"
+        ),
+        "env" => matches!(flag, "-u" | "--unset" | "-S" | "--split-string"),
+        "nice" => matches!(flag, "-n" | "--adjustment"),
+        _ => false,
+    }
+}
+
+/// The real command's normalized head, and the index of the token it came
+/// from. `None` when the segment is only wrappers and their arguments, which
+/// names no command to judge.
+///
+/// One answer to "what command is this?", shared by the classifier, the
+/// delete extractor and the insurance layer. They used to compute it three
+/// ways and disagreed (decision #37): `delete.rs` normalized paths through
+/// `command_head` while `intent.rs` compared token zero raw, so
+/// `C:\Windows\System32\del.exe /s /q x` was a recognised delete to one and
+/// nothing to the other — on the platform where every dialect bug has
+/// actually happened.
+pub fn resolve_head(tokens: &[String]) -> Option<(String, usize)> {
+    let mut i = 0;
+    loop {
+        let head = command_head(tokens.get(i)?);
+        if !COMMAND_WRAPPERS.contains(&head.as_str()) {
+            return Some((head, i));
+        }
+        let wrapper = head;
+        i += 1;
+        // Skip the wrapper's own arguments: flags (and their values, where the
+        // flag takes one) and `KEY=VALUE` environment assignments, which `env`
+        // and `sudo` both accept before the command name.
+        while let Some(tok) = tokens.get(i) {
+            if tok.starts_with('-') {
+                if wrapper_flag_takes_value(&wrapper, tok) {
+                    i += 1;
+                }
+                i += 1;
+            } else if is_env_assignment(tok) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// `FOO=bar` before a command name is an environment assignment, not the
+/// command. Guarded against paths that merely contain `=`: the name half must
+/// be a plain identifier.
+fn is_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.chars().next().is_some_and(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
 }
 
 /// Does this command head delete things?

@@ -137,8 +137,14 @@ fn classify_segment_named(segment: &str) -> Option<Intent> {
     if toks.is_empty() {
         return None;
     }
-    let lc: Vec<String> = toks.iter().map(|t| t.to_ascii_lowercase()).collect();
-    let first = lc[0].as_str();
+    // The command's real head, past any wrapper, normalized the same way the
+    // delete extractor and the insurance layer normalize it. Reading token
+    // zero raw is what made `sudo rm -rf x`, `/bin/rm -rf x` and
+    // `C:\Windows\System32\del.exe /s /q x` all classify as nothing.
+    let (head, at) = crate::delete::resolve_head(&toks)?;
+    let first = head.as_str();
+    // Arguments begin after the command, which is `at`, not 0.
+    let lc: Vec<String> = toks[at..].iter().map(|t| t.to_ascii_lowercase()).collect();
 
     // --- file deletes: unix rm, PowerShell Remove-Item + aliases, cmd del ---
     // PowerShell aliases: rm, ri, del, erase, rd all map to Remove-Item.
@@ -472,6 +478,64 @@ mod tests {
                 "{cmd} destroys a file by writing over it"
             );
         }
+    }
+
+    /// v0.16: a wrapper program hid the real command from every engine.
+    /// Measured before the fix - each of these classified as `None`, so no
+    /// intent, no breaker pressure, and (via the same head resolution) no
+    /// insurance. The wrapper is not the danger; reading token zero as the
+    /// command was.
+    #[test]
+    fn a_wrapper_does_not_hide_the_command_it_runs() {
+        for cmd in [
+            "sudo rm -rf ./dist",
+            "doas rm -rf /",
+            "env rm -rf ./dist",
+            "env FOO=1 rm -rf ./dist",
+            "sudo -u alice rm -rf ./dist",
+            "nice -n 10 rm -rf x",
+            "nohup rm -rf x",
+            "command rm -rf x",
+        ] {
+            assert_eq!(
+                classify_command(cmd),
+                Some(Intent::FileDelete),
+                "{cmd}: the wrapper must not hide the delete"
+            );
+        }
+        // Not only deletes: a wrapper blanked the WHOLE classifier.
+        assert_eq!(
+            classify_command("sudo terraform destroy -auto-approve"),
+            Some(Intent::InfraDestroy),
+        );
+
+        // Control legs. A wrapper with no command after it names nothing to
+        // judge, and the word only counts in command position - otherwise
+        // `echo sudo rm` would classify as a delete.
+        for cmd in ["sudo", "sudo -u alice", "env FOO=1", "echo sudo rm -rf x"] {
+            assert_eq!(classify_command(cmd), None, "{cmd} must not classify");
+        }
+    }
+
+    /// The head is normalized by path and extension, as `delete.rs` always
+    /// normalized it. These two modules disagreed: the Windows full-path form
+    /// was a recognised delete to the extractor and nothing to the
+    /// classifier, on the platform where every dialect bug has happened.
+    #[test]
+    fn a_path_qualified_command_is_the_command_it_names() {
+        for cmd in [
+            "/bin/rm -rf ./dist",
+            "/usr/bin/rm -rf ./dist",
+            "C:\\Windows\\System32\\del.exe /s /q x",
+        ] {
+            assert_eq!(
+                classify_command(cmd),
+                Some(Intent::FileDelete),
+                "{cmd}: a path-qualified delete is still a delete"
+            );
+        }
+        // Control leg - a path-qualified harmless command stays harmless.
+        assert_eq!(classify_command("/bin/ls -la"), None);
     }
 
     /// Appending does not destroy, descriptor plumbing names no file, and a
