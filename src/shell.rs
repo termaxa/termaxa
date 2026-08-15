@@ -18,9 +18,16 @@
 ///   - `$(...)` and backticks cannot be statically analyzed — their PRESENCE
 ///     is reported so the context engine can escalate, rather than
 ///     pretending the contents were checked.
+///   - Redirect targets are extracted in the SAME walk (v0.15 #14 found `>`
+///     lexed and thrown away — `cat /dev/null > .env` wiped a credentials
+///     file invisibly; v0.16 §1.5 folded the separate scan back in after two
+///     walks over one grammar produced three bugs and then measurably
+///     disagreed, decision #37). Each `Segment` carries the `Overwrite`s
+///     found in it; there is no second scanner to feed different input.
 pub fn split_segments(s: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut cur = String::new();
+    let mut cur_redirects = Vec::new();
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     let (mut in_single, mut in_double) = (false, false);
@@ -36,14 +43,22 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                 in_double = !in_double;
                 cur.push(c);
             }
-            '\\' if in_double && i + 1 < chars.len() => {
+            // An escape outside single quotes makes the next character
+            // LITERAL: no quote toggle, no separator, no redirect. Until
+            // v0.16 this arm only fired inside double quotes; outside them,
+            // `\"` toggled quote state and everything after it — including
+            // a `;` and whatever command followed — rode inside one segment
+            // a permissive rule could match whole. A shell runs that second
+            // command. The over-splits go with it: `echo a \; b` is ONE
+            // command to a shell, and now one segment here.
+            '\\' if !in_single && i + 1 < chars.len() => {
                 cur.push(c);
                 cur.push(chars[i + 1]);
                 i += 1;
             }
             _ if in_single || in_double => cur.push(c),
             '&' if i + 1 < chars.len() && chars[i + 1] == '&' => {
-                flush(&mut segments, &mut cur);
+                flush(&mut segments, &mut cur, &mut cur_redirects);
                 i += 1; // consume second &
             }
             // A lone `&` IS a separator — it backgrounds the segment to its
@@ -53,27 +68,100 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
             // `git status*` allow rule. The redirection forms it also appears
             // in are `2>&1` / `>&2` / `<&-` (preceded by `>` or `<`) and
             // `&>file` / `&>>file` (followed by `>`); those are not separators.
-            '&' if !is_redirection_amp(&chars, i) => flush(&mut segments, &mut cur),
-            // `>|` forces clobber past `set -o noclobber` — one operator, not
-            // a redirect followed by a pipe. Splitting here cut the target off
-            // into its own segment, so intent and policy (which split first)
-            // never saw the truncation the redirect scan reports; only backup,
-            // which then re-scanned the raw string, insured it. Found by
-            // unifying the scanners (v0.16 §1.5): the moment the redirect scan
-            // ran on split output, the disagreement became a failing test.
-            '|' if i > 0 && chars[i - 1] == '>' => cur.push(c),
+            '&' if !is_redirection_amp(&chars, i) => {
+                flush(&mut segments, &mut cur, &mut cur_redirects)
+            }
+            // A redirect: consume the operator and its target in THIS walk,
+            // recording the Overwrite the segment will carry. Deliberately
+            // NOT treated as redirects, because they do not create or
+            // truncate a file: `2>&1`, `>&2` (descriptor duplication), `&>`
+            // and `&>>` (stream combination), `<>` (read-write open),
+            // `>(...)` (process substitution — an operator, not a filename),
+            // `\>` (a literal, consumed by the escape arm above), anything
+            // inside quotes, and sinks (`/dev/null` and friends — truncating
+            // one destroys nothing). `>|` (clobber past noclobber) IS a
+            // truncation of the named file, and one operator: splitting at
+            // its `|` cut the target into its own segment, hiding the
+            // truncation from every engine that splits first.
+            '>' => {
+                let prev_is_amp = i > 0 && chars[i - 1] == '&';
+                let prev_is_lt = i > 0 && chars[i - 1] == '<';
+                cur.push(c);
+                let mut j = i + 1;
+                let truncates = if chars.get(j) == Some(&'>') {
+                    cur.push('>');
+                    j += 1;
+                    false
+                } else {
+                    true
+                };
+                if truncates && chars.get(j) == Some(&'|') {
+                    cur.push('|');
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'&') {
+                    // descriptor duplication — keep the `&` as text and let
+                    // the walk continue after it, as `is_redirection_amp`
+                    // always classified it
+                    cur.push('&');
+                    i = j + 1;
+                    continue;
+                }
+                while j < chars.len() && chars[j].is_whitespace() {
+                    cur.push(chars[j]);
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'(') {
+                    // process substitution: `tee >(gzip)` hands tee a pipe,
+                    // not a file — hand the paren back to the walk
+                    i = j;
+                    continue;
+                }
+                // The target: everything until unquoted whitespace or an
+                // unquoted separator, escapes honored as everywhere else in
+                // the walk. Backslashes are RETAINED in the target string,
+                // as they always were for non-boundary characters.
+                let mut target = String::new();
+                let mut quote: Option<char> = None;
+                while j < chars.len() {
+                    let d = chars[j];
+                    match quote {
+                        Some(q) if d == q => quote = None,
+                        Some(_) => {}
+                        None if d == '\'' || d == '"' => quote = Some(d),
+                        None if d == '\\' && j + 1 < chars.len() => {
+                            cur.push(d);
+                            target.push(d);
+                            j += 1;
+                        }
+                        None if d.is_whitespace() => break,
+                        None if matches!(d, ';' | '\n' | '|') => break,
+                        None if d == '&' && !is_redirection_amp(&chars, j) => break,
+                        None => {}
+                    }
+                    cur.push(chars[j]);
+                    target.push(chars[j]);
+                    j += 1;
+                }
+                let target: String = target.trim_matches(|c| c == '\'' || c == '"').to_string();
+                if !target.is_empty() && !prev_is_amp && !prev_is_lt && !is_sink(&target) {
+                    cur_redirects.push(Overwrite { target, truncates });
+                }
+                i = j;
+                continue;
+            }
             '|' => {
-                flush(&mut segments, &mut cur);
+                flush(&mut segments, &mut cur, &mut cur_redirects);
                 if i + 1 < chars.len() && chars[i + 1] == '|' {
                     i += 1; // `||` — consume second |
                 }
             }
-            ';' | '\n' => flush(&mut segments, &mut cur),
+            ';' | '\n' => flush(&mut segments, &mut cur, &mut cur_redirects),
             _ => cur.push(c),
         }
         i += 1;
     }
-    flush(&mut segments, &mut cur);
+    flush(&mut segments, &mut cur, &mut cur_redirects);
     segments
 }
 
@@ -145,106 +233,6 @@ fn is_sink(target: &str) -> bool {
     )
 }
 
-/// Extract the redirect targets from ONE segment.
-///
-/// v0.15. `>` and `>>` were lexed by `split_segments` and then thrown away, so
-/// a command that destroys a file by writing over it was invisible to every
-/// engine: no intent, no preview, no backup. `cat /dev/null > .env` matched the
-/// read-only `cat *` allow rule and wiped a credentials file.
-///
-/// HONESTY NOTE: this is still a second character walk over the same grammar
-/// `split_segments` reads. What changed in v0.16 §1.5 is that it is no longer
-/// a second PUBLIC scanner: only `flush` calls it, on segments the splitter
-/// just produced, so no caller can feed the two walks different inputs. The
-/// walks themselves still disagree on escape handling outside quotes
-/// (`\"` toggles a quote here but not there) — folding them into one walk is
-/// the next commit, and it must pick one escape semantics to do it. Do not
-/// let this comment outlive the second walk.
-///
-/// Deliberately NOT treated as redirects, because they do not create or
-/// truncate a file: `2>&1`, `>&2`, `<&-` (descriptor duplication), `&>` and
-/// `&>>` (stream combination), `<>` (read-write open), `>(...)` (process
-/// substitution — an operator, not a filename), `\>` outside quotes (a
-/// literal character), anything inside quotes, and sinks (`/dev/null` and
-/// friends — truncating one destroys nothing). `>|` (clobber past
-/// noclobber) IS a truncation of the named file.
-fn scan_redirects(segment: &str) -> Vec<Overwrite> {
-    let chars: Vec<char> = segment.chars().collect();
-    let mut out = Vec::new();
-    let (mut in_single, mut in_double) = (false, false);
-    let mut i = 0;
-
-    while i < chars.len() {
-        let c = chars[i];
-        match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            // Escape inside double quotes (as split_segments) and bare:
-            // `echo a \> b` writes a literal `>`, it redirects nothing.
-            '\\' if !in_single && i + 1 < chars.len() => i += 1,
-            _ if in_single || in_double => {}
-            '>' => {
-                // `&>` / `&>>` combine streams; `2>&1` / `>&2` point one
-                // descriptor at another; `<>` opens read-write. None truncate.
-                let prev_is_amp = i > 0 && chars[i - 1] == '&';
-                let prev_is_lt = i > 0 && chars[i - 1] == '<';
-                let mut j = i + 1;
-                let truncates = if chars.get(j) == Some(&'>') {
-                    j += 1;
-                    false
-                } else {
-                    true
-                };
-                // `>|` forces clobber past `set -o noclobber` — still a
-                // truncation of the file that follows.
-                if truncates && chars.get(j) == Some(&'|') {
-                    j += 1;
-                }
-                if chars.get(j) == Some(&'&') {
-                    i = j + 1;
-                    continue;
-                }
-                while j < chars.len() && chars[j].is_whitespace() {
-                    j += 1;
-                }
-                // `>(...)` is process substitution: `tee >(gzip)` hands tee a
-                // pipe, not a file. The draft extracted "(gzip" as a
-                // truncating target here.
-                if chars.get(j) == Some(&'(') {
-                    i = j;
-                    continue;
-                }
-                let start = j;
-                let mut quote: Option<char> = None;
-                while j < chars.len() {
-                    let d = chars[j];
-                    match quote {
-                        Some(q) if d == q => quote = None,
-                        Some(_) => {}
-                        None if d == '\'' || d == '"' => quote = Some(d),
-                        None if d.is_whitespace() => break,
-                        None => {}
-                    }
-                    j += 1;
-                }
-                let target: String = chars[start..j]
-                    .iter()
-                    .collect::<String>()
-                    .trim_matches(|c| c == '\'' || c == '"')
-                    .to_string();
-                if !target.is_empty() && !prev_is_amp && !prev_is_lt && !is_sink(&target) {
-                    out.push(Overwrite { target, truncates });
-                }
-                i = j;
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    out
-}
-
 /// Is the `&` at `i` part of a redirection rather than a command separator?
 /// `2>&1`, `1>&2`, `<&-` have `>` or `<` immediately before; `&>log` and
 /// `&>>log` have `>` immediately after.
@@ -254,13 +242,18 @@ fn is_redirection_amp(chars: &[char], i: usize) -> bool {
     prev_is_redirect || next_is_redirect
 }
 
-fn flush(segments: &mut Vec<Segment>, cur: &mut String) {
+fn flush(segments: &mut Vec<Segment>, cur: &mut String, redirects: &mut Vec<Overwrite>) {
     let t = cur.trim();
     if !t.is_empty() {
         segments.push(Segment {
             text: t.to_string(),
-            redirects: scan_redirects(t),
+            redirects: std::mem::take(redirects),
         });
+    } else {
+        // Nothing but whitespace between separators: whatever the redirect
+        // scan collected has no segment to ride on. Unreachable in practice
+        // (a redirect implies non-whitespace text), cleared for safety.
+        redirects.clear();
     }
     cur.clear();
 }
@@ -396,6 +389,74 @@ mod tests {
         assert!(redirects("cmd <> rw.txt").is_empty());
     }
 
+    /// v0.16 §1.5, behavior CHANGE, pinned deliberately: an escape outside
+    /// single quotes makes the next character literal, as a shell reads it.
+    /// Before unification `\"` toggled quote state, so the `;` and the
+    /// command after it rode inside one segment — `echo \" ; rm -rf x`
+    /// matched an `echo *` allow rule whole while the shell ran `rm -rf x`
+    /// as its own command. The v0.6.1 class, reopened through an escape.
+    #[test]
+    fn an_escaped_quote_does_not_open_a_quote() {
+        assert_eq!(
+            split_segments(r#"echo \" ; rm -rf x"#),
+            vec![r#"echo \""#, "rm -rf x"]
+        );
+        // Control leg — inside double quotes the escape behaves exactly as
+        // before: the quoted `;` stays text and the segment stays whole.
+        assert_eq!(
+            split_segments(r#"echo "keep \" this; here""#),
+            vec![r#"echo "keep \" this; here""#]
+        );
+    }
+
+    /// v0.16 §1.5, behavior CHANGE, pinned deliberately: an escaped
+    /// separator is literal, so the line is ONE command — which is what the
+    /// shell executes. The old walk split at `\;` and `\&`, judging
+    /// segments the shell never runs; an over-split that could fire a rule
+    /// on a command that does not exist (#48 territory).
+    #[test]
+    fn escaped_separators_are_literal() {
+        assert_eq!(split_segments(r"echo a \; b"), vec![r"echo a \; b"]);
+        assert_eq!(split_segments(r"echo a\;b"), vec![r"echo a\;b"]);
+        assert_eq!(
+            split_segments(r"git commit -m msg \&\& rm x"),
+            vec![r"git commit -m msg \&\& rm x"]
+        );
+        // Control legs — unescaped separators split exactly as before.
+        assert_eq!(split_segments("echo a ; b"), vec!["echo a", "b"]);
+        assert_eq!(split_segments("echo a && rm x"), vec!["echo a", "rm x"]);
+        // And a redirect on the merged line still surfaces: one segment,
+        // its overwrite attached.
+        let segs = split_segments(r"echo a \; b > out");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].redirects.len(), 1);
+        assert_eq!(segs[0].redirects[0].target, "out");
+    }
+
+    /// v0.16 §1.5, behavior CHANGE, pinned deliberately: an escaped space in
+    /// a redirect target keeps the filename whole. The old target scan broke
+    /// at the space, insuring a file named `a\` instead of the one the shell
+    /// writes over. Backslashes are retained in the target string, as they
+    /// always were for non-boundary characters.
+    #[test]
+    fn an_escaped_space_keeps_a_target_whole() {
+        let r = redirects(r"cmd > a\ b.txt");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].target, r"a\ b.txt");
+    }
+
+    /// A separator immediately after a target ends the target AND still
+    /// splits: the walk finds the redirect and the next command both.
+    #[test]
+    fn a_separator_ends_a_target_and_still_splits() {
+        let segs = split_segments("cmd > log;next");
+        assert_eq!(segs, vec!["cmd > log", "next"]);
+        assert_eq!(segs[0].redirects[0].target, "log");
+        let segs = split_segments("cmd > a&b");
+        assert_eq!(segs, vec!["cmd > a", "b"]);
+        assert_eq!(segs[0].redirects[0].target, "a");
+    }
+
     /// The empty-target guard, exercised: a trailing redirect names nothing
     /// and must push nothing. The last of the five predicted survivors; the
     /// other four died to `every_sink_spelling_is_a_sink` above.
@@ -412,8 +473,8 @@ mod tests {
         // input distinguishes the spellings, so this pins the behavior
         // they share: a bare trailing escape ends the scan with nothing
         // pushed. (The fingerprint is from the pass over the then-public
-        // `redirect_targets`; the scan is now `scan_redirects`, reached
-        // through the split, and the pinned behavior is the same.)
+        // `redirect_targets`; the scan now lives inside `split_segments`
+        // itself, and the pinned behavior is the same.)
         assert!(redirects("echo x \\").is_empty());
     }
 
