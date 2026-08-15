@@ -2,6 +2,39 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## Unreleased
+
+### Changed
+
+- **Path resolution takes an explicit cwd.** A hook runs in whatever directory
+  the harness spawned it in, which is not the directory the agent's command
+  runs in, so a relative target resolved against the process cwd found nothing
+  and took no backup — silently, because "no such file" and "nothing to
+  insure" are the same answer (#15). `resolve_path_in(raw, cwd)` replaces
+  `resolve_path`; the hook passes the payload cwd, and the ambient fallback is
+  deleted rather than deprecated — with every call site threaded, the compiler
+  reported the old form as dead code, which is the proof nothing resolves
+  ambiently any more.
+
+- **One scanner for one grammar.** Segments and their redirect targets now
+  come from the same walk: `split_segments` returns `Segment` values carrying
+  the `Overwrite`s found in them, and `shell::redirect_targets` is deleted.
+  Two parsers over the same input had already produced three bugs and, once
+  their outputs were compared, two measurable disagreements: `>|` was split at
+  its `|`, so the clobber was invisible to intent and policy (which split
+  first) while backup, re-scanning the raw string, insured it; and the walks
+  read `\"` differently outside quotes. `backup` now consumes per-segment
+  redirects instead of re-scanning the raw command.
+
+  Stated behavior change: **escapes outside single quotes are literal**, as a
+  shell reads them. `echo \" ; rm -rf x` is now two segments — previously the
+  escaped quote opened a quote, the `;` never split, and the whole line
+  (including the `rm` the shell runs as its own command) could match a single
+  permissive rule. Escaped separators (`\;`, `\&`) no longer split, because
+  the shell runs one command there, and an escaped space in a redirect target
+  keeps the filename whole. Each change is pinned by a labeled test with a
+  control leg.
+
 ## v0.15.0 — stop treating commands as strings
 
 ### Changed
