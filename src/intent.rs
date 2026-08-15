@@ -219,9 +219,19 @@ fn classify_segment_named(segment: &str) -> Option<Intent> {
                 t == "--force" || t == "-f" || t == "--force-with-lease" || t.starts_with('+')
             }),
             "reset" => lc.iter().any(|t| t == "--hard"),
-            "clean" => lc
-                .iter()
-                .any(|t| t.starts_with('-') && !t.starts_with("--") && t.contains('f')),
+            // `git clean` deletes untracked files, and git refuses to do it
+            // without a force flag - so the force flag IS the destructive
+            // signal. Both spellings count. The clustered short form needs
+            // the `!starts_with("--")` guard (a long flag merely CONTAINING
+            // an f, like `--dry-run`, is not `-f`), and that guard was
+            // excluding the legitimate long spelling along with it:
+            // `git clean --force` classified as nothing until v0.16, while
+            // `git clean -f` was caught. One flag, two spellings, one
+            // meaning - the same lesson as decision #47, read the flag, not
+            // the shape of the string.
+            "clean" => lc.iter().any(|t| {
+                t == "--force" || (t.starts_with('-') && !t.starts_with("--") && t.contains('f'))
+            }),
             // -D is case-sensitive: -d only deletes merged branches.
             "branch" => toks.iter().any(|t| t == "-D"),
             _ => false,
@@ -477,6 +487,31 @@ mod tests {
                 Some(Intent::FileOverwrite),
                 "{cmd} destroys a file by writing over it"
             );
+        }
+    }
+
+    /// `git clean` deletes untracked files and git refuses without a force
+    /// flag, so the flag is the signal. `--force` was missed while `-f` was
+    /// caught: the guard that stops a long flag merely containing an `f`
+    /// (`--dry-run`) from counting was excluding the real long spelling too.
+    #[test]
+    fn git_clean_counts_both_spellings_of_force() {
+        for cmd in ["git clean -f", "git clean --force", "git clean -fdx"] {
+            assert_eq!(
+                classify_command(cmd),
+                Some(Intent::GitDestructive),
+                "{cmd}: force is force in either spelling"
+            );
+        }
+        // Control legs - git deletes nothing without force, so these are not
+        // destructive, and a long flag containing an `f` must not count.
+        for cmd in [
+            "git clean -n",
+            "git clean --dry-run",
+            "git clean -d",
+            "git clean --interactive",
+        ] {
+            assert_eq!(classify_command(cmd), None, "{cmd} deletes nothing");
         }
     }
 
@@ -1137,15 +1172,14 @@ mod tests {
         }
     }
 
-    /// KNOWN GAP, pinned so a fix flips it deliberately rather than by
-    /// accident: `git clean -f` is classified and `git clean --force` is not.
-    /// The two spellings delete the same untracked files. The rm predicate a
-    /// few lines above handles its own long form by listing `--force`
-    /// explicitly; this one only reads bundled short flags, so the long
-    /// spelling presses nothing toward the breaker and shows no intent in the
-    /// report.
+    /// GAP CLOSED, v0.16 - this test is the INVERSION its own message asked
+    /// for, not a deletion. It read: "`git clean -f` is classified and
+    /// `git clean --force` is not... if this ever starts classifying, the
+    /// gap was fixed and this test should be inverted rather than deleted."
+    /// It now asserts the fixed behaviour on the same inputs, so the record
+    /// of what was broken survives in the place that proves it is not.
     #[test]
-    fn git_clean_recognises_only_the_short_force_flag() {
+    fn git_clean_was_a_known_gap_and_is_now_closed() {
         assert_eq!(
             classify_command("git clean -f"),
             Some(Intent::GitDestructive)
@@ -1156,9 +1190,8 @@ mod tests {
         );
         assert_eq!(
             classify_command("git clean --force"),
-            None,
-            "if this ever starts classifying, the gap was fixed and this test \
-             should be inverted rather than deleted"
+            Some(Intent::GitDestructive),
+            "the pinned gap: both spellings delete the same untracked files"
         );
         // A dry run destroys nothing either way.
         assert_eq!(classify_command("git clean -n"), None);
