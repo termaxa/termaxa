@@ -427,7 +427,7 @@ fn hook_live(settings: &Path, dir: &Path) -> (HookState, Option<bool>) {
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
         "cwd": dir.display().to_string(),
-        "session_id": "termaxa-doctor-probe",
+        "session_id": crate::hook::PROBE_SESSION,
         "tool_input": { "command": "rm -rf /" }
     })
     .to_string();

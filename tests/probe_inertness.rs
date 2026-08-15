@@ -123,6 +123,10 @@ fn the_probe_answers_and_writes_nothing_and_the_binding_holds() {
     //    no session state.
     let (home, project) = scratch("probe");
     let before = file_count(&home);
+    // Spelled literally because a binary crate exposes nothing to integration
+    // tests: `hook::PROBE_SESSION` is the source of truth and cannot be
+    // imported here. Three more literals live in tests/hook_dialects.rs. A
+    // rename needs `grep termaxa-doctor-probe`, not the compiler.
     let out = run_hook(&home, &project, true, "termaxa-doctor-probe");
     assert!(
         out.contains("permissionDecision") && out.contains("deny"),

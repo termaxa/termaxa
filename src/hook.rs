@@ -5,6 +5,22 @@ use anyhow::Result;
 use serde_json::json;
 use std::io::Read;
 
+/// The session id `doctor`'s liveness probe sends, and the value the hook
+/// checks to recognise a probe and stay inert. One meaning, one spelling
+/// (decision #21): it was written out independently in `doctor.rs` and here,
+/// and a sentinel that only works when two string literals agree is a silent
+/// failure waiting to happen - a typo in either would make the probe write a
+/// real audit line, or make a real session go inert.
+///
+/// HONEST RESIDUE: four integration-test literals remain - three in
+/// `tests/hook_dialects.rs` and one in `tests/probe_inertness.rs`. `termaxa`
+/// is a binary crate with no lib target, so integration tests cannot import
+/// this const at all. Those literals are the reason a rename here would need
+/// `grep termaxa-doctor-probe` rather than the compiler. Unifying them needs
+/// a lib target, which is a larger change than this sweep and is the honest
+/// remaining half of decision #21 here.
+pub const PROBE_SESSION: &str = "termaxa-doctor-probe";
+
 /// Which agent is calling us. Detected from the input's shape, so
 /// `termaxa hook` is ONE command that speaks every agent's dialect.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -513,43 +529,6 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Post-execution event: the command already ran. Record a receipt
-    // (source "post") so the circuit breaker can exclude human-approved
-    // commands from the retry threshold (decision #13). No policy eval, no
-    // gating, no output — just append and exit.
-    if input.is_post {
-        let start_dir = if !input.cwd.is_empty() && std::path::Path::new(&input.cwd).is_dir() {
-            std::path::PathBuf::from(&input.cwd)
-        } else {
-            std::env::current_dir().unwrap_or_default()
-        };
-        if let Ok(paths) = crate::paths::resolve_from(&start_dir) {
-            if let Ok(log) = AuditLog::new(&paths.state_dir) {
-                let (ts_ms, ts) = now();
-                let _ = log.append(&AuditEntry {
-                    ts_ms,
-                    ts,
-                    source: "post".into(),
-                    command: command.clone(),
-                    decision: "executed".into(),
-                    matched_rule: None,
-                    reason: "post-execution receipt".into(),
-                    signals: vec![],
-                    escalated: false,
-                    session: input.session.clone(),
-                    backup: None,
-                    preview: None,
-                    intent: crate::intent::classify_command(&command)
-                        .map(|i| i.label().to_string()),
-                    approved: Some(true),
-                    exit_code: None,
-                    cwd: input.cwd.clone(),
-                });
-            }
-        }
-        return Ok(());
-    }
-
     // Agents spawn the hook with an arbitrary working directory, but they tell us
     // the real project dir in the payload's `cwd`. Resolve the policy explicitly
     // from THAT path rather than mutating the global process cwd (which would make
@@ -662,7 +641,7 @@ pub fn run() -> Result<()> {
     // sentinel. An agent command cannot set its harness's env; a leaked env
     // var without the sentinel changes nothing.
     let is_probe = std::env::var("TERMAXA_HOOK_PROBE").as_deref() == Ok("1")
-        && input.session.as_deref() == Some("termaxa-doctor-probe");
+        && input.session.as_deref() == Some(PROBE_SESSION);
 
     let mut backup_id: Option<String> = None;
     if !is_probe && decision.action != Action::Deny {

@@ -719,6 +719,40 @@ rules:
         );
     }
 
+    /// A rule that cannot be reached is not a rule. `*Get-ChildItem*Remove-Item*`
+    /// shipped from v0.11 and could never fire: `split_segments` cuts at the
+    /// `|`, so no segment ever contains both names. It was removed in v0.16
+    /// rather than reworked, and this test records what the policy does with
+    /// the pipeline instead, so its removal stays deliberate.
+    ///
+    /// A bare `Remove-Item` with no destructive flag is `ask`, exactly as
+    /// `rm x` and `del x` are: deleting one named path is ordinary work, and a
+    /// gate that denies it gets uninstalled (#48). The flagged spellings are
+    /// still denied by the sibling rules, which DO fire, because each name and
+    /// its flag live in the same segment.
+    #[test]
+    fn the_powershell_pipeline_is_asked_and_its_flagged_forms_denied() {
+        let p = Policy::builtin().unwrap();
+        for cmd in ["Get-ChildItem | Remove-Item", "Remove-Item x"] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Ask,
+                "{cmd}: an unflagged delete is ordinary work"
+            );
+        }
+        for cmd in [
+            "Get-ChildItem . | Remove-Item -Force",
+            "Get-ChildItem -Path x | Remove-Item -Recurse -Force",
+            "Remove-Item -Recurse x",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Deny,
+                "{cmd}: the flag is in the same segment as the name, so it fires"
+            );
+        }
+    }
+
     #[test]
     fn the_starter_policy_defends_its_own_configuration() {
         let p = Policy::builtin().expect("built-in starter policy must parse");

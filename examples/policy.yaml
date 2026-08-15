@@ -157,9 +157,6 @@ rules:
   - match: "*Remove-Item*-Force*"
     action: deny
     reason: "Forced delete (PowerShell) blocked by default policy."
-  - match: "*Get-ChildItem*Remove-Item*"
-    action: deny
-    reason: "Bulk delete pipeline (PowerShell) blocked by default policy."
   - match: "*del /s*"
     action: deny
     reason: "Recursive delete (cmd) blocked by default policy."

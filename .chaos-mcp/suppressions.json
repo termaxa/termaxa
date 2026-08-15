@@ -95,22 +95,6 @@
         "fingerprint": "26f79d8eac41"
       }
     ],
-    "src/hook.rs": [
-      {
-        "line": 521,
-        "mutator": "replace && with || in run",
-        "addedAt": 1786731671137,
-        "reason": "unreachable: this is a duplicate of the `if input.is_post` block above it, which returns Ok(()) for every post input, so nothing here executes. Not equivalent \u2014 dead. The block should be deleted; the suppression goes away with it",
-        "fingerprint": "c7754d516339"
-      },
-      {
-        "line": 521,
-        "mutator": "delete ! in run",
-        "addedAt": 1786731671137,
-        "reason": "unreachable: this is a duplicate of the `if input.is_post` block above it, which returns Ok(()) for every post input, so nothing here executes. Not equivalent \u2014 dead. The block should be deleted; the suppression goes away with it",
-        "fingerprint": "c7754d516339"
-      }
-    ],
     "src/delete.rs": [
       {
         "line": 224,
