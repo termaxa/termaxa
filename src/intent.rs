@@ -94,16 +94,18 @@ impl Intent {
 pub fn classify_command(command: &str) -> Option<Intent> {
     crate::shell::split_segments(command)
         .iter()
-        .filter_map(|seg| classify_segment(seg))
+        .filter_map(classify_segment)
         .max_by_key(|i| i.rank())
 }
 
 /// A truncating redirect destroys whatever was at the target. Checked before
 /// command-name classification, because the destructive part is the operator
 /// rather than the program: `cat`, `echo` and `ls` are all read-only commands
-/// right up until a `>` is attached to them.
-fn overwrite_intent(segment: &str) -> Option<Intent> {
-    crate::shell::redirect_targets(segment)
+/// right up until a `>` is attached to them. Reads the redirects the segment
+/// arrived with — the split found them; nothing re-scans.
+fn overwrite_intent(segment: &crate::shell::Segment) -> Option<Intent> {
+    segment
+        .redirects
         .iter()
         .any(|o| o.truncates)
         .then_some(Intent::FileOverwrite)
@@ -114,7 +116,7 @@ fn overwrite_intent(segment: &str) -> Option<Intent> {
 /// Scope is deliberately limited to *commands*: `python -c "shutil.rmtree(...)"`
 /// will not classify. That is the cooperative-gate boundary SECURITY.md
 /// documents; the breaker is a speed bump for syntax variation, not a sandbox.
-fn classify_segment(segment: &str) -> Option<Intent> {
+fn classify_segment(segment: &crate::shell::Segment) -> Option<Intent> {
     // Both classifications, highest rank wins, the command-name one on ties.
     // NOT an early return on the overwrite: `psql -c "DROP TABLE u" > out.sql`
     // is db-destroy (rank 4) that also writes a file, and the first draft
@@ -459,6 +461,10 @@ mod tests {
             "echo '' > config.json",
             "ls -la > /etc/hosts",
             "grep -r . / > /tmp/exfil",
+            // `>|` clobbers past noclobber. Until v0.16 §1.5 the splitter cut
+            // this at the `|`, so intent classified it None while backup
+            // insured it — two engines disagreeing about one command.
+            "cmd >| forced.txt",
         ] {
             assert_eq!(
                 classify_command(cmd),

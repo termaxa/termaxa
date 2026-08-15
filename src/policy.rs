@@ -910,7 +910,8 @@ mod combined_gate_tests {
             Action::Allow,
             "known gap — if this starts denying, delete this test and the comment"
         );
-        let r = crate::shell::redirect_targets("cat /dev/null > ./.env");
+        let segs = crate::shell::split_segments("cat /dev/null > ./.env");
+        let r = &segs[0].redirects;
         assert!(
             r.len() == 1 && r[0].truncates && r[0].target == "./.env",
             "the net beneath: insurance sees the spelling the string rules miss"

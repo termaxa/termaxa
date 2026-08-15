@@ -102,6 +102,11 @@ pub fn take(termaxa_dir: &Path, command: &str, cwd: &Path) -> Result<Option<Back
         }
         return Ok(None);
     }
+    let redirects = segments
+        .into_iter()
+        .next()
+        .map(|s| s.redirects)
+        .unwrap_or_default();
     let tokens = crate::pg::shell_tokens(command);
     let (ts_ms, ts) = now();
     let id = format!("b-{}", ts_ms);
@@ -114,7 +119,7 @@ pub fn take(termaxa_dir: &Path, command: &str, cwd: &Path) -> Result<Option<Back
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else if let Some(state) = tf_state_target(&tokens) {
         backup_files(termaxa_dir, &id, &ts, command, &[state])?
-    } else if let Some(paths) = overwrite_targets(command, cwd) {
+    } else if let Some(paths) = overwrite_paths(&redirects, cwd) {
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else {
         return Ok(None);
@@ -315,12 +320,18 @@ fn backup_pg(
 /// the same mechanism as for a delete — copy aside first — because the outcome
 /// is the same: the contents are gone.
 ///
+/// v0.16 §1.5: consumes the redirects the segment arrived with, from the same
+/// split every other engine reads. Until now this function re-scanned its
+/// input string — the one caller that computed redirects from something other
+/// than a split segment, which is exactly how two engines start disagreeing
+/// about what a command targets (decision #37).
+///
 /// Only files that already EXIST are insurable. `> newfile` creates rather than
 /// destroys, and backing up a path with no contents is noise in the manifest.
-/// Appends (`>>`) are excluded upstream by `Overwrite::truncates`.
-fn overwrite_targets(command: &str, cwd: &Path) -> Option<Vec<PathBuf>> {
-    let paths: Vec<PathBuf> = crate::shell::redirect_targets(command)
-        .into_iter()
+/// Appends (`>>`) are excluded here by `Overwrite::truncates`.
+fn overwrite_paths(redirects: &[crate::shell::Overwrite], cwd: &Path) -> Option<Vec<PathBuf>> {
+    let paths: Vec<PathBuf> = redirects
+        .iter()
         .filter(|o| o.truncates)
         .map(|o| crate::delete::resolve_path_in(&o.target, cwd))
         .filter(|p| p.is_file())
@@ -567,6 +578,18 @@ mod tests {
     }
 
     use crate::testutil::TempTree;
+
+    /// The old `overwrite_targets(command, cwd)` shape, for tests: split the
+    /// command as production now does and hand the first segment's redirects
+    /// to `overwrite_paths`.
+    fn overwrite_targets(command: &str, cwd: &Path) -> Option<Vec<PathBuf>> {
+        let redirects = crate::shell::split_segments(command)
+            .into_iter()
+            .next()
+            .map(|s| s.redirects)
+            .unwrap_or_default();
+        overwrite_paths(&redirects, cwd)
+    }
 
     /// A real temp directory containing one file. The guard is returned with
     /// it: dropping it removes the tree, so the caller has to keep it alive

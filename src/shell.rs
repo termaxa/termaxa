@@ -18,7 +18,7 @@
 ///   - `$(...)` and backticks cannot be statically analyzed — their PRESENCE
 ///     is reported so the context engine can escalate, rather than
 ///     pretending the contents were checked.
-pub fn split_segments(s: &str) -> Vec<String> {
+pub fn split_segments(s: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut cur = String::new();
     let chars: Vec<char> = s.chars().collect();
@@ -54,6 +54,14 @@ pub fn split_segments(s: &str) -> Vec<String> {
             // in are `2>&1` / `>&2` / `<&-` (preceded by `>` or `<`) and
             // `&>file` / `&>>file` (followed by `>`); those are not separators.
             '&' if !is_redirection_amp(&chars, i) => flush(&mut segments, &mut cur),
+            // `>|` forces clobber past `set -o noclobber` — one operator, not
+            // a redirect followed by a pipe. Splitting here cut the target off
+            // into its own segment, so intent and policy (which split first)
+            // never saw the truncation the redirect scan reports; only backup,
+            // which then re-scanned the raw string, insured it. Found by
+            // unifying the scanners (v0.16 §1.5): the moment the redirect scan
+            // ran on split output, the disagreement became a failing test.
+            '|' if i > 0 && chars[i - 1] == '>' => cur.push(c),
             '|' => {
                 flush(&mut segments, &mut cur);
                 if i + 1 < chars.len() && chars[i + 1] == '|' {
@@ -67,6 +75,46 @@ pub fn split_segments(s: &str) -> Vec<String> {
     }
     flush(&mut segments, &mut cur);
     segments
+}
+
+/// One shell segment, carrying the redirect targets found in it.
+///
+/// v0.16 §1.5. Segments and redirect targets used to come from two separate
+/// public scanners over the same grammar, and callers chose which to trust —
+/// `intent` read redirects per segment while `backup` re-scanned the raw
+/// command (decision #37: two engines parsing the same input are already
+/// disagreeing). One public type ends the choice: a segment arrives with its
+/// redirects attached, from the same split.
+///
+/// `Deref<Target = str>` keeps every caller that only wants the text
+/// unchanged; the field is private so the text cannot drift from the
+/// redirects computed for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    text: String,
+    /// Files this segment writes over, in order of appearance.
+    pub redirects: Vec<Overwrite>,
+}
+
+impl std::ops::Deref for Segment {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for Segment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// Tests compare segment lists against string literals; the comparison is on
+/// the text alone, which is the only part a string literal can speak for.
+impl PartialEq<&str> for Segment {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
 }
 
 /// A file this command will write over, and how.
@@ -104,13 +152,14 @@ fn is_sink(target: &str) -> bool {
 /// engine: no intent, no preview, no backup. `cat /dev/null > .env` matched the
 /// read-only `cat *` allow rule and wiped a credentials file.
 ///
-/// HONESTY NOTE: this is a second character walk over the same grammar
-/// `split_segments` reads, kept in the same file so they drift together
-/// loudly rather than apart quietly. The unification — one scan producing
-/// segments that carry their redirects (the Segment struct, option 3 in the
-/// v0.15 scope) — is the remaining overwrite work, alongside preview and the
-/// cp/mv/tee/dd destinations. Two parsers for one grammar caused three bugs
-/// here already; do not let this comment outlive the duplication.
+/// HONESTY NOTE: this is still a second character walk over the same grammar
+/// `split_segments` reads. What changed in v0.16 §1.5 is that it is no longer
+/// a second PUBLIC scanner: only `flush` calls it, on segments the splitter
+/// just produced, so no caller can feed the two walks different inputs. The
+/// walks themselves still disagree on escape handling outside quotes
+/// (`\"` toggles a quote here but not there) — folding them into one walk is
+/// the next commit, and it must pick one escape semantics to do it. Do not
+/// let this comment outlive the second walk.
 ///
 /// Deliberately NOT treated as redirects, because they do not create or
 /// truncate a file: `2>&1`, `>&2`, `<&-` (descriptor duplication), `&>` and
@@ -119,7 +168,7 @@ fn is_sink(target: &str) -> bool {
 /// literal character), anything inside quotes, and sinks (`/dev/null` and
 /// friends — truncating one destroys nothing). `>|` (clobber past
 /// noclobber) IS a truncation of the named file.
-pub fn redirect_targets(segment: &str) -> Vec<Overwrite> {
+fn scan_redirects(segment: &str) -> Vec<Overwrite> {
     let chars: Vec<char> = segment.chars().collect();
     let mut out = Vec::new();
     let (mut in_single, mut in_double) = (false, false);
@@ -205,10 +254,13 @@ fn is_redirection_amp(chars: &[char], i: usize) -> bool {
     prev_is_redirect || next_is_redirect
 }
 
-fn flush(segments: &mut Vec<String>, cur: &mut String) {
+fn flush(segments: &mut Vec<Segment>, cur: &mut String) {
     let t = cur.trim();
     if !t.is_empty() {
-        segments.push(t.to_string());
+        segments.push(Segment {
+            text: t.to_string(),
+            redirects: scan_redirects(t),
+        });
     }
     cur.clear();
 }
@@ -234,25 +286,29 @@ pub fn has_substitution(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Redirects as callers now receive them: through the split, attached to
+    /// the segments they were found in. Flattened here because these tests
+    /// assert on targets, not on which segment carried them.
+    fn redirects(cmd: &str) -> Vec<Overwrite> {
+        split_segments(cmd)
+            .into_iter()
+            .flat_map(|s| s.redirects)
+            .collect()
+    }
+
     /// #14. `>` was lexed and discarded, so a command that destroys a file by
     /// writing over it was invisible to every engine.
     #[test]
     fn truncating_redirects_are_extracted() {
-        let r = redirect_targets("cat /dev/null > .env");
+        let r = redirects("cat /dev/null > .env");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].target, ".env");
         assert!(r[0].truncates);
 
+        assert_eq!(redirects("ls -la > /etc/hosts")[0].target, "/etc/hosts");
+        assert_eq!(redirects("echo x >config.json")[0].target, "config.json");
         assert_eq!(
-            redirect_targets("ls -la > /etc/hosts")[0].target,
-            "/etc/hosts"
-        );
-        assert_eq!(
-            redirect_targets("echo x >config.json")[0].target,
-            "config.json"
-        );
-        assert_eq!(
-            redirect_targets(r#"echo x > "my file.txt""#)[0].target,
+            redirects(r#"echo x > "my file.txt""#)[0].target,
             "my file.txt"
         );
     }
@@ -261,7 +317,7 @@ mod tests {
     /// fires on every log line and gets uninstalled.
     #[test]
     fn appending_is_recorded_but_not_truncating() {
-        let r = redirect_targets("echo entry >> app.log");
+        let r = redirects("echo entry >> app.log");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].target, "app.log");
         assert!(!r[0].truncates, ">> appends, it does not destroy");
@@ -281,7 +337,7 @@ mod tests {
             "make 2>&1 | tee out",
         ] {
             assert!(
-                redirect_targets(cmd).is_empty(),
+                redirects(cmd).is_empty(),
                 "{cmd} redirects a descriptor, it does not truncate a file"
             );
         }
@@ -291,9 +347,9 @@ mod tests {
     /// segment splitter already guarantees, from the same scanner.
     #[test]
     fn quoted_redirects_are_text() {
-        assert!(redirect_targets(r#"echo "a > b""#).is_empty());
-        assert!(redirect_targets("echo 'x > y'").is_empty());
-        assert!(redirect_targets(r#"git commit -m "fix > bug""#).is_empty());
+        assert!(redirects(r#"echo "a > b""#).is_empty());
+        assert!(redirects("echo 'x > y'").is_empty());
+        assert!(redirects(r#"git commit -m "fix > bug""#).is_empty());
     }
 
     /// Sinks destroy nothing, and `> /dev/null` is the most common redirect
@@ -309,7 +365,7 @@ mod tests {
             "echo x > NUL",
         ] {
             assert!(
-                redirect_targets(cmd).is_empty(),
+                redirects(cmd).is_empty(),
                 "{cmd} truncates a sink, not a file"
             );
         }
@@ -321,25 +377,23 @@ mod tests {
     fn process_substitution_is_not_a_target() {
         for cmd in ["tee >(gzip -c) < data", "diff x >(sort)", "cmd > >(bar)"] {
             assert!(
-                redirect_targets(cmd)
-                    .iter()
-                    .all(|o| !o.target.starts_with('(')),
+                redirects(cmd).iter().all(|o| !o.target.starts_with('(')),
                 "{cmd}: a paren is an operator, not a filename"
             );
         }
-        assert!(redirect_targets("tee >(gzip -c) < data").is_empty());
+        assert!(redirects("tee >(gzip -c) < data").is_empty());
     }
 
     /// `\>` outside quotes is a literal; `>|` clobbers — a truncation of the
     /// named file; `<>` opens read-write and destroys nothing.
     #[test]
     fn escapes_clobber_and_read_write_open() {
-        assert!(redirect_targets(r"echo a \> b").is_empty());
-        let r = redirect_targets("cmd >| forced.txt");
+        assert!(redirects(r"echo a \> b").is_empty());
+        let r = redirects("cmd >| forced.txt");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].target, "forced.txt");
         assert!(r[0].truncates);
-        assert!(redirect_targets("cmd <> rw.txt").is_empty());
+        assert!(redirects("cmd <> rw.txt").is_empty());
     }
 
     /// The empty-target guard, exercised: a trailing redirect names nothing
@@ -349,7 +403,7 @@ mod tests {
     fn a_trailing_redirect_with_no_target_pushes_nothing() {
         for cmd in ["cmd >", "cmd > ", "cmd >>", "cmd >|", "echo x 2>"] {
             assert!(
-                redirect_targets(cmd).is_empty(),
+                redirects(cmd).is_empty(),
                 "{cmd:?} names no target and must push no Overwrite"
             );
         }
@@ -357,13 +411,15 @@ mod tests {
         // trailing-backslash bound mutants EQUIVALENT (f6a2746dc86a) - no
         // input distinguishes the spellings, so this pins the behavior
         // they share: a bare trailing escape ends the scan with nothing
-        // pushed.
-        assert!(redirect_targets("echo x \\").is_empty());
+        // pushed. (The fingerprint is from the pass over the then-public
+        // `redirect_targets`; the scan is now `scan_redirects`, reached
+        // through the split, and the pinned behavior is the same.)
+        assert!(redirects("echo x \\").is_empty());
     }
 
     #[test]
     fn several_redirects_in_one_segment() {
-        let r = redirect_targets("cmd > out.txt 2> err.txt");
+        let r = redirects("cmd > out.txt 2> err.txt");
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].target, "out.txt");
         assert_eq!(r[1].target, "err.txt");
@@ -409,6 +465,17 @@ mod tests {
         assert_eq!(
             split_segments("make 2>&1 | tee log"),
             vec!["make 2>&1", "tee log"]
+        );
+        // `>|` is a clobber, not a pipe boundary. Splitting at its `|` hid
+        // the truncation from every engine that splits first — intent
+        // classified `cmd >| file` as None while backup insured it.
+        assert_eq!(
+            split_segments("cmd >| forced.txt"),
+            vec!["cmd >| forced.txt"]
+        );
+        assert_eq!(
+            split_segments("cmd >| out.txt | grep x"),
+            vec!["cmd >| out.txt", "grep x"]
         );
     }
 
@@ -474,11 +541,11 @@ mod tests {
 
         // Same question for the redirect scanner: the apostrophe must not
         // swallow the `>` that follows it.
-        let targets = redirect_targets("echo \"it's\" > out.txt");
+        let targets = redirects("echo \"it's\" > out.txt");
         assert_eq!(targets.len(), 1, "{targets:?}");
         assert_eq!(targets[0].target, "out.txt");
 
-        let targets = redirect_targets("echo 'a \"b\"' > out.txt");
+        let targets = redirects("echo 'a \"b\"' > out.txt");
         assert_eq!(targets[0].target, "out.txt");
     }
 
@@ -503,22 +570,22 @@ mod tests {
         assert_eq!(split_segments("ls ||"), ["ls"]);
         // A trailing backslash, inside quotes and bare.
         assert_eq!(split_segments("echo \"a\\"), ["echo \"a\\"]);
-        assert_eq!(redirect_targets("echo a\\").len(), 0);
-        assert_eq!(redirect_targets("echo > out.txt\\").len(), 1);
+        assert_eq!(redirects("echo a\\").len(), 0);
+        assert_eq!(redirects("echo > out.txt\\").len(), 1);
     }
 
     #[test]
     fn a_segment_may_begin_with_the_operator() {
         // Nothing precedes the first character, and the checks for "what came
         // before this?" have to survive that.
-        let targets = redirect_targets("> out.txt");
+        let targets = redirects("> out.txt");
         assert_eq!(targets.len(), 1, "{targets:?}");
         assert_eq!(targets[0].target, "out.txt");
         assert!(targets[0].truncates);
 
         // A leading `&>` combines streams rather than truncating a file, and
         // asking what precedes the `&` must not run off the front.
-        assert_eq!(redirect_targets("&> log.txt").len(), 0);
+        assert_eq!(redirects("&> log.txt").len(), 0);
         assert_eq!(split_segments("&> log.txt"), ["&> log.txt"]);
     }
 
@@ -526,20 +593,20 @@ mod tests {
     fn a_redirect_with_nothing_after_it_has_no_target() {
         // The skip-the-whitespace loop runs to the end of the input here, so
         // the bound on it is the only thing between this and a panic.
-        assert_eq!(redirect_targets("echo >").len(), 0);
-        assert_eq!(redirect_targets("echo >   ").len(), 0);
-        assert_eq!(redirect_targets("echo >>").len(), 0);
+        assert_eq!(redirects("echo >").len(), 0);
+        assert_eq!(redirects("echo >   ").len(), 0);
+        assert_eq!(redirects("echo >>").len(), 0);
     }
 
     #[test]
     fn a_quoted_target_keeps_the_spaces_inside_it() {
         // The quote has to close, or the scan swallows the rest of the line
         // and reports a target nobody wrote.
-        let targets = redirect_targets("echo > 'my file.txt' && ls");
+        let targets = redirects("echo > 'my file.txt' && ls");
         assert_eq!(targets.len(), 1, "{targets:?}");
         assert_eq!(targets[0].target, "my file.txt");
 
-        let targets = redirect_targets("echo > \"my file.txt\"");
+        let targets = redirects("echo > \"my file.txt\"");
         assert_eq!(targets[0].target, "my file.txt");
     }
 
@@ -553,7 +620,7 @@ mod tests {
         assert_eq!(segs.len(), 2, "{segs:?}");
         assert!(segs[1].starts_with("rm -rf"), "{segs:?}");
 
-        let targets = redirect_targets("echo 'a\"b' > out.txt");
+        let targets = redirects("echo 'a\"b' > out.txt");
         assert_eq!(
             targets.len(),
             1,
@@ -579,7 +646,7 @@ mod tests {
     fn a_backslash_inside_single_quotes_escapes_nothing() {
         // Single quotes are literal in a shell: a backslash there protects
         // nothing, so the closing quote is still a closing quote.
-        let targets = redirect_targets("echo '\\' > out.txt");
+        let targets = redirects("echo '\\' > out.txt");
         assert_eq!(targets.len(), 1, "{targets:?}");
         assert_eq!(targets[0].target, "out.txt");
     }
@@ -601,7 +668,7 @@ mod tests {
         // Nothing precedes the first character, and the escape arm's bound is
         // the only thing keeping the index from running off the front of the
         // input. `\> out.txt` writes a literal `>` and redirects nothing.
-        assert_eq!(redirect_targets("\\> out.txt").len(), 0);
+        assert_eq!(redirects("\\> out.txt").len(), 0);
         assert_eq!(split_segments("\\> out.txt"), ["\\> out.txt"]);
     }
 
@@ -623,14 +690,14 @@ mod tests {
             "/DEV/NULL",
         ] {
             assert!(
-                redirect_targets(&format!("echo x > {sink}")).is_empty(),
+                redirects(&format!("echo x > {sink}")).is_empty(),
                 "{sink} destroys nothing and must not be an overwrite target"
             );
         }
         // And a path that merely looks like one is still a file.
         for real in ["/dev/null.bak", "/dev/nullify", "nulled.txt"] {
             assert_eq!(
-                redirect_targets(&format!("echo x > {real}")).len(),
+                redirects(&format!("echo x > {real}")).len(),
                 1,
                 "{real} is an ordinary file"
             );
