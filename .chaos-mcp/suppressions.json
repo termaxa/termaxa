@@ -15,14 +15,14 @@
         "line": 131,
         "mutator": "replace ^ with | in sha256_hex",
         "addedAt": 1786705435998,
-        "reason": "equivalent: SHA-256 `ch` is (e&f)^(!e&g), whose terms are masked by e and !e and so are disjoint — XOR and OR agree on every bit pattern (verified over all 8)",
+        "reason": "equivalent: SHA-256 `ch` is (e&f)^(!e&g), whose terms are masked by e and !e and so are disjoint \u2014 XOR and OR agree on every bit pattern (verified over all 8)",
         "fingerprint": "fe05454fb5c0"
       },
       {
         "line": 138,
         "mutator": "replace ^ with | in sha256_hex",
         "addedAt": 1786705435998,
-        "reason": "equivalent: SHA-256 `maj` is the majority function, identical in XOR and OR form — both single-operator swaps match maj on all 8 bit patterns under Rust's & > ^ > | precedence",
+        "reason": "equivalent: SHA-256 `maj` is the majority function, identical in XOR and OR form \u2014 both single-operator swaps match maj on all 8 bit patterns under Rust's & > ^ > | precedence",
         "fingerprint": "735600a52303"
       }
     ],
@@ -31,35 +31,35 @@
         "line": 49,
         "mutator": "replace is_tty -> bool with true",
         "addedAt": 1786706277919,
-        "reason": "platform-gated: this is the #[cfg(windows)] is_tty, not compiled on Linux, so no test run on this target can observe the change — audit on Windows to score it",
+        "reason": "platform-gated: this is the #[cfg(windows)] is_tty, not compiled on Linux, so no test run on this target can observe the change \u2014 audit on Windows to score it",
         "fingerprint": "dda202a6fe45"
       },
       {
         "line": 49,
         "mutator": "replace is_tty -> bool with false",
         "addedAt": 1786706277919,
-        "reason": "platform-gated: this is the #[cfg(windows)] is_tty, not compiled on Linux, so no test run on this target can observe the change — audit on Windows to score it",
+        "reason": "platform-gated: this is the #[cfg(windows)] is_tty, not compiled on Linux, so no test run on this target can observe the change \u2014 audit on Windows to score it",
         "fingerprint": "dda202a6fe45"
       },
       {
         "line": 50,
         "mutator": "delete - in is_tty",
         "addedAt": 1786706277919,
-        "reason": "platform-gated: STD_OUTPUT_HANDLE in the #[cfg(windows)] is_tty, not compiled on Linux — audit on Windows to score it",
+        "reason": "platform-gated: STD_OUTPUT_HANDLE in the #[cfg(windows)] is_tty, not compiled on Linux \u2014 audit on Windows to score it",
         "fingerprint": "1cc2dfc8f009"
       },
       {
         "line": 61,
         "mutator": "replace != with == in is_tty",
         "addedAt": 1786706277919,
-        "reason": "platform-gated: the GetConsoleMode check in the #[cfg(windows)] is_tty, not compiled on Linux — audit on Windows to score it",
+        "reason": "platform-gated: the GetConsoleMode check in the #[cfg(windows)] is_tty, not compiled on Linux \u2014 audit on Windows to score it",
         "fingerprint": "2cd1cbb6d021"
       },
       {
         "line": 69,
         "mutator": "replace is_tty -> bool with true",
         "addedAt": 1786706277919,
-        "reason": "platform-gated: the #[cfg(not(any(unix, windows)))] fallback, compiled on neither of the targets this project ships — unreachable from any test here",
+        "reason": "platform-gated: the #[cfg(not(any(unix, windows)))] fallback, compiled on neither of the targets this project ships \u2014 unreachable from any test here",
         "fingerprint": "fcbcf165908d"
       }
     ],
@@ -68,14 +68,14 @@
         "line": 54,
         "mutator": "replace > with >= in generate",
         "addedAt": 1786713336077,
-        "reason": "equivalent: the two differ only at one segment, and there find_map over that single segment calls generate_one with the same text — normalize trims the whitespace, and a dropped trailing separator is an inert token to every downstream parser (pg tokenizes, git matches a prefix)",
+        "reason": "equivalent: the two differ only at one segment, and there find_map over that single segment calls generate_one with the same text \u2014 normalize trims the whitespace, and a dropped trailing separator is an inert token to every downstream parser (pg tokenizes, git matches a prefix)",
         "fingerprint": "b573b51bf054"
       },
       {
         "line": 168,
         "mutator": "replace > with >= in git_push_preview",
         "addedAt": 1786713336077,
-        "reason": "equivalent: they differ only at exactly one --stat line, which cannot reach here — git() returns None for empty output, so the block runs only with per-file lines plus the totals line, i.e. two or more",
+        "reason": "equivalent: they differ only at exactly one --stat line, which cannot reach here \u2014 git() returns None for empty output, so the block runs only with per-file lines plus the totals line, i.e. two or more",
         "fingerprint": "a840fd70ac75"
       }
     ],
@@ -84,14 +84,14 @@
         "line": 312,
         "mutator": "replace + with * in wildcard_match",
         "addedAt": 1786720071482,
-        "reason": "equivalent: after the mutated backtrack (pi = star) the next iteration re-enters the star branch and sets star = pi, mark = ti, pi = star + 1 — exactly the state the real branch produces, so the two reconverge before anything is observable. Checked exhaustively over 30,276 pattern/text pairs from {a, b, *} (patterns and texts up to length 6): no input distinguishes them",
+        "reason": "equivalent: after the mutated backtrack (pi = star) the next iteration re-enters the star branch and sets star = pi, mark = ti, pi = star + 1 \u2014 exactly the state the real branch produces, so the two reconverge before anything is observable. Checked exhaustively over 30,276 pattern/text pairs from {a, b, *} (patterns and texts up to length 6): no input distinguishes them",
         "fingerprint": "2590c17b32bd"
       },
       {
         "line": 214,
         "mutator": "replace < with <= in Policy::evaluate",
         "addedAt": 1786720710037,
-        "reason": "equivalent: idx < bi and idx <= bi differ only at idx == bi, and that means the same index into self.rules — so both arms of the if produce the identical (index, rule) pair and `best` is unchanged either way",
+        "reason": "equivalent: idx < bi and idx <= bi differ only at idx == bi, and that means the same index into self.rules \u2014 so both arms of the if produce the identical (index, rule) pair and `best` is unchanged either way",
         "fingerprint": "26f79d8eac41"
       }
     ],
@@ -100,14 +100,14 @@
         "line": 521,
         "mutator": "replace && with || in run",
         "addedAt": 1786731671137,
-        "reason": "unreachable: this is a duplicate of the `if input.is_post` block above it, which returns Ok(()) for every post input, so nothing here executes. Not equivalent — dead. The block should be deleted; the suppression goes away with it",
+        "reason": "unreachable: this is a duplicate of the `if input.is_post` block above it, which returns Ok(()) for every post input, so nothing here executes. Not equivalent \u2014 dead. The block should be deleted; the suppression goes away with it",
         "fingerprint": "c7754d516339"
       },
       {
         "line": 521,
         "mutator": "delete ! in run",
         "addedAt": 1786731671137,
-        "reason": "unreachable: this is a duplicate of the `if input.is_post` block above it, which returns Ok(()) for every post input, so nothing here executes. Not equivalent — dead. The block should be deleted; the suppression goes away with it",
+        "reason": "unreachable: this is a duplicate of the `if input.is_post` block above it, which returns Ok(()) for every post input, so nothing here executes. Not equivalent \u2014 dead. The block should be deleted; the suppression goes away with it",
         "fingerprint": "c7754d516339"
       }
     ],
@@ -125,43 +125,6 @@
         "addedAt": 1786732519506,
         "reason": "equivalent: the arm's body is byte-identical to the `_` default arm (token.starts_with('-')), so deleting it changes no behaviour. It exists to document that PowerShell never uses a leading slash for switches",
         "fingerprint": "5b4c79689c91"
-      }
-    ],
-    "src/shell.rs": [
-      {
-        "line": 59,
-        "mutator": "replace < with > in split_segments",
-        "addedAt": 1786737505742,
-        "reason": "equivalent: not consuming the second `|` is unobservable. The unconsumed character is handled by the same `|` arm on the next iteration, which flushes an empty buffer, and flush() drops empties. Both paths produce identical segments",
-        "fingerprint": "555f7e722b0a"
-      },
-      {
-        "line": 60,
-        "mutator": "replace += with *= in split_segments",
-        "addedAt": 1786737505742,
-        "reason": "equivalent: i *= 1 leaves i unchanged, which is the same as not consuming the second `|`, and an unconsumed `|` only flushes an empty buffer, which flush() drops",
-        "fingerprint": "0d1ba708993c"
-      },
-      {
-        "line": 135,
-        "mutator": "replace < with <= in redirect_targets",
-        "addedAt": 1786737505742,
-        "reason": "equivalent: the bound differs only at a trailing backslash (i + 1 == len). There the real guard falls to the default arm and the mutant skips one position; both then leave the loop with nothing pushed",
-        "fingerprint": "f6a2746dc86a"
-      },
-      {
-        "line": 135,
-        "mutator": "replace + with * in redirect_targets",
-        "addedAt": 1786737505742,
-        "reason": "equivalent: i * 1 < len is i < len, which is always true inside the loop, so the guard reduces to !in_single. It differs only at a trailing backslash, where both paths end the loop having pushed nothing",
-        "fingerprint": "f6a2746dc86a"
-      },
-      {
-        "line": 155,
-        "mutator": "replace + with * in redirect_targets",
-        "addedAt": 1786737505742,
-        "reason": "equivalent: i = j lands on the '&' itself, which the next iteration matches with the default arm and steps over, arriving at the same position as i = j + 1",
-        "fingerprint": "507d53aa5804"
       }
     ],
     "src/pg.rs": [
