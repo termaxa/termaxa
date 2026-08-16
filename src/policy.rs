@@ -151,15 +151,15 @@ impl Policy {
     /// MOST DANGEROUS segment govern the combined verdict (deny > ask > allow).
     /// Closes the v0.6.1 field-report bypass where `git status && <anything>`
     /// rode the `git status*` wildcard.
-    pub fn evaluate_command(&self, command: &str) -> Decision {
+    pub fn evaluate_command(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
         let segments = crate::shell::split_segments(command);
         if segments.len() <= 1 {
-            return self.evaluate(command);
+            return self.evaluate(command, ctx);
         }
         let total = segments.len();
         let mut worst: Option<(usize, Decision)> = None;
         for (i, seg) in segments.iter().enumerate() {
-            let d = self.evaluate(seg);
+            let d = self.evaluate(seg, ctx);
             let replace = match &worst {
                 None => true,
                 // higher severity wins; on ties, an explicitly-matched rule
@@ -189,7 +189,11 @@ impl Policy {
         }
     }
 
-    pub fn evaluate(&self, command: &str) -> Decision {
+    /// `ctx` is unused by the matcher today: this commit threads the execution
+    /// context to every evaluation site without changing a single verdict, so
+    /// the wiring is reviewable on its own. Commit 3 resolves targets here and
+    /// gives `match_path` something to match against.
+    pub fn evaluate(&self, command: &str, _ctx: &crate::resolve::EvalContext) -> Decision {
         // First-match PER READING, MOST SEVERE across readings, earliest rule
         // on ties. See `readings` for what the readings are.
         //
@@ -326,6 +330,13 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 mod schema_and_severity_tests {
     use super::*;
 
+    /// Evaluation context for tests: the current directory as both cwd and
+    /// root. No test here depends on resolution, which is the point - this
+    /// commit changed no verdicts.
+    fn here() -> crate::resolve::EvalContext {
+        crate::resolve::EvalContext::at(std::path::Path::new("."))
+    }
+
     fn policy_from(yaml: &str) -> Policy {
         serde_yaml::from_str(yaml).expect("policy must parse")
     }
@@ -401,7 +412,7 @@ mod schema_and_severity_tests {
             "default: allow\nrules:\n  - match: '\"rm\"*'\n    action: deny\n  \
              - match: \"rm -rf*\"\n    action: deny\n",
         );
-        let d = p.evaluate(r#""rm" -rf /"#);
+        let d = p.evaluate(r#""rm" -rf /"#, &here());
         assert_eq!(d.action, Action::Deny);
         assert_eq!(d.matched_rule.as_deref(), Some("\"rm\"*"));
     }
@@ -414,7 +425,7 @@ mod schema_and_severity_tests {
             "default: allow\nrules:\n  - match: \"rm -rf*\"\n    action: deny\n  \
              - match: '\"rm\"*'\n    action: deny\n",
         );
-        let d = p.evaluate(r#""rm" -rf /"#);
+        let d = p.evaluate(r#""rm" -rf /"#, &here());
         assert_eq!(d.matched_rule.as_deref(), Some("rm -rf*"));
     }
 
@@ -427,7 +438,7 @@ mod schema_and_severity_tests {
             "default: allow\nrules:\n  - match: '\"cat\"*'\n    action: allow\n  \
              - match: \"cat .termaxa*\"\n    action: deny\n",
         );
-        let d = p.evaluate(r#""cat" .termaxa/policy.yaml"#);
+        let d = p.evaluate(r#""cat" .termaxa/policy.yaml"#, &here());
         assert_eq!(
             d.action,
             Action::Deny,
@@ -444,7 +455,7 @@ mod schema_and_severity_tests {
             "default: allow\nrules:\n  - match: \"rm -rf*\"\n    action: deny\n  \
              - match: \"drop table*\"\n    action: deny\n",
         );
-        let d = p.evaluate_command("rm -rf /tmp/x && drop table users");
+        let d = p.evaluate_command("rm -rf /tmp/x && drop table users", &here());
         assert_eq!(d.action, Action::Deny);
         assert_eq!(d.matched_rule.as_deref(), Some("rm -rf*"));
         assert!(d.reason.contains("segment 1/2"), "{}", d.reason);
@@ -456,7 +467,7 @@ mod schema_and_severity_tests {
         // explicit allow. A matched rule breaks TIES between equally severe
         // segments — it does not lower the verdict.
         let p = policy_from("default: ask\nrules:\n  - match: \"ls*\"\n    action: allow\n");
-        let d = p.evaluate_command("curl https://example.invalid/x | ls");
+        let d = p.evaluate_command("curl https://example.invalid/x | ls", &here());
         assert_eq!(
             d.action,
             Action::Ask,
@@ -469,6 +480,13 @@ mod schema_and_severity_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Evaluation context for tests: the current directory as both cwd and
+    /// root. No test here depends on resolution, which is the point - this
+    /// commit changed no verdicts.
+    fn here() -> crate::resolve::EvalContext {
+        crate::resolve::EvalContext::at(std::path::Path::new("."))
+    }
 
     /// Schipper review round 2, finding 2. `intent::tokens` strips quotes and
     /// `policy::normalize` does not, so the classifier saw through disguises
@@ -484,7 +502,7 @@ mod tests {
             r#"'rm' -rf /"#,
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 Action::Deny,
                 "{cmd} must not slip past the deny rule by quoting"
             );
@@ -498,15 +516,20 @@ mod tests {
         let p = Policy::builtin().unwrap();
         // `*drop table*` is written lowercase, so it must catch both.
         assert_eq!(
-            p.evaluate_command("psql -c \"DROP TABLE users\"").action,
+            p.evaluate_command("psql -c \"DROP TABLE users\"", &here())
+                .action,
             Action::Deny
         );
         assert_eq!(
-            p.evaluate_command("psql -c \"drop table users\"").action,
+            p.evaluate_command("psql -c \"drop table users\"", &here())
+                .action,
             Action::Deny
         );
         // `*rm -rf*` likewise.
-        assert_eq!(p.evaluate_command("rm -RF /tmp/x").action, Action::Deny);
+        assert_eq!(
+            p.evaluate_command("rm -RF /tmp/x", &here()).action,
+            Action::Deny
+        );
     }
 
     /// Until v0.15 this was impossible: `evaluate` lowercased the rule as well
@@ -549,7 +572,7 @@ mod tests {
             "remove-item -force c:\\x",
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 Action::Deny,
                 "{cmd} matched a deny in v0.14.2 and must keep matching"
             );
@@ -577,12 +600,14 @@ mod tests {
     fn a_quoted_spelling_of_an_excepted_command_fails_closed() {
         let p = Policy::builtin().unwrap();
         assert_eq!(
-            p.evaluate_command("cat .termaxa/policy.yaml").action,
+            p.evaluate_command("cat .termaxa/policy.yaml", &here())
+                .action,
             Action::Allow,
             "the plain excepted read stays allowed"
         );
         assert_eq!(
-            p.evaluate_command(r#""cat" .termaxa/policy.yaml"#).action,
+            p.evaluate_command(r#""cat" .termaxa/policy.yaml"#, &here())
+                .action,
             Action::Deny,
             "a disguised spelling of a .termaxa read fails closed, loudly"
         );
@@ -633,14 +658,19 @@ rules:
         )
         .unwrap();
         assert_eq!(
-            policy.evaluate("git push origin main").action,
+            policy.evaluate("git push origin main", &here()).action,
             Action::Allow
         );
         assert_eq!(
-            policy.evaluate("git push --force origin main").action,
+            policy
+                .evaluate("git push --force origin main", &here())
+                .action,
             Action::Deny
         );
-        assert_eq!(policy.evaluate("terraform apply").action, Action::Ask);
+        assert_eq!(
+            policy.evaluate("terraform apply", &here()).action,
+            Action::Ask
+        );
     }
 
     #[test]
@@ -654,7 +684,7 @@ rules:
         )
         .unwrap();
         assert_eq!(
-            policy.evaluate("kubectl   delete   pod x").action,
+            policy.evaluate("kubectl   delete   pod x", &here()).action,
             Action::Deny
         );
     }
@@ -670,7 +700,9 @@ rules:
         )
         .unwrap();
         assert_eq!(
-            policy.evaluate("psql -c 'DROP TABLE users'").action,
+            policy
+                .evaluate("psql -c 'DROP TABLE users'", &here())
+                .action,
             Action::Deny
         );
     }
@@ -690,16 +722,21 @@ rules:
         )
         .unwrap();
         // the trench-coat attack: worst segment governs
-        let d = policy.evaluate_command("git status && rm -rf /");
+        let d = policy.evaluate_command("git status && rm -rf /", &here());
         assert_eq!(d.action, Action::Deny);
         assert!(d.reason.contains("rm -rf /"));
         // benign compound with an unmatched segment falls to default (ask)
         assert_eq!(
-            policy.evaluate_command("git status && echo hi").action,
+            policy
+                .evaluate_command("git status && echo hi", &here())
+                .action,
             Action::Ask
         );
         // single commands behave exactly as before
-        assert_eq!(policy.evaluate_command("git status").action, Action::Allow);
+        assert_eq!(
+            policy.evaluate_command("git status", &here()).action,
+            Action::Allow
+        );
     }
 
     #[test]
@@ -707,14 +744,19 @@ rules:
         // The embedded starter policy must always parse (it backs `check`'s
         // zero-setup demo mode) and must classify the headline cases.
         let p = Policy::builtin().expect("built-in starter policy must parse");
-        assert_eq!(p.evaluate_command("rm -rf /").action, Action::Deny);
+        assert_eq!(p.evaluate_command("rm -rf /", &here()).action, Action::Deny);
         assert_eq!(
-            p.evaluate_command("psql -c 'DROP TABLE users'").action,
+            p.evaluate_command("psql -c 'DROP TABLE users'", &here())
+                .action,
             Action::Deny
         );
-        assert_eq!(p.evaluate_command("git status").action, Action::Allow);
         assert_eq!(
-            p.evaluate_command("git push --force origin main").action,
+            p.evaluate_command("git status", &here()).action,
+            Action::Allow
+        );
+        assert_eq!(
+            p.evaluate_command("git push --force origin main", &here())
+                .action,
             Action::Deny
         );
     }
@@ -735,7 +777,7 @@ rules:
         let p = Policy::builtin().unwrap();
         for cmd in ["Get-ChildItem | Remove-Item", "Remove-Item x"] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 Action::Ask,
                 "{cmd}: an unflagged delete is ordinary work"
             );
@@ -746,7 +788,7 @@ rules:
             "Remove-Item -Recurse x",
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 Action::Deny,
                 "{cmd}: the flag is in the same segment as the name, so it fires"
             );
@@ -760,7 +802,7 @@ rules:
         // The command from the review: `echo *` sat below the denies and
         // allowed this outright, and everything after it was judged by a
         // policy the agent had written.
-        let d = p.evaluate_command("echo 'default: allow' > .termaxa/policy.yaml");
+        let d = p.evaluate_command("echo 'default: allow' > .termaxa/policy.yaml", &here());
         assert_eq!(d.action, Action::Deny);
         assert_eq!(d.matched_rule.as_deref(), Some("*.termaxa*"));
 
@@ -776,7 +818,7 @@ rules:
             "rm .github/hooks/hooks.json",
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 Action::Deny,
                 "must not be able to edit the gate: {cmd}"
             );
@@ -821,7 +863,7 @@ rules:
             "git diff .termaxa\\policy.yaml",
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 Action::Allow,
                 "the documented review workflow must not be blocked: {cmd}"
             );
@@ -844,7 +886,7 @@ rules:
             "tee .termaxa/policy.yaml",
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 Action::Deny,
                 "writes into the gate's config must stay denied: {cmd}"
             );
@@ -865,7 +907,7 @@ rules:
             "cp .termaxa/policy.yaml .codex/hooks.json",
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 Action::Deny,
                 "an exception must not become a way through: {cmd}"
             );
@@ -900,7 +942,11 @@ rules:
             "sudo rm --no-preserve-root -rf /",
             "rm -r --no-preserve-root /",
         ] {
-            assert_eq!(p.evaluate_command(cmd).action, Action::Deny, "{cmd}");
+            assert_eq!(
+                p.evaluate_command(cmd, &here()).action,
+                Action::Deny,
+                "{cmd}"
+            );
         }
     }
 
@@ -911,14 +957,18 @@ rules:
         // Still allowed — including bare `ls`, which needs its own rule
         // because `ls *` requires the space.
         for cmd in ["ls", "ls -la src", "grep -rn fn src", "cat Cargo.toml"] {
-            assert_eq!(p.evaluate_command(cmd).action, Action::Allow, "{cmd}");
+            assert_eq!(
+                p.evaluate_command(cmd, &here()).action,
+                Action::Allow,
+                "{cmd}"
+            );
         }
 
         // Different programs that merely start with the same letters. `ls*`
         // and `grep*` used to allow all of these.
         for cmd in ["lsof -i :5432", "lsblk", "lsattr -R /", "grepdiff --help"] {
             assert_ne!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 Action::Allow,
                 "a prefix is not a command: {cmd}"
             );
@@ -930,6 +980,13 @@ rules:
 mod combined_gate_tests {
     use super::*;
 
+    /// Evaluation context for tests: the current directory as both cwd and
+    /// root. No test here depends on resolution, which is the point - this
+    /// commit changed no verdicts.
+    fn here() -> crate::resolve::EvalContext {
+        crate::resolve::EvalContext::at(std::path::Path::new("."))
+    }
+
     /// The `./` spelling is a KNOWN gap, pinned so a future fix flips this
     /// test consciously: `cat /dev/null > ./.env` walks past the `*> .env*`
     /// string rules (belt), but the redirect scanner still extracts the
@@ -940,7 +997,7 @@ mod combined_gate_tests {
     fn the_dot_slash_spelling_is_a_known_gap_with_insurance_beneath() {
         let p = Policy::builtin().unwrap();
         assert_eq!(
-            p.evaluate_command("cat /dev/null > ./.env").action,
+            p.evaluate_command("cat /dev/null > ./.env", &here()).action,
             Action::Allow,
             "known gap — if this starts denying, delete this test and the comment"
         );

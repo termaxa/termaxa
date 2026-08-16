@@ -566,7 +566,11 @@ pub fn run() -> Result<()> {
 
     let policy = Policy::load(&paths.policy_file())?;
 
-    let base = policy.evaluate_command(&command);
+    // The payload's cwd is where the command runs; the project root comes
+    // from the located policy. Never the process cwd - a hook runs wherever
+    // the harness spawned it.
+    let ctx = crate::resolve::EvalContext::from_paths(&start_dir, &paths);
+    let base = policy.evaluate_command(&command, &ctx);
     let signals = context::gather(&command);
     let (mut decision, escalated) = context::apply(base, &signals);
 

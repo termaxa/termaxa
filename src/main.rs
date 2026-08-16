@@ -190,7 +190,11 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     (Policy::builtin()?, paths::demo_state_dir()?)
                 }
             };
-            let base = policy.evaluate_command(&cmd);
+            // `check` runs interactively, so the process cwd IS where the
+            // command would run - the one surface where they legitimately
+            // coincide.
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let base = policy.evaluate_command(&cmd, &resolve::EvalContext::at(cwd));
             let signals = context::gather(&cmd);
             let (decision, escalated) = context::apply(base, &signals);
 

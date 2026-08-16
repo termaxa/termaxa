@@ -621,6 +621,10 @@ pub(crate) fn which(bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn here() -> crate::resolve::EvalContext {
+        crate::resolve::EvalContext::at(std::path::Path::new("."))
+    }
     use crate::testutil::TempTree;
 
     /// `examples/policy.yaml` is the file people copy. It had drifted to 28
@@ -717,14 +721,15 @@ mod tests {
             "cat .termaxa/policy.yaml > /etc/hosts",
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 crate::policy::Action::Deny,
                 "{cmd} must not be allowed via the .termaxa read exception"
             );
         }
         // The exception itself still works — that is what it is for.
         assert_eq!(
-            p.evaluate_command("cat .termaxa/policy.yaml").action,
+            p.evaluate_command("cat .termaxa/policy.yaml", &here())
+                .action,
             crate::policy::Action::Allow
         );
     }
@@ -740,7 +745,7 @@ mod tests {
             "mkfs.ext4 /dev/sdb1",
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 crate::policy::Action::Deny,
                 "{cmd} has no recovery path and must deny, not ask"
             );
@@ -890,7 +895,7 @@ mod tests {
             "git status & rm -rf /",
         ] {
             assert_ne!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 crate::policy::Action::Allow,
                 "{cmd} is still allowed"
             );

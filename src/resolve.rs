@@ -32,15 +32,73 @@
 //! That ordering is deliberate: resolution that decides is resolution that
 //! cannot be reused by a consumer wanting a different policy.
 
-// This module lands one commit ahead of its consumers, deliberately: the
-// representation is reviewable on its own, and wiring it into evaluation is a
-// separate change with its own behaviour to argue about. Until that lands,
-// every item here is dead by construction. The allow is scoped to this module
-// and comes off in the commit that threads it through `policy::evaluate`.
+// EvalContext is now threaded to every evaluation site, but nothing RESOLVES
+// yet: `ResolvedTarget` and the shapes stay dead until commit 3 gives
+// `match_path` something to match against. The allow stays one more commit,
+// scoped here, and comes off with the behaviour change - keeping the
+// mechanical threading separable from the verdicts it enables.
 #![allow(dead_code)]
 
 use crate::delete;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+/// Where a command runs, for the purpose of judging its targets.
+///
+/// Two values, both about the execution context, threaded together because
+/// they travel together: passing them as separate arguments through every
+/// evaluation call site invites transposing them, and a transposed cwd/root
+/// pair fails silently - every target reads as outside the project.
+///
+/// DELIBERATELY SMALL. No policy state, no decision state, no speculative
+/// fields. The resolver consumes this and returns facts; deciding what those
+/// facts are worth stays with the policy layer. A context that grew a
+/// `Decision` or a rule list would put the two on the same side of the line
+/// this module exists to keep.
+#[derive(Debug, Clone)]
+pub struct EvalContext {
+    /// The directory the command runs in - from the hook payload, never the
+    /// process cwd (decision #59's sibling: a hook runs wherever the harness
+    /// spawned it).
+    pub cwd: PathBuf,
+    /// The project root, used only to answer the outside-the-project question.
+    pub root: PathBuf,
+}
+
+impl EvalContext {
+    pub fn new(cwd: impl Into<PathBuf>, root: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            root: root.into(),
+        }
+    }
+
+    /// Context for a command running at `dir`, with no distinct project root -
+    /// the directory is both. Used by surfaces that evaluate without a located
+    /// project, and by tests.
+    pub fn at(dir: impl Into<PathBuf>) -> Self {
+        let d: PathBuf = dir.into();
+        Self {
+            cwd: d.clone(),
+            root: d,
+        }
+    }
+
+    /// Context derived from a located project. `Paths::project_dir` is the
+    /// `.termaxa/` directory, so the project root is its parent - computed
+    /// here once rather than at each call site, where getting it wrong would
+    /// make every target read as outside the project.
+    pub fn from_paths(cwd: impl Into<PathBuf>, paths: &crate::paths::Paths) -> Self {
+        let root = paths
+            .project_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| paths.project_dir.clone());
+        Self {
+            cwd: cwd.into(),
+            root,
+        }
+    }
+}
 
 /// A property of a target that makes an unresolved one worth failing closed on.
 ///
@@ -122,7 +180,7 @@ impl ResolvedTarget {
 ///
 /// `root` is the project directory, used only to answer the outside-root
 /// question. Pass `cwd` for both when there is no distinct root to speak of.
-pub fn target(raw: &str, cwd: &Path, root: &Path) -> ResolvedTarget {
+pub fn target(raw: &str, ctx: &EvalContext) -> ResolvedTarget {
     let as_written = raw.trim().trim_matches('"').trim_matches('\'').to_string();
     let mut shapes = Vec::new();
 
@@ -139,16 +197,19 @@ pub fn target(raw: &str, cwd: &Path, root: &Path) -> ResolvedTarget {
         };
     }
 
-    let resolved = delete::resolve_path_in(&as_written, cwd);
+    let resolved = delete::resolve_path_in(&as_written, &ctx.cwd);
 
-    if !delete::is_inside(&resolved, root) {
+    if !delete::is_inside(&resolved, &ctx.root) {
         shapes.push(SensitiveShape::OutsideRoot);
     }
     if delete::is_user_profile(&resolved) {
         shapes.push(SensitiveShape::UnderUserProfile);
     }
-    if crate::protect::classify(&cwd.display().to_string(), &resolved.display().to_string())
-        .is_some()
+    if crate::protect::classify(
+        &ctx.cwd.display().to_string(),
+        &resolved.display().to_string(),
+    )
+    .is_some()
     {
         shapes.push(SensitiveShape::ProtectedName);
     }
@@ -203,7 +264,7 @@ mod tests {
     fn a_plain_relative_target_resolves_against_the_given_cwd_and_is_ordinary() {
         let t = TempTree::new("resolve-plain");
         let root = t.path();
-        let r = target("./dist", root, root);
+        let r = target("./dist", &EvalContext::at(root));
         assert_eq!(r.as_written, "./dist");
         assert_eq!(r.resolved, Some(root.join("dist")));
         assert!(!r.is_unresolved());
@@ -214,7 +275,7 @@ mod tests {
     fn the_two_readings_are_both_kept() {
         let t = TempTree::new("resolve-readings");
         let root = t.path();
-        let r = target("./sub/../dist", root, root);
+        let r = target("./sub/../dist", &EvalContext::at(root));
         // as_written survives resolution: a reason line quotes what was typed.
         assert_eq!(r.as_written, "./sub/../dist");
         assert_eq!(r.resolved, Some(root.join("dist")));
@@ -225,7 +286,7 @@ mod tests {
         let t = TempTree::new("resolve-var");
         let root = t.path();
         for raw in ["$HOME/.ssh", "${HOME}/.ssh", "%USERPROFILE%\\.ssh", "$X"] {
-            let r = target(raw, root, root);
+            let r = target(raw, &EvalContext::at(root));
             assert!(r.is_unresolved(), "{raw} must not resolve");
             assert!(r.has(SensitiveShape::UnexpandedVar), "{raw}");
             // The gate admits it does not know, rather than inventing a path.
@@ -241,7 +302,7 @@ mod tests {
         // Command substitution is fenced upstream; counting it here would
         // report the same fact twice under the wrong name.
         for raw in ["$(date).log", "cost$.txt", "100%", "50%-done"] {
-            let r = target(raw, root, root);
+            let r = target(raw, &EvalContext::at(root));
             assert!(
                 !r.has(SensitiveShape::UnexpandedVar),
                 "{raw} is not a variable reference"
@@ -254,10 +315,10 @@ mod tests {
         let t = TempTree::new("resolve-outside");
         let root = t.path().join("project");
         std::fs::create_dir_all(&root).unwrap();
-        let r = target("../elsewhere", &root, &root);
+        let r = target("../elsewhere", &EvalContext::at(&root));
         assert!(r.has(SensitiveShape::OutsideRoot));
         // Control leg: inside the project, the shape is absent.
-        let inside = target("./src", &root, &root);
+        let inside = target("./src", &EvalContext::at(&root));
         assert!(!inside.has(SensitiveShape::OutsideRoot));
     }
 
@@ -265,13 +326,13 @@ mod tests {
     fn the_gates_own_files_are_recognised_through_protect() {
         let t = TempTree::new("resolve-protected");
         let root = t.path();
-        let r = target(".termaxa/policy.yaml", root, root);
+        let r = target(".termaxa/policy.yaml", &EvalContext::at(root));
         assert!(
             r.has(SensitiveShape::ProtectedName),
             "the command path and the write path must agree on what is protected"
         );
         // Control leg: an ordinary project file is not protected.
-        let ordinary = target("src/main.rs", root, root);
+        let ordinary = target("src/main.rs", &EvalContext::at(root));
         assert!(!ordinary.has(SensitiveShape::ProtectedName));
     }
 
@@ -282,7 +343,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         // A .termaxa path outside the project is BOTH outside and protected;
         // reporting only the first found would lose half the reason.
-        let r = target("../other/.termaxa/policy.yaml", &root, &root);
+        let r = target("../other/.termaxa/policy.yaml", &EvalContext::at(&root));
         assert!(r.has(SensitiveShape::OutsideRoot), "{:?}", r.shapes);
         assert!(r.has(SensitiveShape::ProtectedName), "{:?}", r.shapes);
     }
