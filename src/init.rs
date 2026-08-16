@@ -79,10 +79,23 @@ rules:
   # here: agents write files constantly, and a gate that asks on every redirect
   # is auto-approved into meaninglessness. Insurance without friction is the
   # trade — see #14.
+  #
+  # The two string rules below are kept, and a `match_path` rule now sits with
+  # them. They are not redundant: the string rules read the command as typed,
+  # the path rule reads what the command actually TOUCHES after resolution.
+  # `> .env` and `> ./.env` are the same file and different strings - the
+  # second walked past both string rules for four releases (known-limitations
+  # 0.2, pinned as a test until v0.16). Matching the resolved target closes
+  # every spelling of one path at once, which is what the string rules could
+  # never do by adding more patterns.
   - match: "*> .env*"
     action: deny
     reason: "Overwriting .env destroys credentials that are not in the repo."
   - match: "*>.env*"
+    action: deny
+    reason: "Overwriting .env destroys credentials that are not in the repo."
+  - match: "*.env*"
+    match_path: "*/.env"
     action: deny
     reason: "Overwriting .env destroys credentials that are not in the repo."
   - match: "*> /etc/*"

@@ -32,13 +32,6 @@
 //! That ordering is deliberate: resolution that decides is resolution that
 //! cannot be reused by a consumer wanting a different policy.
 
-// EvalContext is now threaded to every evaluation site, but nothing RESOLVES
-// yet: `ResolvedTarget` and the shapes stay dead until commit 3 gives
-// `match_path` something to match against. The allow stays one more commit,
-// scoped here, and comes off with the behaviour change - keeping the
-// mechanical threading separable from the verdicts it enables.
-#![allow(dead_code)]
-
 use crate::delete;
 use std::path::PathBuf;
 
@@ -65,13 +58,6 @@ pub struct EvalContext {
 }
 
 impl EvalContext {
-    pub fn new(cwd: impl Into<PathBuf>, root: impl Into<PathBuf>) -> Self {
-        Self {
-            cwd: cwd.into(),
-            root: root.into(),
-        }
-    }
-
     /// Context for a command running at `dir`, with no distinct project root -
     /// the directory is both. Used by surfaces that evaluate without a located
     /// project, and by tests.
@@ -160,6 +146,9 @@ impl ResolvedTarget {
         self.resolved.is_none()
     }
 
+    /// Used by tests asserting on a specific shape. Production reads the
+    /// whole list, because a reason line names every shape a target carries.
+    #[cfg(test)]
     pub fn has(&self, s: SensitiveShape) -> bool {
         self.shapes.contains(&s)
     }

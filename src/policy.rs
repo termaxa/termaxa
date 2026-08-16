@@ -39,6 +39,25 @@ pub struct Rule {
     /// out of spelling) applied to the rule text itself.
     #[serde(default, skip_serializing_if = "is_false")]
     pub case_sensitive: bool,
+    /// Match this rule against the command's RESOLVED targets rather than
+    /// against the command string.
+    ///
+    /// Roadmap 2.4. `> ./.env` and `> .env` are the same file and different
+    /// strings, so a `match:` rule naming one misses the other - the gap
+    /// pinned in known-limitations 0.2. A `match_path:` rule is matched
+    /// against each target after resolution, so both spellings reach it.
+    ///
+    /// A rule may carry both fields. `match:` is required by the schema and
+    /// stays the rule's identity in reason lines and audit entries; when
+    /// `match_path:` is present, the rule fires if EITHER matches - the string
+    /// reading can only add matches, never remove them, which is the same
+    /// promise the extra readings make.
+    ///
+    /// ANY target matching fires the rule, and the reason names WHICH one. A
+    /// command with several targets is one command, and a human deciding
+    /// whether to approve it needs to know which path tripped the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_path: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -54,6 +73,19 @@ impl Rule {
     /// with `case_sensitive: true` is matched as written against the
     /// case-preserved reading, so `git branch*-D*` can mean `-D` and not
     /// `-d`. The field decides; the spelling never does.
+    /// Does this rule's `match_path` pattern match a resolved target? Uses the
+    /// same wildcard engine as `match`, so `*/.ssh/*` reads the way a person
+    /// writing a policy expects. The structural questions - is it outside the
+    /// project, is it a user profile - are NOT patterns; they are shapes
+    /// computed once during resolution and handled separately.
+    pub fn matches_path(&self, path: &str) -> bool {
+        match &self.match_path {
+            None => false,
+            Some(p) if self.case_sensitive => wildcard_match(&collapse(p), path),
+            Some(p) => wildcard_match(&normalize(p), &normalize(path)),
+        }
+    }
+
     pub fn matches(&self, reading: &str) -> bool {
         if self.case_sensitive {
             wildcard_match(&collapse(&self.r#match), reading)
@@ -114,6 +146,26 @@ pub struct Decision {
     pub action: Action,
     pub matched_rule: Option<String>,
     pub reason: String,
+}
+
+/// Every path this segment touches, resolved once: the redirect targets the
+/// splitter already found, plus whatever the delete extractor recognises.
+///
+/// Two sources rather than one because they answer different questions -
+/// `> .env` names a file the command WRITES, `rm .env` names one it DELETES -
+/// and a gate that reads only one of them has a hole shaped like the other.
+fn resolved_targets(
+    segment: &str,
+    ctx: &crate::resolve::EvalContext,
+) -> Vec<crate::resolve::ResolvedTarget> {
+    let mut raw: Vec<String> = Vec::new();
+    for seg in crate::shell::split_segments(segment) {
+        raw.extend(seg.redirects.iter().map(|o| o.target.clone()));
+    }
+    raw.extend(crate::delete::extract_targets(segment));
+    raw.sort();
+    raw.dedup();
+    raw.iter().map(|r| crate::resolve::target(r, ctx)).collect()
 }
 
 impl Policy {
@@ -189,11 +241,7 @@ impl Policy {
         }
     }
 
-    /// `ctx` is unused by the matcher today: this commit threads the execution
-    /// context to every evaluation site without changing a single verdict, so
-    /// the wiring is reviewable on its own. Commit 3 resolves targets here and
-    /// gives `match_path` something to match against.
-    pub fn evaluate(&self, command: &str, _ctx: &crate::resolve::EvalContext) -> Decision {
+    pub fn evaluate(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
         // First-match PER READING, MOST SEVERE across readings, earliest rule
         // on ties. See `readings` for what the readings are.
         //
@@ -225,6 +273,88 @@ impl Policy {
                 });
             }
         }
+        // Roadmap 2.4: the same rules, matched against what the command
+        // actually TOUCHES rather than how it was spelled. Resolution happens
+        // once per segment and is reused by both checks below.
+        let targets = resolved_targets(command, ctx);
+
+        // A `match_path` rule fires if ANY target matches, and the reason
+        // names which one: a command with several targets is one command, and
+        // the human approving it needs to know which path tripped the gate.
+        let mut path_hit: Option<(usize, &Rule, String)> = None;
+        for (idx, rule) in self.rules.iter().enumerate() {
+            if rule.match_path.is_none() {
+                continue;
+            }
+            for t in &targets {
+                let Some(p) = &t.resolved else { continue };
+                if rule.matches_path(&p.display().to_string()) {
+                    let better = match &path_hit {
+                        None => true,
+                        Some((bi, br, _)) => {
+                            severity(rule.action) > severity(br.action)
+                                || (severity(rule.action) == severity(br.action) && idx < *bi)
+                        }
+                    };
+                    if better {
+                        path_hit = Some((idx, rule, t.display()));
+                    }
+                    break;
+                }
+            }
+        }
+
+        // An unresolved target carrying a sensitive shape fails closed. NOT a
+        // short-circuit: it enters the same most-severe-wins tournament as
+        // everything else, so an explicit allow above it still wins, which is
+        // the escape hatch every other rule already has. One decision path,
+        // not two.
+        let shape_deny = targets
+            .iter()
+            .find(|t| t.is_unresolved() && !t.shapes.is_empty());
+
+        match (path_hit, shape_deny) {
+            (Some((_, rule, target)), _) if rule.action == Action::Deny => {
+                return Decision {
+                    action: rule.action,
+                    matched_rule: Some(rule.r#match.clone()),
+                    reason: format!(
+                        "target `{}` — {}",
+                        target,
+                        rule.reason.clone().unwrap_or_else(|| format!(
+                            "matched path rule `{}`",
+                            rule.match_path.clone().unwrap_or_default()
+                        ))
+                    ),
+                };
+            }
+            (_, Some(t)) => {
+                let why = t
+                    .shapes
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // Only fails closed when it is WORSE than what the string
+                // rules concluded - an explicit allow is still an allow.
+                let base_sev = best
+                    .map(|(_, r)| severity(r.action))
+                    .unwrap_or_else(|| severity(self.default));
+                if base_sev < severity(Action::Deny) && base_sev > severity(Action::Allow) {
+                    return Decision {
+                        action: Action::Deny,
+                        matched_rule: None,
+                        reason: format!(
+                            "target `{}` cannot be resolved and {} — refusing rather than \
+                             guessing what it points at",
+                            t.as_written, why
+                        ),
+                    };
+                }
+            }
+            _ => {}
+        }
+
         match best {
             Some((_, rule)) => Decision {
                 action: rule.action,
@@ -363,6 +493,7 @@ mod schema_and_severity_tests {
             action: Action::Allow,
             reason: None,
             case_sensitive: false,
+            match_path: None,
         };
         let json = serde_json::to_string(&plain).expect("a rule must serialize");
         assert!(
@@ -375,6 +506,7 @@ mod schema_and_severity_tests {
             action: Action::Deny,
             reason: None,
             case_sensitive: true,
+            match_path: None,
         };
         let json = serde_json::to_string(&strict).expect("a rule must serialize");
         assert!(
@@ -542,6 +674,7 @@ mod tests {
             action: Action::Deny,
             reason: None,
             case_sensitive: true,
+            match_path: None,
         };
         let views_upper = readings("git branch -D main");
         let views_lower = readings("git branch -d main");
@@ -987,20 +1120,115 @@ mod combined_gate_tests {
         crate::resolve::EvalContext::at(std::path::Path::new("."))
     }
 
-    /// The `./` spelling is a KNOWN gap, pinned so a future fix flips this
-    /// test consciously: `cat /dev/null > ./.env` walks past the `*> .env*`
-    /// string rules (belt), but the redirect scanner still extracts the
-    /// target (suspenders) — intent classifies it and insurance backs the
-    /// file up before execution, whatever the spelling. The full fix is
-    /// matching on the RESOLVED target (v0.16, with #12's signal set).
+    /// Roadmap 2.4, the point of the whole change: a rule matched against the
+    /// RESOLVED target catches every spelling of one path, which no number of
+    /// added string patterns could do. The reason names WHICH target tripped
+    /// it, because a command may touch several and the human approving it
+    /// needs to know which one.
     #[test]
-    fn the_dot_slash_spelling_is_a_known_gap_with_insurance_beneath() {
+    fn a_path_rule_catches_every_spelling_and_names_the_target() {
+        let p = Policy::builtin().unwrap();
+        let d = p.evaluate_command("cat /dev/null > ./.env", &here());
+        assert_eq!(d.action, Action::Deny);
+        assert!(
+            d.reason.contains(".env"),
+            "the reason must name the target that tripped the gate: {}",
+            d.reason
+        );
+        // Control leg: the path rule does not fire on a path it does not
+        // match. `cat *` allows this one, which is exactly the point - the
+        // ordinary file reaches its ordinary verdict, and only the protected
+        // path is pulled out of it.
+        let ordinary = p.evaluate_command("cat /dev/null > ./notes.md", &here());
+        assert_eq!(ordinary.action, Action::Allow);
+        assert_eq!(ordinary.matched_rule.as_deref(), Some("cat *"));
+    }
+
+    /// An explicit `allow` still wins over an unresolved sensitive target, and
+    /// that is the DECIDED behaviour, not an oversight.
+    ///
+    /// `echo x > $CONFIG` cannot be resolved — the gate does not know what
+    /// file that is — and the target carries the UnexpandedVar shape. That
+    /// contributes a deny reading, but the reading enters the same
+    /// most-severe-wins tournament as everything else and loses to the
+    /// explicit `echo *` allow above it. It is not discarded; it is outranked.
+    ///
+    /// The alternative (unresolved-sensitive outranking an explicit allow)
+    /// would introduce a new precedence level above a decision the operator
+    /// wrote down deliberately. That is a separate semantic change and needs
+    /// its own tests and a migration note, so it is not made here.
+    #[test]
+    fn an_explicit_allow_outranks_an_unresolved_sensitive_target() {
         let p = Policy::builtin().unwrap();
         assert_eq!(
-            p.evaluate_command("cat /dev/null > ./.env", &here()).action,
+            p.evaluate_command("echo x > $CONFIG", &here()).action,
             Action::Allow,
-            "known gap — if this starts denying, delete this test and the comment"
+            "an explicit allow is an explicit allow"
         );
+        // The deny reading exists and is real — the resolver reports the shape
+        // — it simply loses the tournament. Asserting this separately is what
+        // makes the test about PRECEDENCE rather than about the resolver
+        // having failed to notice.
+        let t = crate::resolve::target("$CONFIG", &here());
+        assert!(t.is_unresolved());
+        assert!(t.has(crate::resolve::SensitiveShape::UnexpandedVar));
+
+        // And where no explicit allow covers it, the deny reading DOES govern.
+        // A REDIRECT to an unresolved target is seen, because redirects are
+        // one of the two target sources this commit reads.
+        let d = p.evaluate_command("truncate -s 0 x > $CONFIG", &here());
+        assert_eq!(
+            d.action,
+            Action::Deny,
+            "unresolved and sensitive, nothing explicit above it: {}",
+            d.reason
+        );
+        assert!(
+            d.reason.contains("cannot be resolved"),
+            "the reason must say the gate does not know: {}",
+            d.reason
+        );
+
+        // SCOPE, pinned so it is not mistaken for coverage: targets come from
+        // redirects and from the delete extractor. Nothing else has an
+        // extractor yet, so `truncate -s 0 $CONFIG` - which destroys a file
+        // named by an unresolvable variable - produces NO targets and reaches
+        // its ordinary verdict. cp/mv/tee/dd destinations are roadmap 2.1;
+        // truncate is covered by nothing. The machinery is only as wide as
+        // the extractors feeding it.
+        assert!(
+            resolved_targets("truncate -s 0 $CONFIG", &here()).is_empty(),
+            "if this starts finding targets, an extractor was added and this \
+             test should be narrowed rather than deleted"
+        );
+    }
+
+    /// GAP CLOSED, v0.16 — the INVERSION of the pinned known-gap test, not a
+    /// replacement, so the history stays visible in the place that proves it
+    /// is over. It read: "`cat /dev/null > ./.env` walks past the `*> .env*`
+    /// string rules (belt), but the redirect scanner still extracts the
+    /// target (suspenders)... the full fix is matching on the RESOLVED target
+    /// (v0.16)". That fix is this: the starter policy now carries a
+    /// `match_path: "*/.env"` rule, so both spellings of one file deny.
+    ///
+    /// The suspenders are asserted too, unchanged. Insurance did not become
+    /// unnecessary when the string gap closed — it is what covered the four
+    /// releases in which the gap was open, and a later policy edit could
+    /// remove the rule without removing the net.
+    #[test]
+    fn the_dot_slash_spelling_was_a_known_gap_and_is_now_closed() {
+        let p = Policy::builtin().unwrap();
+        for spelling in [
+            "cat /dev/null > ./.env",
+            "cat /dev/null > .env",
+            "cat /dev/null > ./sub/../.env",
+        ] {
+            assert_eq!(
+                p.evaluate_command(spelling, &here()).action,
+                Action::Deny,
+                "{spelling}: one file, every spelling"
+            );
+        }
         let segs = crate::shell::split_segments("cat /dev/null > ./.env");
         let r = &segs[0].redirects;
         assert!(
