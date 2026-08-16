@@ -523,14 +523,61 @@ pub fn is_inside(target: &Path, root: &Path) -> bool {
 /// Put a path into a form two paths can actually be compared in: canonicalized
 /// when possible, with Windows' `\\?\` verbatim prefix stripped, and
 /// case-folded on platforms with case-insensitive filesystems.
+///
+/// CANONICALIZES THE DEEPEST EXISTING ANCESTOR, not just the path itself.
+/// `canonicalize` fails on a path that does not exist yet, and the old
+/// fallback returned the raw lexical path - so comparing an existing root
+/// against a not-yet-created child put the two sides in DIFFERENT forms
+/// whenever any ancestor was a symlink. `is_inside` then answered false for a
+/// child that is plainly inside its parent.
+///
+/// Found by CI (2026-08-16) on all three runners while two developer machines
+/// passed: GitHub's runners reach the temp directory through a symlink and
+/// `/tmp` here does not. Reproduced locally by pointing a root at a symlink -
+/// child absent, is_inside false; child created, is_inside true. Same path,
+/// two answers, decided by whether the target had been created yet, which is
+/// exactly backwards for a tool that judges commands BEFORE they run.
+///
+/// Real-world reach, not just tests: macOS `/tmp` and `/var` are symlinks,
+/// as are plenty of home directories on shared mounts. Any project reached
+/// through one made every not-yet-created target read as outside the project.
 fn for_compare(p: &Path) -> PathBuf {
-    let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let c = canonical_prefix(p);
     let s = c.to_string_lossy().to_string();
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
     if cfg!(windows) {
         PathBuf::from(s.to_lowercase())
     } else {
         PathBuf::from(s)
+    }
+}
+
+/// Canonicalize as much of `p` as exists, then re-append the rest.
+///
+/// Walks up to the deepest ancestor that exists, canonicalizes THAT, and
+/// rejoins the components below it. A path that exists entirely canonicalizes
+/// entirely, as before; one that does not still gets its real prefix, so two
+/// paths under the same root always compare in the same form.
+fn canonical_prefix(p: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            let mut out = c;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                cur = parent.to_path_buf();
+            }
+            // Nothing along the path exists (or we reached the root without
+            // finding anything): the lexical form is the best answer there is.
+            _ => return p.to_path_buf(),
+        }
     }
 }
 
@@ -924,6 +971,48 @@ mod tests {
         assert!(is_filesystem_root(Path::new("/")));
         assert!(is_filesystem_root(Path::new("C:\\")));
         assert!(!is_filesystem_root(Path::new("/usr")));
+    }
+
+    /// Regression, CI 2026-08-16: a target that does not exist YET is still
+    /// inside its parent, even when the parent is reached through a symlink.
+    ///
+    /// `for_compare` canonicalized the existing root and fell back to the raw
+    /// lexical path for the absent child, putting the two sides in different
+    /// forms and answering false. Two developer machines passed and all three
+    /// CI runners failed, because GitHub's runners reach the temp directory
+    /// through a symlink. The bug is not test-only: macOS `/tmp` and `/var`
+    /// are symlinks, so any project under one had every not-yet-created
+    /// target read as outside the project.
+    ///
+    /// The control leg is the point - the fix must not make `is_inside`
+    /// simply answer true more often.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_that_does_not_exist_yet_is_still_inside_a_symlinked_root() {
+        let t = TempTree::new("symlink-root");
+        let real = t.dir("real");
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink must be creatable");
+
+        // The failing case: absent child under a symlinked root.
+        assert!(
+            is_inside(&link.join("not-created-yet"), &link),
+            "an absent child is still inside its parent"
+        );
+        assert!(
+            is_inside(&link.join("a/b/c/d"), &link),
+            "however deep, and however much of it exists"
+        );
+        // Present child, which passed even before the fix.
+        let present = t.dir("real/present");
+        assert!(is_inside(&present, &link));
+
+        // CONTROL LEG: genuinely outside is still outside. Without this, a fix
+        // that always answered true would pass every assertion above.
+        assert!(
+            !is_inside(t.path().join("elsewhere").as_path(), &link),
+            "a sibling of the root is not inside it"
+        );
     }
 
     #[test]
