@@ -198,6 +198,22 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let signals = context::gather(&cmd);
             let (decision, escalated) = context::apply(base, &signals);
 
+            let root = resolved.as_ref().and_then(|p| p.project_dir.parent());
+            // The preview is generated BEFORE the decision is printed, because
+            // it carries the fact the insurance amplifier needs (roadmap 2.5).
+            // Printing first and amplifying after would show one verdict and
+            // enforce another - the shape of bug this release keeps finding.
+            let check_cwd =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let pv = preview::generate(
+                &cmd,
+                root,
+                &check_cwd,
+                decision.action != policy::Action::Deny,
+            );
+            let uninsurable = pv.as_ref().is_some_and(|p| p.uninsurable);
+            let (decision, uninsured_escalation) = context::apply_insurance(decision, uninsurable);
+
             println!();
             println!("{}", ui::field("command", &cmd));
             println!(
@@ -216,6 +232,12 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 };
                 println!("{}", ui::field("context", &ui::dim(&line)));
             }
+            if uninsured_escalation {
+                println!(
+                    "{}",
+                    ui::field("note", &ui::amber("uninsurable — escalated ask → deny"))
+                );
+            }
             if escalated {
                 println!(
                     "{}",
@@ -224,18 +246,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
 
             let mut preview_summary = None;
-            let root = resolved.as_ref().and_then(|p| p.project_dir.parent());
-            // `check` runs in the user's own shell, so the process cwd IS the
-            // base the command would resolve against — threaded explicitly so
-            // that reasoning is visible rather than ambient (v0.16 item 1).
-            let check_cwd =
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            if let Some(pv) = preview::generate(
-                &cmd,
-                root,
-                &check_cwd,
-                decision.action != policy::Action::Deny,
-            ) {
+            if let Some(pv) = pv {
                 println!("\n{}", ui::bold(&pv.title));
                 for l in &pv.lines {
                     println!("{}", l);
@@ -255,7 +266,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 matched_rule: decision.matched_rule.clone(),
                 reason: decision.reason.clone(),
                 signals: signals.iter().map(|s| s.label.clone()).collect(),
-                escalated,
+                escalated: escalated || uninsured_escalation,
                 session: None,
                 backup: None,
                 preview: preview_summary,

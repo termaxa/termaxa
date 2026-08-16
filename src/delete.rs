@@ -65,6 +65,9 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
     let mut lines = Vec::new();
     let mut summary_parts: Vec<String> = Vec::new();
     let mut worst_first: Vec<String> = Vec::new();
+    // Roadmap 2.5: whether anything here is beyond the reach of insurance.
+    // Computed while the preview walks its targets; reported, not acted on.
+    let mut uninsurable = false;
 
     for raw in targets.iter().take(3) {
         let resolved = resolve_path_in(raw, cwd);
@@ -146,11 +149,13 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
                     fmt_num(MAX_FILES)
                 ));
                 worst_first.push("NOT recoverable".into());
+                uninsurable = true;
             }
             None => {
                 lines
                     .push("  ✗ insurance : no backup covers this command — NOT recoverable".into());
                 worst_first.push("NOT recoverable".into());
+                uninsurable = true;
             }
         }
 
@@ -172,6 +177,7 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
         title: "delete impact".into(),
         lines,
         summary,
+        uninsurable,
     })
 }
 

@@ -438,6 +438,12 @@ fn hook_live(settings: &Path, dir: &Path) -> (HookState, Option<bool>) {
     // reported as its own softer diagnostic.
     match invoke(&cmd, &payload, dir, PROBE_TIMEOUT) {
         Some(out) => match parse_probe_decision(&out) {
+            // The probe's verdict is the POLICY's verdict: the hook exempts
+            // probes from the insurance amplifier, precisely so this question
+            // stays answerable. Doctor asks "does the configured policy deny
+            // anything", not "can the enforcement stack stop this command" -
+            // conflating them would make a policy with no rules look
+            // protective (roadmap 2.5).
             Some(decision) => {
                 let denies = decision == "deny";
                 (HookState::Live, Some(denies))

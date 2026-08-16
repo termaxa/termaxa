@@ -602,6 +602,10 @@ pub fn run() -> Result<()> {
         ) {
             decision = crate::policy::Decision {
                 action: Action::Deny,
+                // The breaker chose this deliberately, from history rather
+                // than from a rule - a Context decision in the sense that
+                // matters here: something formed an opinion.
+                source: crate::policy::DecisionSource::Context,
                 matched_rule: Some(crate::intent::BREAKER_RULE.to_string()),
                 reason,
             };
@@ -611,17 +615,44 @@ pub fn run() -> Result<()> {
     // Pass the project root so the delete preview can answer "is this target
     // outside the project?" — the process cwd can't supply it, because the
     // agent may spawn us from anywhere (the Cursor cwd bug).
-    let preview_summary = {
+    let (preview_summary, uninsurable) = {
         // A denied command must not cause a subprocess. The preview is still
         // generated — statically — so the denial reason keeps its detail.
         let live = decision.action != crate::policy::Action::Deny;
-        crate::preview::generate(
+        match crate::preview::generate(
             &command,
             paths.project_dir.parent(),
             std::path::Path::new(&input.cwd),
             live,
-        )
-        .map(|p| p.summary)
+        ) {
+            Some(p) => (Some(p.summary), p.uninsurable),
+            None => (None, false),
+        }
+    };
+
+    // Probe mode requires BOTH the env var and the sentinel session id — see
+    // the note at the audit-suppression site below for why. Computed here
+    // because the insurance amplifier needs it.
+    let is_probe = std::env::var("TERMAXA_HOOK_PROBE").as_deref() == Ok("1")
+        && input.session.as_deref() == Some(PROBE_SESSION);
+
+    // Roadmap 2.5: an ask on a command with no net becomes a deny. Applied
+    // after context escalation, so a signal that raised allow->ask can then
+    // be amplified to deny by uninsurability - the two compose in the order
+    // they are meant to: is this concerning, and if so, is asking safe?
+    //
+    // NOT for a probe. `doctor` asks "does the configured POLICY deny
+    // anything", which is a different question from "can the enforcement
+    // stack stop this command". Amplifying the probe would answer the second
+    // and print the first: a policy with no rules at all would look
+    // protective, because `rm -rf /` is uninsurable and the default is ask.
+    // That misreading gets worse with every safeguard added later, so the
+    // probe sees the policy verdict and enforcement sees the amplified one.
+    // One reader, two questions, answered separately (#37).
+    let (decision, uninsured_escalation) = if is_probe {
+        (decision, false)
+    } else {
+        crate::context::apply_insurance(decision, uninsurable)
     };
 
     // Insure before allowing: PreToolUse runs before execution, so a backup
@@ -644,9 +675,6 @@ pub fn run() -> Result<()> {
     // the sentinel session id, and `doctor` is the only thing that sends the
     // sentinel. An agent command cannot set its harness's env; a leaked env
     // var without the sentinel changes nothing.
-    let is_probe = std::env::var("TERMAXA_HOOK_PROBE").as_deref() == Ok("1")
-        && input.session.as_deref() == Some(PROBE_SESSION);
-
     let mut backup_id: Option<String> = None;
     if !is_probe && decision.action != Action::Deny {
         if let Ok(Some(rec)) =
@@ -670,7 +698,7 @@ pub fn run() -> Result<()> {
                 matched_rule: decision.matched_rule.clone(),
                 reason: decision.reason.clone(),
                 signals: signals.iter().map(|s| s.label.clone()).collect(),
-                escalated,
+                escalated: escalated || uninsured_escalation,
                 session: input.session.clone(),
                 backup: backup_id.clone(),
                 preview: preview_summary.clone(),
@@ -703,7 +731,12 @@ pub fn run() -> Result<()> {
     };
 
     let mut reason = format!("[termaxa] {}", decision.reason);
-    if escalated {
+    if uninsured_escalation {
+        // Named distinctly from context escalation: the record should say
+        // WHICH amplifier fired, or a later reader cannot tell a signal-driven
+        // ask from an uninsurable-driven deny.
+        reason.push_str(" (uninsurable — escalated to deny)");
+    } else if escalated {
         reason.push_str(" (context-escalated)");
     }
     if matches!(decision.action, Action::Ask | Action::Deny) {
@@ -758,11 +791,15 @@ mod tests {
 
         let no_opinion = Decision {
             action: Action::Allow,
+            // The typed form of the distinction this test already drew by
+            // hand: `Default` IS "no opinion" (v0.16, roadmap 2.5).
+            source: crate::policy::DecisionSource::Default,
             matched_rule: None,
             reason: "no rule matched; policy default is `allow`".into(),
         };
         let deliberate = Decision {
             action: Action::Allow,
+            source: crate::policy::DecisionSource::ExplicitRule,
             matched_rule: Some("git status*".into()),
             reason: "matched rule `git status*`".into(),
         };
@@ -788,6 +825,7 @@ mod tests {
         for action in [Action::Ask, Action::Deny] {
             let d = Decision {
                 action,
+                source: crate::policy::DecisionSource::Default,
                 matched_rule: None,
                 reason: "default".into(),
             };

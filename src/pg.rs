@@ -147,6 +147,10 @@ pub fn preview_for(command: &str, cwd: &std::path::Path, live: bool) -> Option<P
         }
     }
 
+    // Roadmap 2.5: the same question the delete preview asks, and it already
+    // had the answer - `plan` returning None IS uninsurable, and the line
+    // below has said so since v0.13 without anything able to act on it.
+    let uninsurable = crate::backup::plan(command, cwd).is_none();
     match crate::backup::plan(command, cwd) {
         Some(plan) => lines.push(format!("  insurance : {} (automatic on run/hook)", plan)),
         None => lines.push("  insurance : none — not reversible without a backup".into()),
@@ -160,6 +164,7 @@ pub fn preview_for(command: &str, cwd: &std::path::Path, live: bool) -> Option<P
         title: "postgres impact".into(),
         lines,
         summary: summary_parts.join("; "),
+        uninsurable,
     })
 }
 

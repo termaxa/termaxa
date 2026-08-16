@@ -195,6 +195,35 @@ pub struct Decision {
     pub action: Action,
     pub matched_rule: Option<String>,
     pub reason: String,
+    /// WHY this verdict, not just what it is.
+    ///
+    /// Roadmap 2.5. `Ask` from an explicit rule and `Ask` from an unmatched
+    /// command are not different strengths of the same thing - they are
+    /// different statements. The first says "stop and think about this"; the
+    /// second says "I have no opinion". Treating them alike made the
+    /// insurance amplifier fire on every unmatched command under a
+    /// `default: ask` policy, which is `uninsurable -> deny` wearing a
+    /// different name.
+    pub source: DecisionSource,
+}
+
+/// Where a verdict came from.
+///
+/// Carried rather than collapsed, for the same reason `ResolvedTarget` keeps
+/// its role: a downstream layer reasoning about a decision needs to know what
+/// kind of statement it is, and re-deriving that from the reason string would
+/// be parsing prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecisionSource {
+    /// No rule matched; this is the policy's default, i.e. the absence of an
+    /// opinion about this command.
+    #[default]
+    Default,
+    /// A rule matched and chose this action deliberately.
+    ExplicitRule,
+    /// A context signal raised the verdict - a production marker, a user
+    /// profile target, command substitution.
+    Context,
 }
 
 /// Every path this segment touches, resolved once: the redirect targets the
@@ -310,6 +339,10 @@ impl Policy {
         let (i, d) = worst.expect("segments nonempty");
         Decision {
             action: d.action,
+            // The compound's verdict is the worst segment's verdict, so it
+            // inherits that segment's source too - a compound denied because
+            // one segment matched a rule is still an explicit-rule decision.
+            source: d.source,
             matched_rule: d.matched_rule,
             reason: format!(
                 "segment {}/{} `{}` — {}",
@@ -408,6 +441,7 @@ impl Policy {
             (Some((_, rule, target, role)), _) if rule.action == Action::Deny => {
                 return Decision {
                     action: rule.action,
+                    source: DecisionSource::ExplicitRule,
                     matched_rule: Some(rule.label()),
                     // The role is in the sentence, not just in the type. A
                     // move that reported "overwriting .env" was correct in
@@ -442,6 +476,7 @@ impl Policy {
                 if base_sev < severity(Action::Deny) && base_sev > severity(Action::Allow) {
                     return Decision {
                         action: Action::Deny,
+                        source: DecisionSource::Context,
                         matched_rule: None,
                         reason: format!(
                             "target `{}` cannot be resolved and {} — refusing rather than \
@@ -457,6 +492,7 @@ impl Policy {
         match best {
             Some((_, rule)) => Decision {
                 action: rule.action,
+                source: DecisionSource::ExplicitRule,
                 matched_rule: Some(rule.label()),
                 reason: rule
                     .reason
@@ -466,6 +502,7 @@ impl Policy {
             None => Decision {
                 action: self.default,
                 matched_rule: None,
+                source: DecisionSource::Default,
                 reason: format!("no rule matched; policy default is `{}`", self.default),
             },
         }

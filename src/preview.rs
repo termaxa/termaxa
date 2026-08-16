@@ -14,6 +14,15 @@ pub struct Preview {
     pub lines: Vec<String>,
     /// One-line summary, embedded in the hook reason for Claude Code prompts.
     pub summary: String,
+    /// True when this command destroys something the backup engine cannot
+    /// copy aside first - either no backup covers the command, or the target
+    /// exceeds the copy budget.
+    ///
+    /// Roadmap 2.5. The preview has computed this since v0.13 and printed it
+    /// ("NOT recoverable"), but nothing could ACT on it: the strongest
+    /// unused signal in the product. Carried as a fact here so the decision
+    /// layer can amplify with it, without the preview deciding anything.
+    pub uninsurable: bool,
 }
 
 /// Generate a preview, optionally with knowledge of the project root.
@@ -109,6 +118,10 @@ fn git_push_preview(command: &str) -> Option<Preview> {
             // Case 3: nothing on the remote to compare against.
             let count = git(&["rev-list", "--count", "HEAD"])?;
             return Some(Preview {
+                // A push is insured by pinning the remote ref before it runs
+                // (`backup::plan` covers forced pushes), and a brand-new
+                // branch destroys nothing on the remote in any case.
+                uninsurable: false,
                 title: format!("push preview ({} -> new remote branch)", branch),
                 lines: vec![format!(
                     "entire branch is new to the remote: {} commit(s)",
@@ -144,6 +157,8 @@ fn git_push_preview(command: &str) -> Option<Preview> {
 
     if count == 0 && loss_count == 0 {
         return Some(Preview {
+            // Nothing to push destroys nothing.
+            uninsurable: false,
             title: format!("push preview ({} -> {})", branch, baseline),
             lines: vec!["nothing to push — remote is up to date".to_string()],
             summary: "nothing to push".to_string(),
@@ -186,6 +201,10 @@ fn git_push_preview(command: &str) -> Option<Preview> {
         summary = format!("remote LOSES {} commit(s); {}", loss_count, summary);
     }
     Some(Preview {
+        // Forced pushes are insured by pinning the remote ref before the
+        // push, which `backup::plan` does. The commits the remote would lose
+        // are recoverable from that pin.
+        uninsurable: false,
         title: format!("push preview ({} -> {})", branch, baseline),
         lines,
         summary,
@@ -238,6 +257,13 @@ fn terraform_preview(bin: &str, destroy: bool) -> Option<Preview> {
     ));
 
     Some(Preview {
+        // Roadmap 2.5. `backup::plan` pins local terraform state, so a
+        // rollback can restore the STATE FILE - it cannot restore a destroyed
+        // cloud resource. When the plan destroys nothing there is nothing to
+        // insure; when it destroys something, insurance does not reach it and
+        // saying otherwise would be the most expensive lie the tool could
+        // tell.
+        uninsurable: del > 0,
         title: format!("{} plan preview", bin),
         lines,
         summary: format!("plan: +{} ~{} -{}", add, change, del),

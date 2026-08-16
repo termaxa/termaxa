@@ -1,4 +1,4 @@
-use crate::policy::{Action, Decision};
+use crate::policy::{Action, Decision, DecisionSource};
 use std::process::Command;
 
 /// A signal the context engine noticed about the environment or the command.
@@ -73,6 +73,61 @@ pub fn gather(command: &str) -> Vec<Signal> {
 /// Escalation ladder: allow -> ask. `ask` and `deny` are never escalated further
 /// (a human is already in the loop, or it's already blocked), and context never
 /// downgrades a decision.
+/// Uninsurability AMPLIFIES an existing concern; it never creates one.
+///
+/// Roadmap 2.5. The preview has known since v0.13 whether a command destroys
+/// something the backup engine cannot copy aside first, and nothing could act
+/// on it - the strongest unused signal in the product.
+///
+/// The rule is `uninsurable + Ask -> Deny`, NOT `uninsurable -> Deny`, and the
+/// difference is the whole design. Measured on a realistic tree before writing
+/// this: `rm -rf node_modules` (9,330 files) exceeds the 5,000-file copy
+/// budget and reads as uninsurable. It is also the most routine destructive
+/// command in JavaScript work, and it destroys nothing that `npm install`
+/// cannot rebuild. A gate that denies it out of the box gets uninstalled, and
+/// the user who uninstalls it loses protection against the commands that
+/// actually matter (#48).
+///
+/// So uninsurability is a risk AMPLIFIER, not a risk signal. Something else -
+/// a policy rule, a context signal, the default - has to have already said
+/// "this is worth stopping for". Then uninsurability decides whether asking is
+/// safe, because an ask a human approves on a command with no net is a
+/// decision made without the fact that matters most.
+///
+/// This also means no regenerable-directory heuristic is needed. The existing
+/// signals establish concern; `rm -rf ~/Documents` is already Ask because it
+/// resolves to a user profile, and becomes Deny here. `rm -rf node_modules`
+/// has no other concern and keeps whatever verdict it had.
+pub fn apply_insurance(decision: Decision, uninsurable: bool) -> (Decision, bool) {
+    // The amplifier may STRENGTHEN an existing safety concern; it does not
+    // create one from an otherwise-unmatched command.
+    //
+    // `DecisionSource::Default` is the absence of an opinion, not a weak
+    // opinion, and the two are semantically different rather than different
+    // strengths of the same thing. Without this clause, a `default: ask`
+    // policy - which the starter policy is - turned every unmatched
+    // uninsurable command into a deny, including `rm -r node_modules`. That
+    // is `uninsurable -> deny` under another name, and it is the posture this
+    // design exists to avoid (#48).
+    let concerned = decision.source != DecisionSource::Default;
+    if uninsurable && concerned && decision.action == Action::Ask {
+        return (
+            Decision {
+                action: Action::Deny,
+                source: decision.source,
+                matched_rule: decision.matched_rule,
+                reason: format!(
+                    "{} — and nothing can be recovered afterwards, so this is \
+                     refused rather than asked",
+                    decision.reason
+                ),
+            },
+            true,
+        );
+    }
+    (decision, false)
+}
+
 pub fn apply(decision: Decision, signals: &[Signal]) -> (Decision, bool) {
     let should_escalate = signals.iter().any(|s| s.escalate);
     if should_escalate && decision.action == Action::Allow {
@@ -84,6 +139,10 @@ pub fn apply(decision: Decision, signals: &[Signal]) -> (Decision, bool) {
         return (
             Decision {
                 action: Action::Ask,
+                // A context signal CHOSE this ask; it is not the absence of
+                // an opinion. That distinction is what lets the insurance
+                // amplifier fire here but not on an unmatched command.
+                source: DecisionSource::Context,
                 matched_rule: decision.matched_rule,
                 reason: format!(
                     "{} — escalated to ask by context: {}",
@@ -116,6 +175,90 @@ fn current_git_branch() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dec(action: Action, source: DecisionSource) -> Decision {
+        Decision {
+            action,
+            source,
+            matched_rule: None,
+            reason: "because".into(),
+        }
+    }
+
+    /// THE PRECEDENCE, pinned in every direction so it cannot be misread.
+    ///
+    /// The amplifier may STRENGTHEN an existing safety concern; it does not
+    /// create one from an otherwise-unmatched command.
+    ///
+    /// Measured before this was written: `rm -rf node_modules` (9,330 files)
+    /// exceeds the 5,000-file copy budget and reads as uninsurable. It is
+    /// also routine, and destroys nothing `npm install` cannot rebuild. The
+    /// first draft fired on any Ask, which under a `default: ask` policy
+    /// denied it - `uninsurable -> deny` under another name (#48).
+    #[test]
+    fn uninsurability_strengthens_a_concern_and_never_invents_one() {
+        // 1. Unmatched + default Ask + uninsurable -> Ask.
+        //    `rm -r node_modules`. The default is the ABSENCE of an opinion,
+        //    not a weak one, and nothing has said this is worth stopping for.
+        let (d, esc) = apply_insurance(dec(Action::Ask, DecisionSource::Default), true);
+        assert_eq!(
+            d.action,
+            Action::Ask,
+            "an unmatched command is not a concern"
+        );
+        assert!(!esc);
+
+        // 2. Explicit Ask + uninsurable -> Deny. A rule chose to stop here;
+        //    uninsurability says asking is not safe, because a human
+        //    approving a command with no net decides without the fact that
+        //    matters most.
+        let (d, esc) = apply_insurance(dec(Action::Ask, DecisionSource::ExplicitRule), true);
+        assert_eq!(d.action, Action::Deny);
+        assert!(esc, "the escalation must be reported, not silent");
+        assert!(
+            d.reason.contains("nothing can be recovered"),
+            "{}",
+            d.reason
+        );
+
+        // 3. Context-escalated Ask + uninsurable -> Deny. `rm -rf ~/Documents`
+        //    is Ask because it resolves to a user profile - a signal, not a
+        //    shrug.
+        let (d, esc) = apply_insurance(dec(Action::Ask, DecisionSource::Context), true);
+        assert_eq!(d.action, Action::Deny);
+        assert!(esc);
+
+        // 4. Explicit Allow + uninsurable -> Allow. The escape hatch holds:
+        //    an operator who wrote the rule outranks the amplifier.
+        for src in [DecisionSource::ExplicitRule, DecisionSource::Context] {
+            let (d, esc) = apply_insurance(dec(Action::Allow, src), true);
+            assert_eq!(d.action, Action::Allow, "an explicit allow is unchanged");
+            assert!(!esc);
+        }
+
+        // 5. Existing Deny + uninsurable -> Deny, and NOT re-escalated: a
+        //    second amplification would double the reason and claim a change
+        //    that did not happen.
+        let base = dec(Action::Deny, DecisionSource::ExplicitRule);
+        let (d, esc) = apply_insurance(base.clone(), true);
+        assert_eq!(d.action, Action::Deny);
+        assert!(!esc);
+        assert_eq!(d.reason, base.reason, "an existing deny is left alone");
+
+        // CONTROL LEG: with insurance available, nothing moves at all - so a
+        // failure above is about the amplifier, not about the plumbing.
+        for src in [
+            DecisionSource::Default,
+            DecisionSource::ExplicitRule,
+            DecisionSource::Context,
+        ] {
+            for act in [Action::Allow, Action::Ask, Action::Deny] {
+                let (d, esc) = apply_insurance(dec(act, src), false);
+                assert_eq!(d.action, act, "insured commands are untouched");
+                assert!(!esc);
+            }
+        }
+    }
 
     use crate::testutil::TestEnv;
     use std::path::{Path, PathBuf};
@@ -263,6 +406,7 @@ mod tests {
     fn decision(action: Action) -> Decision {
         Decision {
             action,
+            source: DecisionSource::ExplicitRule,
             matched_rule: Some("rule".into()),
             reason: "base".into(),
         }
