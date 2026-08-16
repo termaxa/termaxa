@@ -58,6 +58,15 @@ pub struct EvalContext {
 }
 
 impl EvalContext {
+    /// Context from an explicit cwd and root, for callers that have both but
+    /// no `Paths` - the preview layer receives them separately.
+    pub fn new_for_preview(cwd: impl Into<PathBuf>, root: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            root: root.into(),
+        }
+    }
+
     /// Context for a command running at `dir`, with no distinct project root -
     /// the directory is both. Used by surfaces that evaluate without a located
     /// project, and by tests.

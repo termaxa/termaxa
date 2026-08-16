@@ -107,6 +107,32 @@ We state this because it would be very convenient to call every bypass "out of s
 - **One parser per grammar.** The policy engine and the intent classifier share `shell::split_segments`, and the backup engine and preview share `delete::command_head`. Two engines reading the same command differently has produced three separate bugs; the fix each time was to delete the duplicate rather than align it.
 - **State outside the repo:** logs and backups live in `~/.termaxa/`, so a `git reset --hard` — or an agent deleting the project folder — can't destroy your audit trail. (This is fixed as of v0.8 — earlier versions kept state in-repo.)
 - **Append-only audit:** every attempt, including blocked ones, is recorded and never overwritten.
+- **Hash-chained audit (v0.16):** each entry carries the hash of the entry before it, so an edited or removed entry is detectable. Read the next section before treating this as a security boundary.
+
+## What the audit chain does and does not prove
+
+Since v0.16 each audit entry carries the hash of the one before it. `termaxa doctor` reports what it can verify:
+
+```
+✓ chain valid: entries 3-5
+! 2 earlier entries are pre-chain
+✗ audit chain broken at entry 4
+```
+
+**In basic mode — the default, and every Windows install — the chain is tamper-EVIDENT, not tamper-RESISTANT.**
+
+The hook runs as the agent's own user, which means the audit log is written with the agent's own filesystem authority. Anything that can edit an entry can recompute the chain over it. The chain detects accidental corruption, a partial write, and an unsophisticated edit. It does not stop, and cannot detect, a process in the agent's trust domain that rewrites the record deliberately and recomputes the hashes.
+
+**This changes in supervised mode (v0.17), and the reason is privilege rather than cryptography.** There the supervisor owns the state directory, the agent's user has no access to it, and the audit log is written by an authority outside the agent's reach. The record becomes trustworthy because of who holds the pen — not because the hash got cleverer.
+
+Stated plainly, so a changelog line reading "hash-chained audit log" is not mistaken for more than it is:
+
+| mode | who writes the log | what the chain proves |
+|---|---|---|
+| basic (default, all platforms) | the agent's own user | corruption and casual edits are visible |
+| supervised (Unix, v0.17) | the supervisor, outside the agent's reach | the record is one the agent cannot rewrite |
+
+**Migration.** Entries written before v0.16 have no hash. They stay readable and are reported as pre-chain rather than as breaks: Termaxa can prove continuity from the boundary onward, and does not retroactively claim to have protected history it was not there for. A broken link names the entry and leaves the rest of the record readable, because one corrupt line making the whole log unreadable would destroy more evidence than the corruption did.
 
 ## Reporting a vulnerability
 

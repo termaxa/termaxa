@@ -63,6 +63,22 @@ pub fn plan(command: &str, cwd: &Path) -> Option<String> {
             paths.len()
         ));
     }
+    // Overwrites. `take` has insured these since v0.15 (#14) and `plan` never
+    // mentioned them, so every preview of a truncating redirect said "no
+    // backup covers this command" while the backup was in fact taken. The
+    // report and the mechanism disagreeing is the bug shape this release
+    // keeps finding; found by roadmap 2.2, which is the first caller to ask
+    // `plan` about a write.
+    let redirects: Vec<crate::shell::Overwrite> = crate::shell::split_segments(command)
+        .into_iter()
+        .flat_map(|s| s.redirects)
+        .collect();
+    if let Some(paths) = overwrite_paths(&redirects, cwd) {
+        return Some(format!(
+            "copy {} path(s) to .termaxa/backups before they are overwritten",
+            paths.len()
+        ));
+    }
     if tf_state_target(&tokens).is_some() {
         return Some(
             "copy local terraform.tfstate before apply/destroy (remote state not covered)".into(),
@@ -707,6 +723,30 @@ mod tests {
     /// `plan` filters by `exists()`, so a wrong base makes an insurable
     /// command report as uninsurable — the preview then tells a human "not
     /// reversible without a backup" about a file that WOULD be copied aside.
+    /// `plan` REPORTS what `take` will do, and for overwrites it reported
+    /// nothing while `take` insured them - since v0.15 (#14). Every preview of
+    /// a truncating redirect therefore said "no backup covers this command"
+    /// while the file was in fact being copied aside.
+    ///
+    /// Found by roadmap 2.2, the first caller to ask `plan` about a write.
+    /// The report and the mechanism must agree; a gate that understates its
+    /// own protection teaches people to distrust it.
+    #[test]
+    fn plan_reports_the_overwrite_insurance_that_take_actually_performs() {
+        let tmp = TempTree::new("plan-overwrite");
+        let dir = tmp.path();
+        std::fs::write(dir.join("config.json"), "existing\n").unwrap();
+
+        let p = plan("cat /dev/null > config.json", dir)
+            .expect("an existing file about to be overwritten is insurable");
+        assert!(p.contains("overwritten"), "{p}");
+
+        // Control legs: creating names nothing to insure, and appending does
+        // not destroy what is already there.
+        assert!(plan("echo hi > brand-new.txt", dir).is_none());
+        assert!(plan("echo hi >> config.json", dir).is_none());
+    }
+
     #[test]
     fn plan_reports_insurance_against_the_payload_cwd() {
         let tmp = TempTree::new("plan-cwd");

@@ -25,10 +25,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format check
         run: cargo fmt --all -- --check
-      # Advisory on first push; flip to `-D warnings` once it passes green.
-      # (Developed in an environment without clippy; rustc build is warning-clean.)
+      # Blocking since v0.16. It was advisory "until it passes green", and it
+      # has now passed green on three platforms across ten merges - but the
+      # reason to flip it is sharper than that: clippy VERSIONS DIFFER between
+      # a developer machine and CI, and an advisory warning is only caught if
+      # someone reads the scrollback. A `format_in_format_args` lint fired on
+      # Windows clippy 1.96 and not on the newer toolchain the change was
+      # written against; it reached a pushed branch because nothing failed.
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all
       - name: Build release

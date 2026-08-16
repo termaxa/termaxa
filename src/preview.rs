@@ -66,9 +66,109 @@ pub fn generate(
     // Compound commands: preview the first segment that has one.
     let segments = crate::shell::split_segments(command);
     if segments.len() > 1 {
-        return segments.iter().find_map(|s| generate_one(s, cwd, live));
+        if let Some(p) = segments.iter().find_map(|s| generate_one(s, cwd, live)) {
+            return Some(p);
+        }
+        // No per-command preview, but a segment may still overwrite something.
+        return overwrite_preview(command, root, cwd);
     }
-    generate_one(command, cwd, live)
+    generate_one(command, cwd, live).or_else(|| overwrite_preview(command, root, cwd))
+}
+
+/// What a command is about to write over.
+///
+/// Roadmap 2.2. Deletes have had a blast-radius preview since v0.13; writes
+/// had nothing. `cat /dev/null > config.json` destroys a file just as
+/// thoroughly as `rm config.json`, and the human approving it saw a bare
+/// verdict with no title, no lines, and no word about insurance.
+///
+/// Reports only what an existing file loses. A write that CREATES a file
+/// destroys nothing, and a preview that announced it would be noise on
+/// ordinary work - the same judgement `backup` makes when it declines to
+/// insure a path that is not there yet (#48).
+///
+/// Uses the roles from 2.1, so a command's SOURCES are not reported as at
+/// risk: `cp .env backup.txt` reads `.env` and writes `backup.txt`, and only
+/// the second is losing anything.
+fn overwrite_preview(
+    command: &str,
+    root: Option<&std::path::Path>,
+    cwd: &std::path::Path,
+) -> Option<Preview> {
+    let ctx = match root {
+        Some(r) => crate::resolve::EvalContext::new_for_preview(cwd, r),
+        None => crate::resolve::EvalContext::at(cwd),
+    };
+
+    let mut lines = Vec::new();
+    let mut summary_parts = Vec::new();
+    let mut uninsurable = false;
+
+    for t in crate::resolve::command_targets(command, &ctx) {
+        if t.role != crate::resolve::TargetRole::Destination {
+            continue;
+        }
+        let Some(path) = &t.resolved else {
+            // An unresolved destination is already reported by the shape
+            // machinery in policy; repeating it here would say the same thing
+            // twice in one prompt.
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue; // creating, not overwriting
+        };
+        if meta.is_dir() {
+            continue; // a directory destination is where files land, not what is lost
+        }
+
+        let bytes = meta.len();
+        lines.push(format!("  target      : {}", path.display()));
+        lines.push(format!(
+            "  loses       : {} of existing content",
+            fmt_bytes(bytes)
+        ));
+        for s in &t.shapes {
+            lines.push(format!("  ⚠ {}", s.label()));
+        }
+
+        match crate::backup::plan(command, cwd) {
+            Some(plan) => lines.push(format!("  insurance   : {} (automatic on run/hook)", plan)),
+            None => {
+                lines
+                    .push("  ✗ insurance : no backup covers this command — NOT recoverable".into());
+                uninsurable = true;
+            }
+        }
+        summary_parts.push(format!(
+            "{} loses {}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string()),
+            fmt_bytes(bytes)
+        ));
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+    Some(Preview {
+        title: "overwrite impact".into(),
+        lines,
+        summary: summary_parts.join("; "),
+        uninsurable,
+    })
+}
+
+/// Bytes in the shape a human reads at a glance. Deliberately coarse: the
+/// decision is "is this a lot", not "exactly how much".
+fn fmt_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    }
 }
 
 fn generate_one(command: &str, cwd: &std::path::Path, live: bool) -> Option<Preview> {
@@ -749,6 +849,62 @@ mod terraform_stub_tests {
 #[cfg(test)]
 mod live_gate_tests {
     use super::*;
+
+    /// Roadmap 2.2. Deletes have had a blast-radius preview since v0.13;
+    /// writes had none. `cat /dev/null > config.json` destroys a file as
+    /// thoroughly as `rm config.json` and showed the human a bare verdict.
+    #[test]
+    fn an_overwrite_reports_what_the_file_loses() {
+        let t = crate::testutil::TempTree::new("ov-preview");
+        let dir = t.path();
+        std::fs::write(dir.join("config.json"), "some existing content\n").unwrap();
+
+        let pv = generate("cat /dev/null > config.json", None, dir, false)
+            .expect("an overwrite of an existing file has a preview");
+        assert_eq!(pv.title, "overwrite impact");
+        let body = pv.lines.join("\n");
+        assert!(body.contains("config.json"), "{body}");
+        assert!(body.contains("loses"), "{body}");
+        // And the insurance line agrees with what `backup::take` will do -
+        // `plan` had no overwrite branch, so every preview of a write used to
+        // say "NOT recoverable" while the backup was in fact taken.
+        assert!(
+            body.contains("insurance   :"),
+            "an insured overwrite must not read as uninsured: {body}"
+        );
+        assert!(!pv.uninsurable, "this write IS insured");
+    }
+
+    /// Creating a file destroys nothing. A preview announcing it would be
+    /// noise on ordinary work, which is how a gate gets ignored (#48).
+    #[test]
+    fn creating_a_file_has_nothing_to_preview() {
+        let t = crate::testutil::TempTree::new("ov-create");
+        let dir = t.path();
+        assert!(
+            generate("echo hi > brand-new.txt", None, dir, false).is_none(),
+            "a write that creates has no blast radius"
+        );
+    }
+
+    /// The roles from 2.1 carry through: a command's SOURCE is not losing
+    /// anything, and reporting it would be the same false positive the path
+    /// rules had (PR #27).
+    #[test]
+    fn a_source_is_not_reported_as_losing_content() {
+        let t = crate::testutil::TempTree::new("ov-roles");
+        let dir = t.path();
+        std::fs::write(dir.join("src.txt"), "source content\n").unwrap();
+        std::fs::write(dir.join("dst.txt"), "destination content\n").unwrap();
+
+        let pv = generate("cp src.txt dst.txt", None, dir, false).expect("a preview");
+        let body = pv.lines.join("\n");
+        assert!(body.contains("dst.txt"), "the destination loses: {body}");
+        assert!(
+            !body.contains("src.txt"),
+            "the source is only read and must not appear as at risk: {body}"
+        );
+    }
 
     /// Schipper review, finding 4, confirmed with a stub `terraform` on PATH:
     /// a DENIED `terraform destroy` still caused `terraform plan -destroy` to
