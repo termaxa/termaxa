@@ -238,6 +238,14 @@ pub fn is_flag(head: &str, token: &str) -> bool {
         // two-character token (`/s`, `/q`) or an attribute selector
         // (`/a:h`). Anything longer is a path.
         "del" | "rd" | "rmdir" => token.starts_with('-') || is_cmd_switch(token),
+        // cmd-family copy/move: /Y /D /Z are switches, same shape rule and
+        // the same reason it must be a SHAPE rule - `copy /Y a b` on a Unix
+        // box would otherwise keep `/Y` and lose nothing, but `cp /etc/x y`
+        // must keep `/etc/x`. Added in v0.16 when the target extractor
+        // reported `/Y` as a file: harmless for `copy /Y a b`, but
+        // `copy /Y .env` then read `.env` as the DESTINATION, denying a
+        // command that only copies from it.
+        "copy" | "move" | "xcopy" | "robocopy" => token.starts_with('-') || is_cmd_switch(token),
         _ => token.starts_with('-'),
     }
 }

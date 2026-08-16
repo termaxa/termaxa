@@ -361,7 +361,7 @@ impl Policy {
         // A `match_path` rule fires if ANY target matches, and the reason
         // names which one: a command with several targets is one command, and
         // the human approving it needs to know which path tripped the gate.
-        let mut path_hit: Option<(usize, &Rule, String)> = None;
+        let mut path_hit: Option<(usize, &Rule, String, crate::resolve::TargetRole)> = None;
         for (idx, rule) in self.rules.iter().enumerate() {
             if rule.match_path.is_none() {
                 continue;
@@ -382,13 +382,13 @@ impl Policy {
                 if rule.matches_path(&p.display().to_string()) {
                     let better = match &path_hit {
                         None => true,
-                        Some((bi, br, _)) => {
+                        Some((bi, br, _, _)) => {
                             severity(rule.action) > severity(br.action)
                                 || (severity(rule.action) == severity(br.action) && idx < *bi)
                         }
                     };
                     if better {
-                        path_hit = Some((idx, rule, t.display()));
+                        path_hit = Some((idx, rule, t.display(), t.role));
                     }
                     break;
                 }
@@ -405,13 +405,21 @@ impl Policy {
             .find(|t| t.is_unresolved() && !t.shapes.is_empty());
 
         match (path_hit, shape_deny) {
-            (Some((_, rule, target)), _) if rule.action == Action::Deny => {
+            (Some((_, rule, target, role)), _) if rule.action == Action::Deny => {
                 return Decision {
                     action: rule.action,
                     matched_rule: Some(rule.label()),
+                    // The role is in the sentence, not just in the type. A
+                    // move that reported "overwriting .env" was correct in
+                    // its verdict and wrong in its explanation: `mv` does not
+                    // overwrite the source, it REMOVES it. The rule's reason
+                    // is written for one case; the role says which case this
+                    // actually is, and a human approving a prompt should not
+                    // have to know that the two can differ.
                     reason: format!(
-                        "target `{}` — {}",
+                        "target `{}` ({}) — {}",
                         target,
+                        role.effect(),
                         rule.reason.clone().unwrap_or_else(|| format!(
                             "matched path rule `{}`",
                             rule.match_path.clone().unwrap_or_default()
@@ -1361,6 +1369,37 @@ mod combined_gate_tests {
                 .any(|r| r.r#match.is_none() && r.match_path.is_some()),
             "the starter policy should exercise the path-only shape it ships"
         );
+    }
+
+    /// The reason line names the ROLE, because the verdict and the
+    /// explanation were diverging: `mv .env dst` denied with "Overwriting
+    /// .env destroys credentials", and `mv` does not overwrite `.env` - it
+    /// REMOVES it. The rule's reason text is written for one case; the role
+    /// says which case this actually is. A human approving a prompt should
+    /// not have to know those can differ.
+    #[test]
+    fn the_reason_names_what_the_command_does_to_the_target() {
+        let p = Policy::builtin().unwrap();
+
+        let moved = p.evaluate_command("mv .env /tmp/archive/", &here());
+        assert_eq!(moved.action, Action::Deny);
+        assert!(
+            moved.reason.contains("(removed)"),
+            "a move removes its source, and the sentence should say so: {}",
+            moved.reason
+        );
+
+        let written = p.evaluate_command("cp backup.txt .env", &here());
+        assert_eq!(written.action, Action::Deny);
+        assert!(
+            written.reason.contains("(written)"),
+            "a copy writes its destination: {}",
+            written.reason
+        );
+
+        // Both still name the target itself - the role is an addition, not a
+        // replacement.
+        assert!(moved.reason.contains(".env") && written.reason.contains(".env"));
     }
 
     /// Roadmap 2.1: a path rule fires on roles that CHANGE a file, not on

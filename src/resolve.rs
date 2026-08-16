@@ -156,6 +156,18 @@ impl TargetRole {
     /// Does this role mean something existing is at risk? `Source` is the
     /// only one that is not, which is why an extractor that reports every
     /// path-looking argument produces false positives on reads.
+    /// What this command does to the path, phrased to sit inside a reason
+    /// line: "target `x` (removed) — ...". Only destructive roles ever reach
+    /// a reason line, so Source has no natural phrasing here and says what it
+    /// is rather than inventing one.
+    pub fn effect(self) -> &'static str {
+        match self {
+            TargetRole::Source => "read",
+            TargetRole::Destination => "written",
+            TargetRole::Removed => "removed",
+        }
+    }
+
     pub fn is_destructive(self) -> bool {
         matches!(self, TargetRole::Destination | TargetRole::Removed)
     }
@@ -243,8 +255,8 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
         };
         let args = &tokens[at + 1..];
         match head.as_str() {
-            "cp" | "copy" => out.extend(copy_move_targets(args, TargetRole::Source)),
-            "mv" | "move" => out.extend(copy_move_targets(args, TargetRole::Removed)),
+            "cp" | "copy" => out.extend(copy_move_targets(&head, args, TargetRole::Source)),
+            "mv" | "move" => out.extend(copy_move_targets(&head, args, TargetRole::Removed)),
             "tee" => out.extend(tee_targets(args)),
             "dd" => out.extend(dd_targets(args)),
             _ => {}
@@ -270,7 +282,11 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
 /// `-S`/`--suffix` consume the next token; everything else starting with `-`
 /// is a boolean. Getting this wrong makes a flag's VALUE read as a path, so
 /// the list is short and explicit rather than clever.
-fn copy_move_targets(args: &[String], source_role: TargetRole) -> Vec<(String, TargetRole)> {
+fn copy_move_targets(
+    head: &str,
+    args: &[String],
+    source_role: TargetRole,
+) -> Vec<(String, TargetRole)> {
     let mut operands: Vec<String> = Vec::new();
     let mut explicit_dir: Option<String> = None;
     let mut i = 0;
@@ -283,8 +299,11 @@ fn copy_move_targets(args: &[String], source_role: TargetRole) -> Vec<(String, T
             i += 1;
         } else if a == "-S" || a == "--suffix" {
             i += 1; // consumes its value, which is not a path
-        } else if a.starts_with('-') && a.len() > 1 {
-            // boolean flag
+        } else if crate::delete::is_flag(head, a) && a.len() > 1 {
+            // A boolean switch in this command's own syntax: `-r` for cp,
+            // `/Y` for copy. Asked of `delete::is_flag` rather than answered
+            // here, so the two modules cannot come to disagree about what a
+            // switch looks like (#37).
         } else {
             operands.push(a.clone());
         }
@@ -522,6 +541,57 @@ mod tests {
                 ("b".into(), TargetRole::Destination),
             ],
             "-S consumes .bak, which must not read as an operand"
+        );
+    }
+
+    /// cmd.exe switches are switches, not files. Measured before the fix:
+    /// `copy /Y backup.txt .env` reported `/Y` as a Source, and worse,
+    /// `copy /Y .env` reported `.env` as the DESTINATION - `/Y` filled the
+    /// source slot, so a command that only copies FROM .env would have
+    /// denied as if it wrote to it.
+    ///
+    /// Answered by `delete::is_flag`, which already decides this per command
+    /// and per shell, rather than by a second rule here (#37).
+    #[test]
+    fn a_cmd_switch_is_not_an_operand() {
+        assert_eq!(
+            roles("copy /Y backup.txt .env"),
+            vec![
+                (".env".into(), TargetRole::Destination),
+                ("backup.txt".into(), TargetRole::Source),
+            ]
+        );
+        assert_eq!(
+            roles("move /Y a b"),
+            vec![
+                ("a".into(), TargetRole::Removed),
+                ("b".into(), TargetRole::Destination),
+            ]
+        );
+        // One real operand names no destination, switches notwithstanding.
+        assert!(
+            roles("copy /Y .env").is_empty(),
+            "a switch must not fill the source slot and promote .env"
+        );
+        assert_eq!(
+            roles("copy /Y /Z a b"),
+            vec![
+                ("a".into(), TargetRole::Source),
+                ("b".into(), TargetRole::Destination),
+            ]
+        );
+
+        // CONTROL LEG, and the reason the rule matches SHAPE rather than a
+        // leading slash: on Unix an absolute path starts with one too, and
+        // losing it would be a silent under-report on the platform where
+        // `/etc` matters most.
+        assert_eq!(
+            roles("cp /etc/hosts backup"),
+            vec![
+                ("/etc/hosts".into(), TargetRole::Source),
+                ("backup".into(), TargetRole::Destination),
+            ],
+            "an absolute path is not a switch"
         );
     }
 
