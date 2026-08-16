@@ -14,6 +14,7 @@ mod policy;
 mod preview;
 mod protect;
 mod report;
+mod resolve;
 mod runner;
 mod shell;
 #[cfg(test)]
