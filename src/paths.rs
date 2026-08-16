@@ -79,7 +79,11 @@ pub fn resolve_readonly(start: &std::path::Path) -> Result<Paths> {
 }
 
 /// `$TERMAXA_HOME` (tests, custom setups) or `~/.termaxa`.
-fn home_base() -> Result<PathBuf> {
+///
+/// Public since v0.16: `supervise` needs the same answer for the socket path,
+/// and a second copy of the TERMAXA_HOME-then-HOME logic is exactly how two
+/// readers of one question start disagreeing (#37).
+pub fn home_base() -> Result<PathBuf> {
     if let Ok(custom) = std::env::var("TERMAXA_HOME") {
         if !custom.trim().is_empty() {
             return Ok(PathBuf::from(custom));

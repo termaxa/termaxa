@@ -80,9 +80,26 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
             print!("Proceed? [y/N] ");
             io::stdout().flush()?;
             let mut line = String::new();
-            io::stdin().read_line(&mut line)?;
-            let yes = matches!(line.trim().to_lowercase().as_str(), "y" | "yes");
-            if yes {
+            let read = io::stdin().read_line(&mut line)?;
+
+            // NO ONE TO ASK is not the same as a refusal, and saying
+            // "declined" when nobody declined is a lie the user cannot debug.
+            // `read_line` returns Ok(0) on a closed or non-interactive stdin -
+            // which is exactly what a `wrap` shim hands us, since the agent
+            // is not a person at a terminal.
+            //
+            // The verdict is unchanged: an `ask` nobody can answer must not
+            // run. Falling through to the y/N match would already have
+            // declined, by accident of an empty string failing to equal "y";
+            // this makes it a decision with a message that fits (#48 - a gate
+            // whose refusals are unexplainable gets uninstalled).
+            if read == 0 {
+                eprintln!(
+                    "termaxa: this needs a human and stdin is not interactive — \
+                     refused rather than run unasked."
+                );
+                (Some(false), None)
+            } else if matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
                 insure(&mut backup_id);
                 let code = execute(argv)?;
                 (Some(true), Some(code))

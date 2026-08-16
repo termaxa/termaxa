@@ -169,6 +169,48 @@ pub fn run(dir: &Path) -> Result<i32> {
         }
     }
 
+    // ---- 4b. Mode ----
+    println!();
+    println!("{}", bold("Mode"));
+    {
+        // Same answer `supervise` uses for the socket path, from the same
+        // function - so doctor cannot report a mode the hook does not see.
+        let home = crate::paths::home_base().unwrap_or_default();
+        match crate::supervise::detect(&home) {
+            crate::supervise::Mode::Basic => {
+                println!(
+                    "{} {:<13}{}",
+                    green("✓"),
+                    "basic",
+                    dim("everything runs as you; protection is cooperative")
+                );
+                if cfg!(windows) {
+                    println!(
+                        "  {}",
+                        dim("supervised mode is Unix-only — basic mode is the Windows answer")
+                    );
+                }
+            }
+            crate::supervise::Mode::Supervised => {
+                // Detected means the socket EXISTS. Whether it answers is a
+                // different question, and reporting "supervised" for a dead
+                // socket would tell an operator they have a boundary they do
+                // not have.
+                println!(
+                    "{} {:<13}{}",
+                    amber("!"),
+                    "supervised",
+                    dim("socket present — the daemon is v0.17; this hook denies until it answers")
+                );
+                problems.push(
+                    "a supervise socket exists but no daemon is shipped yet — remove it \
+                     or hooks will deny"
+                        .into(),
+                );
+            }
+        }
+    }
+
     // ---- 5. State ----
     println!();
     println!("{}", bold("State"));

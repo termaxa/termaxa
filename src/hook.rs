@@ -598,6 +598,32 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // ---- supervised mode (v0.16 groundwork, v0.17 daemon) ----
+    //
+    // Detected from the filesystem: the socket is either there or it is not.
+    // When it IS there, this hook is inside the agent's trust domain and has
+    // no authority of its own - it forwards the payload and prints what comes
+    // back. Until the daemon ships there is nothing to forward TO, so the
+    // reachability check is the whole of it, and it fails CLOSED.
+    //
+    // That direction is the permanent answer to Cursor 3.11: four releases of
+    // silent fail-open, because a gate that loses its brain and carries on is
+    // worse than one that stops. An operator who configured supervision gets
+    // a refusal with a reason, not a decision made by the wrong process.
+    let termaxa_home = crate::paths::home_base().unwrap_or_default();
+    if crate::supervise::detect(&termaxa_home) == crate::supervise::Mode::Supervised {
+        let err = crate::supervise::SuperviseError::Unreachable;
+        let reason = format!("[termaxa] {}", err.reason());
+        println!("{}", render_response(input.dialect, "deny", &reason));
+        // Same belt-and-suspenders exit as any other deny: stdout JSON
+        // delivery is finicky on Windows, so the block also lands as a
+        // non-zero code. Flushed first, for the same reason the other site
+        // flushes.
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        std::process::exit(2);
+    }
+
     let policy = Policy::load(&paths.policy_file())?;
 
     // The payload's cwd is where the command runs; the project root comes

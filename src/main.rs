@@ -17,9 +17,11 @@ mod report;
 mod resolve;
 mod runner;
 mod shell;
+mod supervise;
 #[cfg(test)]
 mod testutil;
 mod ui;
+mod wrap;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -65,6 +67,12 @@ enum Cmd {
     Hook,
     /// Execute a command through the policy gate: termaxa run -- git push
     Run {
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
+    /// Launch an agent with every shelled command routed through the gate:
+    /// termaxa wrap -- claude   (Unix only in v0.16)
+    Wrap {
         #[arg(last = true)]
         argv: Vec<String>,
     },
@@ -298,6 +306,16 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Cmd::Run { argv } => {
             let p = paths::resolve()?;
             runner::run(&p, &argv)
+        }
+        Cmd::Wrap { argv } => {
+            let p = paths::resolve()?;
+            // The shims live under the Termaxa HOME, not the project state
+            // dir: one agent launch may touch several projects, and a shim
+            // that moved with the cwd would be a different `sh` per
+            // directory. Same accessor the hook and doctor use.
+            let _ = &p;
+            let home = paths::home_base()?;
+            wrap::run(&argv, &home)
         }
         Cmd::Log {
             n,
