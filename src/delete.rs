@@ -368,6 +368,13 @@ pub fn is_delete_command(head: &str) -> bool {
 /// Minimal tokenizer that respects single and double quotes. We cannot reuse
 /// the policy normalizer here: it lowercases, and paths are case-sensitive on
 /// every platform that matters for a delete.
+/// Tokenizer shared with the target extractor, which needs the same splitting
+/// the delete extractor uses so the two cannot disagree about where a
+/// command's arguments begin.
+pub fn tokenize_public(s: &str) -> Vec<String> {
+    tokenize(s)
+}
+
 fn tokenize(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();

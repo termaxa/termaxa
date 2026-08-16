@@ -207,14 +207,7 @@ fn resolved_targets(
     segment: &str,
     ctx: &crate::resolve::EvalContext,
 ) -> Vec<crate::resolve::ResolvedTarget> {
-    let mut raw: Vec<String> = Vec::new();
-    for seg in crate::shell::split_segments(segment) {
-        raw.extend(seg.redirects.iter().map(|o| o.target.clone()));
-    }
-    raw.extend(crate::delete::extract_targets(segment));
-    raw.sort();
-    raw.dedup();
-    raw.iter().map(|r| crate::resolve::target(r, ctx)).collect()
+    crate::resolve::command_targets(segment, ctx)
 }
 
 impl Policy {
@@ -374,6 +367,17 @@ impl Policy {
                 continue;
             }
             for t in &targets {
+                // A path rule protects a file from being CHANGED, so it looks
+                // only at roles that change one. `cp .env backup.txt` reads
+                // .env and leaves it exactly as it was; denying that is the
+                // same false positive the `*.env*` string pattern produced,
+                // arriving through a new door (PR #27). `mv .env dst` DOES
+                // fire, because a move removes its source - which is the
+                // whole reason the extractor reports roles rather than a
+                // flat list of paths.
+                if !t.role.is_destructive() {
+                    continue;
+                }
                 let Some(p) = &t.resolved else { continue };
                 if rule.matches_path(&p.display().to_string()) {
                     let better = match &path_hit {
@@ -1278,7 +1282,7 @@ mod combined_gate_tests {
         // — it simply loses the tournament. Asserting this separately is what
         // makes the test about PRECEDENCE rather than about the resolver
         // having failed to notice.
-        let t = crate::resolve::target("$CONFIG", &here());
+        let t = crate::resolve::target("$CONFIG", crate::resolve::TargetRole::Destination, &here());
         assert!(t.is_unresolved());
         assert!(t.has(crate::resolve::SensitiveShape::UnexpandedVar));
 
@@ -1357,6 +1361,45 @@ mod combined_gate_tests {
                 .any(|r| r.r#match.is_none() && r.match_path.is_some()),
             "the starter policy should exercise the path-only shape it ships"
         );
+    }
+
+    /// Roadmap 2.1: a path rule fires on roles that CHANGE a file, not on
+    /// every path a command mentions.
+    ///
+    /// Extracting `cp`/`mv`/`tee`/`dd` targets reopened the source-side false
+    /// positive from a new direction: `cp .env backup.txt` names `.env`, but
+    /// only reads it. Measured before the guard, all four of these denied.
+    ///
+    /// `mv` is the case the roles exist for. Its source is REMOVED, not read,
+    /// so `mv .env /tmp/archive/` must still deny - a move is a delete of
+    /// where the file used to be, and reporting only the destination would
+    /// miss the destruction entirely.
+    #[test]
+    fn a_path_rule_fires_on_what_changes_a_file_not_on_what_reads_it() {
+        let p = Policy::builtin().unwrap();
+
+        // Destructive roles: the file is written over, or leaves its place.
+        for cmd in [
+            "cp backup.txt .env",
+            "tee .env",
+            "dd if=/dev/zero of=.env",
+            "mv .env /tmp/archive/",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd, &here()).action,
+                Action::Deny,
+                "{cmd}: this changes the protected file"
+            );
+        }
+
+        // Read-only roles: the file is exactly as it was afterwards.
+        for cmd in ["cp .env backup.txt", "dd if=.env of=copy.txt"] {
+            assert_ne!(
+                p.evaluate_command(cmd, &here()).action,
+                Action::Deny,
+                "{cmd}: reading the protected file changes nothing"
+            );
+        }
     }
 
     /// REGRESSION, v0.16: the shipped `.env` rule denied ordinary READS.

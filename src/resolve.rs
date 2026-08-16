@@ -126,9 +126,46 @@ impl SensitiveShape {
     }
 }
 
+/// How a command uses a path.
+///
+/// Roadmap 2.1. The role is the extractor's whole job beyond finding the
+/// path: `cp normal.txt .env` and `mv .env /tmp/foo` both name `.env`, and
+/// only one of them destroys it. Collapsing them into an undifferentiated
+/// "target" is what made the first `.env` rule fire on a command's SOURCE.
+///
+/// THREE roles, not two, because Source means different things across the
+/// commands that have one. `cp`'s source is read and survives; `mv`'s source
+/// is gone afterwards. A downstream layer reasoning by role alone must be
+/// able to tell those apart without re-deriving which command produced them -
+/// otherwise the command grammar leaks back into the policy layer, which is
+/// what this extractor exists to absorb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TargetRole {
+    /// Read, and still there afterwards. `cp SRC dst`, `dd if=SRC`.
+    Source,
+    /// Written to, and whatever was there may be gone. `cp src DST`,
+    /// `tee DST`, `dd of=DST`, and every truncating redirect.
+    Destination,
+    /// Destroyed in place. `rm TARGET`, and `mv SRC dst` - a move is a delete
+    /// of its source, which is the case that would go missing if `mv` only
+    /// reported where the file lands.
+    Removed,
+}
+
+impl TargetRole {
+    /// Does this role mean something existing is at risk? `Source` is the
+    /// only one that is not, which is why an extractor that reports every
+    /// path-looking argument produces false positives on reads.
+    pub fn is_destructive(self) -> bool {
+        matches!(self, TargetRole::Destination | TargetRole::Removed)
+    }
+}
+
 /// One target of a command, in both readings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedTarget {
+    /// How the command uses this path.
+    pub role: TargetRole,
     /// Exactly what appeared in the command, quotes stripped. Never empty.
     pub as_written: String,
     /// The lexically resolved path, or `None` when resolution could not be
@@ -165,11 +202,145 @@ impl ResolvedTarget {
     }
 }
 
+/// Every path a segment touches, with the role the command gives it.
+///
+/// Roadmap 2.1. Four sources, each parsed by its own grammar rather than by
+/// "anything that looks like a path":
+///
+///   redirects   destination   (the splitter already found them)
+///   rm & co.    removed       (`delete::extract_targets`)
+///   cp / mv     per grammar   (operands before the destination are sources;
+///                              `mv`'s are REMOVED, `cp`'s survive)
+///   tee / dd    destination   (every operand; `of=` respectively)
+///
+/// The grammar matters. `cp a b dir/` has three operands and one
+/// destination, so a rule that took "the last path-looking argument and
+/// called the rest targets" would report `b` as at risk when it is only
+/// read. That is the same mistake as matching a path rule against a
+/// command's source, which shipped once already.
+pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> {
+    let mut out: Vec<(String, TargetRole)> = Vec::new();
+
+    // Redirects: the unified scanner already extracted them, with truncation
+    // decided there. An append still names a destination - it does not
+    // truncate, but the path is still one the command writes.
+    for seg in crate::shell::split_segments(segment) {
+        for o in &seg.redirects {
+            out.push((o.target.clone(), TargetRole::Destination));
+        }
+    }
+
+    // Deletes: destroyed in place, which is what Removed means.
+    for t in crate::delete::extract_targets(segment) {
+        out.push((t, TargetRole::Removed));
+    }
+
+    // Per-command grammars.
+    for seg in crate::shell::split_segments(segment) {
+        let tokens = crate::delete::tokenize_public(&seg);
+        let Some((head, at)) = crate::delete::resolve_head(&tokens) else {
+            continue;
+        };
+        let args = &tokens[at + 1..];
+        match head.as_str() {
+            "cp" | "copy" => out.extend(copy_move_targets(args, TargetRole::Source)),
+            "mv" | "move" => out.extend(copy_move_targets(args, TargetRole::Removed)),
+            "tee" => out.extend(tee_targets(args)),
+            "dd" => out.extend(dd_targets(args)),
+            _ => {}
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out.into_iter()
+        .map(|(raw, role)| target(&raw, role, ctx))
+        .collect()
+}
+
+/// `cp`/`mv` grammar: operands are sources except the last, which is the
+/// destination — unless `-t DIR` / `--target-directory=DIR` names the
+/// destination explicitly, in which case EVERY operand is a source.
+///
+/// `source_role` is what this command does to its sources: `cp` reads them,
+/// `mv` removes them. That single parameter is the whole difference between
+/// the two grammars, which is why they share an implementation.
+///
+/// HAND-WALKED value-taking flags (#56). `-t`/`--target-directory` and
+/// `-S`/`--suffix` consume the next token; everything else starting with `-`
+/// is a boolean. Getting this wrong makes a flag's VALUE read as a path, so
+/// the list is short and explicit rather than clever.
+fn copy_move_targets(args: &[String], source_role: TargetRole) -> Vec<(String, TargetRole)> {
+    let mut operands: Vec<String> = Vec::new();
+    let mut explicit_dir: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(rest) = a.strip_prefix("--target-directory=") {
+            explicit_dir = Some(rest.to_string());
+        } else if a == "-t" || a == "--target-directory" {
+            explicit_dir = args.get(i + 1).cloned();
+            i += 1;
+        } else if a == "-S" || a == "--suffix" {
+            i += 1; // consumes its value, which is not a path
+        } else if a.starts_with('-') && a.len() > 1 {
+            // boolean flag
+        } else {
+            operands.push(a.clone());
+        }
+        i += 1;
+    }
+
+    let mut out = Vec::new();
+    match explicit_dir {
+        // -t DIR: the destination is named, so every operand is a source.
+        Some(dir) => {
+            out.push((dir, TargetRole::Destination));
+            out.extend(operands.into_iter().map(|o| (o, source_role)));
+        }
+        None => {
+            // Fewer than two operands names no destination: `cp x` is an
+            // error, and reporting `x` as a destination would be a guess.
+            if operands.len() >= 2 {
+                let dest = operands.pop().expect("len >= 2");
+                out.push((dest, TargetRole::Destination));
+                out.extend(operands.into_iter().map(|o| (o, source_role)));
+            }
+        }
+    }
+    out
+}
+
+/// `tee` grammar: every operand is a file it writes. `-a` appends rather than
+/// truncating, which changes how much is destroyed but not that the path is a
+/// destination — the same call the redirect scanner makes for `>>`.
+fn tee_targets(args: &[String]) -> Vec<(String, TargetRole)> {
+    args.iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(|a| (a.clone(), TargetRole::Destination))
+        .collect()
+}
+
+/// `dd` grammar: `key=value` operands, so the roles are named rather than
+/// positional. `of=` is written, `if=` is read. Everything else (`bs=`,
+/// `count=`, `status=`) is not a path.
+fn dd_targets(args: &[String]) -> Vec<(String, TargetRole)> {
+    let mut out = Vec::new();
+    for a in args {
+        if let Some(v) = a.strip_prefix("of=") {
+            out.push((v.to_string(), TargetRole::Destination));
+        } else if let Some(v) = a.strip_prefix("if=") {
+            out.push((v.to_string(), TargetRole::Source));
+        }
+    }
+    out
+}
+
 /// Resolve one target against the command's cwd and the project root.
 ///
 /// `root` is the project directory, used only to answer the outside-root
 /// question. Pass `cwd` for both when there is no distinct root to speak of.
-pub fn target(raw: &str, ctx: &EvalContext) -> ResolvedTarget {
+pub fn target(raw: &str, role: TargetRole, ctx: &EvalContext) -> ResolvedTarget {
     let as_written = raw.trim().trim_matches('"').trim_matches('\'').to_string();
     let mut shapes = Vec::new();
 
@@ -180,6 +351,7 @@ pub fn target(raw: &str, ctx: &EvalContext) -> ResolvedTarget {
         // path that points nowhere true. A confident wrong answer is worse
         // than an admitted unknown in a tool that reports blast radius.
         return ResolvedTarget {
+            role,
             as_written,
             resolved: None,
             shapes,
@@ -204,6 +376,7 @@ pub fn target(raw: &str, ctx: &EvalContext) -> ResolvedTarget {
     }
 
     ResolvedTarget {
+        role,
         as_written,
         resolved: Some(resolved),
         shapes,
@@ -249,11 +422,158 @@ mod tests {
     use super::*;
     use crate::testutil::TempTree;
 
+    fn roles(cmd: &str) -> Vec<(String, TargetRole)> {
+        let ctx = EvalContext::at(std::path::Path::new("/tmp/proj"));
+        let mut v: Vec<(String, TargetRole)> = command_targets(cmd, &ctx)
+            .into_iter()
+            .map(|t| (t.as_written, t.role))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Roadmap 2.1. The role is the point: `cp` reads its sources and `mv`
+    /// destroys them, and a layer downstream must be able to tell those apart
+    /// without knowing which command produced the list.
+    #[test]
+    fn cp_reads_its_sources_and_mv_removes_them() {
+        assert_eq!(
+            roles("cp normal.txt .env"),
+            vec![
+                (".env".into(), TargetRole::Destination),
+                ("normal.txt".into(), TargetRole::Source),
+            ],
+            "a copy's source survives - it must not read as at-risk"
+        );
+        assert_eq!(
+            roles("mv .env /tmp/foo"),
+            vec![
+                (".env".into(), TargetRole::Removed),
+                ("/tmp/foo".into(), TargetRole::Destination),
+            ],
+            "a move destroys its source, which is the case that goes missing \
+             if only the destination is reported"
+        );
+    }
+
+    /// The grammar is parsed, not guessed. `cp a b c dir/` has three sources
+    /// and one destination; taking "the last path-looking argument and
+    /// calling the rest targets" would report `b` as at risk when it is only
+    /// read - the same mistake as matching a path rule against a source.
+    #[test]
+    fn the_final_operand_is_the_destination_and_the_rest_are_not() {
+        assert_eq!(
+            roles("cp a b c dir/"),
+            vec![
+                ("a".into(), TargetRole::Source),
+                ("b".into(), TargetRole::Source),
+                ("c".into(), TargetRole::Source),
+                ("dir/".into(), TargetRole::Destination),
+            ]
+        );
+        assert_eq!(
+            roles("mv a b c dir/"),
+            vec![
+                ("a".into(), TargetRole::Removed),
+                ("b".into(), TargetRole::Removed),
+                ("c".into(), TargetRole::Removed),
+                ("dir/".into(), TargetRole::Destination),
+            ]
+        );
+        // One operand names no destination. `cp x` is an error; reporting `x`
+        // as a destination would be inventing a fact.
+        assert!(roles("cp x").is_empty());
+    }
+
+    /// `-t DIR` names the destination, so EVERY operand is a source. Without
+    /// this the last operand would be taken as the destination and the real
+    /// one missed entirely - and with a single operand (`mv -t dir/ .env`)
+    /// the whole command would report nothing.
+    #[test]
+    fn an_explicit_target_directory_inverts_the_grammar() {
+        assert_eq!(
+            roles("cp -t dir/ a b"),
+            vec![
+                ("a".into(), TargetRole::Source),
+                ("b".into(), TargetRole::Source),
+                ("dir/".into(), TargetRole::Destination),
+            ]
+        );
+        assert_eq!(
+            roles("cp --target-directory=dir/ a b"),
+            vec![
+                ("a".into(), TargetRole::Source),
+                ("b".into(), TargetRole::Source),
+                ("dir/".into(), TargetRole::Destination),
+            ]
+        );
+        assert_eq!(
+            roles("mv -t dir/ .env"),
+            vec![
+                (".env".into(), TargetRole::Removed),
+                ("dir/".into(), TargetRole::Destination),
+            ]
+        );
+        // A value-taking flag's VALUE is not a path.
+        assert_eq!(
+            roles("cp -S .bak a b"),
+            vec![
+                ("a".into(), TargetRole::Source),
+                ("b".into(), TargetRole::Destination),
+            ],
+            "-S consumes .bak, which must not read as an operand"
+        );
+    }
+
+    /// `tee` writes every operand; `dd` names its roles rather than
+    /// positioning them.
+    #[test]
+    fn tee_writes_every_operand_and_dd_names_its_roles() {
+        assert_eq!(
+            roles("tee a.log b.log"),
+            vec![
+                ("a.log".into(), TargetRole::Destination),
+                ("b.log".into(), TargetRole::Destination),
+            ]
+        );
+        // -a appends rather than truncating, but the path is still written.
+        assert_eq!(
+            roles("tee -a log.txt"),
+            vec![("log.txt".into(), TargetRole::Destination)]
+        );
+        assert_eq!(
+            roles("dd if=/dev/zero of=.env"),
+            vec![
+                (".env".into(), TargetRole::Destination),
+                ("/dev/zero".into(), TargetRole::Source),
+            ]
+        );
+        // Non-path operands are not paths.
+        assert_eq!(
+            roles("dd of=x bs=1M count=10"),
+            vec![("x".into(), TargetRole::Destination)]
+        );
+    }
+
+    /// Redirects and deletes keep answering, and now answer in the same
+    /// vocabulary: a delete REMOVES, a redirect writes a DESTINATION.
+    #[test]
+    fn redirects_and_deletes_speak_the_same_vocabulary() {
+        assert_eq!(
+            roles("cat /dev/null > out.txt"),
+            vec![("out.txt".into(), TargetRole::Destination)]
+        );
+        assert_eq!(
+            roles("rm -rf ./dist"),
+            vec![("./dist".into(), TargetRole::Removed)]
+        );
+    }
+
     #[test]
     fn a_plain_relative_target_resolves_against_the_given_cwd_and_is_ordinary() {
         let t = TempTree::new("resolve-plain");
         let root = t.path();
-        let r = target("./dist", &EvalContext::at(root));
+        let r = target("./dist", TargetRole::Destination, &EvalContext::at(root));
         assert_eq!(r.as_written, "./dist");
         assert_eq!(r.resolved, Some(root.join("dist")));
         assert!(!r.is_unresolved());
@@ -264,7 +584,11 @@ mod tests {
     fn the_two_readings_are_both_kept() {
         let t = TempTree::new("resolve-readings");
         let root = t.path();
-        let r = target("./sub/../dist", &EvalContext::at(root));
+        let r = target(
+            "./sub/../dist",
+            TargetRole::Destination,
+            &EvalContext::at(root),
+        );
         // as_written survives resolution: a reason line quotes what was typed.
         assert_eq!(r.as_written, "./sub/../dist");
         assert_eq!(r.resolved, Some(root.join("dist")));
@@ -275,7 +599,7 @@ mod tests {
         let t = TempTree::new("resolve-var");
         let root = t.path();
         for raw in ["$HOME/.ssh", "${HOME}/.ssh", "%USERPROFILE%\\.ssh", "$X"] {
-            let r = target(raw, &EvalContext::at(root));
+            let r = target(raw, TargetRole::Destination, &EvalContext::at(root));
             assert!(r.is_unresolved(), "{raw} must not resolve");
             assert!(r.has(SensitiveShape::UnexpandedVar), "{raw}");
             // The gate admits it does not know, rather than inventing a path.
@@ -291,7 +615,7 @@ mod tests {
         // Command substitution is fenced upstream; counting it here would
         // report the same fact twice under the wrong name.
         for raw in ["$(date).log", "cost$.txt", "100%", "50%-done"] {
-            let r = target(raw, &EvalContext::at(root));
+            let r = target(raw, TargetRole::Destination, &EvalContext::at(root));
             assert!(
                 !r.has(SensitiveShape::UnexpandedVar),
                 "{raw} is not a variable reference"
@@ -304,10 +628,14 @@ mod tests {
         let t = TempTree::new("resolve-outside");
         let root = t.path().join("project");
         std::fs::create_dir_all(&root).unwrap();
-        let r = target("../elsewhere", &EvalContext::at(&root));
+        let r = target(
+            "../elsewhere",
+            TargetRole::Destination,
+            &EvalContext::at(&root),
+        );
         assert!(r.has(SensitiveShape::OutsideRoot));
         // Control leg: inside the project, the shape is absent.
-        let inside = target("./src", &EvalContext::at(&root));
+        let inside = target("./src", TargetRole::Destination, &EvalContext::at(&root));
         assert!(!inside.has(SensitiveShape::OutsideRoot));
     }
 
@@ -315,13 +643,21 @@ mod tests {
     fn the_gates_own_files_are_recognised_through_protect() {
         let t = TempTree::new("resolve-protected");
         let root = t.path();
-        let r = target(".termaxa/policy.yaml", &EvalContext::at(root));
+        let r = target(
+            ".termaxa/policy.yaml",
+            TargetRole::Destination,
+            &EvalContext::at(root),
+        );
         assert!(
             r.has(SensitiveShape::ProtectedName),
             "the command path and the write path must agree on what is protected"
         );
         // Control leg: an ordinary project file is not protected.
-        let ordinary = target("src/main.rs", &EvalContext::at(root));
+        let ordinary = target(
+            "src/main.rs",
+            TargetRole::Destination,
+            &EvalContext::at(root),
+        );
         assert!(!ordinary.has(SensitiveShape::ProtectedName));
     }
 
@@ -332,7 +668,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         // A .termaxa path outside the project is BOTH outside and protected;
         // reporting only the first found would lose half the reason.
-        let r = target("../other/.termaxa/policy.yaml", &EvalContext::at(&root));
+        let r = target(
+            "../other/.termaxa/policy.yaml",
+            TargetRole::Destination,
+            &EvalContext::at(&root),
+        );
         assert!(r.has(SensitiveShape::OutsideRoot), "{:?}", r.shapes);
         assert!(r.has(SensitiveShape::ProtectedName), "{:?}", r.shapes);
     }
