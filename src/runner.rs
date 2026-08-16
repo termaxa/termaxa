@@ -121,6 +121,9 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         cwd: std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
+        // Filled by `append`, which links each entry to the one before it.
+        prev: None,
+        hash: None,
     })?;
 
     Ok(exit_code.unwrap_or(1))

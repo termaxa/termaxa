@@ -199,6 +199,54 @@ pub fn run(dir: &Path) -> Result<i32> {
                         dim("set TERMAXA_HOOK_DEBUG=1 and check what arrives")
                     );
                 }
+                // ---- chain (v0.16, #13) ----
+                //
+                // Two states reported separately, because they are different
+                // claims. "Continuity from the boundary onward" is provable;
+                // "we protected the history before that" is not, and an
+                // upgrade should not pretend otherwise.
+                if let Ok(chain) =
+                    crate::audit::AuditLog::new(&p.state_dir).and_then(|l| l.verify_chain())
+                {
+                    if chain.verified > 0 && chain.is_intact() {
+                        let first = chain.pre_chain + 1;
+                        let last = chain.pre_chain + chain.verified;
+                        println!(
+                            "  {} {}",
+                            green("✓"),
+                            dim(&format!("chain valid: entries {first}–{last}"))
+                        );
+                    }
+                    if chain.pre_chain > 0 {
+                        println!(
+                            "  {} {}",
+                            amber("!"),
+                            dim(&format!(
+                                "{} earlier entries are pre-chain",
+                                chain.pre_chain
+                            ))
+                        );
+                    }
+                    if !chain.is_intact() {
+                        let which = chain
+                            .breaks
+                            .iter()
+                            .map(|b| b.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let plural = if chain.breaks.len() == 1 { "y" } else { "ies" };
+                        println!(
+                            "  {} audit chain broken at entr{} {}",
+                            red("✗"),
+                            plural,
+                            which
+                        );
+                        problems.push(
+                            "the audit chain does not verify — an entry was edited or removed"
+                                .into(),
+                        );
+                    }
+                }
             } else {
                 println!("  {}", dim("no audit log yet — nothing has been evaluated"));
             }

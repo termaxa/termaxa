@@ -276,6 +276,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 cwd: std::env::current_dir()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
+                // Filled by `append`, which links each entry to the one before it.
+                prev: None,
+                hash: None,
             })?;
 
             // Exit codes make `termaxa check` scriptable: 0 allow, 3 ask, 4 deny.

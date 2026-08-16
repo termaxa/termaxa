@@ -557,6 +557,8 @@ mod tests {
             approved: None,
             exit_code: None,
             cwd: "/work/proj".into(),
+            prev: None,
+            hash: None,
         }
     }
 

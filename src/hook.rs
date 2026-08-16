@@ -374,6 +374,10 @@ fn gate_file_write(w: &FileWrite) {
                 approved: None,
                 exit_code: None,
                 cwd: w.cwd.clone(),
+                // Filled by `append`, which links each entry to the one
+                // before it.
+                prev: None,
+                hash: None,
             });
         }
         if let Ok(policy) = Policy::load(&paths.policy_file()) {
@@ -523,6 +527,10 @@ pub fn run() -> Result<()> {
                     approved: Some(true),
                     exit_code: None,
                     cwd: input.cwd.clone(),
+                    // Filled by `append`, which links each entry to the one
+                    // before it.
+                    prev: None,
+                    hash: None,
                 });
             }
         }
@@ -706,6 +714,10 @@ pub fn run() -> Result<()> {
                 approved: None,
                 exit_code: None,
                 cwd: input.cwd.clone(),
+                // Filled by `append`, which links each entry to the one
+                // before it.
+                prev: None,
+                hash: None,
             });
         }
     }
