@@ -23,9 +23,21 @@ impl fmt::Display for Action {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
-    /// Wildcard pattern matched against the normalized command string.
+    /// Wildcard pattern matched against the normalized command STRING.
     /// `*` matches any run of characters. First matching rule wins.
-    pub r#match: String,
+    ///
+    /// Optional since v0.16, because a rule that matches on resolved paths
+    /// should not have to carry a string pattern it does not mean. Forcing
+    /// one produced a live over-blocking bug: the shipped `.env` path rule
+    /// carried `match: "*.env*"` purely to satisfy the schema, and that
+    /// pattern fired on its own - `cat .env`, `grep KEY .env`,
+    /// `git diff .env` and even `vim .env.sample` were all DENIED. Reading a
+    /// file is ordinary work, and a gate that denies ordinary work gets
+    /// uninstalled (#48).
+    ///
+    /// See `validate` for the invariant that replaced "always present".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#match: Option<String>,
     pub action: Action,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -73,24 +85,61 @@ impl Rule {
     /// with `case_sensitive: true` is matched as written against the
     /// case-preserved reading, so `git branch*-D*` can mean `-D` and not
     /// `-d`. The field decides; the spelling never does.
-    /// Does this rule's `match_path` pattern match a resolved target? Uses the
-    /// same wildcard engine as `match`, so `*/.ssh/*` reads the way a person
-    /// writing a policy expects. The structural questions - is it outside the
-    /// project, is it a user profile - are NOT patterns; they are shapes
-    /// computed once during resolution and handled separately.
+    /// Does this rule's `match_path` pattern match a resolved target?
+    ///
+    /// Matched COMPONENT BY COMPONENT, not as a string glob. `*/.env` means
+    /// "a path whose last component is `.env`", and it matches
+    /// `/tmp/proj/.env`, `C:\\proj\\.env` and a bare `.env` alike.
+    ///
+    /// This is deliberately NOT `wildcard_match` over the path string, which
+    /// is what the first draft did and which was wrong three ways at once:
+    /// `*/.env` missed a target that resolved to a bare `.env` (no separator
+    /// to match), missed `C:\\proj\\.env` (backslashes are not `/`), and
+    /// would have matched `prod.env` if the pattern were loosened to `*.env`
+    /// to compensate. A path is a sequence of components, and a glob over its
+    /// printed form is still string thinking - the exact confusion this whole
+    /// change exists to end.
+    ///
+    /// Splitting reuses `protect::segments`, so the command path and the
+    /// write path cannot come to disagree about what a component is (#37).
+    /// Each component is matched with the same wildcard engine, so
+    /// `*/node_modules/*` and `*/.ssh/id_*` read as expected.
+    ///
+    /// A leading `*` component means "at any depth", so `*/.env` matches
+    /// `.env` at the root as well as nested. Without that, a policy author
+    /// would have to write two rules for one file.
     pub fn matches_path(&self, path: &str) -> bool {
-        match &self.match_path {
-            None => false,
-            Some(p) if self.case_sensitive => wildcard_match(&collapse(p), path),
-            Some(p) => wildcard_match(&normalize(p), &normalize(path)),
+        let Some(pattern) = &self.match_path else {
+            return false;
+        };
+        let pat: Vec<String> = crate::protect::segments(pattern);
+        let seg: Vec<String> = crate::protect::segments(path);
+        match_components(&pat, &seg)
+    }
+
+    /// Does this rule's STRING pattern match a reading? A rule with no
+    /// `match:` matches no string - it speaks only about paths, and saying
+    /// otherwise is how the over-blocking bug happened.
+    pub fn matches(&self, reading: &str) -> bool {
+        let Some(pattern) = &self.r#match else {
+            return false;
+        };
+        if self.case_sensitive {
+            wildcard_match(&collapse(pattern), reading)
+        } else {
+            wildcard_match(&normalize(pattern), reading)
         }
     }
 
-    pub fn matches(&self, reading: &str) -> bool {
-        if self.case_sensitive {
-            wildcard_match(&collapse(&self.r#match), reading)
-        } else {
-            wildcard_match(&normalize(&self.r#match), reading)
+    /// How this rule is named in reason lines and audit entries. A rule
+    /// always has at least one matcher (see `Policy::validate`), so there is
+    /// always something to name.
+    pub fn label(&self) -> String {
+        match (&self.r#match, &self.match_path) {
+            (Some(m), _) => m.clone(),
+            (None, Some(p)) => format!("path:{p}"),
+            // Unreachable: validation rejects a rule with neither.
+            (None, None) => "<no matcher>".to_string(),
         }
     }
 }
@@ -174,7 +223,41 @@ impl Policy {
             .with_context(|| format!("cannot read policy file {}", path.display()))?;
         let policy: Policy = serde_yaml::from_str(&raw)
             .with_context(|| format!("invalid policy YAML in {}", path.display()))?;
+        policy
+            .validate()
+            .with_context(|| format!("invalid policy in {}", path.display()))?;
         Ok(policy)
+    }
+
+    /// THE MATCHER INVARIANT: a rule must carry at least one matcher, and
+    /// neither is individually mandatory.
+    ///
+    ///     match: "git rm *"                        valid
+    ///     match_path: "*/.ssh/*"                   valid
+    ///     match: "git *" + match_path: "*/.ssh/*"  valid, both apply
+    ///     neither                                  INVALID
+    ///
+    /// This replaces "`match` is always present", which was enforced by the
+    /// type system and was the wrong rule: it forced path rules to invent a
+    /// string pattern, and an invented pattern still fires. A rule with no
+    /// matcher at all would silently never fire, which is worse than a parse
+    /// error - a policy author would believe they were protected.
+    ///
+    /// Checked at both parse entry points rather than at evaluation, so an
+    /// unfirable rule cannot reach a decision.
+    pub fn validate(&self) -> Result<()> {
+        for (i, rule) in self.rules.iter().enumerate() {
+            if rule.r#match.is_none() && rule.match_path.is_none() {
+                anyhow::bail!(
+                    "rule {} has neither `match:` nor `match_path:` - a rule with no \
+                     matcher can never fire, so it is a policy that says nothing while \
+                     looking like it says something (action: {:?})",
+                    i + 1,
+                    rule.action
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The built-in starter policy, parsed from the embedded template that
@@ -182,8 +265,12 @@ impl Policy {
     /// exists, so evaluation works with zero setup. Read-only surfaces only —
     /// `run` and `hook` require an explicit project policy (decision #19).
     pub fn builtin() -> Result<Self> {
-        serde_yaml::from_str(crate::init::STARTER_POLICY)
-            .context("failed to parse built-in starter policy")
+        let policy: Policy = serde_yaml::from_str(crate::init::STARTER_POLICY)
+            .context("failed to parse built-in starter policy")?;
+        policy
+            .validate()
+            .context("built-in starter policy violates the matcher invariant")?;
+        Ok(policy)
     }
 
     /// Walk up from `start` looking for `.termaxa/policy.yaml`.
@@ -317,7 +404,7 @@ impl Policy {
             (Some((_, rule, target)), _) if rule.action == Action::Deny => {
                 return Decision {
                     action: rule.action,
-                    matched_rule: Some(rule.r#match.clone()),
+                    matched_rule: Some(rule.label()),
                     reason: format!(
                         "target `{}` — {}",
                         target,
@@ -358,11 +445,11 @@ impl Policy {
         match best {
             Some((_, rule)) => Decision {
                 action: rule.action,
-                matched_rule: Some(rule.r#match.clone()),
+                matched_rule: Some(rule.label()),
                 reason: rule
                     .reason
                     .clone()
-                    .unwrap_or_else(|| format!("matched rule `{}`", rule.r#match)),
+                    .unwrap_or_else(|| format!("matched rule `{}`", rule.label())),
             },
             None => Decision {
                 action: self.default,
@@ -428,6 +515,28 @@ pub fn normalize(s: &str) -> String {
 
 /// Iterative wildcard match where `*` matches any (possibly empty) run of chars.
 /// Case-sensitive. Linear-ish, no recursion, no regex dependency.
+/// Match a component pattern against a component path.
+///
+/// `*` as a WHOLE component means "any run of components, including none" -
+/// the `**` of most glob languages, spelled `*` because a path rule is always
+/// about paths and the two-star distinction buys nothing here. A `*` INSIDE a
+/// component (`id_*`, `*.log`) matches within that component only, and never
+/// across a separator.
+fn match_components(pat: &[String], seg: &[String]) -> bool {
+    match pat.split_first() {
+        // Pattern exhausted: matches only if the path is too.
+        None => seg.is_empty(),
+        Some((head, rest)) if head == "*" => {
+            // Try consuming zero, one, two ... components here.
+            (0..=seg.len()).any(|skip| match_components(rest, &seg[skip..]))
+        }
+        Some((head, rest)) => match seg.split_first() {
+            None => false,
+            Some((s, srest)) => wildcard_match(head, s) && match_components(rest, srest),
+        },
+    }
+}
+
 pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
@@ -489,7 +598,7 @@ mod schema_and_severity_tests {
     #[test]
     fn case_sensitivity_is_written_out_only_when_it_was_asked_for() {
         let plain = Rule {
-            r#match: "ls*".into(),
+            r#match: Some("ls*".into()),
             action: Action::Allow,
             reason: None,
             case_sensitive: false,
@@ -502,7 +611,7 @@ mod schema_and_severity_tests {
         );
 
         let strict = Rule {
-            r#match: "git branch -D*".into(),
+            r#match: Some("git branch -D*".into()),
             action: Action::Deny,
             reason: None,
             case_sensitive: true,
@@ -670,7 +779,7 @@ mod tests {
     #[test]
     fn a_case_sensitive_rule_means_the_case_it_spells() {
         let rule = Rule {
-            r#match: "git branch*-D*".into(),
+            r#match: Some("git branch*-D*".into()),
             action: Action::Deny,
             reason: None,
             case_sensitive: true,
@@ -711,11 +820,11 @@ mod tests {
             );
         }
         // And the starter policy opts in exactly once, on purpose.
-        let cs: Vec<&str> = p
+        let cs: Vec<String> = p
             .rules
             .iter()
             .filter(|r| r.case_sensitive)
-            .map(|r| r.r#match.as_str())
+            .map(|r| r.label())
             .collect();
         assert_eq!(
             cs,
@@ -963,12 +1072,12 @@ rules:
         let idx_self = p
             .rules
             .iter()
-            .position(|r| r.r#match == "*.termaxa*")
+            .position(|r| r.label() == "*.termaxa*")
             .expect("self-defence rule must exist");
         let idx_echo = p
             .rules
             .iter()
-            .position(|r| r.r#match == "echo *")
+            .position(|r| r.label() == "echo *")
             .expect("echo rule must exist");
         assert!(
             idx_self < idx_echo,
@@ -1050,7 +1159,7 @@ rules:
         let idx = |pat: &str| {
             p.rules
                 .iter()
-                .position(|r| r.r#match == pat)
+                .position(|r| r.label() == pat)
                 .unwrap_or_else(|| panic!("rule `{pat}` must exist"))
         };
         assert!(
@@ -1201,6 +1310,162 @@ mod combined_gate_tests {
             "if this starts finding targets, an extractor was added and this \
              test should be narrowed rather than deleted"
         );
+    }
+
+    /// THE MATCHER INVARIANT: at least one matcher, neither individually
+    /// mandatory. Enforced at parse time, because a rule with no matcher can
+    /// never fire - it is a policy that says nothing while looking like it
+    /// says something, which is worse than a parse error.
+    #[test]
+    fn a_rule_needs_at_least_one_matcher() {
+        let ok = [
+            "rules:\n  - match: \"git rm *\"\n    action: deny\n",
+            "rules:\n  - match_path: \"*/.ssh/*\"\n    action: deny\n",
+            "rules:\n  - match: \"git *\"\n    match_path: \"*/.ssh/*\"\n    action: deny\n",
+        ];
+        for y in ok {
+            let p: Policy = serde_yaml::from_str(y).expect("parses");
+            assert!(p.validate().is_ok(), "should be valid:\n{y}");
+        }
+
+        let neither = "rules:\n  - action: deny\n    reason: \"says nothing\"\n";
+        let p: Policy = serde_yaml::from_str(neither).expect("parses as YAML");
+        let err = p.validate().expect_err("a rule with no matcher is invalid");
+        assert!(
+            err.to_string().contains("neither"),
+            "the error must say what is missing: {err}"
+        );
+    }
+
+    /// The shipped policy obeys its own invariant, and `builtin()` enforces
+    /// it rather than trusting the file - the starter policy is the one most
+    /// likely to grow a rule by hand.
+    #[test]
+    fn the_starter_policy_obeys_the_matcher_invariant() {
+        let p = Policy::builtin().expect("builtin parses and validates");
+        for (i, r) in p.rules.iter().enumerate() {
+            assert!(
+                r.r#match.is_some() || r.match_path.is_some(),
+                "rule {i} has no matcher"
+            );
+        }
+        // And at least one rule now uses match_path WITHOUT a string pattern,
+        // which is the shape the schema change exists to allow.
+        assert!(
+            p.rules
+                .iter()
+                .any(|r| r.r#match.is_none() && r.match_path.is_some()),
+            "the starter policy should exercise the path-only shape it ships"
+        );
+    }
+
+    /// REGRESSION, v0.16: the shipped `.env` rule denied ordinary READS.
+    ///
+    /// The rule carried `match: "*.env*"` purely because the schema demanded
+    /// a string pattern, and that pattern fired on its own - a whole-string
+    /// substring match on `.env` anywhere in the command. `cat .env`,
+    /// `grep KEY .env`, `git diff .env`, `ls -la .env`, `cat
+    /// prod.env.example` were all DENIED. Reading a file destroys nothing,
+    /// and a gate that denies ordinary work gets uninstalled (#48).
+    ///
+    /// Both sides are pinned deliberately: a path rule that stops denying
+    /// writes is a hole, and one that starts denying reads is the bug this
+    /// test exists for.
+    #[test]
+    fn the_env_rule_denies_writes_and_leaves_reads_alone() {
+        let p = Policy::builtin().unwrap();
+
+        // Writes to the protected file, every spelling of one path.
+        for cmd in [
+            "cat /dev/null > .env",
+            "cat /dev/null > ./.env",
+            "cat /dev/null > ./sub/../.env",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd, &here()).action,
+                Action::Deny,
+                "{cmd}: one file, every spelling"
+            );
+        }
+
+        // Reads are ordinary work and stay out of the way.
+        for cmd in [
+            "cat .env",
+            "grep KEY .env",
+            "git diff .env",
+            "ls -la .env",
+            "cat prod.env.example",
+        ] {
+            assert_ne!(
+                p.evaluate_command(cmd, &here()).action,
+                Action::Deny,
+                "{cmd}: reading a file destroys nothing"
+            );
+        }
+
+        // The source-side spelling must not trip the path rule: the resolved
+        // TARGET here is config/prod.env, which is not `.env`. Before the
+        // fix, the `*.env*` string pattern matched this on the source alone.
+        let d = p.evaluate_command("cp new.env config/prod.env", &here());
+        assert_ne!(
+            d.action,
+            Action::Deny,
+            "a .env source is not a .env target: {}",
+            d.reason
+        );
+    }
+
+    /// Path patterns are matched COMPONENT BY COMPONENT, not as string globs
+    /// over the printed path. The first draft used `wildcard_match` on the
+    /// whole string and was wrong three ways: `*/.env` missed a bare `.env`
+    /// (no separator), missed `C:\proj\.env` (backslash is not `/`), and
+    /// loosening it to `*.env` would have caught `prod.env` as collateral.
+    #[test]
+    fn a_path_pattern_matches_components_not_strings() {
+        let r = Rule {
+            r#match: None,
+            action: Action::Deny,
+            reason: None,
+            case_sensitive: false,
+            match_path: Some("*/.env".into()),
+        };
+        for hit in [
+            "/tmp/proj/.env",
+            "C:\\proj\\.env",
+            ".env",
+            "./.env",
+            "/a/b/c/.env",
+        ] {
+            assert!(r.matches_path(hit), "{hit} names the protected file");
+        }
+        // Control legs - a component pattern does not match a substring of a
+        // component, which is the whole difference from a string glob.
+        for miss in [
+            "/tmp/proj/prod.env",
+            "/tmp/proj/.env.sample",
+            "/tmp/proj/.envrc",
+            "/tmp/.env/keep.txt",
+        ] {
+            assert!(!r.matches_path(miss), "{miss} is a different file");
+        }
+    }
+
+    /// A `*` component means "at any depth", so one rule covers a file
+    /// wherever it sits, and a `*` inside a component stays inside it.
+    #[test]
+    fn a_star_component_spans_depth_and_a_star_inside_one_does_not() {
+        let deep = Rule {
+            r#match: None,
+            action: Action::Deny,
+            reason: None,
+            case_sensitive: false,
+            match_path: Some("*/.ssh/id_*".into()),
+        };
+        assert!(deep.matches_path("/home/u/.ssh/id_rsa"));
+        assert!(deep.matches_path("/home/u/.ssh/id_ed25519"));
+        assert!(!deep.matches_path("/home/u/.ssh/known_hosts"));
+        // `id_*` must not reach across a separator into the next component.
+        assert!(!deep.matches_path("/home/u/.ssh/id_dir/inner"));
     }
 
     /// GAP CLOSED, v0.16 — the INVERSION of the pinned known-gap test, not a

@@ -76,7 +76,7 @@ pub fn classify(cwd: &str, path: &str) -> Option<Protected> {
 /// where getting it wrong is silent; leaving it in means `.termaxa/../x` is
 /// refused as if it were inside. That is an over-refusal, and an over-refusal
 /// is loud.
-fn segments(path: &str) -> Vec<String> {
+pub(crate) fn segments(path: &str) -> Vec<String> {
     path.split(['/', '\\'])
         .filter(|s| !s.is_empty() && *s != ".")
         .map(|s| s.to_ascii_lowercase())

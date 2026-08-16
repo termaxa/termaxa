@@ -94,8 +94,11 @@ rules:
   - match: "*>.env*"
     action: deny
     reason: "Overwriting .env destroys credentials that are not in the repo."
-  - match: "*.env*"
-    match_path: "*/.env"
+  # No `match:` on purpose. This rule speaks about a PATH, and giving it a
+  # string pattern to satisfy the schema is what broke it the first time:
+  # `match: "*.env*"` fired on its own and denied `cat .env`, `grep KEY .env`,
+  # `git diff .env`, even `vim .env.sample`. Reading a file is ordinary work.
+  - match_path: "*/.env"
     action: deny
     reason: "Overwriting .env destroys credentials that are not in the repo."
   - match: "*> /etc/*"
@@ -706,8 +709,8 @@ mod tests {
             .iter()
             .filter(|r| r.action == crate::policy::Action::Ask)
         {
-            if !recovery.iter().any(|(m, _)| *m == rule.r#match) {
-                unjustified.push(rule.r#match.clone());
+            if !recovery.iter().any(|(m, _)| *m == rule.label()) {
+                unjustified.push(rule.label());
             }
         }
 
@@ -787,12 +790,19 @@ mod tests {
             if r.action != crate::policy::Action::Allow {
                 continue;
             }
+            // Only STRING patterns can be unanchored in the sense this test
+            // means. A path rule matches resolved targets, so `*` in it is a
+            // path glob, not a command prefix, and it cannot shadow a deny by
+            // swallowing a neighbouring command.
+            let Some(pattern) = &r.r#match else {
+                continue;
+            };
             assert!(
-                !r.r#match.starts_with('*') && r.r#match.contains(".termaxa"),
+                !pattern.starts_with('*') && pattern.contains(".termaxa"),
                 "rule {i} `{}` is an unanchored allow sitting above a deny — \
                  it can shadow the rule below it and can never be audited by \
                  reading the denies alone",
-                r.r#match
+                pattern
             );
         }
     }

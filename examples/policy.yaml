@@ -88,8 +88,11 @@ rules:
   - match: "*>.env*"
     action: deny
     reason: "Overwriting .env destroys credentials that are not in the repo."
-  - match: "*.env*"
-    match_path: "*/.env"
+  # No `match:` on purpose. This rule speaks about a PATH, and giving it a
+  # string pattern to satisfy the schema is what broke it the first time:
+  # `match: "*.env*"` fired on its own and denied `cat .env`, `grep KEY .env`,
+  # `git diff .env`, even `vim .env.sample`. Reading a file is ordinary work.
+  - match_path: "*/.env"
     action: deny
     reason: "Overwriting .env destroys credentials that are not in the repo."
   - match: "*> /etc/*"
