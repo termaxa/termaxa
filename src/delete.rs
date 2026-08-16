@@ -1092,7 +1092,23 @@ mod tests {
 
     #[test]
     fn the_as_written_line_appears_only_when_resolution_changed_something() {
-        let tmp = TempTree::new("del-written");
+        // TestEnv, not TempTree: the `~` leg below reads HOME/USERPROFILE
+        // through `home_dir()`, and `HomeGuard` (used by two tests in this
+        // module) removes USERPROFILE and rewrites HOME process-globally.
+        // Reading ambient env without the lock those writers hold is a race:
+        // when it lost, `~` did not expand and the target became
+        // `<cwd>/~/some-home-target`. Green on three CI runners as a pull
+        // request, red on windows-latest for the identical commit as a push -
+        // scheduling, not code.
+        //
+        // HOME is then set explicitly rather than trusted, so the assertion
+        // depends on a value this test controls instead of on whatever the
+        // machine happens to export. #18: the isolated way is the only way.
+        let env = TestEnv::new("del-written");
+        let home = env.root().join("home");
+        std::fs::create_dir_all(&home).expect("home must be creatable");
+        let _guard = HomeGuard::set(Some(&home));
+        let tmp = TempTree::new("del-written-tree");
         let dir = tmp.dir("target");
 
         // An absolute path resolves to itself, and echoing it back twice is
