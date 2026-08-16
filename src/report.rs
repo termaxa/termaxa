@@ -544,6 +544,8 @@ mod tests {
             ts_ms: 0,
             ts: "2026-01-01T00:00:00Z".into(),
             source: "hook".into(),
+            actor: None,
+            decided_by: None,
             command: command.into(),
             decision: decision.into(),
             matched_rule: None,

@@ -226,6 +226,19 @@ pub enum DecisionSource {
     Context,
 }
 
+impl DecisionSource {
+    /// Stable name for the audit record. Same wire-format caution as
+    /// `Dialect::actor`: these strings are written to disk and a reader
+    /// comparing across versions depends on them not moving.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecisionSource::Default => "default",
+            DecisionSource::ExplicitRule => "rule",
+            DecisionSource::Context => "context",
+        }
+    }
+}
+
 /// Every path this segment touches, resolved once: the redirect targets the
 /// splitter already found, plus whatever the delete extractor recognises.
 ///

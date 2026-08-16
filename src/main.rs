@@ -261,6 +261,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 ts_ms,
                 ts,
                 source: "check".into(),
+                // `check` is the human asking, not an agent acting.
+                actor: None,
+                decided_by: Some(decision.source.as_str().to_string()),
                 command: cmd.clone(),
                 decision: decision.action.to_string(),
                 matched_rule: decision.matched_rule.clone(),

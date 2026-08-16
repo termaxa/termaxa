@@ -106,6 +106,10 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         ts_ms,
         ts,
         source: "run".into(),
+        // `run` is the human's own surface: no agent harness produced it, so
+        // naming one would be false provenance.
+        actor: None,
+        decided_by: Some(decision.source.as_str().to_string()),
         command,
         decision: decision.action.to_string(),
         matched_rule: decision.matched_rule,

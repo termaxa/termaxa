@@ -63,6 +63,20 @@ fn normalize_uri_path(p: &str) -> String {
     p.to_string()
 }
 
+impl Dialect {
+    /// Stable name for the audit record. Written to disk, so it is a wire
+    /// format: changing one of these strings rewrites what past entries mean,
+    /// and a reader comparing across versions would silently miscount.
+    pub fn actor(self) -> &'static str {
+        match self {
+            Dialect::ClaudeCode => "claude-code",
+            Dialect::Cursor => "cursor",
+            Dialect::Codex => "codex",
+            Dialect::Copilot => "copilot",
+        }
+    }
+}
+
 pub fn parse_input(raw: &str) -> Option<ParsedHook> {
     // Cursor (and some Windows shells) prepend a UTF-8 BOM; strip it or the
     // JSON parse fails on the leading bytes.
@@ -361,6 +375,14 @@ fn gate_file_write(w: &FileWrite) {
                 ts_ms,
                 ts,
                 source: "hook".into(),
+                actor: Some(w.dialect.actor().to_string()),
+                // A protected-path refusal is the write matcher's own rule,
+                // not the policy's - an explicit decision either way.
+                decided_by: Some(
+                    crate::policy::DecisionSource::ExplicitRule
+                        .as_str()
+                        .to_string(),
+                ),
                 command: subject.clone(),
                 decision: "deny".into(),
                 matched_rule: Some(protected.what.to_string()),
@@ -513,6 +535,10 @@ pub fn run() -> Result<()> {
                     ts_ms,
                     ts,
                     source: "post".into(),
+                    actor: Some(input.dialect.actor().to_string()),
+                    // A receipt records that a command RAN. Nothing decided
+                    // anything here, and naming a decider would invent one.
+                    decided_by: None,
                     command: command.clone(),
                     decision: "executed".into(),
                     matched_rule: None,
@@ -701,6 +727,8 @@ pub fn run() -> Result<()> {
                 ts_ms,
                 ts,
                 source: "hook".into(),
+                actor: Some(input.dialect.actor().to_string()),
+                decided_by: Some(decision.source.as_str().to_string()),
                 command: command.clone(),
                 decision: decision.action.to_string(),
                 matched_rule: decision.matched_rule.clone(),

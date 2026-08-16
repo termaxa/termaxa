@@ -44,6 +44,39 @@ pub struct AuditEntry {
     pub exit_code: Option<i32>,
     pub cwd: String,
 
+    // ---- provenance (v0.16, roadmap 2.6) ----
+    //
+    // Serde-defaulted, so pre-v0.16 lines parse as None (decision #7).
+    /// Which agent harness produced this event: claude-code, cursor, codex,
+    /// copilot. Absent for `run` and `check`, which are the human's own
+    /// surfaces and have no harness to name.
+    ///
+    /// The hook has always known this - it picks the response format from it -
+    /// and threw it away. With two harnesses active in one project the audit
+    /// could not say which caused an entry.
+    ///
+    /// NOT the OS user. In basic mode the hook runs as the agent's own UID, so
+    /// recording it would record the agent's claim about itself dressed as
+    /// provenance. Supervised mode (v0.17) gets a peer UID from SO_PEERCRED,
+    /// which is an identity the agent cannot forge, and that deserves its own
+    /// field when it exists rather than an empty half of a struct now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// What determined the verdict: default (no rule matched), rule, context.
+    ///
+    /// Deliberately NOT called `source`, which on this struct already means
+    /// something else - which SURFACE invoked Termaxa (hook, run, check,
+    /// post). Two different questions, and one word for both would have made
+    /// the record ambiguous in a way no query could recover from.
+    ///
+    /// This is `DecisionSource` persisted, not a second representation of the
+    /// same fact. A silent default-allow is then a JOIN of fields that already
+    /// exist - source=hook, decided_by=default, decision=allow - rather than a
+    /// `silent_default_allow: bool` that would duplicate the information and
+    /// eventually drift from it (#37).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+
     // ---- hash chain (v0.16, issue #13) ----
     //
     // Serde-defaulted so every pre-chain line parses as None, per decision #7:
@@ -244,6 +277,86 @@ mod tests {
     use super::*;
     use crate::testutil::TestEnv;
 
+    /// Roadmap 2.6. Provenance the system can actually establish.
+    ///
+    /// `actor` is the harness; `decided_by` is what determined the verdict.
+    /// The pair answers "which agent caused this, and why did it go that way"
+    /// without either field guessing.
+    #[test]
+    fn an_entry_records_the_harness_and_what_decided_it() {
+        let env = TestEnv::new("provenance");
+        let log = AuditLog::new(env.root()).unwrap();
+
+        let mut hook = entry("rm -rf x");
+        hook.source = "hook".into();
+        hook.actor = Some("claude-code".into());
+        hook.decided_by = Some("rule".into());
+        log.append(&hook).unwrap();
+
+        // `check` is the human's own surface: no harness produced it, and
+        // naming one would be false provenance.
+        let mut check = entry("ls -la");
+        check.source = "check".into();
+        check.actor = None;
+        check.decided_by = Some("default".into());
+        log.append(&check).unwrap();
+
+        let back = log.read_last(10).unwrap();
+        assert_eq!(back[0].actor.as_deref(), Some("claude-code"));
+        assert_eq!(back[0].decided_by.as_deref(), Some("rule"));
+        assert_eq!(back[1].actor, None, "no harness, no actor");
+        assert_eq!(back[1].decided_by.as_deref(), Some("default"));
+    }
+
+    /// A SILENT DEFAULT ALLOW is a join of fields that already exist, not a
+    /// field of its own.
+    ///
+    /// `source = hook` + `decided_by = default` + `decision = allow` is the
+    /// interesting case: an agent ran something, no rule had an opinion, and
+    /// the human was never told. A `silent_default_allow: bool` would
+    /// duplicate that and eventually drift from it (#37).
+    #[test]
+    fn a_silent_default_allow_is_reconstructible_without_its_own_field() {
+        let env = TestEnv::new("silent-join");
+        let log = AuditLog::new(env.root()).unwrap();
+
+        let mut silent = entry("whatever-unmatched");
+        silent.source = "hook".into();
+        silent.decision = "allow".into();
+        silent.decided_by = Some("default".into());
+        log.append(&silent).unwrap();
+
+        // Near misses that must NOT match the same join.
+        let mut by_rule = entry("ls -la");
+        by_rule.source = "hook".into();
+        by_rule.decision = "allow".into();
+        by_rule.decided_by = Some("rule".into());
+        log.append(&by_rule).unwrap();
+
+        let mut human = entry("ls -la");
+        human.source = "check".into();
+        human.decision = "allow".into();
+        human.decided_by = Some("default".into());
+        log.append(&human).unwrap();
+
+        let all = log.read_last(10).unwrap();
+        let silent: Vec<&AuditEntry> = all
+            .iter()
+            .filter(|e| {
+                e.source == "hook"
+                    && e.decided_by.as_deref() == Some("default")
+                    && e.decision == "allow"
+            })
+            .collect();
+
+        assert_eq!(
+            silent.len(),
+            1,
+            "exactly one entry is a silent default allow"
+        );
+        assert_eq!(silent[0].command, "whatever-unmatched");
+    }
+
     /// The chain links entries together and verifies clean.
     #[test]
     fn a_chain_verifies_and_each_entry_names_the_one_before_it() {
@@ -364,6 +477,8 @@ mod tests {
             ts_ms,
             ts,
             source: "test".into(),
+            actor: None,
+            decided_by: None,
             command: command.into(),
             decision: "allow".into(),
             matched_rule: None,
