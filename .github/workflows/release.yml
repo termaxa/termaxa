@@ -21,11 +21,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format check
         run: cargo fmt --all -- --check
+      # Blocking, matching CI since v0.16. The `continue-on-error` here said
+      # "matches CI: clippy non-fatal (for now)" and stopped matching the
+      # moment CI flipped - which made the RELEASE gate weaker than the PR
+      # gate, exactly backwards for the job whose own comment says a tag that
+      # cannot pass checks must never publish.
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
-        continue-on-error: true   # matches CI: clippy non-fatal (for now)
       - name: Tests
-        run: cargo test
+        run: cargo test --all
 
   build:
     name: ${{ matrix.target }}
