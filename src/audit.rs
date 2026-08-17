@@ -138,6 +138,35 @@ pub struct AuditLog {
     path: PathBuf,
 }
 
+/// Open for append, creating at `0600` when it does not exist.
+///
+/// PRIVATE AT CREATION TIME, which is the invariant. The supervisor used to
+/// harden the state directory when it started, and the boundary rig showed why
+/// that is not enough: a daemon runs for hours and the interesting files are
+/// the ones it writes DURING that time. A log created mid-session inherited the
+/// process umask and was readable by any account that knew the path - and the
+/// paths are documented.
+///
+/// Applied in basic mode too. There the agent shares the user, so `0600`
+/// protects nothing from it; what it does protect is the record from OTHER
+/// accounts on a shared machine. The audit log belongs to whoever runs
+/// Termaxa, and no other account should read it by default.
+///
+/// `.mode()` only exists on Unix. Windows has a different permission model
+/// entirely and pretending otherwise would be a claim the OS does not back;
+/// there the file is created with the default ACL and the boundary story for
+/// Windows is basic mode, stated in SECURITY.md.
+fn private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 impl AuditLog {
     /// Log lives at `<termaxa_dir>/logs/audit.jsonl`.
     pub fn new(termaxa_dir: &Path) -> Result<Self> {
@@ -167,10 +196,7 @@ impl AuditLog {
         entry.prev = self.last_hash()?;
         entry.hash = Some(entry.digest());
 
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
+        let mut f = private_append(&self.path)
             .with_context(|| format!("cannot open {}", self.path.display()))?;
         let line = serde_json::to_string(&entry)?;
         writeln!(f, "{}", line)?;

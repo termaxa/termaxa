@@ -16,18 +16,9 @@
 # Runs as root, in a container. Not on a developer machine: it creates and
 # deletes a user account.
 #
-# CURRENT STATUS: 16 of 18 pass. Two fail, and they are REAL GAPS, not rig
-# bugs: an agent can `cat` the audit log and a backup by full path. The
-# supervisor hardens directories when it starts, but files the daemon writes
-# AFTERWARDS are created with the default mode, so anything appended or copied
-# during a session is readable by anyone who knows the path — and the paths are
-# documented.
-#
-# Left failing on purpose. A rig tuned until it is green reports what its
-# author wanted; a rig left red reports what is true, and these two are exactly
-# what v0.17 must close before it ships. The fix belongs in `audit.rs` and
-# `backup.rs` — create at 0600 rather than harden after — with this rig as the
-# acceptance test.
+# STATUS: 18 of 18. The two failures this rig shipped with are closed — state
+# files are now created at 0600 rather than hardened afterwards, which is the
+# invariant a long-running daemon needs. The CI job is blocking.
 
 set -uo pipefail
 
@@ -147,12 +138,28 @@ fi
 # ---------------------------------------------------------------------------
 say "3. Backups — the agent cannot read, edit or delete them"
 # ---------------------------------------------------------------------------
-mkdir -p "$TERMAXA_HOME/backups/b-rig"
-echo "insured contents" > "$TERMAXA_HOME/backups/b-rig/file.txt"
-BK="$TERMAXA_HOME/backups/b-rig/file.txt"
+# Take a REAL backup through the real code path, rather than fabricating one
+# with `echo >`. A fixture that bypasses the code under test cannot test it:
+# the first version of this rig hand-made a backup file, so `make_private`
+# never ran on it and the assertion below failed against a file Termaxa had
+# never written.
+mkdir -p "$PROJECT/doomed" && echo "insured contents" > "$PROJECT/doomed/file.txt"
+# `rm -r`, not `rm -rf`: the starter policy DENIES the forced form, and a
+# denied command correctly takes no backup - so asking for one with `-rf`
+# produced nothing and the assertions below tested a path that did not exist.
+# The control leg caught that; without it this rig would have reported three
+# passes against /nonexistent.
+( cd "$PROJECT" && printf 'y\n' | TERMAXA_HOME="$TERMAXA_HOME" "$BIN" run -- rm -r doomed ) >/dev/null 2>&1
+BK="$(find "$TERMAXA_HOME" -path '*backups*' -name 'file.txt' 2>/dev/null | head -1)"
+if [ -z "$BK" ]; then
+  bad "no backup was produced through the real path; the backup assertions could not run"
+  BK="/nonexistent"
+else
+  echo "  backup: $BK ($(stat -c %a "$BK"))"
+fi
 denied  "read a backup"           cat "$BK"
 denied  "overwrite a backup"      sh -c "echo tampered > '$BK'"
-denied  "delete a backup"         rm -rf "$TERMAXA_HOME/backups/b-rig"
+denied  "delete a backup"         rm -f "$BK"
 allowed "operator reads a backup" cat "$BK"
 
 # ---------------------------------------------------------------------------

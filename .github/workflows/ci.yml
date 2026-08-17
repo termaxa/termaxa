@@ -64,20 +64,14 @@ jobs:
   # paths. This job creates a real account and has it TRY, asserting each
   # attempt fails at the OS.
   #
-  # continue-on-error is DELIBERATE and temporary, and it is not the same
-  # decision as the clippy one (#67). Two of the eighteen assertions currently
-  # FAIL, for a real reason recorded in the rig's own header: files the daemon
-  # writes after startup are created with default modes, so the audit log and
-  # backups are readable by path. Blocking every PR on a known gap would mean
-  # either fixing it under time pressure or deleting the assertion, and the
-  # second is how a rig becomes decorative.
-  #
-  # Remove continue-on-error when the rig is green. It is a v0.17 ship
-  # blocker, not a v0.16 one.
+  # BLOCKING as of this commit: the rig is 18/18. It was continue-on-error
+  # while two assertions failed for a real reason, on the argument that
+  # blocking every PR on a known gap means fixing it under time pressure or
+  # deleting the assertion. The gap is fixed, so the exemption goes with it -
+  # an allowance that outlives its reason is how a rig becomes decorative.
   boundary:
     name: privilege boundary (second real user)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

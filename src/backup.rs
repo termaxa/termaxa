@@ -415,6 +415,7 @@ fn backup_files(
 fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
     if src.is_dir() {
         fs::create_dir_all(dst)?;
+        make_private(dst, true)?;
         for entry in fs::read_dir(src)? {
             let entry = entry?;
             copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
@@ -422,8 +423,34 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
     } else {
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
+            make_private(parent, true)?;
         }
         fs::copy(src, dst)?;
+        // `fs::copy` PRESERVES the source's permission bits, so a
+        // world-readable file stays world-readable once copied aside. That is
+        // the wrong default for a backup: the copy lives in the state
+        // directory and is the record's private property, whatever the
+        // original was. Set after the copy because `fs::copy` writes the mode
+        // itself.
+        make_private(dst, false)?;
+    }
+    Ok(())
+}
+
+/// `0600` for a file, `0700` for a directory. No-op on Windows, which has a
+/// different permission model that this cannot express - see SECURITY.md for
+/// what that means for the Windows boundary story.
+fn make_private(path: &Path, is_dir: bool) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = fs::metadata(path)?.permissions();
+        p.set_mode(if is_dir { 0o700 } else { 0o600 });
+        fs::set_permissions(path, p)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, is_dir);
     }
     Ok(())
 }
