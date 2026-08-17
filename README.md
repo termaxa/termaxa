@@ -313,6 +313,12 @@ rules:
     action: deny
     reason: "DROP TABLE is blocked. Archive or rename instead."
 
+  # match_path matches the RESOLVED target, not the spelling. `> .env` and
+  # `> ./.env` are one file, and a rule needs only one of the two matchers.
+  - match_path: "*/.env"
+    action: deny
+    reason: "Overwriting .env destroys credentials that are not in the repo."
+
 circuit_breaker:                 # optional (on by default)
   enabled: true
   threshold: 2                   # trip on the 3rd repeated destructive attempt
@@ -328,6 +334,7 @@ notify:                          # optional
 |---|---|
 | `termaxa` | what this is, and what to try next |
 | `termaxa init [--claude-code]` | scaffold `.termaxa/`, detect tools, install the hook |
+| `termaxa wrap -- <agent>` | launch an agent with shelled commands routed through the gate (Unix) |
 | `termaxa doctor` | is the gate wired up? binary, policy, agents, tools, state |
 | `termaxa check "<cmd>"` | dry-run: verdict + preview (exit 0/3/4) |
 | `termaxa run -- <cmd>` | gated execution: preview → approve → backup → run |
@@ -345,18 +352,19 @@ Colour is on when output is a terminal and off when it isn't. `NO_COLOR`, `TERMA
 
 Termaxa is pre-1.0. It's real and tested, and it is not magic. Specifically:
 
-- **Hooks advise; they don't enforce.** Termaxa gates commands an agent submits through the Claude Code or Cursor hook. Those agents are *cooperative* — they respect a `deny` and propose an alternative, which is what makes the gate work. An agent running in full-auto mode could, in principle, retry a blocked action through a different command or shell; the circuit breaker raises the cost of that, but a hook is an *integration* point for visibility and policy, not an *enforcement* boundary. True enforcement means owning the execution path — that's **Termaxa Runtime**, on the roadmap. For hard guarantees today, pair Termaxa with OS-level sandboxing.
+- **Hooks advise; they don't enforce.** Termaxa gates commands an agent submits through the Claude Code or Cursor hook. Those agents are *cooperative* — they respect a `deny` and propose an alternative, which is what makes the gate work. An agent running in full-auto mode could, in principle, retry a blocked action through a different command or shell; the circuit breaker raises the cost of that, but a hook is an *integration* point for visibility and policy, not an *enforcement* boundary. `termaxa wrap -- <agent>` (Unix, v0.16) widens this: commands the agent runs *through a shell* pass through the gate even without a hook, though a caller naming `/bin/sh` by absolute path still does not. True enforcement means owning the execution path — that's the supervisor, next release. For hard guarantees today, pair Termaxa with OS-level sandboxing.
 - **Native agent tools bypass the gate.** The hook sees *shell* commands. An agent's own built-in file/edit tools don't go through the shell — observed in live testing, a Cursor agent switched to its native file-delete tool and removed files Termaxa never saw. Non-shell tool calls need OS-level isolation underneath.
 - **Cooperative, not a sandbox.** Termaxa governs commands that flow through the agent hook or `termaxa run`. An agent with raw, unhooked shell access is *not* contained — that needs OS-level sandboxing, a complementary layer. The threat model is *agents making expensive mistakes*, not a malicious agent actively evading you.
 - **Shell parsing is good, not perfect.** It splits on `&&`, `||`, `;`, `|`
-  and flags `$(...)`. Subshells `( )`, deeply nested quoting, and
-  variable-expanded commands are judged conservatively, not deeply
-  understood. A path built from a variable (`rm -rf ~/x/$SID`) is evaluated
-  as written: the delete preview will report the blast radius of
-  `~/x/$SID` literally, and if the variable expands to empty at runtime the
-  real target is the parent. Termaxa cannot see the caller's environment.
+  and flags `$(...)`. Subshells `( )` and deeply nested quoting are judged
+  conservatively, not deeply understood. A path built from a variable
+  (`rm -rf ~/x/$SID`) is **not** resolved — Termaxa cannot see the caller's
+  environment, and expanding it here would be guessing. Since v0.16 that
+  target is carried as *unresolved* rather than resolved-wrongly, which lets
+  the policy layer treat it as its own kind of risk instead of pretending to
+  know where it points.
 - **Previews are best-effort.** No database connection → static analysis only. Terraform previews shell out to `terraform plan`. Remote Terraform state is versioned by its backend, not by Termaxa.
-- **Backups have edges.** `rm` insurance keys on the literal `rm` command. Postgres backups use `pg_dump`/`psql` and must be on your PATH. No retention/pruning yet — backups accumulate.
+- **Backups have edges.** Since v0.16 delete insurance resolves the command head, so `sudo rm`, `/bin/rm` and `env rm` are covered — but a delete expressed some other way (a script, a language runtime) is not, and a target too large to copy is reported as *not recoverable* rather than silently uninsured. Postgres backups use `pg_dump`/`psql` and must be on your PATH. No retention/pruning yet — backups accumulate.
 - **The format may still change.** Pre-1.0 means the policy schema and CLI can shift between minor versions. Pin a release.
 - **Claude Code and Cursor are live-tested.** Both are exercised end-to-end, including the circuit breaker tripping under a real Cursor session. Codex and Copilot dialects parse each agent's format but aren't verified end-to-end yet. Help validating them is welcome.
 - **Windows PowerShell 5.1 mangles redirected Unicode.** `termaxa report > out.txt` writes UTF-16 and garbles the box-drawing glyphs. That's the shell, not Termaxa — use PowerShell 7, or `termaxa report --md | Out-File -Encoding utf8 report.md`.

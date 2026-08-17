@@ -2,38 +2,132 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
-## Unreleased
+## v0.16.0 — targets are things, not strings
+
+v0.15 stopped treating **commands** as strings. v0.16 stops treating three more
+things as text: **targets** (decide on the resolved path, not the spelling),
+**the grammar** (one scanner; the labelled duplicate deleted), and **the
+record** (a hash chain that says what it can prove).
+
+Seventeen commits, thirteen pull requests. **436 tests on Linux, 384 on
+Windows** — quote both figures or neither; four integration files are
+`#![cfg(unix)]` and run zero tests there.
+
+### Security
+
+- **An escaped quote could bypass anchored deny rules — v0.7.0 through
+  v0.15.0.** `echo \" ; terraform destroy -auto-approve` collapsed into a
+  single segment, because the escaped quote opened a quote state and the `;`
+  never split. A prefix-anchored rule (`terraform destroy*`) then never saw a
+  segment starting with `terraform`, and the line matched `echo *` instead.
+  Two of three tested cases resolved to a **silent allow** — no prompt, nothing
+  for a human to intercept.
+
+  Affected versions verified by compiling v0.7.0's splitter and reproducing the
+  single-segment result. Fixed here: escapes outside single quotes are literal,
+  as a shell reads them. **If you are on any release before v0.16.0, upgrade.**
+  Advisory to follow.
+
+### Added
+
+- **`match_path:` rules match a command's RESOLVED targets**, not its spelling.
+  `> .env` and `> ./.env` are one file rather than two strings, and no number
+  of added string patterns could have achieved that — the next spelling is
+  always one edit away. Path patterns match component by component, so
+  `*/.env` catches a bare `.env`, a nested one, and `C:\proj\.env` alike, and
+  does not catch `prod.env` or `.env.sample`.
+- **A rule needs at least one matcher, and neither is mandatory.** `match:`,
+  `match_path:`, or both. Enforced at parse time, because a rule with no
+  matcher can never fire — a policy that says nothing while looking like it
+  says something.
+- **Overwrite previews.** A write now reports what the file loses before it
+  happens, the way deletes have since v0.13:
+
+  ```
+  overwrite impact
+    target      : /proj/config.json
+    loses       : 38 B of existing content
+    insurance   : copy 1 path(s) to .termaxa/backups before they are overwritten
+  ```
+
+- **`cp`, `mv`, `tee` and `dd` destinations are extracted**, each by its own
+  argument grammar, and every target carries the role the command gives it:
+  a copy's source is **read**, its destination **written**, and a move's source
+  is **removed**. `cp a b c dir/` has three sources and one destination; a
+  guess at "the last path-looking argument" would have reported `b` as at risk.
+- **A hash-chained audit log (#13).** Each entry carries the hash of the one
+  before it, so an edited or removed entry is detectable. `doctor` reports what
+  it can verify and says so precisely — `chain valid: entries 3-5`, `2 earlier
+  entries are pre-chain`, `audit chain broken at entry 4`. **Read SECURITY.md
+  before treating this as a security boundary:** in basic mode it is
+  tamper-evident, not tamper-resistant.
+- **Provenance in the audit record:** `actor` (which harness produced the
+  event) and `decided_by` (default, rule, or context). A silent default-allow
+  is now a join of fields that already exist rather than a field of its own.
+- **`termaxa wrap -- <agent>`** (Unix): every command the agent runs *through a
+  shell* passes through the gate, hook or no hook. Shim directory, `PATH`,
+  `SHELL` — not process interception, and the residue is stated: a caller
+  naming `/bin/sh` by absolute path, or exec'ing a binary directly, does not
+  pass through anything.
+- **Mode detection and deny-on-unreachable.** When a supervisor socket exists
+  and nothing answers, the hook **denies** with a reason naming the condition.
+  A gate that loses its brain does not fail open.
 
 ### Changed
 
 - **Path resolution takes an explicit cwd.** A hook runs in whatever directory
   the harness spawned it in, which is not the directory the agent's command
   runs in, so a relative target resolved against the process cwd found nothing
-  and took no backup — silently, because "no such file" and "nothing to
-  insure" are the same answer (#15). `resolve_path_in(raw, cwd)` replaces
-  `resolve_path`; the hook passes the payload cwd, and the ambient fallback is
-  deleted rather than deprecated — with every call site threaded, the compiler
-  reported the old form as dead code, which is the proof nothing resolves
-  ambiently any more.
+  and took no backup — silently, because "no such file" and "nothing to insure"
+  are the same answer (#15). The ambient fallback is deleted rather than
+  deprecated: with every call site threaded, the compiler reported the old form
+  as dead code, which is the proof nothing resolves ambiently any more.
+- **One scanner for one grammar.** Segments and their redirect targets come
+  from the same walk; `shell::redirect_targets` is deleted. Comparing the two
+  walks before removing one surfaced both the escaped-quote bypass above and a
+  second disagreement: `>|` was split at its `|`, so the clobber was invisible
+  to intent and policy while backup, re-scanning the raw string, insured it.
+- **One answer to "what command is this?"** The classifier, the delete
+  extractor and the insurance layer share one head resolution, so `sudo rm`,
+  `/bin/rm`, `env rm`, `doas rm` and `C:\Windows\System32\del.exe` are
+  classified and insured alike. Every one of those was previously classified as
+  **nothing** — no intent, no breaker pressure. `git clean --force` counts too:
+  one flag, two spellings, one meaning.
+- **Uninsurability escalates an existing concern to deny, and never creates
+  one.** An `ask` that a rule or a context signal chose, on a command nothing
+  can recover, becomes a refusal. An unmatched command under a `default: ask`
+  policy does **not** — `rm -rf node_modules` exceeds the copy budget and is
+  routine, and a gate that denies routine work gets uninstalled.
+- **The reason line names what happens to the target**: `(written)` for a copy,
+  `(removed)` for a move.
+- **Clippy is blocking in CI** (`-D warnings`).
 
-- **One scanner for one grammar.** Segments and their redirect targets now
-  come from the same walk: `split_segments` returns `Segment` values carrying
-  the `Overwrite`s found in them, and `shell::redirect_targets` is deleted.
-  Two parsers over the same input had already produced three bugs and, once
-  their outputs were compared, two measurable disagreements: `>|` was split at
-  its `|`, so the clobber was invisible to intent and policy (which split
-  first) while backup, re-scanning the raw string, insured it; and the walks
-  read `\"` differently outside quotes. `backup` now consumes per-segment
-  redirects instead of re-scanning the raw command.
+### Fixed
 
-  Stated behavior change: **escapes outside single quotes are literal**, as a
-  shell reads them. `echo \" ; rm -rf x` is now two segments — previously the
-  escaped quote opened a quote, the `;` never split, and the whole line
-  (including the `rm` the shell runs as its own command) could match a single
-  permissive rule. Escaped separators (`\;`, `\&`) no longer split, because
-  the shell runs one command there, and an escaped space in a redirect target
-  keeps the filename whole. Each change is pinned by a labeled test with a
-  control leg.
+- **`is_inside` reported not-yet-created targets as outside the project** when
+  any ancestor was a symlink — which macOS `/tmp` and `/var` are. `canonicalize`
+  fails on a path that does not exist, so the root canonicalized and the child
+  did not, and the two were compared in different forms. Affected the
+  outside-the-project warning in every prior release.
+- **`backup::plan` and `backup::take` disagreed about overwrites** since v0.15:
+  `take` insured them, `plan` had no overwrite branch, so every preview of a
+  truncating redirect said "NOT recoverable" while the backup was in fact taken.
+- **An `ask` with no interactive stdin said "declined"** when nobody had
+  declined. It now names the condition and still refuses.
+- **A `.env` path rule denied ordinary reads.** The rule carried a string
+  pattern purely to satisfy the schema, and that pattern fired on its own:
+  `cat .env`, `grep KEY .env`, even `vim .env.sample` were denied. Reading a
+  file destroys nothing.
+
+### Known limitations
+
+- The target machinery is only as wide as its extractors. `truncate`, `xcopy`,
+  `robocopy` and any other command that destroys a file by a route without a
+  grammar produce no targets and reach their ordinary verdict.
+- `termaxa wrap` is Unix-only, and catches a shell resolved by name. Absolute
+  paths and direct `execve` are outside what a `PATH` shim can reach.
+- Four integration files remain `#![cfg(unix)]`, so 32 tests — including all
+  the hook-dialect ones — do not run on Windows.
 
 ## v0.15.0 — stop treating commands as strings
 
