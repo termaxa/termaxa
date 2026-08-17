@@ -136,6 +136,23 @@ pub fn run(argv: &[String], termaxa_home: &Path) -> Result<i32> {
         // provenance rather than policy input.
         .env("TERMAXA_WRAPPED", "1");
 
+    // THE ENDPOINT, and only the endpoint.
+    //
+    // The wrapped process runs as the agent, whose $HOME is deliberately not
+    // the operator's - so it cannot discover the socket the way the operator
+    // does, and must be TOLD. The first proving run found this the hard way:
+    // an agent's hook looked in its own home, found nothing, and decided
+    // locally while the supervisor sat idle.
+    //
+    // What travels is the socket path. NOT TERMAXA_HOME: pointing the agent's
+    // state directory at the operator's would reverse the ownership model and
+    // establish a convention where an environment variable hands an agent a
+    // path to privileged state. The agent needs to ask; it does not need to
+    // know where the answers are kept.
+    if let Some(sock) = crate::supervise::endpoint() {
+        cmd.env(crate::supervise::SOCKET_ENV, &sock);
+    }
+
     let status = cmd
         .status()
         .with_context(|| format!("cannot launch {}", argv[0]))?;

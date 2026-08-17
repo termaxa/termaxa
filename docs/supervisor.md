@@ -2,7 +2,7 @@
 
 **Unix only. Not available on Windows** — it needs Unix domain sockets and a second user account in the form this depends on. Basic mode is the Windows answer and is fully supported there; `termaxa doctor` says so rather than hinting.
 
-**Status: the boundary is proved by an automated rig, not yet by a real agent session.** See [What is not yet proven](#what-is-not-yet-proven) before relying on this in anger. That section is not boilerplate — it names specific things nobody has watched happen.
+**Status: proved by an automated rig across two real users, and by one real agent session** — which found a routing bug the rig could not see. See [the field report](field-reports/2026-08-17-supervised-routing.md) and [What is not yet proven](#what-is-not-yet-proven), which is shorter than it was.
 
 ---
 
@@ -135,7 +135,7 @@ Decide deliberately, and write down what you chose.
 
 Everything above is verified by an automated rig and by end-to-end tests with synthetic payloads. **No real agent has run a real session under this topology.** Until that happens, these are the specific things nobody has watched:
 
-- **Whether a real agent can work at all under a separate account.** Credentials are the obvious risk. The first `git push` is where this gets tested for real.
+- **Whether a real agent can finish real work under a separate account.** Claude Code *authenticates* cleanly as a second user — verified 2026-08-17, one OAuth round-trip, no shared HOME and no copied credentials. What is still untested is git: the agent account has no git identity or SSH key, and the first `git push` is where that bites.
 - **Previews in supervised mode.** Static analysis runs supervisor-side; live introspection subprocesses (`psql`, `git`, `terraform show`) run hook-side in the agent's domain and travel as an *agent-observed annotation*, never as the gate's own observation. Where that leaves a preview thinner than in basic mode, the output is supposed to say so. Nobody has compared them side by side.
 - **Latency and contention.** Every command makes a socket round-trip to a single-threaded server with a two-second timeout. An agent issuing commands rapidly may expose queuing the design assumed away.
 - **`SO_PEERCRED` on macOS.** Linux reports the connecting UID. macOS spells it differently (`LOCAL_PEERCRED`, different struct), and rather than guess at an untested ABI, `peer_uid` returns `None` there — so the audit records an absent identity rather than a wrong one.

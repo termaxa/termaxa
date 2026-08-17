@@ -22,7 +22,20 @@
 
 set -uo pipefail
 
-BIN="${1:?usage: rig.sh /path/to/termaxa}"
+BIN_SRC="${1:?usage: rig.sh /path/to/termaxa}"
+
+# The agent must be able to EXECUTE the binary, and where CI checks out is not
+# our business: GitHub runners use /home/runner at 0700, so an agent account
+# cannot traverse to a binary built there. Sections 1-4 never noticed because
+# they run as root or against /tmp; section 5 is the only one that has the
+# agent exec it directly.
+#
+# Copied to a path the rig controls rather than chmod-ing someone's home. A
+# test that loosens the permissions of the directory it happens to be run from
+# has changed the machine to suit itself.
+BIN_DIR="$(mktemp -d)"; chmod 0755 "$BIN_DIR"
+BIN="$BIN_DIR/termaxa"
+cp "$BIN_SRC" "$BIN"; chmod 0755 "$BIN"
 AGENT_USER="termaxa-agent"
 OPERATOR_HOME="$(mktemp -d)"
 # mktemp -d creates at 0700. A real install has TERMAXA_HOME under a 0755 home
@@ -196,8 +209,81 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+say "5. Routing — a hook run as the AGENT reaches the operator's supervisor"
+# ---------------------------------------------------------------------------
+#
+# The assertion the first four sections could not make. They proved ISOLATION:
+# the agent cannot reach the operator's state. They never proved ROUTING: that
+# a hook running as the agent finds the supervisor at all.
+#
+# The first proving run found the gap between those. Every automated test ran
+# the hook and the supervisor as the SAME user, so $HOME-relative endpoint
+# discovery worked. A real agent under a real second account resolved $HOME to
+# its own home, found no socket, concluded basic mode, and decided on its own
+# authority - while the supervisor sat idle. The walls held; the door led
+# nowhere.
+TERMAXA_HOME="$TERMAXA_HOME" "$BIN" supervise > "$PROJECT/sup.log" 2>&1 &
+SUP2=$!
+sleep 1
+SOCK="$TERMAXA_HOME/run/supervise.sock"
+
+if [ -S "$SOCK" ]; then
+  PAYLOAD='{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"'"$PROJECT"'"}'
+
+  # As the agent, with ONLY the endpoint - no TERMAXA_HOME, no path into the
+  # operator's state. This is exactly what `wrap` gives a wrapped agent.
+  OUT="$(echo "$PAYLOAD" | sudo -u "$AGENT_USER" env -i \
+        HOME=/home/$AGENT_USER PATH=/usr/bin:/bin \
+        TERMAXA_SOCKET="$SOCK" "$BIN" hook 2>&1)"
+
+  if echo "$OUT" | grep -q '"permissionDecision":"deny"'; then
+    ok "the agent's hook got a decision back"
+  else
+    bad "the agent's hook did not get a decision: $OUT"
+  fi
+
+  # And the decision was made THERE, not here: the supervisor logged the
+  # agent's uid. Without this the test would pass on a hook that decided
+  # locally and happened to reach the same verdict.
+  AGENT_UID="$(id -u "$AGENT_USER")"
+  if grep -q "uid=$AGENT_UID" "$PROJECT/sup.log"; then
+    ok "the supervisor recorded uid=$AGENT_UID — it decided, not the hook"
+  else
+    bad "the supervisor never saw the request (log: $(tr '\n' ' ' < "$PROJECT/sup.log"))"
+  fi
+
+  # The record landed in the OPERATOR's log, and the agent cannot read it.
+  OPLOG="$(find "$TERMAXA_HOME" -name audit.jsonl 2>/dev/null | head -1)"
+  if [ -n "$OPLOG" ] && grep -q "rm -rf /" "$OPLOG"; then
+    ok "the decision is in the operator's audit log"
+  else
+    bad "the decision is not in the operator's log"
+  fi
+  denied "read the operator's log after it recorded the agent" cat "$OPLOG"
+
+  # CONTROL LEG: with no endpoint told, the agent falls back to basic mode and
+  # decides locally. Proves section 5 is testing routing rather than the hook
+  # merely working at all.
+  echo "$PAYLOAD" | sudo -u "$AGENT_USER" env -i \
+      HOME=/home/$AGENT_USER PATH=/usr/bin:/bin \
+      "$BIN" hook >/dev/null 2>&1
+  BEFORE="$(grep -c "uid=$AGENT_UID" "$PROJECT/sup.log")"
+  sleep 0.3
+  AFTER="$(grep -c "uid=$AGENT_UID" "$PROJECT/sup.log")"
+  if [ "$BEFORE" = "$AFTER" ]; then
+    ok "control: with no endpoint told, nothing reaches the supervisor"
+  else
+    bad "control: a hook with no endpoint still reached the supervisor"
+  fi
+
+  kill -9 $SUP2 2>/dev/null
+else
+  bad "no socket at $SOCK; routing assertions could not run"
+fi
+
+# ---------------------------------------------------------------------------
 say "Result"
 # ---------------------------------------------------------------------------
-rm -rf "$PROJECT" "$OPERATOR_HOME"
+rm -rf "$PROJECT" "$OPERATOR_HOME" "$BIN_DIR"
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

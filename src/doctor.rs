@@ -173,10 +173,7 @@ pub fn run(dir: &Path) -> Result<i32> {
     println!();
     println!("{}", bold("Mode"));
     {
-        // Same answer `supervise` uses for the socket path, from the same
-        // function - so doctor cannot report a mode the hook does not see.
-        let home = crate::paths::home_base().unwrap_or_default();
-        match crate::supervise::detect(&home) {
+        match crate::supervise::detect() {
             crate::supervise::Mode::Basic => {
                 println!(
                     "{} {:<13}{}",
@@ -203,9 +200,13 @@ pub fn run(dir: &Path) -> Result<i32> {
                 // invariant is reported on its own, because "supervised mode
                 // is broken" is not an actionable sentence and "the state
                 // directory is 0755, so the agent can read your audit log" is.
+                // Bound inside the block that reads it: the mode check is
+                // Unix-only, and a binding outside would be dead on Windows -
+                // which `-D warnings` catches there and not here.
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
+                    let home = crate::paths::home_base().unwrap_or_default();
                     if let Ok(md) = std::fs::metadata(&home) {
                         let mode = md.permissions().mode() & 0o777;
                         match mode {

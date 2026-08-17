@@ -47,34 +47,92 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// The socket's name, inside its own directory beside the state directory.
 pub const SOCKET_NAME: &str = "supervise.sock";
 
-/// The directory holding only the socket: `$TERMAXA_HOME/run`, mode `0755`.
+/// Where the supervisor listens, and how a hook finds it.
 ///
-/// The state directory above it is `0711` — EXECUTE WITHOUT READ. That single
-/// mode is what makes supervised mode possible, and it took a rig with a
-/// second real user to find it:
+/// THE ENDPOINT IS NOT STATE, and discovering it like state was the bug the
+/// first proving run found. Every automated test ran the hook and the
+/// supervisor as the same user, so `$HOME`-relative discovery worked. The
+/// first time a real agent ran under a real second account, its hook resolved
+/// `$TERMAXA_HOME` from ITS OWN home, found no socket there, concluded basic
+/// mode, and decided on its own authority - writing an audit log the agent
+/// owned. The walls held; the door led nowhere.
 ///
-///   0755 on the state dir  agent can LIST it, and from there read the audit
-///                          log and the backups. Boundary gone.
-///   0700 on the state dir  agent cannot traverse to the socket, so every
-///                          hook denies. Perfectly secure, completely useless.
-///   0711 on the state dir  agent can traverse THROUGH to a path it already
-///                          knows, cannot enumerate the directory, and the
-///                          log and backups stay 0700 in their own right.
+/// So the two are separated:
 ///
-/// Measured, not reasoned: at 0711 an unprivileged account was denied `ls` on
-/// the state directory, denied `cat` on the audit log, denied `ls` on the logs
-/// directory, and permitted to reach the socket.
+///   operator state   `$TERMAXA_HOME` or `~/.termaxa` — the operator's, and
+///                    the agent has no path into it. Unchanged.
+///   IPC endpoint     a socket path the agent is TOLD, in a runtime directory
+///                    that holds nothing else.
 ///
-/// Traversal needs execute on EVERY directory in the path, which is the part a
-/// design document does not surface. `run/` being 0755 is necessary and not
-/// sufficient.
+/// `$HOME` belongs to the process making the request, which in supervised mode
+/// is deliberately the agent. Pointing the agent's state home at the
+/// operator's would reverse the ownership model, and would establish a
+/// convention where an environment variable hands an agent a path to
+/// privileged state. The endpoint is the only thing the agent needs, so the
+/// endpoint is the only thing it gets.
+///
+/// Resolution order, most explicit first:
+///
+///   1. `$TERMAXA_SOCKET`         set by `wrap`, or by an operator by hand
+///   2. `$XDG_RUNTIME_DIR/termaxa/supervise.sock`   per-user runtime dir
+///   3. `<state>/run/supervise.sock`                the operator's own default
+///
+/// A hook running as the agent finds it via (1), because `wrap` exports it.
+/// The supervisor binds via (3) unless told otherwise, and prints what it
+/// bound so the operator can see it.
+pub const SOCKET_ENV: &str = "TERMAXA_SOCKET";
+/// The directory holding only the socket, under a given state directory.
+///
+/// `0755`, containing nothing but the socket; the state directory above it is
+/// `0711` (traverse, not enumerate). Both numbers came from running the
+/// boundary rig - `0700` makes the socket unreachable and denies everything,
+/// `0755` on the state dir hands over the audit log.
 pub fn socket_dir(termaxa_home: &Path) -> PathBuf {
     termaxa_home.join("run")
 }
 
-/// Where the supervisor's socket lives for a given Termaxa home.
-pub fn socket_path(termaxa_home: &Path) -> PathBuf {
+/// Where the supervisor should BIND, given its own state directory.
+pub fn bind_path(termaxa_home: &Path) -> PathBuf {
+    if let Some(p) = explicit_socket() {
+        return p;
+    }
     socket_dir(termaxa_home).join(SOCKET_NAME)
+}
+
+/// Where a hook should LOOK. Deliberately not `$HOME`-relative.
+///
+/// Returns `None` when no endpoint is configured anywhere, which is the
+/// ordinary basic-mode answer: no supervisor, decide locally.
+pub fn endpoint() -> Option<PathBuf> {
+    if let Some(p) = explicit_socket() {
+        return Some(p);
+    }
+    if let Some(p) = runtime_socket() {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // The operator's own default, which is what a hook run BY the operator
+    // finds. An agent under `wrap` gets (1) instead.
+    let state = crate::paths::home_base().ok()?;
+    let p = socket_dir(&state).join(SOCKET_NAME);
+    p.exists().then_some(p)
+}
+
+fn explicit_socket() -> Option<PathBuf> {
+    std::env::var(SOCKET_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// `$XDG_RUNTIME_DIR/termaxa/supervise.sock`. Per-user, cleaned up by the OS,
+/// and the conventional home for a socket rather than for state.
+fn runtime_socket() -> Option<PathBuf> {
+    std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|d| PathBuf::from(d).join("termaxa").join(SOCKET_NAME))
 }
 
 /// What the hook sends: the payload as it arrived, and nothing it concluded.
@@ -167,19 +225,21 @@ pub enum Mode {
     Supervised,
 }
 
-/// Detect the mode for a Termaxa home.
+/// Is a supervisor configured for THIS process?
+///
+/// Answered from the endpoint, not from a state directory. A hook running as
+/// the agent has no path into the operator's state and must not need one - it
+/// needs the socket it was told about, and nothing else.
 ///
 /// FAILING CLOSED IS NOT THE SAME AS DETECTING SUPERVISION. This answers only
-/// "is a supervisor configured here" — the socket exists. Whether it ANSWERS
-/// is a separate question, and the separation is deliberate: a hook that
-/// treated an unreachable supervisor as "basic mode, carry on" would fail
-/// OPEN at exactly the moment the operator most expects it not to. Detect,
-/// then require an answer, and refuse if there is none.
-pub fn detect(termaxa_home: &Path) -> Mode {
-    if socket_path(termaxa_home).exists() {
-        Mode::Supervised
-    } else {
-        Mode::Basic
+/// "is an endpoint configured and present". Whether it ANSWERS is a separate
+/// question, deliberately: a hook that treated an unreachable supervisor as
+/// "basic mode, carry on" would fail OPEN exactly where the operator most
+/// expects otherwise.
+pub fn detect() -> Mode {
+    match endpoint() {
+        Some(_) => Mode::Supervised,
+        None => Mode::Basic,
     }
 }
 
@@ -195,7 +255,7 @@ pub fn detect(termaxa_home: &Path) -> Mode {
 /// rather than a hang. Every failure below denies.
 #[cfg(unix)]
 pub fn ask(
-    termaxa_home: &Path,
+    sock: &Path,
     payload: &str,
     dialect_hint: Option<&str>,
     cwd: &str,
@@ -203,8 +263,7 @@ pub fn ask(
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
-    let sock = socket_path(termaxa_home);
-    let mut stream = UnixStream::connect(&sock).map_err(|_| SuperviseError::Unreachable)?;
+    let mut stream = UnixStream::connect(sock).map_err(|_| SuperviseError::Unreachable)?;
     let timeout = std::time::Duration::from_secs(2);
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
@@ -228,7 +287,7 @@ pub fn ask(
 
 #[cfg(not(unix))]
 pub fn ask(
-    _termaxa_home: &Path,
+    _sock: &Path,
     _payload: &str,
     _dialect_hint: Option<&str>,
     _cwd: &str,
@@ -316,7 +375,7 @@ pub fn serve(termaxa_home: &Path) -> anyhow::Result<()> {
         }
     }
 
-    let sock = socket_path(termaxa_home);
+    let sock = bind_path(termaxa_home);
 
     // A stale socket file from a killed supervisor would make `bind` fail, and
     // worse, mode detection already reports Supervised for it - so every hook
@@ -497,7 +556,6 @@ pub fn serve(_termaxa_home: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::TempTree;
 
     /// The daemon answers a well-formed request with a decision it made
     /// itself. Exercised without a socket, so a failure here is decision
@@ -563,20 +621,46 @@ mod tests {
         );
     }
 
+    /// The endpoint is discovered from the ENDPOINT, not from a state
+    /// directory, and the distinction is the whole of the routing fix.
+    ///
+    /// The first proving run found a hook running as the agent resolving
+    /// `$HOME` to the agent's home, finding no socket there, concluding basic
+    /// mode, and deciding on its own authority while the supervisor sat idle
+    /// with nothing to do. Discovering an IPC endpoint the way state is
+    /// discovered only works while both live under one user.
     #[test]
-    fn mode_is_read_from_the_filesystem_not_from_configuration() {
-        let t = TempTree::new("mode-detect");
-        let home = t.path();
-        assert_eq!(
-            detect(home),
-            Mode::Basic,
-            "no socket means basic - a config file claiming otherwise would be a claim, \
-             not a fact"
-        );
+    fn the_endpoint_is_told_not_inferred_from_home() {
+        // TestEnv, not TempTree: this reads and writes process-global
+        // environment, and every other reader of it holds this lock. #63 is
+        // the entry about what happens when one test does not.
+        let env = crate::testutil::TestEnv::new("endpoint");
+        let home = env.root().to_path_buf();
 
-        std::fs::create_dir_all(socket_dir(home)).unwrap();
-        std::fs::write(socket_path(home), b"").unwrap();
-        assert_eq!(detect(home), Mode::Supervised);
+        let prev_sock = std::env::var(SOCKET_ENV).ok();
+        let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        std::env::remove_var(SOCKET_ENV);
+        std::env::remove_var("XDG_RUNTIME_DIR");
+
+        // No endpoint anywhere: basic mode, the ordinary answer.
+        assert_eq!(detect(), Mode::Basic);
+
+        // An explicit endpoint is honoured wherever it points - including a
+        // path with no relationship to this process's home, which is exactly
+        // the agent's situation under `wrap`.
+        let sock = home.join("elsewhere.sock");
+        std::fs::write(&sock, b"").unwrap();
+        std::env::set_var(SOCKET_ENV, &sock);
+        assert_eq!(detect(), Mode::Supervised);
+        assert_eq!(endpoint().unwrap(), sock);
+
+        match prev_sock {
+            Some(v) => std::env::set_var(SOCKET_ENV, v),
+            None => std::env::remove_var(SOCKET_ENV),
+        }
+        if let Some(v) = prev_xdg {
+            std::env::set_var("XDG_RUNTIME_DIR", v);
+        }
     }
 
     /// The hook forwards the payload and nothing it concluded. Pinned because

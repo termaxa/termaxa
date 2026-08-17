@@ -694,25 +694,26 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // silent fail-open, because a gate that loses its brain and carries on is
     // worse than one that stops. An operator who configured supervision gets
     // a refusal with a reason, not a decision made by the wrong process.
-    let termaxa_home = crate::paths::home_base().unwrap_or_default();
-    if crate::supervise::detect(&termaxa_home) == crate::supervise::Mode::Supervised {
+    if crate::supervise::detect() == crate::supervise::Mode::Supervised {
         // Forward and print. Nothing below this line runs: this hook has no
         // authority in supervised mode, and exercising any would produce a
         // decision made inside the agent's own trust domain.
         //
-        // A SECOND supervised hook must not recurse into the supervisor - the
+        // The endpoint comes from `TERMAXA_SOCKET` (exported by `wrap`), an
+        // XDG runtime dir, or the operator's own state directory - NOT from
+        // this process's $HOME. The first proving run found why: a hook
+        // running as the agent resolved $HOME to the agent's home, found no
+        // socket, and quietly decided on its own authority.
+        //
+        // A second supervised hook must not recurse into the supervisor: the
         // daemon calls `decide` itself, and if that call re-entered here it
-        // would connect to its own socket and deadlock on a single-threaded
-        // server. `TERMAXA_SUPERVISOR=1` in the daemon's own process is what
-        // breaks the loop.
+        // would connect to its own socket and deadlock a single-threaded
+        // server. TERMAXA_SUPERVISOR=1 in the daemon's own process breaks the
+        // loop.
         if std::env::var("TERMAXA_SUPERVISOR").as_deref() != Ok("1") {
+            let sock = crate::supervise::endpoint().unwrap_or_default();
             return Ok(
-                match crate::supervise::ask(
-                    &termaxa_home,
-                    &buf,
-                    Some(input.dialect.actor()),
-                    &input.cwd,
-                ) {
+                match crate::supervise::ask(&sock, &buf, Some(input.dialect.actor()), &input.cwd) {
                     Ok(resp) => Outcome {
                         rendered: Some(resp.rendered),
                         exit_code: resp.exit_code,
