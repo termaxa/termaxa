@@ -44,18 +44,37 @@ use std::path::{Path, PathBuf};
 /// this is checked before a request is honoured rather than hoped about.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The socket's name inside the operator-owned state directory.
-///
-/// Directory `0755` (the agent user can traverse and connect), socket
-/// connectable by the agent user, everything else inside owned by the
-/// operator and unreadable to the agent. The path convention lives here
-/// rather than at each caller so basic mode and supervised mode cannot come
-/// to disagree about where to look (#37).
+/// The socket's name, inside its own directory beside the state directory.
 pub const SOCKET_NAME: &str = "supervise.sock";
+
+/// The directory holding only the socket: `$TERMAXA_HOME/run`, mode `0755`.
+///
+/// The state directory above it is `0711` — EXECUTE WITHOUT READ. That single
+/// mode is what makes supervised mode possible, and it took a rig with a
+/// second real user to find it:
+///
+///   0755 on the state dir  agent can LIST it, and from there read the audit
+///                          log and the backups. Boundary gone.
+///   0700 on the state dir  agent cannot traverse to the socket, so every
+///                          hook denies. Perfectly secure, completely useless.
+///   0711 on the state dir  agent can traverse THROUGH to a path it already
+///                          knows, cannot enumerate the directory, and the
+///                          log and backups stay 0700 in their own right.
+///
+/// Measured, not reasoned: at 0711 an unprivileged account was denied `ls` on
+/// the state directory, denied `cat` on the audit log, denied `ls` on the logs
+/// directory, and permitted to reach the socket.
+///
+/// Traversal needs execute on EVERY directory in the path, which is the part a
+/// design document does not surface. `run/` being 0755 is necessary and not
+/// sufficient.
+pub fn socket_dir(termaxa_home: &Path) -> PathBuf {
+    termaxa_home.join("run")
+}
 
 /// Where the supervisor's socket lives for a given Termaxa home.
 pub fn socket_path(termaxa_home: &Path) -> PathBuf {
-    termaxa_home.join(SOCKET_NAME)
+    socket_dir(termaxa_home).join(SOCKET_NAME)
 }
 
 /// What the hook sends: the payload as it arrived, and nothing it concluded.
@@ -267,6 +286,36 @@ pub fn serve(termaxa_home: &Path) -> anyhow::Result<()> {
     use std::os::unix::net::UnixListener;
 
     std::fs::create_dir_all(termaxa_home)?;
+    // The socket's own directory, traversable by the agent. The state
+    // directory above it stays private; see `socket_dir`.
+    let dir = socket_dir(termaxa_home);
+    std::fs::create_dir_all(&dir)?;
+    let mut dp = std::fs::metadata(&dir)?.permissions();
+    dp.set_mode(0o755);
+    std::fs::set_permissions(&dir, dp)?;
+
+    // 0711 on the state directory: traversable, not listable. See `socket_dir`
+    // for why this exact mode and not 0700 or 0755.
+    let mut hp = std::fs::metadata(termaxa_home)?.permissions();
+    hp.set_mode(0o711);
+    std::fs::set_permissions(termaxa_home, hp)?;
+
+    // 0711 gives TRAVERSAL, so everything private must be private in its own
+    // right rather than by hiding behind the parent. The rig proved the
+    // difference: with only the parent locked down, the agent could not LIST
+    // the state directory and could still `cat` the audit log and a backup by
+    // full path - paths it can guess, since they are documented.
+    //
+    // Belt and braces on every launch rather than once at init: a directory
+    // created later, or loosened by hand, is re-tightened by the process that
+    // owns the boundary.
+    for private in ["projects", "backups", "logs"] {
+        let p = termaxa_home.join(private);
+        if p.exists() {
+            harden(&p)?;
+        }
+    }
+
     let sock = socket_path(termaxa_home);
 
     // A stale socket file from a killed supervisor would make `bind` fail, and
@@ -315,6 +364,29 @@ pub fn serve(termaxa_home: &Path) -> anyhow::Result<()> {
         let reply = handle(&line, peer_uid);
         let _ = writeln!(stream, "{reply}");
         let _ = stream.flush();
+    }
+    Ok(())
+}
+
+/// Make a directory and everything under it operator-only.
+///
+/// Recursive because the state directory nests: `projects/<hash>/logs/` holds
+/// the audit log, and a permissive directory anywhere on that path is a way in.
+#[cfg(unix)]
+fn harden(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut p = std::fs::metadata(dir)?.permissions();
+    p.set_mode(0o700);
+    std::fs::set_permissions(dir, p)?;
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            harden(&path)?;
+        } else {
+            let mut fp = std::fs::metadata(&path)?.permissions();
+            fp.set_mode(0o600);
+            std::fs::set_permissions(&path, fp)?;
+        }
     }
     Ok(())
 }
@@ -502,6 +574,7 @@ mod tests {
              not a fact"
         );
 
+        std::fs::create_dir_all(socket_dir(home)).unwrap();
         std::fs::write(socket_path(home), b"").unwrap();
         assert_eq!(detect(home), Mode::Supervised);
     }

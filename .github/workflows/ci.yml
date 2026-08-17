@@ -56,3 +56,33 @@ jobs:
             exit 1
           fi
           echo "smoke test passed: benign allowed, destructive denied"
+
+  # The privilege boundary, proved by a second real user.
+  #
+  # Unit tests cannot prove a boundary: every test in the Rust suite runs as
+  # one user, so "the agent cannot write the policy" is an assertion about code
+  # paths. This job creates a real account and has it TRY, asserting each
+  # attempt fails at the OS.
+  #
+  # continue-on-error is DELIBERATE and temporary, and it is not the same
+  # decision as the clippy one (#67). Two of the eighteen assertions currently
+  # FAIL, for a real reason recorded in the rig's own header: files the daemon
+  # writes after startup are created with default modes, so the audit log and
+  # backups are readable by path. Blocking every PR on a known gap would mean
+  # either fixing it under time pressure or deleting the assertion, and the
+  # second is how a rig becomes decorative.
+  #
+  # Remove continue-on-error when the rig is green. It is a v0.17 ship
+  # blocker, not a v0.16 one.
+  boundary:
+    name: privilege boundary (second real user)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build
+      - name: Run the boundary rig
+        run: sudo bash tests/boundary/rig.sh "$PWD/target/debug/termaxa"
