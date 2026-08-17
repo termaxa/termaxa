@@ -140,6 +140,25 @@ Stated plainly, so a changelog line reading "hash-chained audit log" is not mist
 | basic (default, all platforms) | the agent's own user | corruption and casual edits are visible |
 | supervised (Unix, v0.17) | the supervisor, outside the agent's reach | the record is one the agent cannot rewrite |
 
+## Four grades, and what each one leaves open
+
+Supervised mode (v0.17) is not a switch from "unsafe" to "safe". It is one of four topologies, each with a different authority story and a different residue. No grade claims containment, and the bottom row's honest limits are in the same table that sells it.
+
+| grade | routing | authority | what the agent's domain can still do |
+|---|---|---|---|
+| **hook** (basic, default, all platforms) | the harness invokes the hook | the agent's own user | edit the policy and hook configs (advised against by the self-defence rules and the write matcher), delete the record, bypass via any non-hooked execution path |
+| **hook + modes** (Unix, no daemon) | same | the agent's user, but policy and configs operator-owned | delete or edit the record and the backups; bypass via non-hooked paths |
+| **wrapped** (`termaxa wrap -- <agent>`) | every command run *through a shell* reaches the gate, hooked or not | the agent's user | tamper with the record; escape via tools that execute without spawning through the wrapper — an absolute `/bin/sh`, or a direct `execve` |
+| **supervised** (wrap + daemon + modes) | wrapped | **the operator's user** | attempt commands, each of which is denied and recorded; social-engineer the human; anything root-adjacent the OS itself permits |
+
+Two things worth reading off that table rather than around it.
+
+**Every grade is bypassable by an agent that is trying.** The top three are bypassable by an agent that is merely resourceful. The fourth narrows the agent's domain to "ask and be refused", but an agent that can talk to a human can still ask the human, and an OS misconfiguration is still an OS misconfiguration.
+
+**The improvement between rows three and four is privilege, not cleverness.** Wrapped mode routes more commands through the same code; supervised mode moves *who runs that code*. That is the only step in the table that changes what the record is worth, which is why the audit chain section above draws its line exactly there.
+
+Setup, the credential tradeoff, and what supervised mode has and has not been proved against: [docs/supervisor.md](docs/supervisor.md). It is honest about the last part — the boundary is proved by an automated rig with a second real user, and not yet by a real agent session.
+
 **Migration.** Entries written before v0.16 have no hash. They stay readable and are reported as pre-chain rather than as breaks: Termaxa can prove continuity from the boundary onward, and does not retroactively claim to have protected history it was not there for. A broken link names the entry and leaves the rest of the record readable, because one corrupt line making the whole log unreadable would destroy more evidence than the corruption did.
 
 ## Reporting a vulnerability

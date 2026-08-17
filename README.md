@@ -335,6 +335,8 @@ notify:                          # optional
 | `termaxa` | what this is, and what to try next |
 | `termaxa init [--claude-code]` | scaffold `.termaxa/`, detect tools, install the hook |
 | `termaxa wrap -- <agent>` | launch an agent with shelled commands routed through the gate (Unix) |
+| `termaxa supervise` | run the decision daemon as yourself; hooks decide through it (Unix) |
+| `termaxa init --supervised` | print the supervised-mode setup — prints, never executes |
 | `termaxa doctor` | is the gate wired up? binary, policy, agents, tools, state |
 | `termaxa check "<cmd>"` | dry-run: verdict + preview (exit 0/3/4) |
 | `termaxa run -- <cmd>` | gated execution: preview → approve → backup → run |
@@ -352,7 +354,7 @@ Colour is on when output is a terminal and off when it isn't. `NO_COLOR`, `TERMA
 
 Termaxa is pre-1.0. It's real and tested, and it is not magic. Specifically:
 
-- **Hooks advise; they don't enforce.** Termaxa gates commands an agent submits through the Claude Code or Cursor hook. Those agents are *cooperative* — they respect a `deny` and propose an alternative, which is what makes the gate work. An agent running in full-auto mode could, in principle, retry a blocked action through a different command or shell; the circuit breaker raises the cost of that, but a hook is an *integration* point for visibility and policy, not an *enforcement* boundary. `termaxa wrap -- <agent>` (Unix, v0.16) widens this: commands the agent runs *through a shell* pass through the gate even without a hook, though a caller naming `/bin/sh` by absolute path still does not. True enforcement means owning the execution path — that's the supervisor, next release. For hard guarantees today, pair Termaxa with OS-level sandboxing.
+- **Hooks advise; they don't enforce.** Termaxa gates commands an agent submits through the Claude Code or Cursor hook. Those agents are *cooperative* — they respect a `deny` and propose an alternative, which is what makes the gate work. An agent running in full-auto mode could, in principle, retry a blocked action through a different command or shell; the circuit breaker raises the cost of that, but a hook is an *integration* point for visibility and policy, not an *enforcement* boundary. `termaxa wrap -- <agent>` (Unix, v0.16) widens this: commands the agent runs *through a shell* pass through the gate even without a hook, though a caller naming `/bin/sh` by absolute path still does not. **Supervised mode** (Unix, v0.17) goes further and moves the *authority*: a daemon under your user decides, and the agent runs as a different account that cannot read the audit log, edit the backups, or stop the supervisor — proved by a rig that creates a second real user and has it try. See [docs/supervisor.md](docs/supervisor.md), which is also honest that no real agent session has run under it yet. For hard guarantees today, pair Termaxa with OS-level sandboxing.
 - **Native agent tools bypass the gate.** The hook sees *shell* commands. An agent's own built-in file/edit tools don't go through the shell — observed in live testing, a Cursor agent switched to its native file-delete tool and removed files Termaxa never saw. Non-shell tool calls need OS-level isolation underneath.
 - **Cooperative, not a sandbox.** Termaxa governs commands that flow through the agent hook or `termaxa run`. An agent with raw, unhooked shell access is *not* contained — that needs OS-level sandboxing, a complementary layer. The threat model is *agents making expensive mistakes*, not a malicious agent actively evading you.
 - **Shell parsing is good, not perfect.** It splits on `&&`, `||`, `;`, `|`
@@ -373,7 +375,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ## Contributing
 
-Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is dependency-light Rust: ~9,500 lines of production code in `src/`, plus ~10,500 lines of tests (unit tests live beside the code they test; `tests/` holds the integration ones). More test than product, on purpose — `src/policy.rs` and `src/preview.rs` are the best places to start reading, and the test module at the bottom of each file explains what the code is defending against.
+Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is dependency-light Rust: ~10,200 lines of production code in `src/`, plus ~10,600 lines of tests (unit tests live beside the code they test; `tests/` holds the integration ones). More test than product, on purpose — `src/policy.rs` and `src/preview.rs` are the best places to start reading, and the test module at the bottom of each file explains what the code is defending against.
 
 If you can make an agent get past the gate in a way that isn't already documented above, that's the most useful contribution you can make: [open an issue](https://github.com/termaxa/termaxa/issues) or email security@termaxa.com.
 
