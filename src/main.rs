@@ -55,6 +55,10 @@ enum Cmd {
         /// Also write the GitHub Copilot CLI hook (.github/hooks/)
         #[arg(long = "copilot")]
         copilot: bool,
+        /// Print the supervised-mode setup: the commands to run as root, and
+        /// what each one buys. Prints and verifies; never executes.
+        #[arg(long = "supervised")]
+        supervised: bool,
     },
     /// Check whether Termaxa is actually wired up and able to see commands
     Doctor,
@@ -160,14 +164,13 @@ fn dispatch(cli: Cli) -> Result<i32> {
             cursor,
             codex,
             copilot,
+            supervised,
         } => {
-            init::run(
-                &std::env::current_dir()?,
-                claude_code,
-                cursor,
-                codex,
-                copilot,
-            )?;
+            let dir = std::env::current_dir()?;
+            init::run(&dir, claude_code, cursor, codex, copilot)?;
+            if supervised {
+                init::print_supervised_setup(&dir)?;
+            }
             Ok(0)
         }
         Cmd::Doctor => {

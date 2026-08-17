@@ -192,21 +192,59 @@ pub fn run(dir: &Path) -> Result<i32> {
                 }
             }
             crate::supervise::Mode::Supervised => {
+                println!(
+                    "{} {:<13}{}",
+                    green("✓"),
+                    "supervised",
+                    dim("hooks in this project decide through the supervisor")
+                );
+                // Verify what the setup produced rather than assuming the
+                // operator typed it correctly (#34: print and verify). Each
+                // invariant is reported on its own, because "supervised mode
+                // is broken" is not an actionable sentence and "the state
+                // directory is 0755, so the agent can read your audit log" is.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(md) = std::fs::metadata(&home) {
+                        let mode = md.permissions().mode() & 0o777;
+                        match mode {
+                            0o711 => println!(
+                                "  {} {}",
+                                green("✓"),
+                                dim("state dir 0711 — traversable, not listable")
+                            ),
+                            0o700 => {
+                                println!(
+                                    "  {} state dir is 0700 — the agent cannot reach the socket, \
+                                     so every command will be denied",
+                                    red("✗")
+                                );
+                                problems.push(
+                                    "state dir 0700: supervised mode will deny everything — \
+                                     chmod 0711"
+                                        .into(),
+                                );
+                            }
+                            m => {
+                                println!(
+                                    "  {} state dir is {:o} — the agent can list it, and read \
+                                     the audit log and backups inside",
+                                    red("✗"),
+                                    m
+                                );
+                                problems.push(format!(
+                                    "state dir {m:o}: the boundary is not there — chmod 0711"
+                                ));
+                            }
+                        }
+                    }
+                }
+
                 // Detected means the socket EXISTS. Whether it answers is a
                 // different question, and reporting "supervised" for a dead
                 // socket would tell an operator they have a boundary they do
                 // not have.
-                println!(
-                    "{} {:<13}{}",
-                    amber("!"),
-                    "supervised",
-                    dim("socket present — the daemon is v0.17; this hook denies until it answers")
-                );
-                problems.push(
-                    "a supervise socket exists but no daemon is shipped yet — remove it \
-                     or hooks will deny"
-                        .into(),
-                );
             }
         }
     }

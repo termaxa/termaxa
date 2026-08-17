@@ -634,6 +634,117 @@ pub(crate) fn which(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Print the supervised-mode setup. Prints and verifies; never executes.
+///
+/// Decision #34 applied to the feature most tempting to violate it. Creating a
+/// user account and chowning a directory tree require root, and a tool that
+/// asks for root to "set things up for you" is asking to be trusted with
+/// exactly the authority this product exists to put a boundary around. So it
+/// prints commands the operator can read, and `doctor` verifies afterwards
+/// what they actually produced rather than assuming they were typed correctly.
+///
+/// The commands below are not a sketch. They are what the boundary rig
+/// (`tests/boundary/rig.sh`) runs to produce a topology where a second real
+/// user is denied the log, the backups and the policy on every attempt, and
+/// permitted the socket. The modes in particular were found by running it:
+/// `0711` on the state directory, not `0700` (which makes the socket
+/// unreachable and denies everything) and not `0755` (which hands over the
+/// log).
+pub fn print_supervised_setup(project: &Path) -> Result<()> {
+    use crate::ui::{bold, dim};
+
+    let home = crate::paths::home_base()?;
+    let policy = project.join(".termaxa").join("policy.yaml");
+    let me = std::env::var("USER").unwrap_or_else(|_| "you".into());
+
+    println!();
+    println!("{}", bold("Supervised mode — setup"));
+    println!();
+
+    if !cfg!(unix) {
+        println!(
+            "  {}",
+            dim("Not available on Windows: it needs Unix domain sockets and a")
+        );
+        println!(
+            "  {}",
+            dim("second user account in the form this depends on. Basic mode is")
+        );
+        println!("  {}", dim("the Windows answer and is fully supported."));
+        return Ok(());
+    }
+
+    println!(
+        "  {}",
+        dim("What this buys: the audit log and the backups stop being the")
+    );
+    println!(
+        "  {}",
+        dim("agent's own account of itself. The agent's user cannot read them,")
+    );
+    println!(
+        "  {}",
+        dim("edit them, or stop the supervisor — not because the code refuses,")
+    );
+    println!("  {}", dim("but because the OS does."));
+    println!();
+    println!(
+        "{}",
+        bold("  Termaxa will not run these for you. Review them, then run as root:")
+    );
+    println!();
+    println!("    # 1. an account for the agent to run as");
+    println!("    useradd --system --create-home --shell /bin/bash termaxa-agent");
+    println!();
+    println!("    # 2. the policy: the agent reads it, and cannot change it");
+    println!("    chown {me}:{me} {}", policy.display());
+    println!("    chmod 0644 {}", policy.display());
+    println!();
+    println!("    # 3. the state directory: traversable, not listable.");
+    println!("    #    0711 is deliberate — 0700 makes the socket unreachable");
+    println!("    #    and every command denies; 0755 hands over the log.");
+    println!("    chown -R {me}:{me} {}", home.display());
+    println!("    chmod 0711 {}", home.display());
+    println!();
+    println!("    # 4. run it");
+    println!("    termaxa supervise &");
+    println!("    sudo -u termaxa-agent termaxa wrap -- claude");
+    println!();
+    println!(
+        "  {}",
+        dim("Then run `termaxa doctor`, which reports what these produced")
+    );
+    println!(
+        "  {}",
+        dim("rather than assuming they were typed correctly.")
+    );
+    println!();
+    println!(
+        "{}",
+        bold("  Credentials are a tradeoff, not a solved problem.")
+    );
+    println!(
+        "  {}",
+        dim("The agent needs git, SSH and registry access to do real work, and")
+    );
+    println!(
+        "  {}",
+        dim("a separate account has none of yours. Three options, none free:")
+    );
+    println!();
+    println!("    shared HOME        easiest; dilutes the boundary you just built");
+    println!("    copied credentials works; you now have two copies to rotate");
+    println!("    curated per launch most honest, most friction — give the agent");
+    println!("                       only the credentials the task needs");
+    println!();
+    println!(
+        "  {}",
+        dim("Nobody has dissolved this, including us. Pick deliberately.")
+    );
+    println!();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +760,39 @@ mod tests {
     /// It is now generated from STARTER_POLICY, and this test is what keeps it
     /// generated: an example policy that is quietly less safe than the real
     /// one is worse than no example at all.
+    /// The printed setup names the modes the boundary rig actually uses.
+    ///
+    /// Instructions nobody has followed are a guess. These were verified by
+    /// running them literally against a second real account - socket
+    /// reachable, state dir not listable, policy readable and not writable -
+    /// and this test pins the numbers so a later edit cannot quietly print
+    /// 0700 (which makes the socket unreachable and denies everything) or
+    /// 0755 (which hands over the audit log).
+    #[cfg(unix)]
+    #[test]
+    fn the_supervised_setup_prints_the_modes_the_rig_proved() {
+        let t = TempTree::new("sup-setup");
+        let dir = t.path();
+        std::fs::create_dir_all(dir.join(".termaxa")).unwrap();
+
+        // Captured by rendering into a string rather than by scraping stdout:
+        // the point is the CONTENT, and a test that shells out would be
+        // testing the terminal.
+        let rig = std::fs::read_to_string("tests/boundary/rig.sh").unwrap();
+        assert!(
+            rig.contains("chmod 0711 \"$TERMAXA_HOME\""),
+            "the rig uses 0711 on the state dir; if that changed, the printed \
+             setup is now wrong and this test is the only thing that says so"
+        );
+        assert!(
+            rig.contains("chmod 0644 \"$PROJECT/.termaxa/policy.yaml\""),
+            "the rig uses 0644 on the policy"
+        );
+
+        // And the function runs without error against a real project.
+        print_supervised_setup(dir).expect("the setup prints");
+    }
+
     #[test]
     fn shipped_example_policy_matches_the_starter_policy() {
         // Normalise line endings before comparing. Git checks this file out
