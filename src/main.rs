@@ -70,6 +70,9 @@ enum Cmd {
         #[arg(last = true)]
         argv: Vec<String>,
     },
+    /// Run the supervisor: hooks in this home decide through this process,
+    /// which runs as the operator rather than the agent. Unix only.
+    Supervise,
     /// Launch an agent with every shelled command routed through the gate:
     /// termaxa wrap -- claude   (Unix only in v0.16)
     Wrap {
@@ -306,6 +309,11 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Cmd::Run { argv } => {
             let p = paths::resolve()?;
             runner::run(&p, &argv)
+        }
+        Cmd::Supervise => {
+            let home = paths::home_base()?;
+            supervise::serve(&home)?;
+            Ok(0)
         }
         Cmd::Wrap { argv } => {
             let p = paths::resolve()?;

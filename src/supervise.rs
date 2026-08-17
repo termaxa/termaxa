@@ -164,6 +164,59 @@ pub fn detect(termaxa_home: &Path) -> Mode {
     }
 }
 
+/// Ask the supervisor to decide, from inside the agent's domain.
+///
+/// The hook sends the RAW PAYLOAD and prints what comes back. It does not
+/// parse, evaluate, insure, or audit on its own authority here - anything it
+/// concluded would be the agent's own account of itself, and the record's
+/// whole value in this mode is that it is not.
+///
+/// Two seconds, matching the doctor probe's discipline: an agent is blocked
+/// on this answer, and a supervisor that has wedged must produce a refusal
+/// rather than a hang. Every failure below denies.
+#[cfg(unix)]
+pub fn ask(
+    termaxa_home: &Path,
+    payload: &str,
+    dialect_hint: Option<&str>,
+    cwd: &str,
+) -> Result<Response, SuperviseError> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let sock = socket_path(termaxa_home);
+    let mut stream = UnixStream::connect(&sock).map_err(|_| SuperviseError::Unreachable)?;
+    let timeout = std::time::Duration::from_secs(2);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let req = request_for(payload, dialect_hint, cwd);
+    let line = serde_json::to_string(&req).map_err(|_| SuperviseError::Malformed)?;
+    stream
+        .write_all(format!("{line}\n").as_bytes())
+        .map_err(|_| SuperviseError::Unreachable)?;
+    stream.flush().map_err(|_| SuperviseError::Unreachable)?;
+
+    let mut resp = String::new();
+    let read = BufReader::new(stream).read_line(&mut resp);
+    match read {
+        Ok(0) => Err(SuperviseError::Timeout),
+        Ok(_) => check_response(&resp),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(SuperviseError::Timeout),
+        Err(_) => Err(SuperviseError::Unreachable),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn ask(
+    _termaxa_home: &Path,
+    _payload: &str,
+    _dialect_hint: Option<&str>,
+    _cwd: &str,
+) -> Result<Response, SuperviseError> {
+    Err(SuperviseError::Unreachable)
+}
+
 /// Validate a response against what we sent.
 ///
 /// Version is checked on the way IN as well as on the way out: a daemon older
@@ -190,10 +243,253 @@ pub fn request_for(payload: &str, dialect_hint: Option<&str>, cwd: &str) -> Requ
     }
 }
 
+// ---------------------------------------------------------------------------
+// the daemon (v0.17)
+// ---------------------------------------------------------------------------
+
+/// Serve until killed. One connection, one payload, one response.
+///
+/// Runs under the OPERATOR's UID. The agent's UID may connect and may write a
+/// request; it may not read the policy, edit the log, or delete a backup,
+/// because those live in a directory it cannot enter. That is the whole point
+/// of the release: the boundary is the filesystem's, not the code's.
+///
+/// Single-threaded on purpose. Requests are short (parse, evaluate, insure,
+/// append) and an agent issues them serially anyway; a thread per connection
+/// would buy nothing and add a way for two requests to interleave inside the
+/// audit append. If a proving run shows contention, that measurement is the
+/// argument for changing it.
+#[cfg(unix)]
+pub fn serve(termaxa_home: &Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    std::fs::create_dir_all(termaxa_home)?;
+    let sock = socket_path(termaxa_home);
+
+    // A stale socket file from a killed supervisor would make `bind` fail, and
+    // worse, mode detection already reports Supervised for it - so every hook
+    // denies while nothing is listening. Removing it here is safe because we
+    // are about to bind the same path; if another supervisor is genuinely
+    // live, the bind below fails and says so.
+    if sock.exists() {
+        std::fs::remove_file(&sock)?;
+    }
+
+    let listener =
+        UnixListener::bind(&sock).with_context(|| format!("cannot bind {}", sock.display()))?;
+
+    // 0666 on the socket: the agent user must connect. That is NOT a hole -
+    // connecting lets it ask, not decide. The directory above is what keeps
+    // the policy, the log and the backups out of its reach.
+    let mut p = std::fs::metadata(&sock)?.permissions();
+    p.set_mode(0o666);
+    std::fs::set_permissions(&sock, p)?;
+
+    eprintln!("termaxa: supervising on {}", sock.display());
+    eprintln!("termaxa: hooks in this home now decide through this process");
+
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("termaxa: accept failed: {e}");
+                continue;
+            }
+        };
+
+        // Who asked. SO_PEERCRED is the kernel's answer, not the caller's
+        // claim - the one identity in this system the agent cannot forge.
+        let peer_uid = peer_uid(&stream);
+
+        let mut line = String::new();
+        if BufReader::new(stream.try_clone()?)
+            .read_line(&mut line)
+            .is_err()
+        {
+            continue;
+        }
+
+        let reply = handle(&line, peer_uid);
+        let _ = writeln!(stream, "{reply}");
+        let _ = stream.flush();
+    }
+    Ok(())
+}
+
+/// Answer one request. Separated from the socket loop so it is testable
+/// without a socket, and so a panic in decision logic cannot be confused with
+/// a transport failure.
+#[cfg(unix)]
+fn handle(line: &str, peer_uid: Option<u32>) -> String {
+    let err = |msg: &str| {
+        serde_json::to_string(&Response {
+            version: PROTOCOL_VERSION,
+            rendered: msg.to_string(),
+            exit_code: 2,
+            audit_seq: None,
+        })
+        .unwrap_or_default()
+    };
+
+    let req: Request = match serde_json::from_str(line.trim()) {
+        Ok(r) => r,
+        Err(_) => return err("[termaxa] the supervisor could not read that request"),
+    };
+
+    // Version checked on the way IN as well as out: a hook older than this
+    // daemon will send a request this daemon half-understands, and answering
+    // it anyway is the garbled decision the protocol exists to prevent.
+    if req.version != PROTOCOL_VERSION {
+        return err(&format!(
+            "[termaxa] hook speaks protocol v{}, supervisor speaks v{} — \
+             refusing rather than guessing at the difference",
+            req.version, PROTOCOL_VERSION
+        ));
+    }
+
+    // The supervisor re-derives everything from the payload it received. The
+    // dialect hint travels for the log line, never for the decision.
+    // The daemon decides on its OWN authority, so its call into the hook path
+    // must not detect supervised mode and forward back to itself. One process,
+    // one socket, single-threaded: that would deadlock on the first request.
+    std::env::set_var("TERMAXA_SUPERVISOR", "1");
+    let outcome = match crate::hook::decide(&req.payload) {
+        Ok(o) => o,
+        Err(e) => return err(&format!("[termaxa] the supervisor failed to decide: {e}")),
+    };
+
+    if let Some(uid) = peer_uid {
+        eprintln!(
+            "termaxa: uid={} hint={} exit={}",
+            uid,
+            req.dialect_hint.as_deref().unwrap_or("-"),
+            outcome.exit_code
+        );
+    }
+
+    serde_json::to_string(&Response {
+        version: PROTOCOL_VERSION,
+        rendered: outcome.rendered.unwrap_or_default(),
+        exit_code: outcome.exit_code,
+        audit_seq: outcome.audit_seq,
+    })
+    .unwrap_or_default()
+}
+
+/// The connecting process's UID, from the kernel.
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Some(cred.uid)
+    } else {
+        None
+    }
+}
+
+/// macOS spells it `LOCAL_PEERCRED` with a different struct; until the
+/// proving run happens on a Mac, this reports "unknown" rather than guessing
+/// at an ABI nobody here has tested. An absent UID is recorded as absent.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn peer_uid(_stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    None
+}
+
+#[cfg(not(unix))]
+pub fn serve(_termaxa_home: &Path) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "termaxa supervise requires Unix domain sockets and a second user account. \
+         Windows has neither in the form this depends on; basic mode is the Windows \
+         answer and is fully supported."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::TempTree;
+
+    /// The daemon answers a well-formed request with a decision it made
+    /// itself. Exercised without a socket, so a failure here is decision
+    /// logic rather than transport.
+    #[cfg(unix)]
+    #[test]
+    fn the_supervisor_decides_and_answers() {
+        // A real project, because the supervisor decides against a real
+        // policy - the first draft of this test pointed at /tmp and failed
+        // with "no policy found", which was the test being wrong and the
+        // daemon being right.
+        let env = crate::testutil::TestEnv::new("sup-decide");
+        let proj = env.root().join("proj");
+        std::fs::create_dir_all(proj.join(".termaxa")).unwrap();
+        std::fs::write(
+            proj.join(".termaxa/policy.yaml"),
+            "version: 1\ndefault: ask\nrules:\n  - match: \"*rm -rf*\"\n    action: deny\n    reason: \"blocked\"\n",
+        )
+        .unwrap();
+        let cwd = proj.display().to_string();
+        let payload = format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"rm -rf /"}},"cwd":"{}"}}"#,
+            cwd.replace('\\', "/")
+        );
+        let req = serde_json::to_string(&request_for(&payload, Some("claude-code"), &cwd)).unwrap();
+
+        let raw = handle(&req, Some(1000));
+        let resp: Response = serde_json::from_str(&raw).expect("a well-formed response");
+        assert_eq!(resp.version, PROTOCOL_VERSION);
+        assert_eq!(resp.exit_code, 2, "rm -rf / is denied: {}", resp.rendered);
+        assert!(resp.rendered.contains("deny"), "{}", resp.rendered);
+    }
+
+    /// A request from a hook speaking a different protocol version is refused
+    /// with a message, not answered with a decision the two ends would read
+    /// differently.
+    #[cfg(unix)]
+    #[test]
+    fn a_skewed_request_is_refused_rather_than_half_understood() {
+        let mut req = request_for("{}", None, "/tmp");
+        req.version = PROTOCOL_VERSION + 1;
+        let raw = handle(&serde_json::to_string(&req).unwrap(), None);
+        let resp: Response = serde_json::from_str(&raw).unwrap();
+        assert_eq!(resp.exit_code, 2);
+        assert!(
+            resp.rendered.contains("protocol"),
+            "the refusal names the cause: {}",
+            resp.rendered
+        );
+    }
+
+    /// Garbage on the socket is refused, not interpreted. The supervisor is
+    /// reachable by the agent's UID by design, so it will be sent garbage.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_request_is_refused_not_guessed_at() {
+        let resp: Response = serde_json::from_str(&handle("not json", None)).unwrap();
+        assert_eq!(resp.exit_code, 2);
+        assert!(
+            resp.rendered.contains("could not read"),
+            "{}",
+            resp.rendered
+        );
+    }
 
     #[test]
     fn mode_is_read_from_the_filesystem_not_from_configuration() {

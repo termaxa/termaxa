@@ -352,9 +352,23 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
 /// no `.termaxa/` at all and a policy that will not parse. Both are states in
 /// which the shell path has nothing to say, and both are states in which
 /// "do not overwrite the hook config" is still the right answer.
-fn gate_file_write(w: &FileWrite) {
+/// Refuse a write to the gate's own configuration.
+///
+/// Returns an `Outcome` rather than exiting: this used to call
+/// `process::exit(2)` inline, which is correct for a one-shot hook process and
+/// FATAL for the supervisor daemon - the first protected-file write an agent
+/// attempted would have taken the supervisor down with it, and a dead
+/// supervisor denies everything afterwards (v0.16's deny-on-unreachable). A
+/// gate that kills itself by refusing something is a denial of service with
+/// extra steps.
+fn gate_file_write(w: &FileWrite) -> Outcome {
+    let silent = Outcome {
+        rendered: None,
+        exit_code: 0,
+        audit_seq: None,
+    };
     let Some(protected) = crate::protect::classify(&w.cwd, &w.path) else {
-        return;
+        return silent;
     };
 
     let subject = format!("{} {}", w.tool, w.path);
@@ -407,10 +421,11 @@ fn gate_file_write(w: &FileWrite) {
         }
     }
 
-    println!("{}", render_response(w.dialect, "deny", &reason));
-    use std::io::Write as _;
-    let _ = std::io::stdout().flush();
-    std::process::exit(2);
+    Outcome {
+        rendered: Some(render_response(w.dialect, "deny", &reason)),
+        exit_code: 2,
+        audit_seq: None,
+    }
 }
 
 /// Should this decision be withheld rather than emitted?
@@ -477,9 +492,70 @@ pub fn render_response(dialect: Dialect, permission: &str, reason: &str) -> Stri
 ///
 /// Non-Bash tools and unparsable input fall through with no decision
 /// (exit 0, no output), leaving Claude Code's normal permission flow intact.
+/// What a hook invocation concluded, before anyone prints or exits.
+///
+/// v0.17. The decision path used to print and `process::exit` inline, which
+/// is fine for a process that answers one payload and dies - and impossible
+/// for a daemon that must answer thousands and stay alive. Both callers now
+/// share the same logic and differ only in what they do with this:
+/// `hook::run` prints and exits, `supervise` serialises it onto a socket.
+///
+/// Duplicating the decision path instead would have put two engines on one
+/// question, which is the mistake this codebase keeps paying for (#37) - and
+/// here the two copies would have been the trusted one and the untrusted one.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    /// The rendered response in the harness's dialect, or `None` when the
+    /// answer is silence (an allow the agent should not be interrupted by).
+    pub rendered: Option<String>,
+    pub exit_code: i32,
+    /// The audit sequence this was recorded under.
+    ///
+    /// Always `None` today: the audit log is append-only JSONL with no
+    /// sequence numbers, so there is nothing to report. The field is in the
+    /// PROTOCOL because a hook that cannot write the record still wants a way
+    /// to reference the entry the supervisor wrote — but the protocol
+    /// carrying it does not mean this end can fill it.
+    ///
+    /// Kept rather than removed because the wire type is already published in
+    /// v0.16's `Response`; removing it here would leave the two halves
+    /// disagreeing about the message shape. It is filled when the log grows
+    /// sequence numbers, which is its own decision (#65: record what the
+    /// system can establish).
+    ///
+    /// The allow is for WINDOWS specifically: both readers of this field live
+    /// in `#[cfg(unix)]` blocks (the daemon's response, the hook's forward),
+    /// so a Windows build sees it written and never read. Scoped to the field
+    /// rather than the struct, and narrated, because "dead on one platform"
+    /// is a different fact from "dead".
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub audit_seq: Option<u64>,
+}
+
 pub fn run() -> Result<()> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
+    let outcome = decide(&buf)?;
+    if let Some(r) = &outcome.rendered {
+        println!("{r}");
+    }
+    // Belt and suspenders: Cursor and Copilot also honor the process exit code
+    // (2 = block). On Windows especially, stdout JSON delivery can be finicky,
+    // so a denied command exits non-zero to guarantee the block lands.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    if outcome.exit_code != 0 {
+        std::process::exit(outcome.exit_code);
+    }
+    Ok(())
+}
+
+/// Decide one payload. Prints nothing, exits nothing.
+///
+/// The whole hook path, minus I/O: this is what the daemon calls with bytes
+/// off a socket and what `run` calls with bytes off stdin.
+pub fn decide(raw_payload: &str) -> Result<Outcome> {
+    let buf = raw_payload.to_string();
 
     // Diagnostic: set TERMAXA_HOOK_DEBUG=<path> to capture exactly what the
     // agent delivered (raw stdin + argv). Invaluable for debugging Windows
@@ -511,9 +587,13 @@ pub fn run() -> Result<()> {
             // configuration. Anything else here stays out of the way, exactly
             // as before.
             if let Some(w) = parse_file_write(&buf) {
-                gate_file_write(&w);
+                return Ok(gate_file_write(&w));
             }
-            return Ok(());
+            return Ok(Outcome {
+                rendered: None,
+                exit_code: 0,
+                audit_seq: None,
+            });
         }
     };
     let command = input.command.clone();
@@ -560,7 +640,11 @@ pub fn run() -> Result<()> {
                 });
             }
         }
-        return Ok(());
+        return Ok(Outcome {
+            rendered: None,
+            exit_code: 0,
+            audit_seq: None,
+        });
     }
 
     // Agents spawn the hook with an arbitrary working directory, but they tell us
@@ -612,16 +696,40 @@ pub fn run() -> Result<()> {
     // a refusal with a reason, not a decision made by the wrong process.
     let termaxa_home = crate::paths::home_base().unwrap_or_default();
     if crate::supervise::detect(&termaxa_home) == crate::supervise::Mode::Supervised {
-        let err = crate::supervise::SuperviseError::Unreachable;
-        let reason = format!("[termaxa] {}", err.reason());
-        println!("{}", render_response(input.dialect, "deny", &reason));
-        // Same belt-and-suspenders exit as any other deny: stdout JSON
-        // delivery is finicky on Windows, so the block also lands as a
-        // non-zero code. Flushed first, for the same reason the other site
-        // flushes.
-        use std::io::Write as _;
-        let _ = std::io::stdout().flush();
-        std::process::exit(2);
+        // Forward and print. Nothing below this line runs: this hook has no
+        // authority in supervised mode, and exercising any would produce a
+        // decision made inside the agent's own trust domain.
+        //
+        // A SECOND supervised hook must not recurse into the supervisor - the
+        // daemon calls `decide` itself, and if that call re-entered here it
+        // would connect to its own socket and deadlock on a single-threaded
+        // server. `TERMAXA_SUPERVISOR=1` in the daemon's own process is what
+        // breaks the loop.
+        if std::env::var("TERMAXA_SUPERVISOR").as_deref() != Ok("1") {
+            return Ok(
+                match crate::supervise::ask(
+                    &termaxa_home,
+                    &buf,
+                    Some(input.dialect.actor()),
+                    &input.cwd,
+                ) {
+                    Ok(resp) => Outcome {
+                        rendered: Some(resp.rendered),
+                        exit_code: resp.exit_code,
+                        audit_seq: resp.audit_seq,
+                    },
+                    Err(e) => Outcome {
+                        rendered: Some(render_response(
+                            input.dialect,
+                            "deny",
+                            &format!("[termaxa] {}", e.reason()),
+                        )),
+                        exit_code: 2,
+                        audit_seq: None,
+                    },
+                },
+            );
+        }
     }
 
     let policy = Policy::load(&paths.policy_file())?;
@@ -829,19 +937,21 @@ pub fn run() -> Result<()> {
 
     // A probe must always answer — `doctor` reads the decision to prove the hook
     // can run at all, and silence is indistinguishable from a dead hook.
-    if !silent || is_probe {
-        println!("{}", render_response(input.dialect, permission, &reason));
-    }
+    let rendered = if !silent || is_probe {
+        Some(render_response(input.dialect, permission, &reason))
+    } else {
+        None
+    };
 
-    // Belt and suspenders: Cursor and Copilot also honor the process exit code
-    // (2 = block). On Windows especially, stdout JSON delivery can be finicky,
-    // so a denied command exits non-zero to guarantee the block lands.
-    use std::io::Write as _;
-    let _ = std::io::stdout().flush();
-    if decision.action == Action::Deny {
-        std::process::exit(2);
-    }
-    Ok(())
+    Ok(Outcome {
+        rendered,
+        exit_code: if decision.action == Action::Deny {
+            2
+        } else {
+            0
+        },
+        audit_seq: None,
+    })
 }
 
 #[cfg(test)]
