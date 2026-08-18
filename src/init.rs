@@ -644,6 +644,18 @@ pub(crate) fn which(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The directory the project sits in, which the agent must traverse to reach
+/// it. Named rather than assumed: the first proving run's setup said
+/// `chmod 0755 ~`, which makes the operator's entire home listable to the
+/// agent - broader than needed, and the same over-permission the state
+/// directory already avoids with 0711.
+fn home_of_project(project: &Path) -> std::path::PathBuf {
+    project
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| project.to_path_buf())
+}
+
 /// Print the supervised-mode setup. Prints and verifies; never executes.
 ///
 /// Decision #34 applied to the feature most tempting to violate it. Creating a
@@ -716,9 +728,27 @@ pub fn print_supervised_setup(project: &Path) -> Result<()> {
     println!("    chown -R {me}:{me} {}", home.display());
     println!("    chmod 0711 {}", home.display());
     println!();
-    println!("    # 4. run it");
+    println!("    # 4. the agent needs to reach the project. 0711 lets it");
+    println!("    #    traverse to a path it knows without listing your home.");
+    println!("    chmod 0711 {}", home_of_project(project).display());
+    println!();
+    println!("    # 5. run it, from the project directory");
+    println!("    cd {}", project.display());
     println!("    termaxa supervise &");
     println!("    sudo -u termaxa-agent termaxa wrap -- claude");
+    println!();
+    println!(
+        "  {}",
+        dim("If that last line asks for YOUR password, this machine's sudoers")
+    );
+    println!(
+        "  {}",
+        dim("rule is root-only (`NOPASSWD: ALL` for root, common on managed dev")
+    );
+    println!(
+        "  {}",
+        dim("boxes). `sudo -i` then `su - termaxa-agent` gets there without one.")
+    );
     println!();
     println!(
         "  {}",

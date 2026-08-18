@@ -167,9 +167,26 @@ fn dispatch(cli: Cli) -> Result<i32> {
             supervised,
         } => {
             let dir = std::env::current_dir()?;
-            init::run(&dir, claude_code, cursor, codex, copilot)?;
+            // `--supervised` prints the setup and nothing else. It used to run
+            // the whole of `init` first, so an operator who had just run
+            // `init --claude-code` saw ~60 lines they had already read - the
+            // harness list, the tools list, the full settings.json snippet,
+            // and "To wire Termaxa into Claude Code, run: termaxa init
+            // --claude-code" - with the supervised instructions buried under
+            // it. Found by the first proving run, where it was the first
+            // thing a supervised user read.
+            //
+            // It still scaffolds when the project has no policy yet, so
+            // `init --supervised` alone in a fresh directory does the right
+            // thing rather than printing setup for a project that does not
+            // exist.
             if supervised {
+                if !dir.join(".termaxa").join("policy.yaml").exists() {
+                    init::run(&dir, claude_code, cursor, codex, copilot)?;
+                }
                 init::print_supervised_setup(&dir)?;
+            } else {
+                init::run(&dir, claude_code, cursor, codex, copilot)?;
             }
             Ok(0)
         }

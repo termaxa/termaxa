@@ -2,6 +2,91 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.17.0 — the authority moves
+
+v0.16 stopped treating targets as strings. v0.17 moves **who decides**.
+
+A daemon runs as you; the agent runs as a different user; the two talk over a
+socket. The agent's account cannot read the audit log, edit the backups, change
+the policy, or stop the supervisor — not because the code refuses, but because
+the OS does. Eight pull requests, **441 tests on Linux, 386 on Windows**, and a
+boundary rig of 23 assertions that creates a second real account and has it try.
+
+The honest headline: **a real agent session found a bug that none of that
+caught.** See below.
+
+### Added
+
+- **`termaxa supervise`** (Unix) — a decision daemon under the operator's user.
+  In supervised mode the hook forwards the raw payload and prints what comes
+  back; it does not evaluate, insure, audit or preview on its own authority,
+  because anything it concluded would be a conclusion reached inside the
+  agent's trust domain.
+- **`termaxa init --supervised`** — prints the setup and runs none of it.
+  Creating a user and chowning a directory tree need root, and a tool that asks
+  for root to set things up for you is asking to be trusted with exactly the
+  authority this mode exists to bound. `termaxa doctor` then reports what those
+  commands actually produced, including whether the state directory is `0711`.
+- **A privilege boundary rig** (`tests/boundary/rig.sh`, blocking in CI) — 23
+  assertions run against a real second account, each with a **control leg**
+  proving the operator *can* do the thing, so a refusal means "blocked" rather
+  than "impossible for everyone".
+- **`docs/supervisor.md`** and a published [field
+  report](docs/field-reports/2026-08-17-supervised-routing.md).
+
+### Changed
+
+- **State files are private at creation**, not hardened afterwards. A daemon
+  runs for hours and the interesting files are the ones it writes *during* that
+  time: a log line appended mid-session inherited the process umask, and a
+  backup inherited the **source file's** mode, so insuring a world-readable file
+  produced a world-readable copy. Applied in basic mode too.
+- **The endpoint is told, not inferred from `$HOME`.** State discovery and IPC
+  discovery are now separate concepts — see the bug below.
+- **`hook::run` split into `decide()` plus a thin I/O wrapper**, so the daemon
+  and the one-shot hook share one decision path rather than two engines on one
+  question.
+- **The root rule names the root.** `match: "rm -rf /*"` is a wildcard: it
+  matched every absolute path and then explained itself as "delete from root".
+  A real agent was correctly stopped from deleting a `.git` directory and told
+  the reason was the filesystem root. Narrowed; every case still denies.
+
+### Fixed
+
+- **Supervised mode did not route.** The first real agent session found that a
+  hook running as the agent resolved the socket path from *its own* `$HOME`,
+  found nothing, concluded basic mode, and decided on its own authority —
+  writing an audit log the agent owned. The boundary was intact throughout: 18
+  rig assertions passed in that same session. **The walls held; the door led
+  nowhere.**
+
+  439 unit tests, three green CI platforms and synthetic end-to-end tests were
+  all consistent with a working system, because every one of them ran the hook
+  and the supervisor as the same user. The rig now asserts routing across two
+  real UIDs, which is the test that was missing.
+- **`gate_file_write` called `process::exit(2)`.** Under the daemon, the first
+  protected-file write an agent attempted would have killed the supervisor —
+  and a dead supervisor denies everything afterwards.
+
+### Known limitations
+
+- **Unix only.** Windows has neither Unix domain sockets nor a second user
+  account in the form this depends on; basic mode is the Windows answer and is
+  fully supported.
+- **This is not isolation.** Supervised mode moves who decides and who holds the
+  record. The interception boundary is exactly where it was: an agent's native
+  file tools bypass a supervised gate precisely as they bypass a basic one, and
+  `wrap` catches a shell resolved by name, not `/bin/sh` by absolute path.
+- **Credentials are a tradeoff, not a solved problem.** The agent account has
+  none of your git, SSH or registry access. Shared HOME dilutes the boundary;
+  copied credentials create rotation debt; curated-per-launch is most honest and
+  most friction. Claude Code *does* authenticate cleanly as a second user — one
+  OAuth round-trip, verified.
+- **`SO_PEERCRED` on macOS** returns no UID rather than guessing at an untested
+  `LOCAL_PEERCRED` ABI. An absent identity is recorded as absent.
+- **Daemon lifecycle** is `termaxa supervise &`. systemd units and launchd
+  plists are recipes to write, not managed for you.
+
 ## v0.16.0 — targets are things, not strings
 
 v0.15 stopped treating **commands** as strings. v0.16 stops treating three more
