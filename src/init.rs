@@ -376,24 +376,14 @@ pub fn run(
     }
 
     // --- detect agent harnesses ---
+    let detected = detect_harnesses(dir);
     println!("\nAgent harnesses detected:");
-    let mut found_any = false;
-    for (label, probe) in [
-        (
-            "Claude Code",
-            dir.join(".claude").exists() || which("claude"),
-        ),
-        ("Cursor", dir.join(".cursor").exists()),
-        ("OpenHands", which("openhands")),
-        ("Codex CLI", which("codex")),
-    ] {
-        if probe {
-            println!("  ✓ {}", label);
-            found_any = true;
-        }
-    }
-    if !found_any {
+    if detected.is_empty() {
         println!("  (none found — hook mode still works once you add one)");
+    } else {
+        for h in &detected {
+            println!("  ✓ {}", h.label);
+        }
     }
 
     // --- detect tools worth governing ---
@@ -412,6 +402,55 @@ pub fn run(
     ] {
         if which(tool) {
             println!("  ✓ {}", tool);
+        }
+    }
+
+    // Set when init's own liveness probe says the hook it just registered does
+    // not answer. The closing line must not say "Done" over that.
+    let mut verified_dead = false;
+
+    // --- wire up the harness ---
+    //
+    // AUTO-WIRE WHEN THERE IS NOTHING TO CHOOSE. With no flag given and
+    // exactly one harness detected, `init` installs that hook rather than
+    // printing "run me again with --claude-code" underneath "✓ Claude Code".
+    // The tool had already answered the question it was asking.
+    //
+    // With SEVERAL detected it asks, because picking one for you would be
+    // guessing at which agent you actually use — and wiring the wrong one
+    // looks identical to working until an ungated session happens.
+    //
+    // An explicit flag always wins: someone who names a harness gets that
+    // harness, whatever is detected.
+    let no_flag =
+        !write_claude_hook && !write_cursor_hook && !write_codex_hook && !write_copilot_hook;
+    let (write_claude_hook, write_cursor_hook, write_codex_hook, write_copilot_hook) =
+        if no_flag && detected.len() == 1 && !already_wired(dir, detected[0].flag) {
+            let only = detected[0].flag;
+            println!("\n→ one harness detected; wiring it ({})", only);
+            (
+                only == "--claude-code",
+                only == "--cursor",
+                only == "--codex",
+                only == "--copilot",
+            )
+        } else {
+            (
+                write_claude_hook,
+                write_cursor_hook,
+                write_codex_hook,
+                write_copilot_hook,
+            )
+        };
+
+    if no_flag && detected.len() > 1 {
+        println!(
+            "\n→ {} harnesses detected. Termaxa will not pick one for you —",
+            detected.len()
+        );
+        println!("  wiring the wrong one looks exactly like working. Re-run with:");
+        for h in &detected {
+            println!("      termaxa init {:<16} # {}", h.flag, h.label);
         }
     }
 
@@ -443,8 +482,10 @@ pub fn run(
             println!("  NOTE: restart Cursor after this so it reloads hook config.");
         }
 
-        println!("\nTo wire Termaxa into Claude Code, run: termaxa init --claude-code");
-        println!("To wire Termaxa into Cursor (v1.7+), run: termaxa init --cursor");
+        if detected.is_empty() {
+            println!("\nNo harness detected yet. When you add one:");
+            println!("  termaxa init --claude-code   |   --cursor   |   --codex   |   --copilot");
+        }
 
         if write_codex_hook {
             // Codex uses the same PreToolUse contract as Claude Code.
@@ -481,11 +522,47 @@ pub fn run(
     }
 
     if let Ok(p) = crate::paths::resolve() {
+        // --- verify, rather than assume ---
+        //
+        // `init` used to end by telling you to run `doctor`. A user who does
+        // not know why would skip it, and the failure this catches is the one
+        // that looks like success: a hook registered in settings.json that
+        // never runs. The proving run hit exactly that - a source build not on
+        // PATH, so the registration pointed at a binary the harness could not
+        // find, and only `doctor` said so.
+        //
+        // So `init` asks the question itself: it invokes the hook it just
+        // registered, exactly as the agent would, and reports what came back.
+        if write_claude_hook {
+            let settings = dir.join(".claude").join("settings.json");
+            if settings.exists() {
+                match crate::doctor::hook_live(&settings, dir).0 {
+                    crate::doctor::HookState::Live => {
+                        println!("\n✓ verified: the hook answered when invoked");
+                    }
+                    crate::doctor::HookState::Dead => {
+                        verified_dead = true;
+                        println!("\n✗ the hook is registered but did NOT answer when invoked.");
+                        println!("  Commands would run ungated, and this is the state that");
+                        println!("  looks safe. Most often the binary is not on PATH:");
+                        println!("      which termaxa      # should print a path");
+                        println!("  Then `termaxa doctor` for the full picture.");
+                    }
+                    crate::doctor::HookState::Absent => {}
+                }
+            }
+        }
+
         println!("\nRuntime state (logs, backups) lives OUTSIDE the repo:");
         println!("  {}", p.state_dir.display());
     }
 
-    println!("\nDone. Try:  termaxa check \"git push --force origin main\"");
+    if verified_dead {
+        println!("\nNOT done: the gate is registered and not running. Fix the PATH");
+        println!("problem above, then re-run `termaxa doctor` until it says live.");
+    } else {
+        println!("\nDone. Try:  termaxa check \"git push --force origin main\"");
+    }
     Ok(())
 }
 
@@ -785,6 +862,85 @@ pub fn print_supervised_setup(project: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A harness Termaxa can wire itself into, and whether it is present here.
+///
+/// v0.18. Detection existed since v0.9 and fed a printed list only: `init`
+/// told you it had found Claude Code and then asked you to re-run with
+/// `--claude-code`. That is a question the tool had already answered, and the
+/// first thing a new user has to get right — the proving run's setup output
+/// showed it plainly, printing "To wire Termaxa into Claude Code, run:
+/// termaxa init --claude-code" directly under "✓ Claude Code".
+pub struct Harness {
+    pub label: &'static str,
+    /// The flag that wires it, for the message when several are present and
+    /// the tool must not choose.
+    pub flag: &'static str,
+}
+
+/// Which harnesses are present in this project or on this PATH.
+///
+/// Project evidence (`.claude/`, `.cursor/`) is checked as well as PATH,
+/// because a repo carrying a harness's config is a stronger signal about what
+/// the user works with than a binary that happens to be installed.
+pub fn detect_harnesses(dir: &Path) -> Vec<Harness> {
+    let mut out = Vec::new();
+    if dir.join(".claude").exists() || which("claude") {
+        out.push(Harness {
+            label: "Claude Code",
+            flag: "--claude-code",
+        });
+    }
+    if dir.join(".cursor").exists() {
+        out.push(Harness {
+            label: "Cursor",
+            flag: "--cursor",
+        });
+    }
+    if which("codex") {
+        out.push(Harness {
+            label: "Codex CLI",
+            flag: "--codex",
+        });
+    }
+    if dir.join(".github").join("hooks").exists() || which("copilot") {
+        out.push(Harness {
+            label: "GitHub Copilot CLI",
+            flag: "--copilot",
+        });
+    }
+    if which("openhands") {
+        out.push(Harness {
+            label: "OpenHands",
+            flag: "--openhands",
+        });
+    }
+    out
+}
+
+/// Is this harness ALREADY wired, by us or by hand?
+///
+/// Auto-wiring must not overwrite a working configuration. A hook wired by
+/// hand often names an absolute path deliberately - because the binary is not
+/// on PATH, which is precisely the case where replacing it with a bare
+/// `termaxa hook` turns a live gate into a registered-but-dead one. An
+/// integration test caught exactly that when auto-detect first landed: a
+/// hand-wired hook under a restricted PATH was silently replaced and the
+/// session became ungated.
+///
+/// So the rule is narrow: auto-wire when nothing is there. An explicit flag
+/// still overwrites, because someone naming `--claude-code` is asking for it.
+fn already_wired(dir: &Path, flag: &str) -> bool {
+    let path = match flag {
+        "--claude-code" => dir.join(".claude").join("settings.json"),
+        "--cursor" => dir.join(".cursor").join("hooks.json"),
+        _ => return false,
+    };
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return false;
+    };
+    raw.contains("termaxa")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,6 +987,66 @@ mod tests {
 
         // And the function runs without error against a real project.
         print_supervised_setup(dir).expect("the setup prints");
+    }
+
+    /// v0.18: `init` wires a uniquely detected harness rather than telling
+    /// you to run it again with a flag it had already worked out.
+    #[test]
+    fn one_detected_harness_needs_no_flag() {
+        let t = TempTree::new("autodetect-one");
+        let dir = t.path();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+
+        let found = detect_harnesses(dir);
+        assert_eq!(
+            found.len(),
+            1,
+            "{:?}",
+            found.iter().map(|h| h.label).collect::<Vec<_>>()
+        );
+        assert_eq!(found[0].flag, "--claude-code");
+    }
+
+    /// With several present the tool ASKS. Picking one would be guessing at
+    /// which agent the user actually runs, and wiring the wrong one looks
+    /// exactly like working right up until an ungated session.
+    #[test]
+    fn several_detected_harnesses_are_not_chosen_between() {
+        let t = TempTree::new("autodetect-many");
+        let dir = t.path();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".cursor")).unwrap();
+
+        let found = detect_harnesses(dir);
+        assert!(found.len() >= 2, "both should be detected");
+        let flags: Vec<&str> = found.iter().map(|h| h.flag).collect();
+        assert!(flags.contains(&"--claude-code") && flags.contains(&"--cursor"));
+
+        // Every detected harness offers the flag that wires it — the message
+        // is only useful if the user can act on it.
+        for h in &found {
+            assert!(h.flag.starts_with("--"), "{} has no flag", h.label);
+            assert!(!h.label.is_empty());
+        }
+    }
+
+    /// A project with nothing in it detects nothing, rather than guessing from
+    /// a binary that happens to be installed elsewhere on the machine.
+    #[test]
+    fn an_empty_project_detects_nothing_from_its_own_evidence() {
+        let t = TempTree::new("autodetect-none");
+        let dir = t.path();
+        // `which` may still find harnesses on a developer machine, so this
+        // asserts the PROJECT contributes nothing rather than that the list is
+        // empty — the latter would fail on any box with claude installed.
+        let found = detect_harnesses(dir);
+        for h in &found {
+            assert!(
+                !dir.join(".claude").exists() && !dir.join(".cursor").exists(),
+                "{} was detected from project evidence that does not exist",
+                h.label
+            );
+        }
     }
 
     #[test]

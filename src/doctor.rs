@@ -538,7 +538,7 @@ pub enum HookState {
 /// 3. **It writes nothing.** `TERMAXA_HOOK_PROBE` puts `hook::run` in an inert
 ///    mode: no backup, no audit entry. `doctor` has never created state and
 ///    this does not start.
-fn hook_live(settings: &Path, dir: &Path) -> (HookState, Option<bool>) {
+pub(crate) fn hook_live(settings: &Path, dir: &Path) -> (HookState, Option<bool>) {
     let Some(cmd) = registered_command(settings) else {
         return (HookState::Absent, None);
     };
