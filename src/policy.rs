@@ -1491,6 +1491,47 @@ mod combined_gate_tests {
         }
     }
 
+    /// The root rule names the root, and nothing else.
+    ///
+    /// `match: "rm -rf /*"` is a WILDCARD: it matched every absolute path, so
+    /// `rm -rf /home/me/project/.git` was denied with "Recursive delete from
+    /// root is blocked". Right verdict, wrong sentence — and a proving run
+    /// caught it when a real agent was correctly stopped from deleting a
+    /// `.git` directory and told the reason was the filesystem root.
+    ///
+    /// Both still deny. The difference is what the human is told, which is
+    /// the whole product on the occasions it matters.
+    #[test]
+    fn the_root_rule_explains_itself_only_for_the_root() {
+        let p = Policy::builtin().unwrap();
+
+        for cmd in ["rm -rf /", "rm -rf / --no-preserve-root"] {
+            let d = p.evaluate_command(cmd, &here());
+            assert_eq!(d.action, Action::Deny);
+            assert!(
+                d.reason.contains("filesystem root"),
+                "{cmd}: names the root: {}",
+                d.reason
+            );
+        }
+
+        // An absolute path that is NOT the root still denies, and says why
+        // truthfully.
+        for cmd in [
+            "rm -rf /home/me/project/.git",
+            "rm -rf /tmp/build",
+            "rm -rf .git",
+        ] {
+            let d = p.evaluate_command(cmd, &here());
+            assert_eq!(d.action, Action::Deny, "{cmd} must still deny");
+            assert!(
+                !d.reason.contains("filesystem root"),
+                "{cmd} is not the root: {}",
+                d.reason
+            );
+        }
+    }
+
     /// REGRESSION, v0.16: the shipped `.env` rule denied ordinary READS.
     ///
     /// The rule carried `match: "*.env*"` purely because the schema demanded

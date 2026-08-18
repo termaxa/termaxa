@@ -149,9 +149,19 @@ rules:
   - match: "git push*--force*"
     action: deny
     reason: "Force pushes are blocked by policy. Open a PR instead."
-  - match: "rm -rf /*"
+  # The filesystem root, and only the root. `rm -rf /*` would be a WILDCARD
+  # matching every absolute path — `rm -rf /home/me/project/.git` included —
+  # and would then explain itself as "delete from root", which is the right
+  # verdict wearing the wrong sentence. A proving run caught it: an agent was
+  # correctly stopped from deleting a .git directory and told the reason was
+  # the filesystem root. The broad `*rm -rf*` rule below catches everything
+  # else and says something true about it.
+  - match: "rm -rf /"
     action: deny
-    reason: "Recursive delete from root is blocked."
+    reason: "Recursive delete from the filesystem root is blocked."
+  - match: "rm -rf / *"
+    action: deny
+    reason: "Recursive delete from the filesystem root is blocked."
   # GNU rm refuses `rm -rf /` on its own; --no-preserve-root is the one
   # spelling it obeys. The rule above is named for the command everybody
   # quotes, this one is named for the command that actually works.

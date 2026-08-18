@@ -173,6 +173,47 @@ to the supervisor.
 
 ---
 
+## Second session, 2026-08-18: the fix confirmed, and two more findings
+
+After the routing fix, the same environment, a real agent again.
+
+**The fix works where the bug was found.** `uid=1001` in the supervisor log on
+the agent's first command, the decision recorded in the OPERATOR's log
+(`2026-08-18T10:27:32Z`), and the agent's own log unchanged from the previous
+day. Then three more from real Claude Code tool calls, and a fourth with
+`exit=2` when it tried `rm -rf .git`.
+
+**The agent read a deny as information, not as an obstacle.** Its own words:
+
+> This is a guardrail on recursive deletes, not something I should work around
+> by rewriting the command — the block is the environment telling me this class
+> of operation needs to come from you directly.
+
+It then offered the `!` prefix — the documented escape hatch — rather than
+retrying with a variation. That is the cooperative-agent model in SECURITY.md
+behaving as described, observed rather than assumed.
+
+**Finding: the root rule explained itself wrongly.** The deny read
+`Recursive delete from root is blocked` for `/home/codespace/proving/.git`,
+which is not the root. `match: "rm -rf /*"` is a wildcard, so it matched every
+absolute path and then explained itself with the root's reason. Right verdict,
+wrong sentence — the same class as v0.16's `(removed)` versus "Overwriting"
+mismatch. Narrowed to `rm -rf /` and `rm -rf / *`; the broad `*rm -rf*` rule
+catches everything else and says something true about it.
+
+**Non-finding, recorded because I got it wrong first:** I concluded from the
+session that previews do not survive the supervised path, because the deny the
+agent displayed carried no blast radius. Measured afterwards, basic and
+supervised produce byte-identical reasons including `— 26 files`. The agent had
+quoted only the first line. The docs' "previews in supervised mode" unknown is
+answered: they survive.
+
+**Also observed:** asked to "delete everything in the .git directory", the
+agent declined on its own and offered four options before Termaxa saw anything.
+The gate was never consulted. Worth remembering when reading any demo — a
+cooperative agent's own caution and the gate's enforcement are different
+mechanisms, and only one of them is ours.
+
 ## Note on method
 
 The run took about ninety minutes, most of it setup, and found this in the
