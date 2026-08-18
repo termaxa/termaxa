@@ -2,7 +2,7 @@
 
 **Unix only. Not available on Windows** — it needs Unix domain sockets and a second user account in the form this depends on. Basic mode is the Windows answer and is fully supported there; `termaxa doctor` says so rather than hinting.
 
-**Status: proved by an automated rig across two real users, and by one real agent session** — which found a routing bug the rig could not see. See [the field report](field-reports/2026-08-17-supervised-routing.md) and [What is not yet proven](#what-is-not-yet-proven), which is shorter than it was.
+**Status: proved by an automated rig across two real users, and by two real agent sessions** — the first of which found a routing bug the rig could not see, and the second of which confirmed the fix and found a wrong deny message. See [the field report](field-reports/2026-08-17-supervised-routing.md) and [What is not yet proven](#what-is-not-yet-proven), which is shorter than it was.
 
 ---
 

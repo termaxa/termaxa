@@ -23,6 +23,8 @@ If your threat model includes an agent *actively trying to evade you*, you need 
 
 **Termaxa is an enforcement and recovery layer, not an isolation layer.** It can decide what an intercepted action should do, explain the consequence before it happens, preserve recoverability, and record what happened. It does not make an untrusted agent unable to act outside the interception boundary. Everything below follows from that sentence.
 
+Supervised mode (v0.17) does not change it. It moves *who decides and who holds the record* outside the agent's reach, which is a real and measurable improvement to what the audit is worth — and it leaves the interception boundary exactly where it was. An agent's native file tools bypass a supervised gate precisely as they bypass a basic one.
+
 ### Where the line is, and what it costs
 
 The distinction is **intent to evade**, not degree of misbehaviour.
@@ -64,7 +66,7 @@ We state this because it would be very convenient to call every bypass "out of s
 
 Some of these are **architectural boundaries** — they follow from Termaxa being an enforcement layer rather than an isolation layer, and no amount of implementation work removes them. Others are **implementation gaps** tracked for correction. They are listed together deliberately, because both affect what you should rely on today, and separating them would invite reading a known bug as "out of scope." Each entry says which it is.
 
-*Implementation claims below are current as of v0.16. The threat model above is stable; this list is not.*
+*Implementation claims below are current as of v0.17. The threat model above is stable; this list is not.*
 
 - **Shell parsing is heuristic.** Termaxa splits on `&&`, `||`, `;`, `|`, a lone `&` and newlines, and detects `$(...)`/backticks (escalating those to a human). It does not fully parse subshells `( )`, process substitution, or variable-expanded command names. Unparseable constructs are judged conservatively (the policy default, which ships as `ask`), but "conservative" is not "guaranteed."
 - *(implementation, largely closed in v0.15/v0.16)* **The policy engine and the intent classifier once read a command differently.** The classifier strips quotes before tokenizing; policy matching normalized whitespace and case but matched a string that still contained them, so `"rm" -rf /` classified as a file-delete while missing the `rm -rf /*` deny rule. Since v0.15 policy matches against several readings including the tokenized form, so the quoted spelling is caught. The readings can only ADD matches, never remove one. What remains is that the two layers still have separate tokenizers, and a construct only one of them understands is judged by only one of them.
@@ -131,7 +133,7 @@ Since v0.16 each audit entry carries the hash of the one before it. `termaxa doc
 
 The hook runs as the agent's own user, which means the audit log is written with the agent's own filesystem authority. Anything that can edit an entry can recompute the chain over it. The chain can expose accidental corruption, partial writes, and unsophisticated edits — what it catches depends on what changed and what remains readable. It does not stop, and cannot detect, a process in the agent's trust domain that rewrites the record deliberately and recomputes the hashes.
 
-**This changes in supervised mode (v0.17), and the reason is privilege rather than cryptography.** There the supervisor owns the state directory, the agent's user has no access to it, and the audit log is written by an authority outside the agent's reach. The record becomes trustworthy because of who holds the pen — not because the hash got cleverer.
+**Supervised mode (Unix, v0.17) changes this, and the reason is privilege rather than cryptography.** The supervisor owns the state directory, the agent's user has no access to it, and the audit log is written by an authority outside the agent's reach. The record becomes trustworthy because of who holds the pen — not because the hash got cleverer. A boundary rig with a second real account asserts each half of that: the agent cannot read, append to, or delete the log, and cannot list the directory holding it.
 
 Stated plainly, so a changelog line reading "hash-chained audit log" is not mistaken for more than it is:
 
@@ -157,7 +159,11 @@ Two things worth reading off that table rather than around it.
 
 **The improvement between rows three and four is privilege, not cleverness.** Wrapped mode routes more commands through the same code; supervised mode moves *who runs that code*. That is the only step in the table that changes what the record is worth, which is why the audit chain section above draws its line exactly there.
 
-Setup, the credential tradeoff, and what supervised mode has and has not been proved against: [docs/supervisor.md](docs/supervisor.md). It is honest about the last part — the boundary is proved by an automated rig with a second real user, and not yet by a real agent session.
+Setup, the credential tradeoff, and what supervised mode has and has not been proved against: [docs/supervisor.md](docs/supervisor.md).
+
+**What it has been proved against, and what that cost.** The boundary is asserted by an automated rig that creates a second real account and has it try — 23 assertions, each with a control leg proving the operator *can* do the thing, so a refusal means "blocked" rather than "impossible for everyone". It has also been run once with a real agent, and the [field report](docs/field-reports/2026-08-17-supervised-routing.md) is published including what broke: the first session found that agent commands never reached the supervisor at all, because a hook running as the agent resolved the socket path from *its own* `$HOME`. The walls held; the door led nowhere. 439 unit tests, 18 boundary assertions and three green CI platforms were all consistent with a working system, because every one of them ran the hook and the supervisor as the same user.
+
+That is the honest state of this row: proved by a rig, proved once by a real session, and the one real session found a bug the rig could not see.
 
 **Migration.** Entries written before v0.16 have no hash. They stay readable and are reported as pre-chain rather than as breaks: Termaxa can prove continuity from the boundary onward, and does not retroactively claim to have protected history it was not there for. A broken link names the entry and leaves the rest of the record readable, because one corrupt line making the whole log unreadable would destroy more evidence than the corruption did.
 
