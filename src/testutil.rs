@@ -72,8 +72,28 @@ fn claim(label: &str) -> PathBuf {
 ///
 /// A cleanup that silently failed is how litter accumulates in the first
 /// place, so the guard says so rather than shrugging.
+///
+/// Removal retries briefly before the verdict (#47). On Windows a directory
+/// cannot be removed while any process holds a handle inside it, and a
+/// just-exited child's handles — a spawned `git`, most concretely — are
+/// released by the OS asynchronously. Under a loaded parallel test run that
+/// release loses a race a single `remove_dir_all` was never going to win;
+/// measured on `main`, the same teardown that passes every serial run fails
+/// every loaded one. Ten attempts over half a second is enough margin for
+/// handle release and still fast enough to fail loudly when a tree has
+/// genuinely outlived its guard. Unconditional rather than `cfg(windows)`:
+/// the loop exits on the first success, so where the first attempt already
+/// works this is the old code.
 fn release(root: &Path) -> bool {
-    let _ = std::fs::remove_dir_all(root);
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_dir_all(root);
+        if !root.exists() {
+            return true;
+        }
+    }
     !root.exists()
 }
 
