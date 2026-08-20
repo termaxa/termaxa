@@ -57,7 +57,7 @@ const SENSITIVE: &[(&str, &str)] = &[
 ];
 
 pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Option<Preview> {
-    let targets = extract_targets(command);
+    let targets = extract_targets_detailed(command);
     if targets.is_empty() {
         return None;
     }
@@ -69,7 +69,36 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
     // Computed while the preview walks its targets; reported, not acted on.
     let mut uninsurable = false;
 
-    for raw in targets.iter().take(3) {
+    for tok in targets.iter().take(3) {
+        let raw = &tok.text;
+
+        // Issue #11: a target carrying a variable the shell has not expanded
+        // yet. `resolve_path_in` would happily join `x/$SID` onto the cwd and
+        // print a real-looking path that will never exist — while the path the
+        // shell actually deletes, if `$SID` is empty, is the parent. Both
+        // public incidents (the `$TEMP_WT` worktree wipe, Codex's `$HOME`
+        // cleanup) ran on exactly that gap between the written string and the
+        // executed path. `resolve::target` has refused to resolve these since
+        // v0.16; the preview is the reader a human sees, so it must refuse
+        // too — an admitted unknown, not a confident wrong answer.
+        if tok.has_unexpanded_var() {
+            lines.push(format!("  target      : {}", raw));
+            lines.push(
+                "  ⚠ UNRESOLVED: contains a shell variable — if empty at execution, \
+                 the delete lands on a different path than written"
+                    .into(),
+            );
+            lines.push(
+                "  ✗ insurance : cannot back up a path unknown until the shell expands it \
+                 — NOT recoverable"
+                    .into(),
+            );
+            worst_first.push("UNRESOLVED variable in target".into());
+            uninsurable = true;
+            summary_parts.push(format!("{} — unresolved variable", short(raw)));
+            continue;
+        }
+
         let resolved = resolve_path_in(raw, cwd);
         let display = resolved.display().to_string();
 
@@ -189,14 +218,36 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
 /// classifier already knows about. Deliberately conservative: if we can't
 /// confidently identify a target we return nothing rather than guessing, and
 /// the caller falls back to no preview.
+///
+/// A projection of `extract_targets_detailed` — one extractor, two views
+/// (decision #37: two engines parsing the same command differently is the
+/// bug class this module exists to close). Callers that need to know whether
+/// a target can be resolved at all take the detailed form.
 pub fn extract_targets(command: &str) -> Vec<String> {
+    extract_targets_detailed(command)
+        .into_iter()
+        .map(|t| t.text)
+        .collect()
+}
+
+/// Delete targets with their quoting provenance attached.
+///
+/// The provenance exists because of what `tokenize` throws away: after quote
+/// stripping, `'lit$SID'` and `$SID` are indistinguishable strings, and only
+/// one of them expands. Keeping the quotes in the token text instead — the
+/// obvious fix — breaks `resolve_head`, which must keep recognising `"rm"`
+/// as `rm` (the quoting shape this project has already shipped a bypass
+/// for). So the text stays exactly what it was, and what the quotes *meant*
+/// travels beside it.
+pub fn extract_targets_detailed(command: &str) -> Vec<Tok> {
     let mut out = Vec::new();
     for segment in crate::shell::split_segments(command) {
-        let tokens = tokenize(&segment);
+        let tokens = tokenize_detailed(&segment);
         if tokens.is_empty() {
             continue;
         }
-        let Some((head, at)) = resolve_head(&tokens) else {
+        let texts: Vec<String> = tokens.iter().map(|t| t.text.clone()).collect();
+        let Some((head, at)) = resolve_head(&texts) else {
             continue;
         };
         if !is_delete_command(&head) {
@@ -207,7 +258,7 @@ pub fn extract_targets(command: &str) -> Vec<String> {
         // wrapper present those are different positions, and reading from
         // token zero would take the wrapper's own arguments as targets.
         for t in tokens.iter().skip(at + 1) {
-            if is_flag(&head, t) {
+            if is_flag(&head, &t.text) {
                 continue;
             }
             out.push(t.clone());
@@ -390,24 +441,102 @@ pub fn tokenize_public(s: &str) -> Vec<String> {
 }
 
 fn tokenize(s: &str) -> Vec<String> {
+    tokenize_detailed(s).into_iter().map(|t| t.text).collect()
+}
+
+/// A token with the one fact quote-stripping destroys: whether its content
+/// came from inside single quotes, where the shell expands nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tok {
+    pub text: String,
+    /// Every character of `text` arrived from inside single quotes.
+    /// `'lit$SID'` keeps this; `x/$SID` and `"$SID"` do not (double quotes
+    /// expand variables, so for this question they are the same as no
+    /// quotes at all).
+    pub single_quoted: bool,
+}
+
+impl Tok {
+    /// Does this token carry a shell variable the gate cannot expand —
+    /// `$NAME` or `${NAME}` outside single quotes and not escaped?
+    ///
+    /// Deliberately NOT a blanket dollar check. The r/ClaudeCode design
+    /// review named the false positives a naive rule produces, and each is
+    /// excluded here and pinned by a test:
+    ///
+    ///   `'lit$SID'`   single quotes never expand — a filename
+    ///   `\$SID`       the backslash reaches the shell as an escape
+    ///   `costs$5`     a digit after `$` is positional-parameter shaped; in
+    ///                 a delete target it is overwhelmingly a filename
+    ///
+    /// Out of scope, deliberately: `$(...)` is command substitution, a
+    /// different hazard; `%VAR%` is cmd, where an undefined name stays as
+    /// literal text rather than collapsing to empty, so the failure class
+    /// this detects — a path silently shrinking to its parent — does not
+    /// arise there.
+    pub fn has_unexpanded_var(&self) -> bool {
+        if self.single_quoted {
+            return false;
+        }
+        let chars: Vec<char> = self.text.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            if *c != '$' {
+                continue;
+            }
+            if i > 0 && chars[i - 1] == '\\' {
+                continue;
+            }
+            if let Some(next) = chars.get(i + 1) {
+                if next.is_ascii_alphabetic() || *next == '_' || *next == '{' {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// `tokenize`, keeping provenance instead of discarding it. The `text` field
+/// of every token is byte-identical to what `tokenize` returns — consumers
+/// like `resolve_head` see exactly the strings they always did.
+fn tokenize_detailed(s: &str) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
+    // True until the first character arrives from outside single quotes.
+    // An empty token never gets pushed, so the initial value only ever
+    // reaches `out` alongside at least one single-quoted character.
+    let mut all_single = true;
     for c in s.chars() {
         match (quote, c) {
             (Some(q), ch) if ch == q => quote = None,
-            (Some(_), ch) => cur.push(ch),
+            (Some(q), ch) => {
+                if q != '\'' {
+                    all_single = false;
+                }
+                cur.push(ch);
+            }
             (None, '"') | (None, '\'') => quote = Some(c),
             (None, ch) if ch.is_whitespace() => {
                 if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
+                    out.push(Tok {
+                        text: std::mem::take(&mut cur),
+                        single_quoted: all_single,
+                    });
                 }
+                all_single = true;
             }
-            (None, ch) => cur.push(ch),
+            (None, ch) => {
+                all_single = false;
+                cur.push(ch);
+            }
         }
     }
     if !cur.is_empty() {
-        out.push(cur);
+        out.push(Tok {
+            text: cur,
+            single_quoted: all_single,
+        });
     }
     out
 }
@@ -836,6 +965,87 @@ mod tests {
         // non-deletes produce nothing
         assert!(extract_targets("git status").is_empty());
         assert!(extract_targets("ls -la /c/Users").is_empty());
+    }
+
+    #[test]
+    fn preview_admits_an_unresolvable_target_instead_of_inventing_a_path() {
+        // Issue #11, asserted as the r/ClaudeCode review asked: prove the
+        // BAD OUTCOME is blocked — a resolved path printed for a target the
+        // shell has not expanded — not merely that a dollar token exists.
+        let cwd = std::env::current_dir().unwrap();
+        let p = preview_for("rm -rf x/$SID", None, &cwd).expect("delete preview");
+
+        // The line issue #11 was filed about: cwd-joined `$SID`, a path that
+        // will never exist, printed as fact.
+        let invented = resolve_path_in("x/$SID", &cwd).display().to_string();
+        assert!(
+            !p.lines.iter().any(|l| l.contains(&invented)),
+            "preview printed a resolved path for an unexpanded variable: {:?}",
+            p.lines
+        );
+        // What replaces it: the target as written, and an admitted unknown.
+        assert!(p.lines.iter().any(|l| l.contains("x/$SID")));
+        assert!(p.lines.iter().any(|l| l.contains("UNRESOLVED")));
+        // The summary leads with it — that is the sentence an agent's
+        // confirmation prompt shows a human.
+        assert!(p.summary.contains("UNRESOLVED variable"));
+        // No backup can cover a path unknown until expansion.
+        assert!(p.uninsurable);
+    }
+
+    #[test]
+    fn unexpanded_var_detection_is_quote_aware() {
+        // The three false positives from the r/ClaudeCode review, plus the
+        // live cases. `flagged(cmd)` = the sole extracted target carries an
+        // unexpanded variable.
+        fn flagged(cmd: &str) -> bool {
+            let t = extract_targets_detailed(cmd);
+            assert_eq!(t.len(), 1, "expected one target from {cmd:?}, got {t:?}");
+            t[0].has_unexpanded_var()
+        }
+
+        assert!(flagged("rm -rf x/$SID")); // the incident shape
+        assert!(flagged("rm -rf \"$SID\"")); // double quotes expand
+        assert!(flagged("rm -rf ${SID}")); // braced form
+        assert!(!flagged("rm -rf 'lit$SID'")); // single quotes do not
+        assert!(!flagged("rm -rf \\$SID")); // escaped, reaches shell literal
+        assert!(!flagged("rm -rf costs$5")); // digit: a filename
+        assert!(!flagged("rm -rf x")); // control
+                                       // `$(...)` is command substitution — a different hazard, not this
+                                       // detector's claim to make.
+        assert!(!flagged("rm -rf $(pwd)"));
+
+        // Single-quote provenance survives extraction with the text intact.
+        let t = extract_targets_detailed("rm -rf 'lit$SID'");
+        assert_eq!(t[0].text, "lit$SID");
+        assert!(t[0].single_quoted);
+    }
+
+    #[test]
+    fn quoted_head_resolution_survives_the_provenance_change() {
+        // Regression guard. Keeping quotes in the token text — the obvious
+        // way to remember them — makes `resolve_head` stop recognising
+        // `"rm"`, the quoting shape this project has already shipped a
+        // bypass for. Provenance must travel BESIDE the text, never in it.
+        assert_eq!(extract_targets("\"rm\" -rf x"), vec!["x"]);
+
+        // And the two views are one extractor: the plain form is exactly
+        // the detailed form's text (decision #37 — two engines parsing one
+        // command differently is the bug class this module closes).
+        for cmd in [
+            "rm -rf x/$SID",
+            "\"rm\" -rf x",
+            "rm -rf 'lit$SID'",
+            "git status && rm -rf ./dist",
+            "del /s /q C:\\tmp",
+        ] {
+            let plain = extract_targets(cmd);
+            let detailed: Vec<String> = extract_targets_detailed(cmd)
+                .into_iter()
+                .map(|t| t.text)
+                .collect();
+            assert_eq!(plain, detailed, "views diverged for {cmd:?}");
+        }
     }
 
     #[test]
