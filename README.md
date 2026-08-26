@@ -30,10 +30,18 @@ Termaxa is a third option: a gate the agent's commands pass through. It reads a 
 
 ## Quick start (5 minutes)
 
-**1. Install.** Download a prebuilt binary from [Releases](https://github.com/termaxa/termaxa/releases) and put it on your PATH — or, with a Rust toolchain:
+**1. Install.**
 
 ```bash
-cargo install termaxa
+brew install termaxa/tap/termaxa     # macOS / Linux (prebuilt, sha256-pinned)
+cargo install termaxa                # any OS, with a Rust toolchain
+```
+
+Windows: download `termaxa-windows-x86_64.exe` from [Releases](https://github.com/termaxa/termaxa/releases), rename to `termaxa.exe`, put it on your PATH. (A winget manifest is submitted; this line updates when it lands.)
+
+There is deliberately no `curl | sh` installer — Termaxa itself flags that pattern as a hazard, and the gate's rules apply to the gate. Every binary is a checksummed Release asset built by the tag-gated CI.
+
+```bash
 termaxa                       # what this is, and what to try next
 termaxa check "rm -rf /"      # works immediately — no setup, no project config
 ```

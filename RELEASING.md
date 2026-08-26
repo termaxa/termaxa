@@ -21,3 +21,13 @@
 7. After the GitHub release publishes, run cargo publish — otherwise cargo install termaxa lags behind the GitHub release.
    - Deliberately manual. crates.io publishes are permanent — a version can be yanked, never deleted or re-published with different content. GitHub releases can be edited or removed. Automating the irreversible step would remove the last human checkpoint before a permanent action, which is the argument this tool makes about destructive commands. The gate applies to us too.
 8. After bumping Cargo.toml: run cargo build (updates Cargo.lock), then commit both Cargo.toml and Cargo.lock together in the release-prep commit, before tagging. Then tag → push → CI green → cargo publish.
+
+9. Update the package managers (after cargo publish):
+   - Homebrew tap: in termaxa/homebrew-tap, bump `version` and the three
+     sha256s in Formula/termaxa.rb (sha256sum the downloaded release
+     assets — never copy hashes you didn't compute). The tap's own CI
+     installs the formula on macOS and Linux; green there is the gate.
+   - winget: `wingetcreate update Termaxa.Termaxa --urls <new .exe url> --version <ver> --submit`
+     (or bump the three manifests in the winget-pkgs fork by hand).
+   Both are deliberately manual, same reasoning as step 7: publishing to
+   package managers is the last human checkpoint before strangers' machines.
