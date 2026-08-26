@@ -108,7 +108,11 @@ pub fn sha256_hex(data: &[u8]) -> String {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    // Block-aligned by construction: the padding above ends the message at a
+    // multiple of 64, so the remainder as_chunks returns is always empty.
+    // (clippy 1.98's chunks_exact_to_as_chunks; the array type is also the
+    // truer one for a SHA-256 block.)
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().enumerate().take(16) {
             let b = &chunk[i * 4..i * 4 + 4];
