@@ -948,7 +948,7 @@ mod tests {
     fn here() -> crate::resolve::EvalContext {
         crate::resolve::EvalContext::at(std::path::Path::new("."))
     }
-    use crate::testutil::TempTree;
+    use crate::testutil::{TempTree, TestEnv};
 
     /// `examples/policy.yaml` is the file people copy. It had drifted to 28
     /// rules against the starter's 44 — missing every broad delete deny and
@@ -974,7 +974,15 @@ mod tests {
         // Captured by rendering into a string rather than by scraping stdout:
         // the point is the CONTENT, and a test that shells out would be
         // testing the terminal.
-        let rig = std::fs::read_to_string("tests/boundary/rig.sh").unwrap();
+        // Anchored to the crate root rather than the cwd. The cwd belongs to
+        // the PROCESS, `TestEnv::chdir` moves it, and this test holds no lock
+        // — so a relative read here is a bet that no cwd mover is scheduled
+        // beside it. Measured on this tree, that bet loses 6 times in 30 runs
+        // at `--test-threads=16` and never at default threads (#51).
+        let rig = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/boundary/rig.sh"),
+        )
+        .unwrap();
         assert!(
             rig.contains("chmod 0711 \"$TERMAXA_HOME\""),
             "the rig uses 0711 on the state dir; if that changed, the printed \
@@ -993,8 +1001,16 @@ mod tests {
     /// you to run it again with a flag it had already worked out.
     #[test]
     fn one_detected_harness_needs_no_flag() {
-        let t = TempTree::new("autodetect-one");
-        let dir = t.path();
+        // "Exactly one" is a claim about what detection SEES, and half of what
+        // it sees is `which` reading the machine. Without the isolated PATH
+        // this test asserts a property of the developer's box: on one with
+        // `codex` installed it detects two and fails every run, at any thread
+        // count (#51). The neighbouring empty-project test dodged the same
+        // trap by weakening its assertion; this one keeps the exact count and
+        // controls the environment that makes it true.
+        let mut env = TestEnv::new("autodetect-one");
+        env.isolate_path();
+        let dir = env.root();
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
 
         let found = detect_harnesses(dir);

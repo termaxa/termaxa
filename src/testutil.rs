@@ -1,7 +1,7 @@
 //! Test-only isolation for the process-global state this suite reaches into.
 //!
-//! `TERMAXA_HOME` and the working directory belong to the PROCESS, and cargo
-//! runs tests as threads inside one process. Three tests in `paths.rs` used to
+//! `TERMAXA_HOME`, the working directory and `PATH` belong to the PROCESS, and
+//! cargo runs tests as threads inside one process. Three tests in `paths.rs` used to
 //! set them by hand and delete the trees they pointed at, which produced a
 //! flake that read as a missing policy (#17) and, on every green run in
 //! between, quietly wrote state into the developer's real `~/.termaxa`.
@@ -18,6 +18,14 @@
 //! - [`TestEnv`] is a `TempTree` plus the lock, `TERMAXA_HOME` pointed into
 //!   the tree, and the cwd restored on the way out. Only tests that need the
 //!   environment redirected should pay for the serialisation.
+//!   [`TestEnv::isolate_path`] adds `PATH` to what it covers, for the tests
+//!   whose subject is what `which` can find (#51).
+//!
+//! The third global arrived late for a reason worth keeping: `PATH` was being
+//! rewritten by hand in two modules, correctly in one and without a restore
+//! guard in the other, while the newest test to depend on it did neither and
+//! quietly asserted a property of the developer's machine. A global the guard
+//! has no word for is one every test has to remember on its own.
 //!
 //! ```ignore
 //! let tmp = TempTree::new("my-case");
@@ -170,6 +178,55 @@ fn listing(dir: &Path) -> BTreeSet<OsString> {
     }
 }
 
+/// Wait for a just-written stub to actually be executable.
+///
+/// "Written" and "executable" are not the same instant in a multithreaded
+/// process. `exec` refuses a file any process still holds open for writing
+/// (`ETXTBSY`). The writing descriptor here is closed by the time this runs —
+/// but a sibling test that forks while it was open leaves the child holding a
+/// copy until that child reaches its own `exec`, and a stub exec'd inside that
+/// window fails. Nothing is misusing anything: `fork` in a threaded process
+/// copies descriptors it was never told about.
+///
+/// Measured with this write-then-exec shape lifted into a standalone program:
+/// 37 of 4800 execs at 16 threads returned `ExecutableFileBusy`, none serially
+/// (#51). Both stub helpers in this suite have that shape, which is why the
+/// wait lives here rather than in either of them.
+///
+/// Retry-then-verdict, the shape #47 settled on: the window is microseconds
+/// and closes on its own, and once an `exec` has succeeded no writer remains
+/// to reopen it. Running the stub once is harmless — these print and exit.
+pub fn wait_until_executable(path: &Path) {
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        match std::process::Command::new(path).arg("--warmup").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => continue,
+            _ => return,
+        }
+    }
+}
+
+/// Absolute path of `bin` on the current `PATH`, if it resolves to a file.
+///
+/// Used only to find the lookup tool itself before [`TestEnv::isolate_path`]
+/// takes `PATH` away, so the isolated directory can still answer honestly.
+#[cfg(not(windows))]
+fn locate(bin: &str) -> Option<PathBuf> {
+    let out = std::process::Command::new("which").arg(bin).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let first = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    let path = PathBuf::from(first);
+    path.is_file().then_some(path)
+}
+
 /// Names present at drop that were not present at construction.
 fn arrivals(before: &BTreeSet<OsString>, after: &BTreeSet<OsString>) -> Vec<OsString> {
     after.difference(before).cloned().collect()
@@ -185,6 +242,11 @@ pub struct TestEnv {
     tree: TempTree,
     previous_home: Option<OsString>,
     previous_cwd: Option<PathBuf>,
+    /// `None` until [`TestEnv::isolate_path`] runs; `Some(previous)` after,
+    /// where `previous` is itself absent if the process had no `PATH`.
+    /// Captured once, like the cwd, so repeated calls still restore the value
+    /// the test started from.
+    previous_path: Option<Option<OsString>>,
     watch: Option<(PathBuf, BTreeSet<OsString>)>,
 }
 
@@ -214,6 +276,7 @@ impl TestEnv {
             tree,
             previous_home,
             previous_cwd: None,
+            previous_path: None,
             watch,
         }
     }
@@ -251,6 +314,63 @@ impl TestEnv {
         std::env::set_current_dir(dir).expect("cwd must be settable");
     }
 
+    /// Point `PATH` at a directory holding the lookup tool and nothing else,
+    /// so `which`-style detection runs for real and honestly reports absence.
+    ///
+    /// `PATH` is the third process-global this suite reaches into, after
+    /// `TERMAXA_HOME` and the working directory, and it is the one the guard
+    /// had no word for. `init`'s autodetect test asserted an exact harness
+    /// count while `which` was still reading the developer's machine, so it
+    /// passed only where no second agent CLI happened to be installed — on a
+    /// box with `codex` on `PATH` it fails 30 runs out of 30, at any thread
+    /// count (#51). The sibling test one screen down already carries a comment
+    /// warning about exactly this; the knowledge existed and did not reach the
+    /// newer test, which is the argument for putting it here instead.
+    ///
+    /// Emptying `PATH` is the obvious move and it is the wrong one. Measured
+    /// both ways: with `PATH` empty the `which` spawn itself fails with
+    /// `NotFound` and the lookup reports "absent" because it never ran, which
+    /// is a test passing through a broken mechanism rather than a real
+    /// negative. Keeping the finder reachable and nothing else keeps the
+    /// lookup honest.
+    /// Returns the directory now standing in for `PATH`, so a test that needs
+    /// a lookup to SUCCEED can put something there to be found.
+    pub fn isolate_path(&mut self) -> PathBuf {
+        if self.previous_path.is_none() {
+            self.previous_path = Some(std::env::var_os("PATH"));
+        }
+
+        let only_bin = self.tree.path().join("only-bin");
+        std::fs::create_dir_all(&only_bin).expect("the isolated bin dir must be creatable");
+
+        // Windows keeps `where.exe` in System32 along with the rest of the OS,
+        // and none of the harness CLIs live there, so naming that directory
+        // alongside ours gives the same shape without copying a system binary
+        // out of it.
+        if cfg!(windows) {
+            let system32 = std::env::var_os("SystemRoot")
+                .map(|root| PathBuf::from(root).join("System32"))
+                .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"));
+            std::env::set_var(
+                "PATH",
+                format!("{};{}", only_bin.display(), system32.display()),
+            );
+            return only_bin;
+        }
+
+        // Locate the finder through the PATH the process still has, then put a
+        // copy of it — and nothing else — in front of the test.
+        //
+        // A host with no `which` at all is left with an empty directory on
+        // purpose: there, `init::which` already answers false for everything,
+        // so this reports the same thing the host itself would.
+        if let Some(finder) = locate("which") {
+            let _ = std::fs::copy(&finder, only_bin.join("which"));
+        }
+        std::env::set_var("PATH", &only_bin);
+        only_bin
+    }
+
     /// Watch a stand-in directory instead of the real one, so the check at
     /// drop can be tested without writing to anybody's home.
     #[cfg(test)]
@@ -266,6 +386,14 @@ impl Drop for TestEnv {
         // longer exists breaks `getcwd` for everything scheduled after it.
         if let Some(cwd) = self.previous_cwd.take() {
             let _ = std::env::set_current_dir(cwd);
+        }
+        // Same reasoning as the cwd above: a PATH left pointing into a tree
+        // that is about to be deleted breaks every lookup scheduled after it.
+        if let Some(previous) = self.previous_path.take() {
+            match previous {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
         }
         match self.previous_home.take() {
             Some(previous) => std::env::set_var("TERMAXA_HOME", previous),
@@ -350,6 +478,67 @@ mod tests {
         assert!(!root.exists(), "the guard must remove its own tree");
         assert_eq!(std::env::var_os("TERMAXA_HOME"), home_before);
         assert_eq!(std::env::current_dir().ok(), Some(cwd_before));
+    }
+
+    /// The anti-rot test for the third global, and it has to assert BOTH
+    /// halves.
+    ///
+    /// "The harness was not found" is the easy half and it is worthless alone:
+    /// an empty `PATH` produces exactly that answer, because the `which` spawn
+    /// itself fails and the lookup reports absence without ever running.
+    /// Measured, and the reason this helper copies the finder in rather than
+    /// clearing the variable. So the test also puts a binary in the isolated
+    /// directory and requires it to be FOUND — that is the assertion that
+    /// fails if isolation ever degrades into breaking the mechanism.
+    #[cfg(not(windows))]
+    #[test]
+    fn isolating_path_hides_the_machine_without_breaking_the_lookup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut env = TestEnv::new("path-isolation");
+        let bin = env.isolate_path();
+
+        let planted = bin.join("termaxa-not-a-real-harness");
+        std::fs::write(&planted, "#!/bin/sh\nexit 0\n").expect("plant must be writable");
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755))
+            .expect("plant must be executable");
+
+        assert!(
+            crate::init::which("termaxa-not-a-real-harness"),
+            "the lookup must still run: a binary in the isolated directory has \
+             to be found, or every negative below is just a broken spawn"
+        );
+        for harness in ["codex", "copilot", "openhands"] {
+            assert!(
+                !crate::init::which(harness),
+                "{harness} was found through an isolated PATH — the developer's \
+                 machine is still reaching the test"
+            );
+        }
+    }
+
+    #[test]
+    fn the_guard_puts_path_back() {
+        let _outer = lock();
+        let path_before = std::env::var_os("PATH");
+
+        {
+            let mut env = TestEnv::build(None, "restores-path");
+            let bin = env.isolate_path();
+            // Leading rather than equal: Windows keeps System32 behind ours so
+            // `where.exe` stays reachable.
+            let live = std::env::var("PATH").expect("the guard exports a PATH");
+            assert!(
+                live.starts_with(&bin.display().to_string()),
+                "the guard must put its own bin dir in front while it is alive, got {live}"
+            );
+        }
+
+        assert_eq!(
+            std::env::var_os("PATH"),
+            path_before,
+            "a PATH left pointing into a deleted tree breaks every lookup after it"
+        );
     }
 
     /// Run `f` with panic output silenced, and report whether it panicked.
