@@ -196,6 +196,11 @@ fn listing(dir: &Path) -> BTreeSet<OsString> {
 /// Retry-then-verdict, the shape #47 settled on: the window is microseconds
 /// and closes on its own, and once an `exec` has succeeded no writer remains
 /// to reopen it. Running the stub once is harmless — these print and exit.
+/// Unix only, and not merely because both callers are: `ETXTBSY` is a unix
+/// errno, and Windows keeps a just-written file busy through sharing
+/// violations on a different code path. A stub there would need its own
+/// measurement before it got its own wait.
+#[cfg(unix)]
 pub fn wait_until_executable(path: &Path) {
     for attempt in 0..10 {
         if attempt > 0 {
@@ -343,11 +348,16 @@ impl TestEnv {
         let only_bin = self.tree.path().join("only-bin");
         std::fs::create_dir_all(&only_bin).expect("the isolated bin dir must be creatable");
 
-        // Windows keeps `where.exe` in System32 along with the rest of the OS,
-        // and none of the harness CLIs live there, so naming that directory
-        // alongside ours gives the same shape without copying a system binary
-        // out of it.
-        if cfg!(windows) {
+        // `#[cfg]` and not `cfg!`: the two branches call different functions,
+        // and `cfg!` is a runtime bool that leaves BOTH of them compiled on
+        // both platforms. `locate` exists only off Windows, so the first
+        // version of this compiled here and failed the Windows leg.
+        #[cfg(windows)]
+        {
+            // Windows keeps `where.exe` in System32 along with the rest of the
+            // OS, and none of the harness CLIs live there, so naming that
+            // directory behind ours gives the same shape without copying a
+            // system binary out of it.
             let system32 = std::env::var_os("SystemRoot")
                 .map(|root| PathBuf::from(root).join("System32"))
                 .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"));
@@ -355,7 +365,6 @@ impl TestEnv {
                 "PATH",
                 format!("{};{}", only_bin.display(), system32.display()),
             );
-            return only_bin;
         }
 
         // Locate the finder through the PATH the process still has, then put a
@@ -364,10 +373,14 @@ impl TestEnv {
         // A host with no `which` at all is left with an empty directory on
         // purpose: there, `init::which` already answers false for everything,
         // so this reports the same thing the host itself would.
-        if let Some(finder) = locate("which") {
-            let _ = std::fs::copy(&finder, only_bin.join("which"));
+        #[cfg(not(windows))]
+        {
+            if let Some(finder) = locate("which") {
+                let _ = std::fs::copy(&finder, only_bin.join("which"));
+            }
+            std::env::set_var("PATH", &only_bin);
         }
-        std::env::set_var("PATH", &only_bin);
+
         only_bin
     }
 
