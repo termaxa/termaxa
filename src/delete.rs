@@ -454,6 +454,15 @@ pub struct Tok {
     /// expand variables, so for this question they are the same as no
     /// quotes at all).
     pub single_quoted: bool,
+    /// Char positions in `text` holding a `$` that reached the shell escaped.
+    ///
+    /// Consuming the backslash destroys the same evidence quote stripping
+    /// does: after it, `"\$SID"` and `"$SID"` are one string and only one of
+    /// them expands. The backslash cannot stay in `text` — a token that keeps
+    /// it names a different file than `pg::shell_tokens` names, which is the
+    /// divergence #50 is about — so where it stood travels beside the text,
+    /// the same way `single_quoted` does.
+    literal_dollars: Vec<usize>,
 }
 
 impl Tok {
@@ -486,6 +495,11 @@ impl Tok {
             if i > 0 && chars[i - 1] == '\\' {
                 continue;
             }
+            // Same fact, for the spelling where the backslash did not
+            // survive tokenization: `"\$SID"`.
+            if self.literal_dollars.contains(&i) {
+                continue;
+            }
             if let Some(next) = chars.get(i + 1) {
                 if next.is_ascii_alphabetic() || *next == '_' || *next == '{' {
                     return true;
@@ -507,8 +521,34 @@ fn tokenize_detailed(s: &str) -> Vec<Tok> {
     // An empty token never gets pushed, so the initial value only ever
     // reaches `out` alongside at least one single-quoted character.
     let mut all_single = true;
-    for c in s.chars() {
+    let mut literal_dollars: Vec<usize> = Vec::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
         match (quote, c) {
+            // Inside double quotes a backslash escapes the next character,
+            // so `"a\"b"` is the one argument `a"b` and the quote it hides
+            // closes nothing. This is `pg::shell_tokens`' rule verbatim, and
+            // adopting it is #50: until v0.17 the backslash was literal
+            // here, so the preview resolved `a\b` while the backup engine
+            // copied `a"b` — one delete, two filenames, and the resolved-path
+            // policy layer reading the preview's.
+            //
+            // Verbatim includes where the rule is wrong: a shell keeps the
+            // backslash before an ordinary character, so `"a\nb"` is really
+            // `a\nb` and both lexers here say `anb`. That is a divergence
+            // from bash, not between the two engines, and closing it means
+            // moving both together rather than one of them now.
+            (Some('"'), '\\') => {
+                if let Some(next) = chars.next() {
+                    all_single = false;
+                    if next == '$' {
+                        // Only walked when an escaped `$` actually arrives,
+                        // which keeps the count off the hot path.
+                        literal_dollars.push(cur.chars().count());
+                    }
+                    cur.push(next);
+                }
+            }
             (Some(q), ch) if ch == q => quote = None,
             (Some(q), ch) => {
                 if q != '\'' {
@@ -522,6 +562,7 @@ fn tokenize_detailed(s: &str) -> Vec<Tok> {
                     out.push(Tok {
                         text: std::mem::take(&mut cur),
                         single_quoted: all_single,
+                        literal_dollars: std::mem::take(&mut literal_dollars),
                     });
                 }
                 all_single = true;
@@ -536,6 +577,7 @@ fn tokenize_detailed(s: &str) -> Vec<Tok> {
         out.push(Tok {
             text: cur,
             single_quoted: all_single,
+            literal_dollars,
         });
     }
     out
@@ -1009,6 +1051,7 @@ mod tests {
         assert!(flagged("rm -rf ${SID}")); // braced form
         assert!(!flagged("rm -rf 'lit$SID'")); // single quotes do not
         assert!(!flagged("rm -rf \\$SID")); // escaped, reaches shell literal
+        assert!(!flagged(r#"rm -rf "\$SID""#)); // same escape, inside quotes (#50)
         assert!(!flagged("rm -rf costs$5")); // digit: a filename
         assert!(!flagged("rm -rf x")); // control
                                        // `$(...)` is command substitution — a different hazard, not this
@@ -1045,6 +1088,61 @@ mod tests {
                 .map(|t| t.text)
                 .collect();
             assert_eq!(plain, detailed, "views diverged for {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn the_preview_and_the_backup_name_the_same_files() {
+        // The property, not the behaviour (#50). Two lexers reach one delete:
+        // the preview reads targets through `tokenize_detailed`, and
+        // `backup::rm_targets` reads them through `pg::shell_tokens`. When
+        // they name different files, the preview counts one path and the
+        // insurance copies another — the two halves of the same promise
+        // describing different deletes.
+        //
+        // Pinning agreement rather than either reading is what makes this
+        // survive the shared lexer the roadmap wants: whatever the
+        // implementation becomes, this is its acceptance test.
+        fn through_the_backup_lexer(cmd: &str) -> Vec<String> {
+            let tokens = crate::pg::shell_tokens(cmd);
+            let Some((head, at)) = resolve_head(&tokens) else {
+                return Vec::new();
+            };
+            if !is_delete_command(&head) {
+                return Vec::new();
+            }
+            tokens[at + 1..]
+                .iter()
+                .filter(|t| !is_flag(&head, t))
+                .cloned()
+                .collect()
+        }
+
+        for cmd in [
+            // The measured divergence: bash resolves the argument to `a"b`,
+            // and until v0.17 only one of the two lexers agreed with it.
+            r#"rm -rf "a\"b""#,
+            r#"rm -rf "dir\"with\"quotes"/x"#,
+            // Neighbours that must not move while that one is fixed.
+            "rm -rf ./dist",
+            "rm -rf 'lit$SID'",
+            r#"rm -rf "spaced name""#,
+            r#"rm -rf 'single "inside' plain"#,
+            "\"rm\" -rf x",
+            "del /s /q C:\\tmp",
+            r#"rm -rf back\slash"#,
+            // Both lexers drop a backslash a shell would keep, so both say
+            // `anb`. Pinned deliberately: the property under test is that
+            // the preview and the insurance name one file, and this is the
+            // shape where they agree on a reading bash does not share.
+            r#"rm -rf "a\nb""#,
+            r#"rm -rf "\$SID""#,
+        ] {
+            assert_eq!(
+                extract_targets(cmd),
+                through_the_backup_lexer(cmd),
+                "preview and backup disagree about {cmd:?}"
+            );
         }
     }
 
