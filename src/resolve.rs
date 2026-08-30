@@ -648,6 +648,20 @@ mod tests {
         );
     }
 
+    /// #50, one layer down from where it was found. The policy layer reads
+    /// its delete targets through `delete::extract_targets`, so the lexer
+    /// that named the wrong file named it here too: a `match_path` rule
+    /// written against the real filename missed, and the reason line quoted
+    /// a path nothing on disk had. The resolved reading is the file bash
+    /// deletes.
+    #[test]
+    fn an_escaped_quote_resolves_to_the_file_the_shell_deletes() {
+        assert_eq!(
+            roles(r#"rm -rf "a\"b""#),
+            vec![("a\"b".to_string(), TargetRole::Removed)]
+        );
+    }
+
     #[test]
     fn a_plain_relative_target_resolves_against_the_given_cwd_and_is_ordinary() {
         let t = TempTree::new("resolve-plain");
