@@ -1085,6 +1085,9 @@ mod tests {
         .expect("stub must be writable");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("stub must be executable");
+        // Written is not yet executable under parallel load — see #51 and the
+        // helper's own note. Same shape as the preview stub, same wait.
+        crate::testutil::wait_until_executable(&path);
 
         let previous = std::env::var_os("PATH");
         let combined = match &previous {

@@ -337,7 +337,19 @@ fn terraform_preview(bin: &str, destroy: bool) -> Option<Preview> {
     if destroy {
         args.push("-destroy");
     }
-    let out = std::process::Command::new(bin).args(&args).output().ok()?;
+    let out = match std::process::Command::new(bin).args(&args).output() {
+        Ok(out) => out,
+        Err(_e) => {
+            // Production stays best-effort and silent, as below. The test
+            // binary names the failure, because "the planner would not start"
+            // and "the plan came back non-zero" are different facts that both
+            // arrive here as `None` — and #51 spent a red CI leg on not being
+            // able to tell them apart from the log.
+            #[cfg(test)]
+            eprintln!("terraform preview: could not run {bin}: {_e}");
+            return None;
+        }
+    };
     if !out.status.success() {
         return None; // uninitialized dir, bad config — best effort, stay silent
     }
@@ -763,6 +775,11 @@ mod terraform_stub_tests {
         .expect("stub must be writable");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("stub must be executable");
+
+        // Both stub helpers in this suite write an executable and then have
+        // it exec'd immediately, which is the ETXTBSY window (#51). The wait
+        // lives in `testutil` so neither has to carry the reasoning.
+        crate::testutil::wait_until_executable(&path);
         path
     }
 
