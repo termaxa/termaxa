@@ -341,6 +341,7 @@ fn expand_into(out: &mut Vec<Segment>, segments: Vec<Segment>, via: Option<&str>
         } else {
             None
         };
+        seg.wraps = inner.is_some();
         out.push(seg);
         if let Some((shell, script)) = inner {
             let label = format!("{shell} -c");
@@ -404,6 +405,12 @@ pub struct Segment {
     /// `split_segments_deep` found it inside a `-c` string. `None` for a
     /// segment typed at the top level (#62).
     pub via: Option<String>,
+    /// True when this segment is a shell wrapper whose `-c` string was read
+    /// and follows it as segments of its own. The policy treats such a
+    /// segment as transparent unless a rule names it: the string inside
+    /// decides, not the policy default applied to `sh` (#65, decision of
+    /// 2026-09-03).
+    pub wraps: bool,
 }
 
 impl Segment {
@@ -501,6 +508,7 @@ fn flush(
             command: command.trim().to_string(),
             redirects: std::mem::take(redirects),
             via: None,
+            wraps: false,
         });
     } else {
         // Nothing but whitespace between separators: whatever the redirect
