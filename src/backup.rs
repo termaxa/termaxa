@@ -39,7 +39,14 @@ pub fn plan(command: &str, cwd: &Path) -> Option<String> {
     if segments.len() > 1 {
         return segments.iter().find_map(|s| plan(s, cwd));
     }
-    let tokens = crate::pg::shell_tokens(command);
+    // Tokens of the segment's own words. Tokenizing the full text put
+    // `/dev/null` among rm's operands — it exists, so it was planned, and
+    // copying a device is what made `take` fail on the real target (#61).
+    let own = segments
+        .first()
+        .map(|s| s.command().to_string())
+        .unwrap_or_default();
+    let tokens = crate::pg::shell_tokens(&own);
     if let Some((remote, branch)) = git_force_push_target(&tokens) {
         return Some(format!(
             "snapshot {}/{} to a local backup branch before it is overwritten",
@@ -118,12 +125,14 @@ pub fn take(termaxa_dir: &Path, command: &str, cwd: &Path) -> Result<Option<Back
         }
         return Ok(None);
     }
-    let redirects = segments
+    // The segment's own words for the operand readers, its redirects for
+    // the overwrite reader — both from the one split (#61).
+    let (own, redirects) = segments
         .into_iter()
         .next()
-        .map(|s| s.redirects)
+        .map(|s| (s.command().to_string(), s.redirects))
         .unwrap_or_default();
-    let tokens = crate::pg::shell_tokens(command);
+    let tokens = crate::pg::shell_tokens(&own);
     let (ts_ms, ts) = now();
     let id = format!("b-{}", ts_ms);
 
@@ -962,6 +971,42 @@ mod tests {
             state.join("backups").join("manifest.jsonl").is_file(),
             "an insured operation leaves a record behind"
         );
+    }
+
+    /// #61. The stderr-silencing spelling read `/dev/null` as an operand of
+    /// rm; the plan counted it, the copy failed on a device, and the runner
+    /// deleted the real target with no backup. Measured against the binary
+    /// on 2026-09-02 before this test existed: "backup failed (the source
+    /// path is neither a regular file nor a symlink to a regular file);
+    /// proceeding — command was approved", then `(no backups yet)`.
+    #[test]
+    fn a_delete_with_its_stderr_silenced_is_still_insured() {
+        let tmp = TempTree::new("bk-silenced");
+        let state = tmp.dir("state");
+        let doomed = tmp.file("doomed.txt", "precious");
+
+        for spelling in [
+            "> /dev/null 2>&1",
+            "2>/dev/null",
+            ">/dev/null",
+            "2>&1 >/dev/null",
+        ] {
+            let command = format!("rm -rf {} {spelling}", doomed.display());
+            assert_eq!(
+                plan(&command, &test_cwd()).as_deref(),
+                Some("copy 1 path(s) to .termaxa/backups before deletion"),
+                "{command}: the plan counts the file and nothing else"
+            );
+            let record = take(&state, &command, &test_cwd())
+                .unwrap_or_else(|e| panic!("{command}: the backup must not fail: {e}"))
+                .unwrap_or_else(|| panic!("{command}: the delete is insurable"));
+            assert_eq!(record.kind, "files");
+            assert!(
+                record.note.starts_with("1 path(s)"),
+                "{command}: one path copied, not two: {}",
+                record.note
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

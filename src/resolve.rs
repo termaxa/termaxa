@@ -256,9 +256,10 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
         out.push((t, TargetRole::Removed));
     }
 
-    // Per-command grammars.
+    // Per-command grammars, over the segment's own words: a redirect's
+    // target is a Destination above, not an operand here (#61).
     for seg in crate::shell::split_segments(segment) {
-        let tokens = crate::delete::tokenize_public(&seg);
+        let tokens = crate::delete::tokenize_public(seg.command());
         let Some((head, at)) = crate::delete::resolve_head(&tokens) else {
             continue;
         };
@@ -481,6 +482,34 @@ mod tests {
             ],
             "a move destroys its source, which is the case that goes missing \
              if only the destination is reported"
+        );
+    }
+
+    /// A redirection is a Destination the splitter reports, never an
+    /// operand of the command it is attached to (#61). Before this, `>` and
+    /// `log` were read as `mv`'s operands and `log` became the move's
+    /// destination while `b`, the real one, became a source.
+    #[test]
+    fn a_redirection_is_not_an_operand() {
+        assert_eq!(
+            roles("mv a b > log 2>&1"),
+            vec![
+                ("a".into(), TargetRole::Removed),
+                ("b".into(), TargetRole::Destination),
+                ("log".into(), TargetRole::Destination),
+            ]
+        );
+        assert_eq!(
+            roles("cp a b 2>/dev/null"),
+            vec![
+                ("a".into(), TargetRole::Source),
+                ("b".into(), TargetRole::Destination),
+            ],
+            "a sink is not a destination and not an operand"
+        );
+        assert_eq!(
+            roles("rm -rf ./cache > /dev/null 2>&1"),
+            vec![("./cache".into(), TargetRole::Removed)]
         );
     }
 
