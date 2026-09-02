@@ -34,9 +34,10 @@ pub enum Destructive {
 /// it just doesn't cause a connection to the database it was blocked from.
 pub fn preview_for(command: &str, cwd: &std::path::Path, live: bool) -> Option<Preview> {
     let tokens = shell_tokens(command);
-    if tokens.first().map(|t| !t.ends_with("psql") && t != "psql") != Some(false) {
-        return None; // not a psql invocation
-    }
+    // The same test `introspect` applies before it spawns: the file stem must
+    // be exactly `psql`. `ends_with("psql")` accepted `evilpsql` and rejected
+    // `psql.exe`, so a Windows install was never previewed at all.
+    psql_program(&tokens)?; // not a psql invocation
     let sql = extract_sql(&tokens)?;
     let stmts = parse_destructive(&sql);
     if stmts.is_empty() {
@@ -45,7 +46,15 @@ pub fn preview_for(command: &str, cwd: &std::path::Path, live: bool) -> Option<P
 
     let mut lines = Vec::new();
     let mut summary_parts = Vec::new();
-    let mut live_reached = false;
+    // What the footer may say. Until v0.17.1 a single bool collapsed five
+    // situations into "(database unreachable — static analysis only)": a
+    // denied command (never spawns, by design), a filtered DELETE (no cheap
+    // estimate, by design), a psql that could not be started, a psql that
+    // exited non-zero, and a psql whose output carried no count. Two of the
+    // five never spoke to a database; the line asserted a fact about one
+    // anyway. Measured against a reachable Postgres 16 on 2026-09-01: the
+    // filtered DELETE and the denied DROP both printed it.
+    let mut status = LiveStatus::NotAttempted;
 
     for stmt in stmts.iter().take(3) {
         match stmt {
@@ -58,9 +67,8 @@ pub fn preview_for(command: &str, cwd: &std::path::Path, live: bool) -> Option<P
                         t,
                         if *cascade { " CASCADE" } else { "" }
                     ));
-                    let info = if live { introspect(command, t) } else { None };
+                    let info = ask(live, command, t, &mut status);
                     if let Some(info) = &info {
-                        live_reached = true;
                         lines.push(format!("    rows (estimate) : {}", info.rows_display()));
                         if info.dependents.is_empty() {
                             lines.push("    referenced by   : nothing — no FK dependents".into());
@@ -98,8 +106,7 @@ pub fn preview_for(command: &str, cwd: &std::path::Path, live: bool) -> Option<P
                         t,
                         if *cascade { " CASCADE" } else { "" }
                     ));
-                    if let Some(info) = live.then(|| introspect(command, t)).flatten() {
-                        live_reached = true;
+                    if let Some(info) = ask(live, command, t, &mut status) {
                         lines.push(format!(
                             "    rows to erase (estimate) : {}",
                             info.rows_display()
@@ -128,8 +135,7 @@ pub fn preview_for(command: &str, cwd: &std::path::Path, live: bool) -> Option<P
                         "  DELETE FROM {} — NO WHERE CLAUSE (deletes every row)",
                         table
                     ));
-                    if let Some(info) = live.then(|| introspect(command, table)).flatten() {
-                        live_reached = true;
+                    if let Some(info) = ask(live, command, table, &mut status) {
                         lines.push(format!(
                             "    rows to delete (estimate) : {}",
                             info.rows_display()
@@ -156,8 +162,18 @@ pub fn preview_for(command: &str, cwd: &std::path::Path, live: bool) -> Option<P
         None => lines.push("  insurance : none — not reversible without a backup".into()),
     }
 
-    if !live_reached {
-        lines.push("  (database unreachable — static analysis only)".into());
+    match status {
+        LiveStatus::Reached => {}
+        LiveStatus::NotAttempted if !live => lines.push(
+            "  (database not consulted — live introspection is skipped for a denied command)"
+                .into(),
+        ),
+        LiveStatus::NotAttempted => lines
+            .push("  (database not consulted — no statement here has a cheap row estimate)".into()),
+        LiveStatus::Failed(why) => {
+            lines.push(format!("  (live introspection failed — {why})"));
+            lines.push("  (static analysis only)".into());
+        }
     }
 
     Some(Preview {
@@ -166,6 +182,80 @@ pub fn preview_for(command: &str, cwd: &std::path::Path, live: bool) -> Option<P
         summary: summary_parts.join("; "),
         uninsurable,
     })
+}
+
+/// The outcome of the live tier, for the footer. `Reached` wins once any
+/// table answered; the first failure is kept otherwise, so a preview over
+/// three tables reports the first thing that went wrong rather than the last.
+enum LiveStatus {
+    NotAttempted,
+    Failed(LiveError),
+    Reached,
+}
+
+/// Run the catalog query when the caller allows it, and record what happened.
+fn ask(live: bool, command: &str, table: &str, status: &mut LiveStatus) -> Option<TableInfo> {
+    if !live {
+        return None;
+    }
+    match introspect(command, table) {
+        Ok(info) => {
+            *status = LiveStatus::Reached;
+            Some(info)
+        }
+        Err(why) => {
+            if matches!(status, LiveStatus::NotAttempted) {
+                *status = LiveStatus::Failed(why);
+            }
+            None
+        }
+    }
+}
+
+/// Why live introspection produced no estimate — psql's own account, not a
+/// guess. Rendered verbatim into the preview footer.
+#[derive(Debug, PartialEq)]
+pub enum LiveError {
+    /// The binary could not be started: not on the hook process's PATH, or a
+    /// path that does not exist. `prog` is what we tried to run.
+    Spawn { prog: String, detail: String },
+    /// psql ran and exited non-zero. `detail` is the first line of its stderr,
+    /// which names the real reason: no password under `-w`, a table that does
+    /// not exist, a connection refused.
+    Exit { code: Option<i32>, detail: String },
+    /// psql exited 0 but its stdout carried no row estimate. `seen` is the
+    /// first line we could not read as one, or a note that there was none.
+    Output { seen: String },
+}
+
+impl std::fmt::Display for LiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiveError::Spawn { prog, detail } => write!(f, "could not start {prog}: {detail}"),
+            LiveError::Exit { code, detail } => {
+                match code {
+                    Some(c) => write!(f, "psql exited {c}: {detail}")?,
+                    None => write!(f, "psql was killed by a signal: {detail}")?,
+                }
+                // `-w` is ours, so the remedy is ours to name: the preview
+                // never prompts, and a shell that typed the password by hand
+                // proves nothing about a child that cannot.
+                if detail.contains("no password supplied") {
+                    write!(
+                        f,
+                        " — the preview never prompts; set PGPASSWORD or ~/.pgpass"
+                    )?;
+                }
+                Ok(())
+            }
+            LiveError::Output { seen } => {
+                write!(
+                    f,
+                    "psql answered but no row estimate was found; first line: {seen}"
+                )
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,39 +301,87 @@ impl TableInfo {
 /// more. We now REBUILD the argv from a small allowlist of connection
 /// parameters, so nothing we did not explicitly recognise can reach the child
 /// process. `-w` is forced so the preview can never hang waiting for a password.
-fn introspect(original_command: &str, table: &str) -> Option<TableInfo> {
+///
+/// SHAPE (v0.17.1). The three statements are sent as three `-c` flags, not one
+/// string. Two measured reasons, both against PostgreSQL 16.15 on 2026-09-01:
+///
+///   - psql before 15 prints only the LAST result of a multi-statement `-c`
+///     string (reproduced on 16 with `-v SHOW_ALL_RESULTS=off`): the count
+///     never arrived and the parser saw the dependents line first. Separate
+///     flags print every result on every version.
+///   - A SET inside one string shares the implicit transaction with the two
+///     SELECTs, and `default_transaction_read_only` governs only transactions
+///     that start afterwards — a `CREATE TABLE` in the same string succeeded.
+///     As its own `-c` it binds the two that follow; the same write then fails
+///     with "cannot execute CREATE TABLE in a read-only transaction".
+///
+/// `ON_ERROR_STOP` is set so an error in the middle statement ends the run
+/// with a non-zero exit and the reason on stderr; without it psql carries on
+/// to the third statement and exits 0 with nothing to parse.
+///
+/// Every way this can fail returns the reason, because the preview prints it.
+fn introspect(original_command: &str, table: &str) -> Result<TableInfo, LiveError> {
     let esc = table.replace('\'', "''"); // embed safely inside '...'
-    let q = format!(
-        "SET default_transaction_read_only = on; \
-         SELECT COALESCE((SELECT reltuples::bigint FROM pg_class WHERE oid = '{esc}'::regclass), -1); \
-         SELECT COALESCE(string_agg(DISTINCT c.conrelid::regclass::text, ','), '') \
-           FROM pg_constraint c WHERE c.contype = 'f' AND c.confrelid = '{esc}'::regclass;"
-    );
+    let statements = [
+        "SET default_transaction_read_only = on;".to_string(),
+        format!(
+            "SELECT COALESCE((SELECT reltuples::bigint FROM pg_class WHERE oid = '{esc}'::regclass), -1);"
+        ),
+        format!(
+            "SELECT COALESCE(string_agg(DISTINCT c.conrelid::regclass::text, ','), '') \
+             FROM pg_constraint c WHERE c.contype = 'f' AND c.confrelid = '{esc}'::regclass;"
+        ),
+    ];
 
     let tokens = shell_tokens(original_command);
-    let prog = psql_program(&tokens)?;
+    let prog = psql_program(&tokens).ok_or_else(|| LiveError::Spawn {
+        prog: tokens.first().cloned().unwrap_or_default(),
+        detail: "not a psql command".into(),
+    })?;
     let mut args = connection_args(&tokens);
-    args.extend(["-w", "-t", "-A", "-X", "-c"].iter().map(|s| s.to_string()));
-    args.push(q);
+    args.extend(
+        ["-w", "-t", "-A", "-X", "-v", "ON_ERROR_STOP=1"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    for stmt in statements {
+        args.push("-c".into());
+        args.push(stmt);
+    }
 
     let out = Command::new(&prog)
         .args(&args)
         .env("PGCONNECT_TIMEOUT", "3")
         .output()
-        .ok()?;
+        .map_err(|e| LiveError::Spawn {
+            prog: prog.clone(),
+            detail: e.to_string(),
+        })?;
     if !out.status.success() {
-        return None; // wrong table, no permissions, db down — degrade to static
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = stderr
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("(nothing on stderr)")
+            .to_string();
+        return Err(LiveError::Exit {
+            code: out.status.code(),
+            detail,
+        });
     }
     let text = String::from_utf8_lossy(&out.stdout);
     // psql echoes a command-status tag for the leading SET even under -t -A,
     // so it arrives as a line before the two result rows. Drop it explicitly
-    // rather than positionally — a silent parse failure here degrades the
-    // preview to "database unreachable", which reads like a connection problem.
+    // rather than positionally.
     let mut lines = text
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && *l != "SET");
-    let rows: i64 = lines.next()?.trim().parse().ok()?;
+    let first = lines.next().unwrap_or("(no output)");
+    let rows: i64 = first.parse().map_err(|_| LiveError::Output {
+        seen: first.to_string(),
+    })?;
     let dependents: Vec<String> = lines
         .next()
         .map(|l| {
@@ -254,7 +392,7 @@ fn introspect(original_command: &str, table: &str) -> Option<TableInfo> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(TableInfo { rows, dependents })
+    Ok(TableInfo { rows, dependents })
 }
 
 /// The psql binary to invoke, taken from the command's own first token so a
@@ -972,11 +1110,25 @@ mod tests {
 
     #[cfg(unix)]
     fn stub_psql(dir: &std::path::Path, body: &str, code: i32) -> std::path::PathBuf {
+        stub_psql_full(dir, body, "", code)
+    }
+
+    /// A stub that can also speak on stderr, which is where real psql puts
+    /// the reason for a non-zero exit. Neither body may contain a `"`.
+    #[cfg(unix)]
+    fn stub_psql_full(
+        dir: &std::path::Path,
+        stdout: &str,
+        stderr: &str,
+        code: i32,
+    ) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("psql");
         std::fs::write(
             &path,
-            format!("#!/bin/sh\nprintf '%s\\n' \"{body}\"\nexit {code}\n"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"{stdout}\"\nprintf '%s\\n' \"{stderr}\" >&2\nexit {code}\n"
+            ),
         )
         .expect("stub must be writable");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
@@ -1014,7 +1166,9 @@ mod tests {
             p.lines
         );
         assert!(
-            !p.lines.iter().any(|l| l.contains("database unreachable")),
+            !p.lines
+                .iter()
+                .any(|l| l.contains("static analysis only") || l.contains("not consulted")),
             "the database answered: {:?}",
             p.lines
         );
@@ -1044,10 +1198,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_database_that_refuses_degrades_to_static_analysis() {
-        // Wrong table, no permission, database down: all the same answer, and
-        // it must be a quieter preview rather than a missing one.
+        // Wrong table, no permission, database down: a quieter preview rather
+        // than a missing one — and the footer carries psql's own words for
+        // which of the three it was, instead of asserting "unreachable".
         let tmp = TempTree::new("pg-refused");
-        let psql = stub_psql(tmp.path(), "FATAL: no", 1);
+        let psql = stub_psql_full(tmp.path(), "", "FATAL: no", 1);
         let command = format!("{} -d shop -c \"TRUNCATE users\"", psql.display());
 
         assert!(fk_dependents(&command, "users").is_empty());
@@ -1055,12 +1210,209 @@ mod tests {
         let p = preview_for(&command, std::path::Path::new("."), true)
             .expect("static analysis still applies");
         assert!(
-            p.lines.iter().any(|l| l.contains("database unreachable")),
+            p.lines
+                .iter()
+                .any(|l| l.contains("psql exited 1: FATAL: no")),
             "{:?}",
             p.lines
         );
         assert!(
+            p.lines.iter().any(|l| l.contains("static analysis only")),
+            "{:?}",
+            p.lines
+        );
+        assert!(
+            !p.lines.iter().any(|l| l.contains("unreachable")),
+            "a non-zero exit is not a claim about reachability: {:?}",
+            p.lines
+        );
+        assert!(
             p.lines.iter().any(|l| l.contains("TRUNCATE users")),
+            "{:?}",
+            p.lines
+        );
+    }
+
+    /// The forced `-w` means a child can never type the password a human
+    /// typed. psql says so on stderr; the footer repeats it and names the
+    /// remedy, because "unreachable" sent the reader to check the network.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_password_is_reported_with_the_remedy() {
+        let tmp = TempTree::new("pg-nopw");
+        let psql = stub_psql_full(
+            tmp.path(),
+            "",
+            "psql: error: connection to server at localhost, port 5432 failed: fe_sendauth: no password supplied",
+            2,
+        );
+        let command = format!("{} -d shop -c \"TRUNCATE users\"", psql.display());
+
+        let p = preview_for(&command, std::path::Path::new("."), true)
+            .expect("static analysis still applies");
+        let footer = p
+            .lines
+            .iter()
+            .find(|l| l.contains("live introspection failed"))
+            .unwrap_or_else(|| panic!("no failure line: {:?}", p.lines));
+        assert!(footer.contains("psql exited 2"), "{footer}");
+        assert!(footer.contains("no password supplied"), "{footer}");
+        assert!(footer.contains("PGPASSWORD"), "{footer}");
+    }
+
+    /// psql before 15 prints only the last result of a multi-statement `-c`
+    /// string, so the dependents arrive where the count should be. The argv
+    /// now avoids that shape; if a psql produces it anyway, the footer shows
+    /// the line it could not read instead of blaming the database.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_without_a_count_is_reported_as_unread() {
+        let tmp = TempTree::new("pg-lastonly");
+        let psql = stub_psql(tmp.path(), "orders,invoices\n", 0);
+        let command = format!("{} -d shop -c \"TRUNCATE users\"", psql.display());
+
+        let p = preview_for(&command, std::path::Path::new("."), true)
+            .expect("static analysis still applies");
+        let footer = p
+            .lines
+            .iter()
+            .find(|l| l.contains("live introspection failed"))
+            .unwrap_or_else(|| panic!("no failure line: {:?}", p.lines));
+        assert!(footer.contains("no row estimate was found"), "{footer}");
+        assert!(footer.contains("orders,invoices"), "{footer}");
+    }
+
+    /// The catalog query is three `-c` flags, one statement each — the shape
+    /// that prints every result on every psql version and makes the
+    /// read-only SET govern the two SELECTs. Asserted on the argv the stub
+    /// received, not on the SQL text, so a future "tidy-up" back into one
+    /// string is caught here rather than on a psql 14 box.
+    #[cfg(unix)]
+    #[test]
+    fn the_catalog_query_is_sent_as_three_separate_statements() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempTree::new("pg-argv");
+        let argv_file = tmp.path().join("argv");
+        let psql = tmp.path().join("psql");
+        std::fs::write(
+            &psql,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"{}\"\nprintf 'SET\\n7\\n\\n'\nexit 0\n",
+                argv_file.display()
+            ),
+        )
+        .expect("stub must be writable");
+        std::fs::set_permissions(&psql, std::fs::Permissions::from_mode(0o755))
+            .expect("stub must be executable");
+        let command = format!("{} -d shop -c \"TRUNCATE users\"", psql.display());
+
+        let p = preview_for(&command, std::path::Path::new("."), true)
+            .expect("a truncate is previewable");
+        assert!(
+            p.lines
+                .iter()
+                .any(|l| l.contains("rows to erase (estimate) : 7")),
+            "{:?}",
+            p.lines
+        );
+
+        let argv = std::fs::read_to_string(&argv_file).expect("the stub recorded its argv");
+        let argv: Vec<&str> = argv.lines().collect();
+        let statements: Vec<&str> = argv
+            .windows(2)
+            .filter(|w| w[0] == "-c")
+            .map(|w| w[1])
+            .collect();
+        assert_eq!(statements.len(), 3, "{argv:?}");
+        assert!(
+            statements[0].starts_with("SET default_transaction_read_only"),
+            "{argv:?}"
+        );
+        assert!(statements[1].contains("reltuples"), "{argv:?}");
+        assert!(statements[2].contains("pg_constraint"), "{argv:?}");
+        for s in &statements {
+            assert_eq!(
+                s.matches(';').count(),
+                1,
+                "one statement per flag, or psql < 15 prints only the last: {s}"
+            );
+        }
+        assert!(
+            argv.windows(2).any(|w| w == ["-v", "ON_ERROR_STOP=1"]),
+            "a failing middle statement must end the run non-zero: {argv:?}"
+        );
+        assert!(
+            argv.contains(&"-w"),
+            "the preview must never prompt: {argv:?}"
+        );
+    }
+
+    /// A denied command never spawns (v0.14.2). The footer used to call that
+    /// "database unreachable" — a claim about a database nobody asked.
+    #[test]
+    fn a_denied_command_says_the_database_was_not_consulted() {
+        let p = preview_for(
+            "psql -d shop -c \"DROP TABLE users\"",
+            std::path::Path::new("."),
+            false,
+        )
+        .expect("static analysis still applies");
+        let footer = p.lines.last().expect("a footer");
+        assert!(footer.contains("not consulted"), "{footer}");
+        assert!(footer.contains("denied"), "{footer}");
+        assert!(!footer.contains("unreachable"), "{footer}");
+    }
+
+    /// A filtered DELETE has no cheap estimate, so the live tier is never
+    /// asked — the first sighting of the old footer on a reachable database
+    /// was exactly this shape. Live is on, and nothing may be spawned: there
+    /// is no psql at the path this command names.
+    #[test]
+    fn a_filtered_delete_says_the_database_was_not_consulted() {
+        let p = preview_for(
+            "/nonexistent/bin/psql -d shop -c \"DELETE FROM users WHERE id < 5\"",
+            std::path::Path::new("."),
+            true,
+        )
+        .expect("static analysis still applies");
+        assert!(
+            p.lines
+                .iter()
+                .any(|l| l.contains("cannot estimate cheaply")),
+            "{:?}",
+            p.lines
+        );
+        let footer = p.lines.last().expect("a footer");
+        assert!(footer.contains("not consulted"), "{footer}");
+        assert!(
+            footer.contains("no statement here has a cheap row estimate"),
+            "{footer}"
+        );
+        assert!(!footer.contains("unreachable"), "{footer}");
+    }
+
+    /// A psql that cannot be started — not on the hook process's PATH, or a
+    /// path that does not exist — is named as such. This runs on every
+    /// platform: nothing is executed, because nothing can be.
+    #[test]
+    fn a_psql_that_cannot_be_started_is_named() {
+        let p = preview_for(
+            "/nonexistent/bin/psql -d shop -c \"TRUNCATE users\"",
+            std::path::Path::new("."),
+            true,
+        )
+        .expect("static analysis still applies");
+        let footer = p
+            .lines
+            .iter()
+            .find(|l| l.contains("live introspection failed"))
+            .unwrap_or_else(|| panic!("no failure line: {:?}", p.lines));
+        assert!(
+            footer.contains("could not start /nonexistent/bin/psql"),
+            "{footer}"
+        );
+        assert!(
+            p.lines.iter().any(|l| l.contains("static analysis only")),
             "{:?}",
             p.lines
         );
@@ -1080,9 +1432,30 @@ mod tests {
             false
         )
         .is_none());
+        // `ends_with("psql")` let this one through; the stem test does not.
+        assert!(preview_for(
+            "evilpsql -c \"DROP TABLE users\"",
+            std::path::Path::new("."),
+            false
+        )
+        .is_none());
         // An absolute path to the real client still is one.
         assert!(preview_for(
             "/usr/bin/psql -c \"DROP TABLE users\"",
+            std::path::Path::new("."),
+            false
+        )
+        .is_some());
+        // And so is the Windows binary, which `ends_with("psql")` rejected —
+        // no Windows install was ever previewed.
+        assert!(preview_for(
+            "psql.exe -c \"DROP TABLE users\"",
+            std::path::Path::new("."),
+            false
+        )
+        .is_some());
+        assert!(preview_for(
+            r#"C:\pg\16\bin\psql.exe -c "DROP TABLE users""#,
             std::path::Path::new("."),
             false
         )

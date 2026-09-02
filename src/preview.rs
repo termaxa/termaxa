@@ -178,7 +178,13 @@ fn generate_one(command: &str, cwd: &std::path::Path, live: bool) -> Option<Prev
         // static to fall back on, so a non-live preview has no answer.
         return if live { git_push_preview(&cmd) } else { None };
     }
-    if cmd.starts_with("psql") || cmd.contains(" psql ") {
+    // Route by the program's file stem, not by the text. `pg::preview_for`
+    // has accepted `/usr/local/pgsql/bin/psql` since v0.14.1 and has a test
+    // saying so; this line never sent it one, because the normalized text
+    // starts with the directory. `psql.exe` was rejected the same way.
+    // Measured 2026-09-01: `/tmp/psql14/psql -c "TRUNCATE users"` produced no
+    // postgres preview at all.
+    if crate::pg::psql_program(&crate::pg::shell_tokens(command)).is_some() {
         return crate::pg::preview_for(command, cwd, live);
     }
     for bin in ["terraform", "tofu"] {
@@ -969,6 +975,35 @@ mod live_gate_tests {
             p.summary.contains("users"),
             "denial reason lost its detail: {}",
             p.summary
+        );
+    }
+
+    /// The route to the postgres preview goes by the program's file stem.
+    /// `pg::preview_for` accepted an absolute path and had a test proving it;
+    /// the dispatcher matched on text that starts with the directory, so no
+    /// non-PATH install and no Windows `psql.exe` ever reached that test's
+    /// subject. Asserted through `generate`, the entry the runner uses.
+    #[test]
+    fn a_psql_reached_by_path_or_by_exe_still_gets_the_postgres_preview() {
+        for command in [
+            r#"/usr/local/pgsql/bin/psql -d shop -c "DROP TABLE users""#,
+            r#"psql.exe -d shop -c "DROP TABLE users""#,
+            r#"C:\pg\16\bin\psql.exe -d shop -c "DROP TABLE users""#,
+        ] {
+            let p = generate(command, None, std::path::Path::new("."), false)
+                .unwrap_or_else(|| panic!("no preview for {command}"));
+            assert_eq!(p.title, "postgres impact", "{command}");
+            assert!(p.summary.contains("users"), "{command}: {}", p.summary);
+        }
+        assert!(
+            generate(
+                r#"psqlx -d shop -c "DROP TABLE users""#,
+                None,
+                std::path::Path::new("."),
+                false,
+            )
+            .is_none(),
+            "a look-alike is not psql"
         );
     }
 

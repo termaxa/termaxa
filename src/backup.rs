@@ -222,9 +222,10 @@ fn backup_git_ref(
 /// insurance must cover the same blast radius the preview measures.
 fn pg_backup_targets(command: &str) -> Option<(Vec<String>, bool)> {
     let tokens = crate::pg::shell_tokens(command);
-    if tokens.first().map(|t| t.ends_with("psql")) != Some(true) {
-        return None;
-    }
+    // Same test the preview and the spawn apply: the file stem must be
+    // exactly `psql`. `ends_with("psql")` insured `evilpsql` and left
+    // `psql.exe` — every Windows install — without insurance.
+    crate::pg::psql_program(&tokens)?;
     let sql = tokens
         .iter()
         .position(|t| t == "-c" || t == "--command")
@@ -872,6 +873,14 @@ mod tests {
         assert!(
             pg_backup_targets(r#"mysql -e "DROP TABLE users""#).is_none(),
             "another client is not psql"
+        );
+        assert!(
+            pg_backup_targets(r#"evilpsql -d shop -c "TRUNCATE users""#).is_none(),
+            "a look-alike is not psql either — `ends_with` said it was"
+        );
+        assert!(
+            pg_backup_targets(r#"psql.exe -d shop -c "TRUNCATE users""#).is_some(),
+            "the Windows binary is psql, and was uninsured until the stem test"
         );
         assert!(
             pg_backup_targets("psql -d shop").is_none(),
