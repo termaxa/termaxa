@@ -301,6 +301,83 @@ fn target_word(chars: &[char], cur: &mut String, mut j: usize) -> (String, usize
     (target, j)
 }
 
+/// POSIX shells whose `-c <string>` runs the string as a command line.
+/// Narrow on purpose (#62): each name here is one a cooperative harness or
+/// agent has been seen to spell. `ksh` and `ash` wait for a capture; `fish`
+/// has its own syntax and is not read.
+const POSIX_SHELLS: [&str; 4] = ["sh", "bash", "dash", "zsh"];
+
+/// How many `-c` strings deep the reading goes. `sh -c "sh -c '…'"` is two;
+/// four is more than any harness produces and bounds a pathological input.
+const MAX_WRAP_DEPTH: usize = 4;
+
+/// `split_segments`, and then through every POSIX shell `-c` string found.
+///
+/// #62. `sh -c "cat /dev/null > src/main.rs"` was a segment whose head is
+/// `sh`, with two arguments, to every engine: no overwrite intent, no
+/// preview, no insurance, and the ask it got came from the policy default.
+/// The `wrap` shim forwards every agent command in exactly that shape.
+///
+/// Additive: the wrapper segment stays, and the string's own segments follow
+/// it, each carrying the wrapper it was read through in `via`. Nothing that
+/// matched before stops matching — a rule on `sh *` still sees the wrapper —
+/// and the most dangerous segment still decides. The wrapper's own
+/// redirects (`sh -c "…" > log`) stay on the wrapper. Callers that judge a
+/// whole command line use this; callers handed one segment's text and
+/// asked about that segment alone keep `split_segments`.
+pub fn split_segments_deep(s: &str) -> Vec<Segment> {
+    let mut out = Vec::new();
+    expand_into(&mut out, split_segments(s), None, 0);
+    out
+}
+
+fn expand_into(out: &mut Vec<Segment>, segments: Vec<Segment>, via: Option<&str>, depth: usize) {
+    for mut seg in segments {
+        if let Some(v) = via {
+            seg.via = Some(v.to_string());
+        }
+        let inner = if depth < MAX_WRAP_DEPTH {
+            wrapped_command(&seg)
+        } else {
+            None
+        };
+        out.push(seg);
+        if let Some((shell, script)) = inner {
+            let label = format!("{shell} -c");
+            expand_into(out, split_segments(&script), Some(&label), depth + 1);
+        }
+    }
+}
+
+/// The shell and the string, when this segment is a POSIX shell running a
+/// `-c` string. The head is resolved past `sudo`/`env` and by file stem, so
+/// `sudo /bin/sh -c "…"` counts. The flag may be its own token or part of
+/// a cluster — `bash -lc "…"` is how Codex spells it — and the string is the
+/// token after it. `sh script.sh`, a bare `sh -c`, and a `-c` with nothing
+/// after it are not read.
+fn wrapped_command(seg: &Segment) -> Option<(String, String)> {
+    let tokens = crate::delete::tokenize_public(seg.command());
+    let (head, at) = crate::delete::resolve_head(&tokens)?;
+    if !POSIX_SHELLS.contains(&head.as_str()) {
+        return None;
+    }
+    let mut i = at + 1;
+    while let Some(tok) = tokens.get(i) {
+        if !tok.starts_with('-') || tok == "-" || tok.starts_with("--") {
+            return None; // a script file or an operand, not a -c string
+        }
+        if tok[1..].contains('c') {
+            let script = tokens.get(i + 1)?;
+            if script.trim().is_empty() {
+                return None;
+            }
+            return Some((head, script.clone()));
+        }
+        i += 1;
+    }
+    None
+}
+
 /// One shell segment, carrying the redirect targets found in it.
 ///
 /// v0.16 §1.5. Segments and redirect targets used to come from two separate
@@ -323,6 +400,10 @@ pub struct Segment {
     command: String,
     /// Files this segment writes over, in order of appearance.
     pub redirects: Vec<Overwrite>,
+    /// The shell wrapper this segment was read through, as `sh -c`, when
+    /// `split_segments_deep` found it inside a `-c` string. `None` for a
+    /// segment typed at the top level (#62).
+    pub via: Option<String>,
 }
 
 impl Segment {
@@ -419,6 +500,7 @@ fn flush(
             text: t.to_string(),
             command: command.trim().to_string(),
             redirects: std::mem::take(redirects),
+            via: None,
         });
     } else {
         // Nothing but whitespace between separators: whatever the redirect
@@ -590,6 +672,112 @@ mod tests {
         // a segment without redirections reads the same both ways
         let seg = &split_segments("rm -rf ./cache")[0];
         assert_eq!(seg.command(), &**seg);
+    }
+
+    /// #62. A POSIX shell's -c string is read as segments of its own,
+    /// after the wrapper, each marked with the wrapper it came through.
+    #[test]
+    fn a_posix_shell_c_string_is_read_as_its_own_segments() {
+        let segs = split_segments_deep(r#"sh -c "cat /dev/null > src/main.rs""#);
+        let texts: Vec<&str> = segs.iter().map(|s| &**s).collect();
+        assert_eq!(
+            texts,
+            [
+                r#"sh -c "cat /dev/null > src/main.rs""#,
+                "cat /dev/null > src/main.rs"
+            ]
+        );
+        assert_eq!(segs[0].via, None, "the wrapper was typed at the top level");
+        assert_eq!(segs[1].via.as_deref(), Some("sh -c"));
+        assert!(
+            segs[0].redirects.is_empty(),
+            "the quoted `>` is text to the wrapper"
+        );
+        assert_eq!(segs[1].redirects[0].target, "src/main.rs");
+
+        // Codex's spelling: the flag in a cluster, a compound inside.
+        let segs = split_segments_deep(r#"bash -lc "rm -rf ./dist && echo done""#);
+        let texts: Vec<&str> = segs.iter().map(|s| &**s).collect();
+        assert_eq!(
+            texts,
+            [
+                r#"bash -lc "rm -rf ./dist && echo done""#,
+                "rm -rf ./dist",
+                "echo done"
+            ]
+        );
+        assert!(segs[1..]
+            .iter()
+            .all(|s| s.via.as_deref() == Some("bash -c")));
+
+        // Resolved past sudo and by file stem; every shell on the list.
+        for cmd in [
+            r#"sudo sh -c "rm -rf ./dist""#,
+            r#"/bin/sh -c "rm -rf ./dist""#,
+            r#"dash -c "rm -rf ./dist""#,
+            r#"zsh -ec "rm -rf ./dist""#,
+            r#"sh -e -c "rm -rf ./dist""#,
+            "sh -c 'rm -rf ./dist'",
+        ] {
+            let segs = split_segments_deep(cmd);
+            assert_eq!(segs.len(), 2, "{cmd}");
+            assert_eq!(&*segs[1], "rm -rf ./dist", "{cmd}");
+        }
+
+        // The wrapper's own redirect stays on the wrapper.
+        let segs = split_segments_deep(r#"sh -c "echo hi" > out.log"#);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].redirects[0].target, "out.log");
+        assert!(segs[1].redirects.is_empty());
+        assert_eq!(&*segs[1], "echo hi");
+    }
+
+    /// What is deliberately not read: a script file, a bare `-c`, a shell
+    /// off the list, and the string beyond the depth limit.
+    #[test]
+    fn what_a_shell_wrapper_reading_leaves_alone() {
+        for cmd in [
+            "sh deploy.sh",
+            "bash ./scripts/clean.sh --force",
+            "sh -c",
+            "sh -c \"\"",
+            r#"fish -c "rm -rf ./dist""#,
+            r#"ksh -c "rm -rf ./dist""#,
+            r#"python -c "import shutil; shutil.rmtree('dist')""#,
+            "sh - script.sh",
+            "bash --norc script.sh",
+        ] {
+            let segs = split_segments_deep(cmd);
+            assert_eq!(segs.len(), 1, "{cmd}");
+            assert_eq!(segs[0].via, None, "{cmd}");
+        }
+        // Nesting is read to the limit and no further.
+        let two = r#"sh -c "bash -c 'rm -rf ./dist'""#;
+        let segs = split_segments_deep(two);
+        let texts: Vec<&str> = segs.iter().map(|s| &**s).collect();
+        assert_eq!(texts, [two, "bash -c 'rm -rf ./dist'", "rm -rf ./dist"]);
+        assert_eq!(segs[1].via.as_deref(), Some("sh -c"));
+        assert_eq!(segs[2].via.as_deref(), Some("bash -c"));
+        // Six wrappers deep, double-quoted with the inner quotes escaped.
+        let mut deep = "rm -rf ./dist".to_string();
+        for _ in 0..6 {
+            deep = format!(
+                "sh -c \"{}\"",
+                deep.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+        }
+        let segs = split_segments_deep(&deep);
+        assert_eq!(
+            segs.len(),
+            MAX_WRAP_DEPTH + 1,
+            "one wrapper per level, then stop"
+        );
+        assert_ne!(
+            &*segs[MAX_WRAP_DEPTH], "rm -rf ./dist",
+            "the innermost string was not reached"
+        );
+        // The plain split is unchanged: one segment, no reading through.
+        assert_eq!(split_segments(two).len(), 1);
     }
 
     #[test]

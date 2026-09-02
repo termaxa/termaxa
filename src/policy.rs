@@ -326,7 +326,7 @@ impl Policy {
     /// Closes the v0.6.1 field-report bypass where `git status && <anything>`
     /// rode the `git status*` wildcard.
     pub fn evaluate_command(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
-        let segments = crate::shell::split_segments(command);
+        let segments = crate::shell::split_segments_deep(command);
         if segments.len() <= 1 {
             return self.evaluate(command, ctx);
         }
@@ -358,10 +358,15 @@ impl Policy {
             source: d.source,
             matched_rule: d.matched_rule,
             reason: format!(
-                "segment {}/{} `{}` — {}",
+                "segment {}/{} `{}`{} — {}",
                 i + 1,
                 total,
                 segments[i],
+                segments[i]
+                    .via
+                    .as_deref()
+                    .map(|v| format!(" (inside {v})"))
+                    .unwrap_or_default(),
                 d.reason
             ),
         }
@@ -1009,6 +1014,39 @@ rules:
                 .action,
             Action::Deny
         );
+    }
+
+    /// #62: a rule that allows the shell does not allow what the shell is
+    /// told to run. The string's own segments are judged, and the reason
+    /// says which wrapper the losing segment was read through.
+    #[test]
+    fn a_shell_c_string_is_judged_by_what_it_runs() {
+        let policy: Policy = serde_yaml::from_str(
+            r#"
+default: ask
+rules:
+  - match: "sh *"
+    action: allow
+  - match: "rm -rf *"
+    action: deny
+"#,
+        )
+        .unwrap();
+        let d = policy.evaluate_command(r#"sh -c "rm -rf ./dist""#, &here());
+        assert_eq!(d.action, Action::Deny);
+        assert!(d.reason.contains("segment 2/2"), "{}", d.reason);
+        assert!(d.reason.contains("(inside sh -c)"), "{}", d.reason);
+        assert!(d.reason.contains("rm -rf ./dist"), "{}", d.reason);
+        // The wrapper rule still applies to what it names; the string is
+        // judged on its own, so an unmatched command inside falls to the
+        // default exactly as it would typed at the top level.
+        assert_eq!(
+            policy.evaluate_command("sh clean.sh", &here()).action,
+            Action::Allow
+        );
+        let d = policy.evaluate_command(r#"sh -c "ls -la""#, &here());
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
+        assert!(d.reason.contains("(inside sh -c)"), "{}", d.reason);
     }
 
     #[test]

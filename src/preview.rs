@@ -63,8 +63,9 @@ pub fn generate(
     if let Some(p) = crate::delete::preview_for(command, root, cwd) {
         return Some(p);
     }
-    // Compound commands: preview the first segment that has one.
-    let segments = crate::shell::split_segments(command);
+    // Compound commands: preview the first segment that has one. A POSIX
+    // shell's -c string counts as segments of its own (#62).
+    let segments = crate::shell::split_segments_deep(command);
     if segments.len() > 1 {
         if let Some(p) = segments.iter().find_map(|s| generate_one(s, cwd, live)) {
             return Some(p);
@@ -1028,6 +1029,25 @@ mod live_gate_tests {
 
     /// Deletes never spawned anything, so they are unaffected either way —
     /// asserted so a future refactor can't quietly gate them too.
+    /// #62: a command inside a POSIX shell's -c string gets the preview it
+    /// would get typed at the top level — the demo command got none.
+    #[test]
+    fn a_shell_c_string_is_previewed_as_the_command_inside_it() {
+        let inner = "rm -rf /tmp/tmx-none-such";
+        let wrapped = format!(r#"sh -c "{inner}""#);
+        let direct = generate(inner, None, std::path::Path::new("."), false);
+        let through = generate(&wrapped, None, std::path::Path::new("."), false);
+        assert!(direct.is_some(), "the control leg previews");
+        assert_eq!(
+            through.as_ref().map(|p| &p.summary),
+            direct.as_ref().map(|p| &p.summary)
+        );
+        assert!(
+            generate("sh deploy.sh", None, std::path::Path::new("."), false).is_none(),
+            "a script file is not read"
+        );
+    }
+
     #[test]
     fn deletes_preview_identically_whether_live_or_not() {
         let live = generate(
