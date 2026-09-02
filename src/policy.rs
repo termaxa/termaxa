@@ -334,6 +334,15 @@ impl Policy {
         let mut worst: Option<(usize, Decision)> = None;
         for (i, seg) in segments.iter().enumerate() {
             let d = self.evaluate(seg, ctx);
+            // A shell wrapper whose string was read is transparent unless a
+            // rule names it. Under a policy with no rule for `sh`, the
+            // wrapper segment fell to the default and outranked the allow
+            // its own string had earned - every command through the `wrap`
+            // shim was asked. The string decides; `deny sh *` still counts,
+            // because that rule names the wrapper. Decision of 2026-09-03.
+            if seg.wraps && d.matched_rule.is_none() {
+                continue;
+            }
             let replace = match &worst {
                 None => true,
                 // higher severity wins; on ties, an explicitly-matched rule
@@ -349,7 +358,12 @@ impl Policy {
                 worst = Some((i, d));
             }
         }
-        let (i, d) = worst.expect("segments nonempty");
+        let Some((i, d)) = worst else {
+            // Every segment was an unnamed wrapper - only reachable if the
+            // depth limit cut the reading off with nothing inside. Judge the
+            // whole line as typed.
+            return self.evaluate(command, ctx);
+        };
         Decision {
             action: d.action,
             // The compound's verdict is the worst segment's verdict, so it
@@ -1047,6 +1061,45 @@ rules:
         let d = policy.evaluate_command(r#"sh -c "ls -la""#, &here());
         assert_eq!(d.action, Action::Ask, "{}", d.reason);
         assert!(d.reason.contains("(inside sh -c)"), "{}", d.reason);
+    }
+
+    /// A wrapper no rule names is transparent: `sh -c "echo hi"` is allowed
+    /// by the starter policy's `echo *`, where the `sh` segment used to fall
+    /// to the default and outrank it. A rule that names the wrapper still
+    /// counts, and a script file - not read, so not a wrapper - still falls
+    /// to the default.
+    #[test]
+    fn an_unnamed_wrapper_is_transparent_and_a_named_one_is_not() {
+        let starter = Policy::builtin().unwrap();
+        let d = starter.evaluate_command(r#"sh -c "echo hi""#, &here());
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        assert!(d.reason.contains("(inside sh -c)"), "{}", d.reason);
+        assert_eq!(
+            starter
+                .evaluate_command(r#"sh -c "no-such-command-tmx""#, &here())
+                .action,
+            Action::Ask,
+            "an unmatched command inside still falls to the default"
+        );
+        assert_eq!(
+            starter.evaluate_command("sh script.sh", &here()).action,
+            Action::Ask,
+            "a script file is not read, so it is not transparent"
+        );
+        let names_the_shell: Policy = serde_yaml::from_str(
+            r#"
+default: ask
+rules:
+  - match: "sh *"
+    action: deny
+  - match: "echo *"
+    action: allow
+"#,
+        )
+        .unwrap();
+        let d = names_the_shell.evaluate_command(r#"sh -c "echo hi""#, &here());
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        assert!(d.reason.contains("segment 1/2"), "{}", d.reason);
     }
 
     #[test]
