@@ -241,7 +241,7 @@ pub fn extract_targets(command: &str) -> Vec<String> {
 /// travels beside it.
 pub fn extract_targets_detailed(command: &str) -> Vec<Tok> {
     let mut out = Vec::new();
-    for segment in crate::shell::split_segments(command) {
+    for segment in crate::shell::split_segments_deep(command) {
         // The segment's own words. The split already found every
         // redirection; reading the full text here made `2>/dev/null` and
         // `/dev/null` into targets, and the insurance that then tried to
@@ -989,6 +989,17 @@ mod tests {
         let long = format!("/home/user/{}", "a".repeat(60));
         assert_eq!(short(&long).chars().count(), 40);
         assert!(short(&long).ends_with("aaa"));
+    }
+
+    /// #62: the delete inside a POSIX shell's -c string names its target.
+    #[test]
+    fn a_delete_inside_a_shell_c_string_names_its_target() {
+        assert_eq!(extract_targets(r#"sh -c "rm -rf ./dist""#), vec!["./dist"]);
+        assert_eq!(
+            extract_targets(r#"bash -lc "cd /tmp && rm -rf ./dist ./build""#),
+            vec!["./dist", "./build"]
+        );
+        assert!(extract_targets("sh clean.sh ./dist").is_empty());
     }
 
     #[test]

@@ -35,18 +35,22 @@ pub struct BackupRecord {
 /// backup" about a file that would in fact be copied aside. A preview whose
 /// lines are meant to be facts cannot resolve against the process cwd.
 pub fn plan(command: &str, cwd: &Path) -> Option<String> {
-    let segments = crate::shell::split_segments(command);
-    if segments.len() > 1 {
-        return segments.iter().find_map(|s| plan(s, cwd));
-    }
+    // Every segment, including the ones inside a POSIX shell's -c string
+    // (#62); the first with a plan is the plan. Each segment is judged from
+    // the split's own reading of it, never by splitting its text again —
+    // a wrapper segment's text splits into the wrapper and its string,
+    // without end.
+    crate::shell::split_segments_deep(command)
+        .iter()
+        .find_map(|s| plan_segment(s, cwd))
+}
+
+fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
+    let command: &str = segment;
     // Tokens of the segment's own words. Tokenizing the full text put
     // `/dev/null` among rm's operands — it exists, so it was planned, and
     // copying a device is what made `take` fail on the real target (#61).
-    let own = segments
-        .first()
-        .map(|s| s.command().to_string())
-        .unwrap_or_default();
-    let tokens = crate::pg::shell_tokens(&own);
+    let tokens = crate::pg::shell_tokens(segment.command());
     if let Some((remote, branch)) = git_force_push_target(&tokens) {
         return Some(format!(
             "snapshot {}/{} to a local backup branch before it is overwritten",
@@ -76,11 +80,7 @@ pub fn plan(command: &str, cwd: &Path) -> Option<String> {
     // report and the mechanism disagreeing is the bug shape this release
     // keeps finding; found by roadmap 2.2, which is the first caller to ask
     // `plan` about a write.
-    let redirects: Vec<crate::shell::Overwrite> = crate::shell::split_segments(command)
-        .into_iter()
-        .flat_map(|s| s.redirects)
-        .collect();
-    if let Some(paths) = overwrite_paths(&redirects, cwd) {
+    if let Some(paths) = overwrite_paths(&segment.redirects, cwd) {
         return Some(format!(
             "copy {} path(s) to .termaxa/backups before they are overwritten",
             paths.len()
@@ -116,23 +116,24 @@ fn tf_state_target(tokens: &[String]) -> Option<PathBuf> {
 /// Take the backup. Returns the record on success, a printable error string
 /// on a failed attempt, or Ok(None) when the command needs no insurance.
 pub fn take(termaxa_dir: &Path, command: &str, cwd: &Path) -> Result<Option<BackupRecord>> {
-    let segments = crate::shell::split_segments(command);
-    if segments.len() > 1 {
-        for s in &segments {
-            if let Some(rec) = take(termaxa_dir, s, cwd)? {
-                return Ok(Some(rec)); // insure the first insurable segment
-            }
+    for segment in crate::shell::split_segments_deep(command) {
+        if let Some(rec) = take_segment(termaxa_dir, &segment, cwd)? {
+            return Ok(Some(rec)); // insure the first insurable segment
         }
-        return Ok(None);
     }
+    Ok(None)
+}
+
+fn take_segment(
+    termaxa_dir: &Path,
+    segment: &crate::shell::Segment,
+    cwd: &Path,
+) -> Result<Option<BackupRecord>> {
+    let command: &str = segment;
     // The segment's own words for the operand readers, its redirects for
     // the overwrite reader — both from the one split (#61).
-    let (own, redirects) = segments
-        .into_iter()
-        .next()
-        .map(|s| (s.command().to_string(), s.redirects))
-        .unwrap_or_default();
-    let tokens = crate::pg::shell_tokens(&own);
+    let tokens = crate::pg::shell_tokens(segment.command());
+    let redirects = &segment.redirects;
     let (ts_ms, ts) = now();
     let id = format!("b-{}", ts_ms);
 
@@ -144,7 +145,7 @@ pub fn take(termaxa_dir: &Path, command: &str, cwd: &Path) -> Result<Option<Back
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else if let Some(state) = tf_state_target(&tokens) {
         backup_files(termaxa_dir, &id, &ts, command, &[state])?
-    } else if let Some(paths) = overwrite_paths(&redirects, cwd) {
+    } else if let Some(paths) = overwrite_paths(redirects, cwd) {
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else {
         return Ok(None);
@@ -970,6 +971,51 @@ mod tests {
         assert!(
             state.join("backups").join("manifest.jsonl").is_file(),
             "an insured operation leaves a record behind"
+        );
+    }
+
+    /// #62. `sh -c "cat /dev/null > src/main.rs"` was asked, approved and
+    /// executed with no backup: insurance saw `sh` with two arguments.
+    #[test]
+    fn a_command_inside_a_shell_c_string_is_insured() {
+        let tmp = TempTree::new("bk-shell-c");
+        let state = tmp.dir("state");
+        let doomed = tmp.file("doomed.txt", "precious");
+        // Forward slashes on purpose. Inside the double-quoted -c string a
+        // backslash escapes the next character to this lexer (the #50 rule,
+        // where bash would keep `\U` as is), so a Windows temp path spelled
+        // `C:\Users\...` arrives as `C:Users...` and names nothing. That is
+        // #56's divergence, not this test's subject; Windows reads `C:/...`.
+        let d = doomed.display().to_string().replace('\\', "/");
+
+        for (command, expected_plan) in [
+            (
+                format!(r#"sh -c "cat /dev/null > {d}""#),
+                "copy 1 path(s) to .termaxa/backups before they are overwritten",
+            ),
+            (
+                format!(r#"bash -lc "rm -rf {d}""#),
+                "copy 1 path(s) to .termaxa/backups before deletion",
+            ),
+        ] {
+            assert_eq!(
+                plan(&command, &test_cwd()).as_deref(),
+                Some(expected_plan),
+                "{command}"
+            );
+            let record = take(&state, &command, &test_cwd())
+                .unwrap_or_else(|e| panic!("{command}: the backup must not fail: {e}"))
+                .unwrap_or_else(|| panic!("{command}: the command inside is insurable"));
+            assert_eq!(record.kind, "files", "{command}");
+            assert!(
+                record.note.starts_with("1 path(s)"),
+                "{command}: {}",
+                record.note
+            );
+        }
+        assert!(
+            plan("sh clean.sh", &test_cwd()).is_none(),
+            "a script file is not read"
         );
     }
 

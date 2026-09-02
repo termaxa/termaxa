@@ -245,7 +245,7 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
     // Redirects: the unified scanner already extracted them, with truncation
     // decided there. An append still names a destination - it does not
     // truncate, but the path is still one the command writes.
-    for seg in crate::shell::split_segments(segment) {
+    for seg in crate::shell::split_segments_deep(segment) {
         for o in &seg.redirects {
             out.push((o.target.clone(), TargetRole::Destination));
         }
@@ -258,7 +258,7 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
 
     // Per-command grammars, over the segment's own words: a redirect's
     // target is a Destination above, not an operand here (#61).
-    for seg in crate::shell::split_segments(segment) {
+    for seg in crate::shell::split_segments_deep(segment) {
         let tokens = crate::delete::tokenize_public(seg.command());
         let Some((head, at)) = crate::delete::resolve_head(&tokens) else {
             continue;

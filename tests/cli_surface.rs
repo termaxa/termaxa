@@ -78,7 +78,7 @@ fn project(root: &Path) -> PathBuf {
     std::fs::write(
         proj.join(".termaxa").join("policy.yaml"),
         "version: 1\ndefault: ask\nrules:\n  - match: \"rm -rf /*\"\n    action: deny\n  \
-         - match: \"sh*\"\n    action: allow\n",
+         - match: \"sh*\"\n    action: allow\n  - match: \"exit*\"\n    action: allow\n",
     )
     .expect("policy must be writable");
     proj

@@ -92,7 +92,7 @@ impl Intent {
 /// segment, and returns the most severe intent found — mirroring the
 /// "most dangerous segment dictates the verdict" rule.
 pub fn classify_command(command: &str) -> Option<Intent> {
-    crate::shell::split_segments(command)
+    crate::shell::split_segments_deep(command)
         .iter()
         .filter_map(classify_segment)
         .max_by_key(|i| i.rank())
@@ -513,6 +513,31 @@ mod tests {
         ] {
             assert_eq!(classify_command(cmd), None, "{cmd} deletes nothing");
         }
+    }
+
+    /// #62: a POSIX shell's -c string is the command. `sh -c "cat /dev/null
+    /// > src/main.rs"` was asked by policy default, previewed nothing and
+    /// took no backup; to this classifier it was `sh` with two arguments.
+    #[test]
+    fn a_posix_shell_does_not_hide_the_command_it_runs() {
+        assert_eq!(
+            classify_command(r#"sh -c "cat /dev/null > src/main.rs""#),
+            Some(Intent::FileOverwrite)
+        );
+        assert_eq!(
+            classify_command(r#"bash -lc "rm -rf ./dist""#),
+            Some(Intent::FileDelete)
+        );
+        assert_eq!(
+            classify_command(r#"sudo sh -c "psql -d shop -c 'DROP TABLE users'""#),
+            Some(Intent::DbDestroy)
+        );
+        assert_eq!(classify_command(r#"sh -c "ls -la""#), None);
+        assert_eq!(
+            classify_command("sh clean.sh"),
+            None,
+            "a script file is not read"
+        );
     }
 
     /// v0.16: a wrapper program hid the real command from every engine.

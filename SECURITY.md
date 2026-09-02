@@ -58,7 +58,7 @@ and insurance carry the weight rather than `ask`.
 
 > Would a cooperative agent, making an ordinary mistake, hit this?
 
-If yes, it is a bug and it gets fixed regardless of threat model — a careless agent hits `rm -r -f /` and `git push -f` exactly as readily as a hostile one. If it only fires under deliberate evasion — quoting a command name to dodge a rule, `bash -c` to hide a payload, a SQL comment inside a keyword — it is a documented limit, and this section is that documentation.
+If yes, it is a bug and it gets fixed regardless of threat model — a careless agent hits `rm -r -f /` and `git push -f` exactly as readily as a hostile one. If it only fires under deliberate evasion — quoting a command name to dodge a rule, a payload hidden in `python -c` or `eval`, a SQL comment inside a keyword — it is a documented limit, and this section is that documentation. (A POSIX shell's `-c` string — `sh`, `bash`, `dash`, `zsh` — is read as the command it runs, since v0.17.1 (#62): agents and harnesses spell ordinary commands that way. A script file, a heredoc, `eval`, and the Windows shells are not read; the last is tracked as its own issue.)
 
 We state this because it would be very convenient to call every bypass "out of scope," and that is exactly when a framing deserves suspicion.
 
