@@ -64,6 +64,49 @@ fn run_termaxa(
 }
 
 /// A scratch tree, cleared first so a crashed earlier run cannot leak in.
+/// Like `termaxa`, but gives up after `secs` and kills the child: the
+/// wrapper used to recurse without end (#65), and a hung test is worse
+/// than a failed one.
+fn termaxa_within(home: &Path, cwd: &Path, args: &[&str], stdin: &str, secs: u64) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_termaxa"));
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("TERMAXA_HOME", home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("the binary must be runnable");
+    {
+        let mut pipe = child.stdin.take().expect("stdin must be piped");
+        let _ = pipe.write_all(stdin.as_bytes());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut timed_out = false;
+    while child
+        .try_wait()
+        .expect("the child must be pollable")
+        .is_none()
+    {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            timed_out = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().expect("the child must exit");
+    assert!(
+        !timed_out,
+        "termaxa {args:?} did not finish within {secs}s — the wrapper is recursing again (#65)"
+    );
+    Output {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: out.status.code().unwrap_or(-1),
+    }
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let base = std::env::temp_dir().join(format!("termaxa-cli-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
@@ -356,5 +399,77 @@ fn rollback_restores_nothing_unless_it_is_confirmed() {
         out.stdout.contains("✓ 1 path(s) restored"),
         "the count is the report of what happened: {:?}",
         out.stdout
+    );
+}
+
+/// #65. Through the wrapper, an allowed command was never executed: the
+/// runner's `sh` resolved to the shim again and the wrapper recursed until
+/// killed. The residue test pinned a deny and a bypass; nothing pinned an
+/// execution. The fixture allows `sh*` and `exit*`, so `sh -c "exit 3"` is
+/// allowed at both levels, and its exit code must come back through the
+/// wrapper and the shim.
+#[test]
+fn wrap_executes_what_it_allows() {
+    let tmp = scratch("wrap-allow");
+    let (home, proj) = (tmp.join("home"), project(&tmp));
+    let out = termaxa_within(&home, &proj, &["wrap", "--", "sh", "-c", "exit 3"], "", 30);
+    assert_eq!(
+        out.code, 3,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        !out.stderr.contains("not interactive"),
+        "the gate must not ask twice: {}",
+        out.stderr
+    );
+    // A shell nested inside the approved command is the real one, not the
+    // shim: one gate, and the inner exit code comes back.
+    let out = termaxa_within(
+        &home,
+        &proj,
+        &["wrap", "--", "sh", "-c", "sh -c 'exit 5'"],
+        "",
+        30,
+    );
+    assert_eq!(
+        out.code, 5,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+}
+
+/// #65, the asked half: through the wrapper an approved delete asked twice
+/// and then refused for lack of stdin, leaving the file in place and no
+/// backup. Now it asks once, insures, and executes.
+#[test]
+fn wrap_executes_what_it_approves_after_insuring_it() {
+    let tmp = scratch("wrap-approve");
+    let (home, proj) = (tmp.join("home"), project(&tmp));
+    std::fs::write(proj.join("doomed.txt"), "precious").unwrap();
+
+    let out = termaxa_within(
+        &home,
+        &proj,
+        &["wrap", "--", "sh", "-c", "rm -rf ./doomed.txt"],
+        "y\n",
+        30,
+    );
+    assert!(
+        !proj.join("doomed.txt").exists(),
+        "the approved delete must have run\nstdout: {}\nstderr: {}",
+        out.stdout,
+        out.stderr
+    );
+    let asks = out.stdout.matches("Proceed?").count() + out.stderr.matches("Proceed?").count();
+    assert_eq!(
+        asks, 1,
+        "asked exactly once\nstdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    let backups = termaxa(&home, &proj, &["backups"], "").stdout;
+    assert!(
+        backups.contains("rm -rf ./doomed.txt"),
+        "the backup was taken before the delete ran: {backups}"
     );
 }
