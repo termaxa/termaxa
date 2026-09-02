@@ -172,7 +172,17 @@ fn shell_join(argv: &[String]) -> String {
 }
 
 fn execute(argv: &[String]) -> Result<i32> {
-    let status = Command::new(&argv[0]).args(&argv[1..]).status()?;
+    // Outside the wrapper's shims (#65): under `termaxa wrap`, `sh` by name
+    // is the shim, and the shim is what brought us here.
+    let inherited = std::env::var_os("PATH");
+    let (program, path) = match crate::paths::home_base() {
+        Ok(home) => crate::wrap::outside_shims(&argv[0], inherited.as_deref(), &home),
+        Err(_) => (argv[0].clone().into(), inherited.unwrap_or_default()),
+    };
+    let status = Command::new(&program)
+        .args(&argv[1..])
+        .env("PATH", &path)
+        .status()?;
     Ok(status.code().unwrap_or(1))
 }
 

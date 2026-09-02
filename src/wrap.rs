@@ -115,6 +115,70 @@ pub fn install_shims(termaxa_home: &Path, _termaxa_bin: &Path) -> Result<PathBuf
     )
 }
 
+/// The program and `PATH` an approved command runs with: the shim directory
+/// taken out of `PATH`, and a bare program name resolved through what is
+/// left, so it is the real shell and not the shim again.
+///
+/// #65. The shim forwards `sh -c "<cmd>"` to `termaxa run -- sh -c "<cmd>"`.
+/// The runner then executed `sh` by name, through the same `PATH` the
+/// wrapper had set up, and got the shim: an allowed command recursed
+/// without end (`wrap -- sh -c 'echo hi'` hung), an asked one asked twice
+/// and then found no stdin. Nothing ever reached `/bin/sh`. Measured on
+/// 2026-09-03; the residue test had pinned a deny and a bypass, never an
+/// execution.
+///
+/// The command's own children run with the same stripped `PATH`, which is
+/// the intent: what was approved was the command and what it spawns. A
+/// program given with a path separator is left alone; a bare name that
+/// resolves nowhere is left bare, for the OS to report as before.
+pub fn outside_shims(
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+    termaxa_home: &Path,
+) -> (std::ffi::OsString, std::ffi::OsString) {
+    let shims = shim_dir(termaxa_home);
+    let same_dir = |entry: &str| -> bool {
+        let e = Path::new(entry);
+        e == shims
+            || match (e.canonicalize(), shims.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+    };
+    let kept: Vec<String> = path
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .split(path_separator())
+        .filter(|entry| !entry.is_empty() && !same_dir(entry))
+        .map(str::to_string)
+        .collect();
+    let stripped: std::ffi::OsString = kept.join(path_separator()).into();
+    let bare = !program.contains('/') && !program.contains('\\');
+    let resolved = if bare {
+        kept.iter()
+            .map(|dir| Path::new(dir).join(program))
+            .find(|candidate| is_executable_file(candidate))
+            .map(|p| p.into_os_string())
+            .unwrap_or_else(|| program.into())
+    } else {
+        program.into()
+    };
+    (resolved, stripped)
+}
+
+#[cfg(unix)]
+fn is_executable_file(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(p: &Path) -> bool {
+    std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
+}
+
 /// Launch `argv` with the shims in front of it.
 pub fn run(argv: &[String], termaxa_home: &Path) -> Result<i32> {
     if argv.is_empty() {
@@ -230,6 +294,62 @@ mod tests {
     /// This is the grades table's "escape via tools that execute without
     /// spawning through the wrapper", made concrete. A test that only proved
     /// the happy path would let someone read the wrapper as interception.
+    /// #65: the runner's own `sh` must be the real one. The shim directory
+    /// leaves `PATH`, a bare name resolves through what remains, a path
+    /// is left alone, and a name that resolves nowhere stays bare.
+    #[cfg(unix)]
+    #[test]
+    fn an_approved_command_runs_outside_the_shims() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TempTree::new("wrap-outside");
+        let dir = install_shims(t.path(), Path::new("/usr/bin/termaxa")).unwrap();
+        let real = t.dir("realbin");
+        std::fs::write(real.join("sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let mut p = std::fs::metadata(real.join("sh")).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(real.join("sh"), p).unwrap();
+
+        let path = format!("{}:{}:/nonexistent", dir.display(), real.display());
+        let (program, stripped) = outside_shims("sh", Some(std::ffi::OsStr::new(&path)), t.path());
+        assert_eq!(
+            program,
+            real.join("sh").into_os_string(),
+            "the bare name resolves past the shim to the real shell"
+        );
+        let stripped = stripped.to_string_lossy().into_owned();
+        assert!(
+            !stripped.contains(&dir.display().to_string()),
+            "the shim directory is out of the child's PATH: {stripped}"
+        );
+        assert!(
+            stripped.starts_with(&real.display().to_string()),
+            "{stripped}"
+        );
+
+        // A trailing slash is the same directory.
+        let path = format!("{}/:{}", dir.display(), real.display());
+        let (_, stripped) = outside_shims("sh", Some(std::ffi::OsStr::new(&path)), t.path());
+        assert!(
+            !stripped.to_string_lossy().contains("shims"),
+            "{stripped:?}"
+        );
+
+        // A program given as a path is left alone; a name that resolves
+        // nowhere stays a name.
+        let (program, _) = outside_shims("/bin/sh", Some(std::ffi::OsStr::new(&path)), t.path());
+        assert_eq!(program, std::ffi::OsString::from("/bin/sh"));
+        let (program, _) = outside_shims(
+            "no-such-program-tmx",
+            Some(std::ffi::OsStr::new(&path)),
+            t.path(),
+        );
+        assert_eq!(program, std::ffi::OsString::from("no-such-program-tmx"));
+
+        // No shims on PATH at all: nothing changes but the resolution.
+        let (_, same) = outside_shims("sh", Some(std::ffi::OsStr::new("/usr/bin:/bin")), t.path());
+        assert_eq!(same, std::ffi::OsString::from("/usr/bin:/bin"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_absolute_path_shell_is_outside_what_a_path_shim_can_reach() {
