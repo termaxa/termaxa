@@ -242,7 +242,12 @@ pub fn extract_targets(command: &str) -> Vec<String> {
 pub fn extract_targets_detailed(command: &str) -> Vec<Tok> {
     let mut out = Vec::new();
     for segment in crate::shell::split_segments(command) {
-        let tokens = tokenize_detailed(&segment);
+        // The segment's own words. The split already found every
+        // redirection; reading the full text here made `2>/dev/null` and
+        // `/dev/null` into targets, and the insurance that then tried to
+        // copy a device failed — with the real target deleted uninsured
+        // behind it (#61).
+        let tokens = tokenize_detailed(segment.command());
         if tokens.is_empty() {
             continue;
         }
@@ -984,6 +989,23 @@ mod tests {
         let long = format!("/home/user/{}", "a".repeat(60));
         assert_eq!(short(&long).chars().count(), 40);
         assert!(short(&long).ends_with("aaa"));
+    }
+
+    #[test]
+    fn a_redirection_is_not_a_delete_target() {
+        // #61: `2>/dev/null` became a target that did not exist, and
+        // `/dev/null` a target that did — one the insurance then tried to
+        // copy, failing, while the real target was deleted uninsured.
+        for cmd in [
+            "rm -rf ./cache",
+            "rm -rf ./cache 2>/dev/null",
+            "rm -rf ./cache > /dev/null 2>&1",
+            "rm -rf ./cache >log 2>&1",
+            "rm -rf ./cache 2>&1 >/dev/null",
+            "rm -rf 2>/dev/null ./cache",
+        ] {
+            assert_eq!(extract_targets(cmd), vec!["./cache"], "{cmd}");
+        }
     }
 
     #[test]

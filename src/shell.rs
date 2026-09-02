@@ -28,6 +28,13 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut cur = String::new();
     let mut cur_redirects = Vec::new();
+    // Where every redirection in the current segment sits, as [start, end)
+    // char indices into `chars`: operator, any file descriptor number that
+    // is its own word before it, and the target. `flush` builds the
+    // segment's `command` by leaving these out. Recorded here, in the one
+    // walk that finds them, so no engine has to find them again (#61).
+    let mut cur_spans: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = 0;
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     let (mut in_single, mut in_double) = (false, false);
@@ -58,7 +65,15 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
             }
             _ if in_single || in_double => cur.push(c),
             '&' if i + 1 < chars.len() && chars[i + 1] == '&' => {
-                flush(&mut segments, &mut cur, &mut cur_redirects);
+                flush(
+                    &mut segments,
+                    &mut cur,
+                    &mut cur_redirects,
+                    &chars[seg_start..i],
+                    seg_start,
+                    &mut cur_spans,
+                );
+                seg_start = i + 2;
                 i += 1; // consume second &
             }
             // A lone `&` IS a separator — it backgrounds the segment to its
@@ -69,7 +84,15 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
             // in are `2>&1` / `>&2` / `<&-` (preceded by `>` or `<`) and
             // `&>file` / `&>>file` (followed by `>`); those are not separators.
             '&' if !is_redirection_amp(&chars, i) => {
-                flush(&mut segments, &mut cur, &mut cur_redirects)
+                flush(
+                    &mut segments,
+                    &mut cur,
+                    &mut cur_redirects,
+                    &chars[seg_start..i],
+                    seg_start,
+                    &mut cur_spans,
+                );
+                seg_start = i + 1;
             }
             // A redirect: consume the operator and its target in THIS walk,
             // recording the Overwrite the segment will carry. Deliberately
@@ -86,6 +109,13 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
             '>' => {
                 let prev_is_amp = i > 0 && chars[i - 1] == '&';
                 let prev_is_lt = i > 0 && chars[i - 1] == '<';
+                // `&>` and `<>` are one operator whose first character the
+                // walk already pushed; the span starts there.
+                let start = if prev_is_amp || prev_is_lt {
+                    i - 1
+                } else {
+                    span_start(&chars, seg_start, i)
+                };
                 cur.push(c);
                 let mut j = i + 1;
                 let truncates = if chars.get(j) == Some(&'>') {
@@ -100,11 +130,14 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                     j += 1;
                 }
                 if chars.get(j) == Some(&'&') {
-                    // descriptor duplication — keep the `&` as text and let
-                    // the walk continue after it, as `is_redirection_amp`
-                    // always classified it
+                    // descriptor duplication — keep the `&` and the
+                    // descriptor as text, as `is_redirection_amp` always
+                    // classified it, and leave the whole of `2>&1` out of
+                    // the command text: it names no file.
                     cur.push('&');
-                    i = j + 1;
+                    let end = descriptor(&chars, &mut cur, j + 1);
+                    cur_spans.push((start, end));
+                    i = end;
                     continue;
                 }
                 while j < chars.len() && chars[j].is_whitespace() {
@@ -117,52 +150,155 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                     i = j;
                     continue;
                 }
-                // The target: everything until unquoted whitespace or an
-                // unquoted separator, escapes honored as everywhere else in
-                // the walk. Backslashes are RETAINED in the target string,
-                // as they always were for non-boundary characters.
-                let mut target = String::new();
-                let mut quote: Option<char> = None;
-                while j < chars.len() {
-                    let d = chars[j];
-                    match quote {
-                        Some(q) if d == q => quote = None,
-                        Some(_) => {}
-                        None if d == '\'' || d == '"' => quote = Some(d),
-                        None if d == '\\' && j + 1 < chars.len() => {
-                            cur.push(d);
-                            target.push(d);
-                            j += 1;
-                        }
-                        None if d.is_whitespace() => break,
-                        None if matches!(d, ';' | '\n' | '|') => break,
-                        None if d == '&' && !is_redirection_amp(&chars, j) => break,
-                        None => {}
-                    }
-                    cur.push(chars[j]);
-                    target.push(chars[j]);
-                    j += 1;
-                }
-                let target: String = target.trim_matches(|c| c == '\'' || c == '"').to_string();
+                let (target, end) = target_word(&chars, &mut cur, j);
                 if !target.is_empty() && !prev_is_amp && !prev_is_lt && !is_sink(&target) {
                     cur_redirects.push(Overwrite { target, truncates });
                 }
-                i = j;
+                // A sink or a duplication still occupies the command line;
+                // only the Overwrite record is withheld, not the span.
+                cur_spans.push((start, end));
+                i = end;
                 continue;
             }
             '|' => {
-                flush(&mut segments, &mut cur, &mut cur_redirects);
+                flush(
+                    &mut segments,
+                    &mut cur,
+                    &mut cur_redirects,
+                    &chars[seg_start..i],
+                    seg_start,
+                    &mut cur_spans,
+                );
                 if i + 1 < chars.len() && chars[i + 1] == '|' {
                     i += 1; // `||` — consume second |
                 }
+                seg_start = i + 1;
             }
-            ';' | '\n' => flush(&mut segments, &mut cur, &mut cur_redirects),
+            ';' | '\n' => {
+                flush(
+                    &mut segments,
+                    &mut cur,
+                    &mut cur_redirects,
+                    &chars[seg_start..i],
+                    seg_start,
+                    &mut cur_spans,
+                );
+                seg_start = i + 1;
+            }
+            // An input redirection: `< file`, `<< WORD` (heredoc), `<<< word`
+            // (here-string), `<> file`, `<& n`. None of them names a file the
+            // command deletes, copies or moves, so the whole thing is a span
+            // the command text leaves out. The text keeps it verbatim, as it
+            // always did: this arm pushes exactly what the walk pushed before
+            // it existed. `<(...)` is process substitution — hand the paren
+            // back to the walk.
+            '<' => {
+                let start = span_start(&chars, seg_start, i);
+                cur.push(c);
+                let mut j = i + 1;
+                if chars.get(j) == Some(&'<') {
+                    cur.push('<');
+                    j += 1;
+                    if chars.get(j) == Some(&'<') {
+                        cur.push('<');
+                        j += 1;
+                    }
+                } else if chars.get(j) == Some(&'>') {
+                    cur.push('>');
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'&') {
+                    cur.push('&');
+                    j = descriptor(&chars, &mut cur, j + 1);
+                    cur_spans.push((start, j));
+                    i = j;
+                    continue;
+                }
+                while j < chars.len() && chars[j].is_whitespace() {
+                    cur.push(chars[j]);
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'(') {
+                    i = j;
+                    continue;
+                }
+                let (_, end) = target_word(&chars, &mut cur, j);
+                cur_spans.push((start, end));
+                i = end;
+                continue;
+            }
             _ => cur.push(c),
         }
         i += 1;
     }
-    flush(&mut segments, &mut cur, &mut cur_redirects);
+    flush(
+        &mut segments,
+        &mut cur,
+        &mut cur_redirects,
+        &chars[seg_start..],
+        seg_start,
+        &mut cur_spans,
+    );
     segments
+}
+
+/// Where a redirection's span begins: at the operator, or at the file
+/// descriptor number in front of it when that number is a word of its own.
+/// `2>err` redirects descriptor 2; `file2>err` is the word `file2` followed
+/// by a redirect of stdout — the shell reads it that way, so this does too.
+fn span_start(chars: &[char], seg_start: usize, op: usize) -> usize {
+    let mut k = op;
+    while k > seg_start && chars[k - 1].is_ascii_digit() {
+        k -= 1;
+    }
+    if k < op && (k == seg_start || chars[k - 1].is_whitespace()) {
+        k
+    } else {
+        op
+    }
+}
+
+/// The descriptor after `>&` or `<&`: digits, or `-` to close. Pushed to
+/// the text verbatim; returns the index after it.
+fn descriptor(chars: &[char], cur: &mut String, mut j: usize) -> usize {
+    while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '-') {
+        cur.push(chars[j]);
+        j += 1;
+    }
+    j
+}
+
+/// A redirection's target: everything until unquoted whitespace or an
+/// unquoted separator, escapes honored as everywhere else in the walk.
+/// Backslashes are RETAINED in the target string, as they always were for
+/// non-boundary characters. Every character is pushed to the segment text;
+/// returns the target with its surrounding quotes stripped, and the index
+/// after it.
+fn target_word(chars: &[char], cur: &mut String, mut j: usize) -> (String, usize) {
+    let mut target = String::new();
+    let mut quote: Option<char> = None;
+    while j < chars.len() {
+        let d = chars[j];
+        match quote {
+            Some(q) if d == q => quote = None,
+            Some(_) => {}
+            None if d == '\'' || d == '"' => quote = Some(d),
+            None if d == '\\' && j + 1 < chars.len() => {
+                cur.push(d);
+                target.push(d);
+                j += 1;
+            }
+            None if d.is_whitespace() => break,
+            None if matches!(d, ';' | '\n' | '|') => break,
+            None if d == '&' && !is_redirection_amp(chars, j) => break,
+            None => {}
+        }
+        cur.push(chars[j]);
+        target.push(chars[j]);
+        j += 1;
+    }
+    let target: String = target.trim_matches(|c| c == '\'' || c == '"').to_string();
+    (target, j)
 }
 
 /// One shell segment, carrying the redirect targets found in it.
@@ -180,8 +316,23 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     text: String,
+    /// The text with every redirection left out — operator, descriptor and
+    /// target — so a caller reading the command's own words does not take
+    /// `2>/dev/null` for a file it deletes. Built by the split from the spans
+    /// it found; nothing re-scans (#61).
+    command: String,
     /// Files this segment writes over, in order of appearance.
     pub redirects: Vec<Overwrite>,
+}
+
+impl Segment {
+    /// The segment's own words: program, flags and operands, with the
+    /// redirections removed. `rm -rf ./cache > /dev/null 2>&1` reads
+    /// `rm -rf ./cache`. Use this to find what a command acts on; use the
+    /// `Deref` text to match rules against what was typed.
+    pub fn command(&self) -> &str {
+        &self.command
+    }
 }
 
 impl std::ops::Deref for Segment {
@@ -242,11 +393,31 @@ fn is_redirection_amp(chars: &[char], i: usize) -> bool {
     prev_is_redirect || next_is_redirect
 }
 
-fn flush(segments: &mut Vec<Segment>, cur: &mut String, redirects: &mut Vec<Overwrite>) {
+fn flush(
+    segments: &mut Vec<Segment>,
+    cur: &mut String,
+    redirects: &mut Vec<Overwrite>,
+    source: &[char],
+    seg_start: usize,
+    spans: &mut Vec<(usize, usize)>,
+) {
     let t = cur.trim();
     if !t.is_empty() {
+        // The text is the source between separators, verbatim (every arm of
+        // the walk pushes the characters it consumed), so the command is
+        // the same source with the recorded spans left out.
+        let command: String = source
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| {
+                let at = seg_start + k;
+                !spans.iter().any(|&(a, b)| a <= at && at < b)
+            })
+            .map(|(_, c)| *c)
+            .collect();
         segments.push(Segment {
             text: t.to_string(),
+            command: command.trim().to_string(),
             redirects: std::mem::take(redirects),
         });
     } else {
@@ -255,6 +426,7 @@ fn flush(segments: &mut Vec<Segment>, cur: &mut String, redirects: &mut Vec<Over
         // (a redirect implies non-whitespace text), cleared for safety.
         redirects.clear();
     }
+    spans.clear();
     cur.clear();
 }
 
@@ -348,6 +520,78 @@ mod tests {
     /// Sinks destroy nothing, and `> /dev/null` is the most common redirect
     /// in existence. Classifying it fed the breaker on every build command —
     /// the third redirected build log of any session was DENIED.
+    #[test]
+    fn the_command_text_leaves_every_redirection_out() {
+        // (input, the command each segment reads as)
+        for (cmd, want) in [
+            ("rm -rf ./cache 2>/dev/null", vec!["rm -rf ./cache"]),
+            ("rm -rf ./cache > /dev/null 2>&1", vec!["rm -rf ./cache"]),
+            ("rm -rf ./cache >log 2>&1", vec!["rm -rf ./cache"]),
+            ("rm -rf ./cache 2>&1 >/dev/null", vec!["rm -rf ./cache"]),
+            ("cat /dev/null > src/main.rs", vec!["cat /dev/null"]),
+            ("sort < in.txt > out.txt", vec!["sort"]),
+            ("cmd &>all.log", vec!["cmd"]),
+            ("cmd &>>all.log", vec!["cmd"]),
+            ("echo a >> log", vec!["echo a"]),
+            ("echo a >| log", vec!["echo a"]),
+            ("cat > \"my file.txt\"", vec!["cat"]),
+            ("rm > early -rf ./cache", vec!["rm  -rf ./cache"]),
+            ("cat <<EOF\nbody\nEOF", vec!["cat", "body", "EOF"]),
+            ("cat <<< word", vec!["cat"]),
+            ("exec 3<&0", vec!["exec"]),
+            ("exec 3<> /tmp/f", vec!["exec"]),
+            // a digit that is part of a word is not a descriptor
+            ("rm -rf ./cache2>log", vec!["rm -rf ./cache2"]),
+            // process substitution is an operand, not a redirection
+            ("tee >(gzip) file", vec!["tee >(gzip) file"]),
+            ("diff <(ls a) <(ls b)", vec!["diff <(ls a) <(ls b)"]),
+            // separators still split, and each side keeps its own words
+            (
+                "git status & rm -rf / 2>/dev/null",
+                vec!["git status", "rm -rf /"],
+            ),
+            ("echo a > x && echo b > y", vec!["echo a", "echo b"]),
+            // quoted operators are text, in both readings
+            ("echo \"a > b\"", vec!["echo \"a > b\""]),
+        ] {
+            let segs = split_segments(cmd);
+            let got: Vec<&str> = segs.iter().map(|s| s.command()).collect();
+            assert_eq!(got, want, "{cmd}");
+        }
+    }
+
+    /// The command text is derived; the text is what was typed. Adding the
+    /// derivation must not have moved a single character of the text or a
+    /// single recorded redirect.
+    #[test]
+    fn the_command_text_changes_nothing_about_the_text_or_the_redirects() {
+        for (cmd, texts) in [
+            (
+                "rm -rf ./cache > /dev/null 2>&1",
+                vec!["rm -rf ./cache > /dev/null 2>&1"],
+            ),
+            ("sort < in.txt > out.txt", vec!["sort < in.txt > out.txt"]),
+            ("cat <<EOF\nbody\nEOF", vec!["cat <<EOF", "body", "EOF"]),
+            ("exec 3<&0", vec!["exec 3<&0"]),
+            ("tee >(gzip) file", vec!["tee >(gzip) file"]),
+            ("cat > \"my file.txt\"", vec!["cat > \"my file.txt\""]),
+            ("echo \"a > b\"", vec!["echo \"a > b\""]),
+            ("git status & rm -rf /", vec!["git status", "rm -rf /"]),
+        ] {
+            let segs = split_segments(cmd);
+            let got: Vec<&str> = segs.iter().map(|s| &**s).collect();
+            assert_eq!(got, texts, "{cmd}: the text is verbatim");
+        }
+        let targets =
+            |cmd: &str| -> Vec<String> { redirects(cmd).into_iter().map(|o| o.target).collect() };
+        assert_eq!(targets("rm -rf ./cache >log 2>&1"), vec!["log"]);
+        assert_eq!(targets("cat > \"my file.txt\""), vec!["my file.txt"]);
+        assert!(redirects("sort < in.txt").is_empty());
+        // a segment without redirections reads the same both ways
+        let seg = &split_segments("rm -rf ./cache")[0];
+        assert_eq!(seg.command(), &**seg);
+    }
+
     #[test]
     fn sinks_are_not_targets() {
         for cmd in [
