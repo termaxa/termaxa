@@ -369,6 +369,10 @@ circuit_breaker:                 # optional (on by default)
 notify:                          # optional
   webhook: https://hooks.slack.com/services/...
   on: [deny, ask]
+
+# Both default to the cooperative choice; set them for unattended runs.
+unrecognised: allow              # deny: refuse a shell event the hook cannot read
+backup_failure: proceed          # deny: refuse a command whose backup could not be taken
 ```
 
 ## Command reference
@@ -398,6 +402,7 @@ Colour is on when output is a terminal and off when it isn't. `NO_COLOR`, `TERMA
 Termaxa is pre-1.0. It's real and tested, and it is not magic. Specifically:
 
 - **Hooks advise; they don't enforce.** Termaxa gates commands an agent submits through the Claude Code or Cursor hook. Those agents are *cooperative* — they respect a `deny` and propose an alternative, which is what makes the gate work. An agent running in full-auto mode could, in principle, retry a blocked action through a different command or shell; the circuit breaker raises the cost of that, but a hook is an *integration* point for visibility and policy, not an *enforcement* boundary. `termaxa wrap -- <agent>` (Unix, v0.16) widens this: commands the agent runs *through a shell* pass through the gate even without a hook, though a caller naming `/bin/sh` by absolute path still does not. [**Supervised mode**](#supervised-mode-unix-v017) (Unix, v0.17) goes further and moves the *authority* — but it moves who decides, not where the boundary is: an agent's native tools bypass it exactly as they bypass a basic gate. For hard guarantees today, pair Termaxa with OS-level sandboxing.
+- **The gate fails open on a payload it doesn't recognise — by design, and you can turn that off.** A hook that fails closed on every harness update becomes the outage the day a harness renames an event. So a payload Termaxa can't read passes through untouched, and `termaxa doctor` and the liveness probe are how you find out it happened. (It has happened: Cursor 3.11 renamed its hook events and four releases went ungated before v0.11.4.) For unattended runs, where a stopped agent is cheaper than an ungated one, `unrecognised: deny` in the policy refuses any event that looks like a shell tool call and can't be read, and `backup_failure: deny` refuses a command whose insurance couldn't be taken instead of running it with a warning nobody is reading.
 - **Native agent tools bypass the gate.** The hook sees *shell* commands. An agent's own built-in file/edit tools don't go through the shell — observed in live testing, a Cursor agent switched to its native file-delete tool and removed files Termaxa never saw. Non-shell tool calls need OS-level isolation underneath.
 - **Cooperative, not a sandbox.** Termaxa governs commands that flow through the agent hook, `termaxa run`, or a `wrap`ped shell. An agent with raw, unhooked shell access is *not* contained — that needs OS-level sandboxing, a complementary layer. Supervised mode does not change this: it makes the *record* trustworthy and the *decision* privileged, and leaves the interception boundary where it was. The threat model is *agents making expensive mistakes*, not a malicious agent actively evading you.
 - **Shell parsing is good, not perfect.** It splits on `&&`, `||`, `;`, `|`

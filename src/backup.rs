@@ -432,6 +432,22 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
             copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
         }
     } else {
+        // Only a regular file is copied. `fs::copy` on a FIFO opens it for
+        // reading and blocks until a writer appears - inside a hook, that is
+        // a harness waiting forever on a backup of a build directory that
+        // happened to hold a named pipe. A socket or a device fails the same
+        // check `fs::copy` would apply, one open() earlier. The failure is
+        // reported like any other: the command proceeds or is refused by
+        // `backup_failure`.
+        let kind = fs::metadata(src)
+            .with_context(|| format!("cannot stat {}", src.display()))?
+            .file_type();
+        if !kind.is_file() {
+            bail!(
+                "{} is not a regular file (a pipe, socket or device cannot be copied)",
+                src.display()
+            );
+        }
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
             make_private(parent, true)?;
@@ -1017,6 +1033,33 @@ mod tests {
             plan("sh clean.sh", &test_cwd()).is_none(),
             "a script file is not read"
         );
+    }
+
+    /// A named pipe inside the target used to hang the copy - `fs::copy`
+    /// opens a FIFO for reading and waits for a writer that never comes,
+    /// inside a hook the harness is waiting on. Now it is an error, quickly.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_inside_the_target_fails_the_copy_instead_of_hanging_it() {
+        let tmp = TempTree::new("bk-fifo");
+        let tree = tmp.dir("tree");
+        std::fs::write(tree.join("keep.txt"), "x").unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(tree.join("pipe"))
+            .status()
+            .expect("mkfifo must be runnable");
+        assert!(status.success());
+        let dst = tmp.path().join("copy");
+        let (send, recv) = std::sync::mpsc::channel();
+        let src = tree.clone();
+        std::thread::spawn(move || {
+            let _ = send.send(copy_recursive(&src, &dst).map_err(|e| e.to_string()));
+        });
+        let result = recv
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the copy must finish, not block on the pipe");
+        let err = result.expect_err("a pipe is not copyable");
+        assert!(err.contains("not a regular file"), "{err}");
     }
 
     /// #61. The stderr-silencing spelling read `/dev/null` as an operand of

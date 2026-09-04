@@ -192,6 +192,30 @@ rules:
   - match: "*rd /s*"
     action: deny
     reason: "Recursive delete (cmd) blocked by default policy."
+  # A recovery point is the one delete with nothing behind it. Field report,
+  # Sep 2026: an agent wiped a drive, and the parent agent sent to recover it
+  # deleted the day-old shadow copy it was trying to restore. vssadmin and
+  # diskshadow spell it "delete shadows"; wmic spells it "shadowcopy delete";
+  # PowerShell reaches it through Win32_ShadowCopy and .Delete().
+  - match: "*delete shadows*"
+    action: deny
+    reason: "Deleting shadow copies destroys the recovery point itself."
+  - match: "*shadowcopy delete*"
+    action: deny
+    reason: "Deleting shadow copies destroys the recovery point itself."
+  - match: "*Win32_ShadowCopy*Delete*"
+    action: deny
+    reason: "Deleting shadow copies destroys the recovery point itself."
+  # The PowerShell way to delete a WMI/CIM instance - shadow copies are the
+  # common target. `Get-WmiObject Win32_ShadowCopy | ForEach-Object
+  # { $_.Delete() }` is split at the pipe and neither half names both; it
+  # falls to the default, which asks. Known gap, recorded in the test.
+  - match: "*Remove-WmiObject*"
+    action: deny
+    reason: "Removing a WMI instance (a shadow copy, typically) is not recoverable."
+  - match: "*Remove-CimInstance*"
+    action: deny
+    reason: "Removing a CIM instance (a shadow copy, typically) is not recoverable."
   - match: "kubectl delete*"
     action: deny
     reason: "kubectl delete is blocked. Use a manifest change + apply."

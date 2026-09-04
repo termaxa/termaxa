@@ -362,12 +362,19 @@ fn wrapped_command(seg: &Segment) -> Option<(String, String)> {
     if !POSIX_SHELLS.contains(&head.as_str()) {
         return None;
     }
+    // The same walk the wrap shim makes (#69): long options are stepped
+    // over, `-o` takes an argument, `--` and `-` end the options, and the
+    // first operand is a script file, which is not read.
     let mut i = at + 1;
     while let Some(tok) = tokens.get(i) {
-        if !tok.starts_with('-') || tok == "-" || tok.starts_with("--") {
-            return None; // a script file or an operand, not a -c string
+        if tok == "--" || tok == "-" || !tok.starts_with('-') {
+            return None; // end of options, or a script file
         }
-        if tok[1..].contains('c') {
+        if tok == "-o" {
+            i += 2;
+            continue;
+        }
+        if !tok.starts_with("--") && tok[1..].contains('c') {
             let script = tokens.get(i + 1)?;
             if script.trim().is_empty() {
                 return None;
@@ -725,6 +732,8 @@ mod tests {
             r#"dash -c "rm -rf ./dist""#,
             r#"zsh -ec "rm -rf ./dist""#,
             r#"sh -e -c "rm -rf ./dist""#,
+            r#"bash --norc -c "rm -rf ./dist""#,
+            r#"bash -o pipefail -c "rm -rf ./dist""#,
             "sh -c 'rm -rf ./dist'",
         ] {
             let segs = split_segments_deep(cmd);
