@@ -162,6 +162,36 @@ fn default_notify_on() -> Vec<String> {
     vec!["deny".to_string()]
 }
 
+/// Policy for a hook payload the reader cannot parse. See `Policy::unrecognised`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Unrecognised {
+    #[default]
+    Allow,
+    Deny,
+}
+
+impl Unrecognised {
+    fn is_default(v: &Self) -> bool {
+        *v == Self::Allow
+    }
+}
+
+/// Policy for a backup that could not be taken. See `Policy::backup_failure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupFailure {
+    #[default]
+    Proceed,
+    Deny,
+}
+
+impl BackupFailure {
+    fn is_default(v: &Self) -> bool {
+        *v == Self::Proceed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Policy {
     #[serde(default = "default_version")]
@@ -173,6 +203,26 @@ pub struct Policy {
     pub rules: Vec<Rule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<Notify>,
+    /// What the hook does with a payload it does not recognise as a shell
+    /// tool call it can read. `allow` (the default) passes it through
+    /// untouched - the cooperative gate's founding choice: a hook that fails
+    /// closed on every harness update becomes the outage the day an event is
+    /// renamed. `deny` refuses any event that looks like a shell tool call
+    /// (a tool named like a shell, or a `command` field) the reader could
+    /// not parse - for unattended runs, where a stopped agent is cheaper than
+    /// an ungated one. Known-limitation 4 records the two incidents behind
+    /// this knob.
+    #[serde(default, skip_serializing_if = "Unrecognised::is_default")]
+    pub unrecognised: Unrecognised,
+    /// What happens when the insurance cannot be taken for a command the gate
+    /// would otherwise let run. `proceed` (the default) reports the failure
+    /// and runs the approved command - insurance failing to bind must not
+    /// cancel the flight for a person at a terminal. `deny` refuses instead:
+    /// the choice for unattended runs, where nobody sees the warning and the
+    /// uninsured delete is the whole risk. #61 is the receipt: a copy that
+    /// failed on `/dev/null` and a directory deleted with no backup behind it.
+    #[serde(default, skip_serializing_if = "BackupFailure::is_default")]
+    pub backup_failure: BackupFailure,
 }
 
 fn default_version() -> u32 {
@@ -1131,6 +1181,46 @@ rules:
         assert_eq!(
             policy.evaluate_command("git status", &here()).action,
             Action::Allow
+        );
+    }
+
+    /// Field report, Sep 2026: the parent agent sent to recover a wiped
+    /// drive deleted the shadow copy it was restoring from. Every spelling of
+    /// that delete is a hard stop; listing shadow copies is not.
+    #[test]
+    fn deleting_a_recovery_point_is_a_hard_stop_in_every_spelling() {
+        let p = Policy::builtin().unwrap();
+        for cmd in [
+            "vssadmin delete shadows /all /quiet",
+            "vssadmin Delete Shadows /For=C: /Oldest",
+            "wmic shadowcopy delete",
+            "wmic shadowcopy delete /nointeractive",
+            "(Get-WmiObject Win32_ShadowCopy).Delete()",
+            "Get-WmiObject Win32_ShadowCopy | Remove-WmiObject",
+            "Get-CimInstance Win32_ShadowCopy | Remove-CimInstance",
+            r#"cmd /c "vssadmin delete shadows /all /quiet""#,
+        ] {
+            let d = p.evaluate_command(cmd, &here());
+            assert_eq!(d.action, Action::Deny, "{cmd}: {}", d.reason);
+            assert!(d.reason.contains("recover"), "{cmd}: {}", d.reason);
+        }
+        // Known gap, stated rather than hidden: the pipeline form is split at
+        // the pipe, and `$_.Delete()` on its own names nothing. It falls to
+        // the default, which asks - not an allow, and not yet a hard stop.
+        let d = p.evaluate_command(
+            "Get-WmiObject Win32_ShadowCopy | ForEach-Object { $_.Delete() }",
+            &here(),
+        );
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
+        // diskshadow runs a script file the gate cannot read: the default, not an allow.
+        assert_ne!(
+            p.evaluate_command("diskshadow /s wipe.txt", &here()).action,
+            Action::Allow
+        );
+        assert_ne!(
+            p.evaluate_command("vssadmin list shadows", &here()).action,
+            Action::Deny,
+            "listing recovery points is not deleting them"
         );
     }
 

@@ -550,6 +550,112 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// A payload the reader could not parse, that nevertheless looks like a
+/// shell tool call: a tool named like a shell, or a `command` field, within a
+/// few levels of the JSON. This is the shape known-limitation 4 describes -
+/// Cursor 3.11 renamed its events and the gate passed every command through
+/// in silence for four releases. Under `unrecognised: deny` the answer is a
+/// refusal with a reason, and the payload is worth filing. Under the default
+/// it stays a pass-through, as it always was.
+fn refuse_unrecognised(raw: &str) -> Option<Outcome> {
+    let json: serde_json::Value = serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok()?;
+    if !looks_like_shell_tool_event(&json, 0) {
+        return None;
+    }
+    let cwd = json
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty() && std::path::Path::new(c).is_dir())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            json.get("workspace_roots")
+                .and_then(|r| r.get(0))
+                .and_then(|r| r.as_str())
+                .map(std::path::PathBuf::from)
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let paths = crate::paths::resolve_from(&cwd).ok()?;
+    let policy = Policy::load(&paths.policy_file()).ok()?;
+    if policy.unrecognised != crate::policy::Unrecognised::Deny {
+        return None;
+    }
+    let reason = "termaxa: hook payload not recognised as a shell tool call the gate can read; \
+                  refused because the policy sets `unrecognised: deny`. Set TERMAXA_HOOK_DEBUG to \
+                  a file to capture the payload and file it."
+        .to_string();
+    if let Ok(log) = AuditLog::new(&paths.state_dir) {
+        let (ts_ms, ts) = now();
+        let _ = log.append(&AuditEntry {
+            ts_ms,
+            ts,
+            source: "hook".into(),
+            actor: Some("unrecognised".into()),
+            decided_by: Some("policy".into()),
+            command: raw.chars().take(200).collect(),
+            decision: "deny".into(),
+            matched_rule: Some("unrecognised: deny".into()),
+            reason: reason.clone(),
+            signals: vec![],
+            escalated: false,
+            session: None,
+            backup: None,
+            preview: None,
+            intent: None,
+            approved: None,
+            exit_code: None,
+            cwd: cwd.display().to_string(),
+            prev: None,
+            hash: None,
+        });
+    }
+    Some(Outcome {
+        rendered: Some(render_response(Dialect::ClaudeCode, "deny", &reason)),
+        exit_code: 2,
+        audit_seq: None,
+    })
+}
+
+/// A tool named like a shell, or a `command` string, anywhere in the first
+/// four levels. A file read or edit has neither; a renamed shell event has
+/// at least one.
+fn looks_like_shell_tool_event(v: &serde_json::Value, depth: usize) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    match v {
+        serde_json::Value::Object(map) => map.iter().any(|(k, val)| {
+            let key = k.to_ascii_lowercase();
+            if key == "command" && val.is_string() {
+                return true;
+            }
+            if matches!(key.as_str(), "tool_name" | "toolname" | "tool" | "name") {
+                if let Some(name) = val.as_str() {
+                    let n = name.to_ascii_lowercase();
+                    if [
+                        "bash",
+                        "shell",
+                        "exec",
+                        "terminal",
+                        "cmd",
+                        "powershell",
+                        "pwsh",
+                    ]
+                    .iter()
+                    .any(|w| n.contains(w))
+                    {
+                        return true;
+                    }
+                }
+            }
+            looks_like_shell_tool_event(val, depth + 1)
+        }),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|i| looks_like_shell_tool_event(i, depth + 1)),
+        _ => false,
+    }
+}
+
 /// Decide one payload. Prints nothing, exits nothing.
 ///
 /// The whole hook path, minus I/O: this is what the daemon calls with bytes
@@ -588,6 +694,9 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
             // as before.
             if let Some(w) = parse_file_write(&buf) {
                 return Ok(gate_file_write(&w));
+            }
+            if let Some(refused) = refuse_unrecognised(&buf) {
+                return Ok(refused);
             }
             return Ok(Outcome {
                 rendered: None,
@@ -818,7 +927,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // That misreading gets worse with every safeguard added later, so the
     // probe sees the policy verdict and enforcement sees the amplified one.
     // One reader, two questions, answered separately (#37).
-    let (decision, uninsured_escalation) = if is_probe {
+    let (mut decision, uninsured_escalation) = if is_probe {
         (decision, false)
     } else {
         crate::context::apply_insurance(decision, uninsurable)
@@ -846,10 +955,26 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // var without the sentinel changes nothing.
     let mut backup_id: Option<String> = None;
     if !is_probe && decision.action != Action::Deny {
-        if let Ok(Some(rec)) =
-            crate::backup::take(&paths.state_dir, &command, std::path::Path::new(&input.cwd))
-        {
-            backup_id = Some(rec.id);
+        match crate::backup::take(&paths.state_dir, &command, std::path::Path::new(&input.cwd)) {
+            Ok(Some(rec)) => backup_id = Some(rec.id),
+            Ok(None) => {}
+            // Best effort by default: the failure is not even reported here,
+            // because a hook has no terminal to report to. Under
+            // `backup_failure: deny` the verdict changes instead - an
+            // unattended run has nobody to read a warning, and an uninsured
+            // delete is the whole risk (#61 is the receipt).
+            Err(e) if policy.backup_failure == crate::policy::BackupFailure::Deny => {
+                decision = crate::policy::Decision {
+                    action: Action::Deny,
+                    matched_rule: decision.matched_rule.clone(),
+                    reason: format!(
+                        "insurance failed ({e}) and the policy sets `backup_failure: deny` \
+                         — an uninsured command does not run"
+                    ),
+                    source: decision.source,
+                };
+            }
+            Err(_) => {}
         }
     }
 

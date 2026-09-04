@@ -473,3 +473,182 @@ fn wrap_executes_what_it_approves_after_insuring_it() {
         "the backup was taken before the delete ran: {backups}"
     );
 }
+
+/// #69. The shim forwarded only a leading, bare `-c`; `bash -lc` (Codex's
+/// spelling), `bash -e -c`, `bash --norc -c` and `bash -o pipefail -c` ran
+/// through the real shell ungated. Now every spelling is gated exactly once
+/// and the shell's own options reach execution, while a script file and a
+/// bare `-c` still pass through untouched.
+#[test]
+fn wrap_reads_a_c_wherever_the_shell_would() {
+    let tmp = scratch("wrap-cluster");
+    let (home, proj) = (tmp.join("home"), project(&tmp));
+    for spelling in [
+        vec!["-c"],
+        vec!["-lc"],
+        vec!["-e", "-c"],
+        vec!["--norc", "-c"],
+        vec!["-o", "pipefail", "-c"],
+    ] {
+        let mut args = vec!["wrap", "--", "bash"];
+        args.extend(spelling.iter().copied());
+        args.push("exit 3");
+        let out = termaxa_within(&home, &proj, &args, "", 30);
+        let asks = out.stdout.matches("decision").count() + out.stderr.matches("decision").count();
+        assert_eq!(
+            out.code, 3,
+            "{spelling:?}: stdout {}\nstderr {}",
+            out.stdout, out.stderr
+        );
+        assert_eq!(
+            asks, 1,
+            "{spelling:?}: gated exactly once\n{}{}",
+            out.stdout, out.stderr
+        );
+    }
+    std::fs::write(proj.join("s.sh"), "exit 7\n").unwrap();
+    let out = termaxa_within(&home, &proj, &["wrap", "--", "sh", "s.sh"], "", 30);
+    assert_eq!(
+        out.code, 7,
+        "a script file is not read: {}{}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        !out.stdout.contains("decision") && !out.stderr.contains("decision"),
+        "no gate for a script file: {}{}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+/// The fail-mode knob. A payload that looks like a shell tool call but that
+/// the reader cannot parse passes through by default (exit 0, no decision),
+/// exactly as it always did; under `unrecognised: deny` it is refused with a
+/// reason and exit 2. An unrelated payload is never refused, and a payload
+/// the reader does understand is judged as before.
+#[test]
+fn an_unrecognised_shell_event_passes_through_by_default_and_is_refused_by_policy() {
+    let tmp = scratch("unrecognised");
+    let (home, proj) = (tmp.join("home"), project(&tmp));
+    let renamed = format!(
+        r#"{{"cwd": {}, "event": "beforeShellRun", "tool": {{"name": "shell", "args": {{"command": "rm -rf /"}}}}}}"#,
+        serde_json::to_string(&proj.display().to_string()).unwrap()
+    );
+    let unrelated = format!(
+        r#"{{"cwd": {}, "event": "fileRead", "path": "src/main.rs"}}"#,
+        serde_json::to_string(&proj.display().to_string()).unwrap()
+    );
+    let readable = format!(
+        r#"{{"cwd": {}, "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {{"command": "exit 3"}}}}"#,
+        serde_json::to_string(&proj.display().to_string()).unwrap()
+    );
+
+    let out = termaxa(&home, &proj, &["hook"], &renamed);
+    assert_eq!(
+        out.code, 0,
+        "default: pass through\nstdout {}\nstderr {}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stdout.trim().is_empty(),
+        "default: no decision rendered: {}",
+        out.stdout
+    );
+
+    let policy = proj.join(".termaxa").join("policy.yaml");
+    let mut text = std::fs::read_to_string(&policy).unwrap();
+    text.push_str("unrecognised: deny\n");
+    std::fs::write(&policy, text).unwrap();
+
+    let out = termaxa(&home, &proj, &["hook"], &renamed);
+    assert_eq!(
+        out.code, 2,
+        "deny: refused\nstdout {}\nstderr {}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stdout.contains("\"deny\""),
+        "deny rendered: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("not recognised"),
+        "the reason says why: {}",
+        out.stdout
+    );
+
+    let out = termaxa(&home, &proj, &["hook"], &unrelated);
+    assert_eq!(
+        out.code, 0,
+        "an unrelated event is not a shell call: {}",
+        out.stdout
+    );
+    assert!(out.stdout.trim().is_empty(), "{}", out.stdout);
+
+    let out = termaxa(&home, &proj, &["hook"], &readable);
+    assert_eq!(
+        out.code, 0,
+        "a readable payload is judged as before: {}{}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stdout.contains("\"allow\""),
+        "exit* is allowed by the fixture: {}",
+        out.stdout
+    );
+}
+
+/// The insurance knob. A backup that cannot be taken proceeds with a warning
+/// by default - the approved command runs uninsured; under `backup_failure:
+/// deny` the command is refused and the target survives. A socket inside
+/// the target is a copy that fails the way `/dev/null` did in #61.
+#[cfg(unix)]
+#[test]
+fn a_failed_backup_proceeds_by_default_and_is_refused_by_policy() {
+    let tmp = scratch("backup-failure");
+    let (home, proj) = (tmp.join("home"), project(&tmp));
+    let make_target = || {
+        let junk = proj.join("junk");
+        let _ = std::fs::remove_dir_all(&junk);
+        std::fs::create_dir_all(&junk).unwrap();
+        std::fs::write(junk.join("keep.txt"), "x").unwrap();
+        // A socket: `fs::copy` cannot open it, so the copy fails at once.
+        let sock = std::os::unix::net::UnixListener::bind(junk.join("sock"))
+            .expect("the fixture needs a socket");
+        std::mem::forget(sock);
+        junk
+    };
+
+    let junk = make_target();
+    let out = termaxa(&home, &proj, &["run", "--", "rm", "-rf", "./junk"], "y\n");
+    assert!(
+        !junk.exists(),
+        "default: the approved delete ran uninsured\n{}{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("proceeding"),
+        "default: the failure is reported: {}",
+        out.stderr
+    );
+
+    let policy = proj.join(".termaxa").join("policy.yaml");
+    let mut text = std::fs::read_to_string(&policy).unwrap();
+    text.push_str("backup_failure: deny\n");
+    std::fs::write(&policy, text).unwrap();
+
+    let junk = make_target();
+    let out = termaxa(&home, &proj, &["run", "--", "rm", "-rf", "./junk"], "y\n");
+    assert!(
+        junk.exists(),
+        "deny: the uninsured delete did not run\n{}{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("backup_failure: deny"),
+        "the refusal names the knob: {}",
+        out.stderr
+    );
+}

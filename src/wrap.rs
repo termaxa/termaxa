@@ -68,20 +68,46 @@ pub fn install_shims(termaxa_home: &Path, termaxa_bin: &Path) -> Result<PathBuf>
 
     for shell in SHIMMED_SHELLS {
         let path = dir.join(shell);
-        // `-c "cmd"` is how a shell is asked to run one command, and it is
-        // the only form we forward: the agent's shell tool uses it. An
-        // interactive shell (no `-c`) is a human at a terminal and is passed
-        // through untouched, because gating a person's own login shell is not
-        // what this is for.
+        // A `-c` string is how a shell is asked to run one command, and it is
+        // the form we forward. It may sit in a cluster - `bash -lc` is how
+        // Codex spells it - or after other options (`sh -e -c`), so the shim
+        // scans the options the way `split_segments_deep` does and forwards
+        // the whole argument list, options intact, so `-l` and `-e` still
+        // reach the shell that finally runs it (#69). An interactive shell
+        // (no `-c`) or a script file is a human or a file at a terminal and
+        // is passed through untouched, because gating a person's own login
+        // shell is not what this is for.
         let script = format!(
-            "#!/bin/sh\n\
-             # termaxa shim — generated, do not edit.\n\
-             # `sh -c \"<command>\"` is routed through the gate; anything else\n\
-             # is handed to the real shell unchanged.\n\
-             if [ \"$1\" = \"-c\" ] && [ -n \"$2\" ]; then\n\
-             \x20 exec {bin} run -- {shell} -c \"$2\"\n\
-             fi\n\
-             exec /bin/{shell} \"$@\"\n",
+            r#"#!/bin/sh
+# termaxa shim - generated, do not edit.
+# A `-c` string, alone or in a cluster such as `-lc` or `-ec`, is routed
+# through the gate with the shell's other options intact; anything else
+# (a script file, an interactive shell) is handed to the real shell unchanged.
+expect_string=""
+skip_next=""
+for a in "$@"; do
+  if [ -n "$expect_string" ]; then
+    if [ -n "$a" ]; then
+      exec {bin} run -- {shell} "$@"
+    fi
+    break
+  fi
+  if [ -n "$skip_next" ]; then
+    skip_next=""
+    continue
+  fi
+  case "$a" in
+    --) break ;;
+    -) break ;;
+    --*) ;;
+    -o) skip_next=1 ;;
+    -*c*) expect_string=1 ;;
+    -*) ;;
+    *) break ;;
+  esac
+done
+exec /bin/{shell} "$@"
+"#,
             bin = termaxa_bin.display(),
             shell = shell,
         );
@@ -119,7 +145,7 @@ pub fn install_shims(termaxa_home: &Path, _termaxa_bin: &Path) -> Result<PathBuf
 /// taken out of `PATH`, and a bare program name resolved through what is
 /// left, so it is the real shell and not the shim again.
 ///
-/// #65. The shim forwards `sh -c "<cmd>"` to `termaxa run -- sh -c "<cmd>"`.
+/// #65. The shim forwards `sh -c "<cmd>"` to `termaxa run -- sh "$@"`.
 /// The runner then executed `sh` by name, through the same `PATH` the
 /// wrapper had set up, and got the shim: an allowed command recursed
 /// without end (`wrap -- sh -c 'echo hi'` hung), an asked one asked twice

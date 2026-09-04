@@ -46,17 +46,32 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     // is visible rather than relying on an ambient default inside resolve.
     let run_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut backup_id: Option<String> = None;
-    let insure = |backup_id: &mut Option<String>| {
+    // Returns whether the command may go on to run. A failed backup proceeds
+    // with a warning by default; a policy that sets `backup_failure: deny`
+    // refuses instead, because nobody is reading warnings on an unattended run.
+    let insure = |backup_id: &mut Option<String>| -> bool {
         match crate::backup::take(&paths.state_dir, &command, &run_cwd) {
             Ok(Some(rec)) => {
                 println!("🛟 backup {} — {}", rec.id, rec.note);
                 *backup_id = Some(rec.id);
+                true
             }
-            Ok(None) => {} // nothing to insure
-            Err(e) => eprintln!(
-                "termaxa: backup failed ({}); proceeding — command was approved",
-                e
-            ),
+            Ok(None) => true, // nothing to insure
+            Err(e) if policy.backup_failure == crate::policy::BackupFailure::Deny => {
+                eprintln!(
+                    "termaxa: backup failed ({}); refused — the policy sets \
+                     `backup_failure: deny`, so an uninsured command does not run",
+                    e
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!(
+                    "termaxa: backup failed ({}); proceeding — command was approved",
+                    e
+                );
+                true
+            }
         }
     };
 
@@ -100,18 +115,24 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
                 );
                 (Some(false), None)
             } else if matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
-                insure(&mut backup_id);
-                let code = execute(argv)?;
-                (Some(true), Some(code))
+                if insure(&mut backup_id) {
+                    let code = execute(argv)?;
+                    (Some(true), Some(code))
+                } else {
+                    (Some(false), None)
+                }
             } else {
                 eprintln!("termaxa: declined.");
                 (Some(false), None)
             }
         }
         Action::Allow => {
-            insure(&mut backup_id);
-            let code = execute(argv)?;
-            (None, Some(code))
+            if insure(&mut backup_id) {
+                let code = execute(argv)?;
+                (None, Some(code))
+            } else {
+                (Some(false), None)
+            }
         }
     };
 
