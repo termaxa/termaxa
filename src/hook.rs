@@ -209,7 +209,8 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
             .unwrap_or(false)
             || s("source")
                 .map(|a| a.to_lowercase().contains("codex"))
-                .unwrap_or(false);
+                .unwrap_or(false)
+            || sent_by_codex(&v);
         return Some(ParsedHook {
             dialect: if looks_codex {
                 Dialect::Codex
@@ -309,7 +310,8 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
     let looks_codex = s("agent")
         .or_else(|| s("source"))
         .map(|a| a.to_lowercase().contains("codex"))
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || sent_by_codex(&v);
     let dialect = if v.get("toolName").is_some() {
         Dialect::Copilot
     } else if is_cursor {
@@ -439,9 +441,31 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
 /// silence is safe. See the comment at the call site in `run` for why the
 /// default-allow goes silent at all.
 fn is_silent(dialect: Dialect, decision: &crate::policy::Decision) -> bool {
-    matches!(dialect, Dialect::ClaudeCode | Dialect::Codex)
-        && decision.action == crate::policy::Action::Allow
-        && decision.matched_rule.is_none()
+    match dialect {
+        Dialect::ClaudeCode => {
+            decision.action == crate::policy::Action::Allow && decision.matched_rule.is_none()
+        }
+        // Codex rejects an explicit `allow` at PreToolUse ("unsupported
+        // permissionDecision:allow", measured Sep 5, 2026, codex-cli 0.153.4,
+        // Windows) and treats a failed hook as fail-open to its own prompt.
+        // Every allow is silence, matched or not; the audit log keeps the
+        // rule name.
+        Dialect::Codex => decision.action == crate::policy::Action::Allow,
+        _ => false,
+    }
+}
+
+/// Codex's real PreToolUse payload (captured live Sep 5, 2026, codex-cli
+/// 0.153.4 on Windows) carries no `agent` or `source` tag; it is the Claude
+/// Code shape plus `turn_id`, `model`, `permission_mode` and a transcript
+/// under `~/.codex/sessions`. `turn_id` is the field Claude Code does not
+/// send; the transcript path is the fallback.
+fn sent_by_codex(v: &serde_json::Value) -> bool {
+    v.get("turn_id").is_some()
+        || v.get("transcript_path")
+            .and_then(|p| p.as_str())
+            .map(|p| p.contains(".codex"))
+            .unwrap_or(false)
 }
 
 /// Decision -> the JSON each agent expects on stdout.
@@ -1024,13 +1048,28 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // Suggested by Tim Schipper.
     let silent = is_silent(input.dialect, &decision);
 
+    // Codex honours exactly one PreToolUse verdict: `deny`. An `ask` is
+    // "unsupported permissionDecision:ask", which fails the hook and falls
+    // open to Codex's own prompt - or to nothing at all under --full-auto.
+    // So an ask is rendered as a deny whose reason says the gate asked and
+    // how to proceed; the audit log records the ask the policy made.
+    let codex_ask = input.dialect == Dialect::Codex && decision.action == Action::Ask;
     let permission = match decision.action {
         Action::Allow => "allow",
+        Action::Ask if codex_ask => "deny",
         Action::Ask => "ask",
         Action::Deny => "deny",
     };
 
-    let mut reason = format!("[termaxa] {}", decision.reason);
+    let mut reason = if codex_ask {
+        format!(
+            "[termaxa] asks: {} — Codex cannot prompt from a hook, so this is refused; \
+             add an allow rule to .termaxa/policy.yaml for this command, or run it yourself",
+            decision.reason
+        )
+    } else {
+        format!("[termaxa] {}", decision.reason)
+    };
     if uninsured_escalation {
         // Named distinctly from context escalation: the record should say
         // WHICH amplifier fired, or a later reader cannot tell a signal-driven
@@ -1071,7 +1110,14 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
 
     Ok(Outcome {
         rendered,
-        exit_code: if decision.action == Action::Deny {
+        // Exit 2 is the belt under the JSON for Cursor and Copilot. Not for
+        // Codex: measured Sep 5, 2026, a Termaxa deny reached codex-cli
+        // 0.153.4 on Windows as "hook exited with code 1" - the wrapper that
+        // runs the hook flattens a non-zero exit to 1, and Codex treats any
+        // exit other than 0 or 2 as a failed hook, which fails open. The JSON
+        // on stdout is Codex's documented channel; the exit code stays 0 so
+        // the JSON is read.
+        exit_code: if decision.action == Action::Deny && input.dialect != Dialect::Codex {
             2
         } else {
             0
