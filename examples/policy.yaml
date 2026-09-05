@@ -347,6 +347,63 @@ rules:
   - match: "docker ps*"
     action: allow
 
+  # ---- PowerShell read-only cmdlets ----
+  # Codex on Windows speaks PowerShell, and under Codex an ask is a refusal
+  # (its hooks can only deny), so a read-only probe that falls to the
+  # default stops the agent. These take no script block; Where-Object and
+  # ForEach-Object are left out on purpose, because their block can hide a
+  # delete. A `$var = ...` assignment is read as the command it assigns.
+  - match: "Get-ChildItem*"
+    action: allow
+  - match: "Get-Item*"
+    action: allow
+  - match: "Get-Content*"
+    action: allow
+  - match: "Get-Location*"
+    action: allow
+  - match: "Get-Command*"
+    action: allow
+  - match: "Get-Date*"
+    action: allow
+  - match: "Get-Help*"
+    action: allow
+  - match: "Get-Member*"
+    action: allow
+  - match: "Get-FileHash*"
+    action: allow
+  - match: "Resolve-Path*"
+    action: allow
+  - match: "Test-Path*"
+    action: allow
+  - match: "Split-Path*"
+    action: allow
+  - match: "Join-Path*"
+    action: allow
+  - match: "Select-String*"
+    action: allow
+  - match: "Select-Object*"
+    action: allow
+  - match: "Sort-Object*"
+    action: allow
+  - match: "Measure-Object*"
+    action: allow
+  - match: "Compare-Object*"
+    action: allow
+  - match: "Format-Table*"
+    action: allow
+  - match: "Format-List*"
+    action: allow
+  - match: "Out-String*"
+    action: allow
+  - match: "Write-Output*"
+    action: allow
+  - match: "Write-Host*"
+    action: allow
+  - match: "ConvertTo-Json*"
+    action: allow
+  - match: "ConvertFrom-Json*"
+    action: allow
+
   # ---- the ordinary dev loop: build, test, lint, run ----
   # These fell to the default and were asked about every time, and every
   # time they were approved. An ask that is always approved is not a safety
