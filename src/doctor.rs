@@ -673,7 +673,7 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// exits, which is acceptable in a short-lived diagnostic and stated here
 /// rather than hidden.
 fn invoke(cmd: &str, payload: &str, dir: &Path, timeout: std::time::Duration) -> Option<String> {
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
 
@@ -700,7 +700,20 @@ fn invoke(cmd: &str, payload: &str, dir: &Path, timeout: std::time::Duration) ->
         .ok()?;
 
     // take() so the handle DROPS after the write — the hook reads to EOF.
-    child.stdin.take()?.write_all(payload.as_bytes()).ok()?;
+    //
+    // main() restores SIGPIPE's default so that `termaxa log | head` dies
+    // quietly. That default kills the PROBE too: a registered command that
+    // exits before reading its stdin - `sh -c "termaxa hook"` on a PATH
+    // with no termaxa exits 127 at once - closes the pipe, and a write to a
+    // closed pipe is SIGPIPE, which ended `init` with wait status 13 on CI
+    // (Sep 6, 2026; once in a container on Sep 4). The race is whether the
+    // child exits before the write. Ignore the signal for the write only:
+    // a broken pipe then comes back as an error, which is the answer the
+    // probe wants - the hook did not read - and the default is put back
+    // before anything else prints.
+    let stdin = child.stdin.take()?;
+    let written = write_ignoring_sigpipe(stdin, payload.as_bytes());
+    written.ok()?;
 
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
@@ -721,6 +734,21 @@ fn invoke(cmd: &str, payload: &str, dir: &Path, timeout: std::time::Duration) ->
             None
         }
     }
+}
+
+/// Write to a child's pipe with SIGPIPE ignored for the duration, so a reader
+/// that has already gone away is an `Err(BrokenPipe)` and not the end of this
+/// process. The previous disposition is put back before returning.
+fn write_ignoring_sigpipe(mut stdin: impl std::io::Write, payload: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    let result = stdin.write_all(payload);
+    drop(stdin);
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, previous);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -925,6 +953,41 @@ mod tests {
     /// The timeout the scope specified. A hanging hook is Dead within ~2s;
     /// without this, `doctor` hung forever, once per detected agent —
     /// demonstrated against the first draft with `timeout 8` exiting 124.
+    /// A registered command that goes away without reading its stdin - as
+    /// `sh -c "termaxa hook"` does on a PATH with no termaxa, exiting 127
+    /// at once - must come back as a broken pipe, not as this process
+    /// killed by SIGPIPE. The probe's own payload is small enough to land
+    /// in the pipe buffer before the child exits, which is why the crash was
+    /// a race on CI; here the payload is larger than the buffer, so the
+    /// write blocks until the child closes the pipe and the outcome is
+    /// deterministic. SIGPIPE is restored to its default the way main()
+    /// does it, so a regression ends the test binary with signal 13 rather
+    /// than a failed assertion: that is the crash this pins.
+    #[test]
+    #[cfg(unix)]
+    fn a_write_to_a_hook_that_closed_its_stdin_is_an_error_not_a_death() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exec 0<&-; sleep 1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sh must be runnable");
+        let stdin = child.stdin.take().unwrap();
+        let payload = vec![b'x'; 1 << 20];
+
+        let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let result = write_ignoring_sigpipe(stdin, &payload);
+        let after = unsafe { libc::signal(libc::SIGPIPE, previous) };
+        let _ = child.wait();
+
+        let err = result.expect_err("the reader is gone; the write must fail, not kill us");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+        assert_eq!(after, libc::SIG_DFL, "the disposition is put back");
+    }
+
     #[test]
     #[cfg(unix)]
     fn a_hanging_hook_is_dead_within_the_timeout() {
