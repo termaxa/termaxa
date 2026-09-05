@@ -1,0 +1,456 @@
+# Termaxa policy — first matching rule wins; `*` is a wildcard.
+# Actions: allow (run silently) | ask (require approval) | deny (block)
+#
+# ORDER MATTERS, and the hard stops come first on purpose. Until v0.14.1 the
+# read-only allows sat at the top, so a broad prefix shadowed the stop below
+# it: `git branch -D main` matched `git branch*` and was ALLOWED, and
+# `echo $(rm -rf /)` matched `echo *` before `*rm -rf*` could deny it. A rule
+# that can never be reached is not a rule. Put your own exceptions ABOVE the
+# deny you want them to override — that is what first-match-wins is for.
+#
+# Matching is case-insensitive unless a rule opts in with
+# `case_sensitive: true` (rare; used where a flag's case carries the meaning,
+# like `git branch -D` vs `-d`). Quoting cannot disguise a command: rules are
+# matched against the tokenized reading as well as the raw one, and the most
+# severe verdict governs.
+version: 1
+default: ask
+
+rules:
+  # ---- self-defence: the gate's own configuration ----
+  # A gate that will happily rewrite its own rules is a suggestion. These
+  # come FIRST because first-match-wins: `echo *` at the bottom of this file
+  # would otherwise allow
+  #     echo 'default: allow' > .termaxa/policy.yaml
+  # and every command after it is judged by the agent's own policy.
+  #
+  # `*` matches any run of characters, so one rule covers both path
+  # separators: `.termaxa/policy.yaml` and `.termaxa\policy.yaml`.
+  #
+  # These are SHELL rules, and an agent's file-writing tool (Write, Edit, the
+  # editor's apply-patch) produces no command for them to match. The same
+  # files are therefore defended a second way: `termaxa init` also registers
+  # a PreToolUse hook on the write tools, which reads the target path and
+  # denies a write landing in `.termaxa/` or an agent hook config. It reads
+  # nothing else and has no opinion about any other file — see src/protect.rs.
+  #
+  # A project wired by hand from a pre-v0.15 snippet has the shell half only.
+  # `termaxa doctor` fingerprints the policy for that case: what was not
+  # blocked can at least be noticed.
+  #
+  # Reads are denied too, except for the handful listed below, because
+  # separating reads from writes in general would mean enumerating every read
+  # command. To add one, put it in that group — NOT at the top of the file.
+  - match: "*.claude*settings*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+  - match: "*.cursor*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+  - match: "*.codex*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+  - match: "*.github*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+
+  # ---- destruction by overwrite (v0.15) ----
+  #
+  # `>` truncates. Until v0.15 the operator was lexed and discarded, so
+  # `cat /dev/null > .env` matched the read-only `cat *` rule and was ALLOWED.
+  # Nothing was deleted; the contents were simply replaced.
+  #
+  # POSITION IS LOAD-BEARING, twice over. These sit with the self-defence
+  # denies and ABOVE the .termaxa read exceptions below, because those
+  # exceptions end in `*` and a trailing `*` swallows a redirect — placed any
+  # lower, `cat .termaxa/policy.yaml > .env` matches `cat .termaxa*` and the
+  # gate's own reviewability exception launders the overwrite it exists to
+  # stop. `the_gates_own_exception_cannot_launder_an_overwrite` holds this.
+  #
+  # These rules cover the paths whose loss is not recoverable from the repo.
+  # Everything else that truncates is classified `file-overwrite` and insured
+  # (backup::overwrite_targets copies the file aside first), but is NOT gated
+  # here: agents write files constantly, and a gate that asks on every redirect
+  # is auto-approved into meaninglessness. Insurance without friction is the
+  # trade — see #14.
+  #
+  # The two string rules below are kept, and a `match_path` rule now sits with
+  # them. They are not redundant: the string rules read the command as typed,
+  # the path rule reads what the command actually TOUCHES after resolution.
+  # `> .env` and `> ./.env` are the same file and different strings - the
+  # second walked past both string rules for four releases (known-limitations
+  # 0.2, pinned as a test until v0.16). Matching the resolved target closes
+  # every spelling of one path at once, which is what the string rules could
+  # never do by adding more patterns.
+  - match: "*> .env*"
+    action: deny
+    reason: "Overwriting .env destroys credentials that are not in the repo."
+  - match: "*>.env*"
+    action: deny
+    reason: "Overwriting .env destroys credentials that are not in the repo."
+  # No `match:` on purpose. This rule speaks about a PATH, and giving it a
+  # string pattern to satisfy the schema is what broke it the first time:
+  # `match: "*.env*"` fired on its own and denied `cat .env`, `grep KEY .env`,
+  # `git diff .env`, even `vim .env.sample`. Reading a file is ordinary work.
+  - match_path: "*/.env"
+    action: deny
+    reason: "Overwriting .env destroys credentials that are not in the repo."
+  - match: "*> /etc/*"
+    action: deny
+    reason: "Overwriting a system config file."
+  - match: "*> ~/.ssh/*"
+    action: deny
+    reason: "Overwriting an SSH key or config."
+  - match: "*> *id_rsa*"
+    action: deny
+    reason: "Overwriting an SSH private key."
+
+  # The policy is an in-repo artifact, reviewable in PRs, and the deny below
+  # would otherwise make that workflow impossible: `git add .termaxa/…`,
+  # `git diff .termaxa/…` and `cp .termaxa/policy.yaml backup.yaml` are all
+  # blocked by it. These exceptions give the workflow back.
+  #
+  # The test for inclusion is that the `.termaxa` path can only be READ, never
+  # written. diff/status/log/show/cat read it; add/commit stage what is
+  # already on disk. `checkout`, `restore` and `config` are absent on purpose
+  # — overwriting the working tree from a ref is exactly what the deny is for,
+  # so restoring a clobbered policy stays a thing you do yourself.
+  #
+  # `cat` and `cp` are anchored on the SOURCE path so the copy can only go the
+  # safe way: `cp .termaxa/policy.yaml backup.yaml` matches,
+  # `cp backup.yaml .termaxa/policy.yaml` does not.
+  #
+  # Position matters twice over. Above the deny, or these never fire. Below
+  # the four denies above, because a trailing `*` swallows a redirect —
+  #     cat .termaxa/policy.yaml > .claude/settings.json
+  # matches `cat .termaxa*` too, and at the top of the file it would allow
+  # that and shadow the rule that exists to stop it.
+  - match: "git diff *.termaxa*"
+    action: allow
+  - match: "git status *.termaxa*"
+    action: allow
+  - match: "git log *.termaxa*"
+    action: allow
+  - match: "git show *.termaxa*"
+    action: allow
+  - match: "git add *.termaxa*"
+    action: allow
+  - match: "git commit *.termaxa*"
+    action: allow
+  - match: "cat .termaxa*"
+    action: allow
+  - match: "cp .termaxa*"
+    action: allow
+  - match: "*.termaxa*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+
+  # ---- destructive: hard stops ----
+  - match: "git push*--force*"
+    action: deny
+    reason: "Force pushes are blocked by policy. Open a PR instead."
+  # The filesystem root, and only the root. `rm -rf /*` would be a WILDCARD
+  # matching every absolute path — `rm -rf /home/me/project/.git` included —
+  # and would then explain itself as "delete from root", which is the right
+  # verdict wearing the wrong sentence. A proving run caught it: an agent was
+  # correctly stopped from deleting a .git directory and told the reason was
+  # the filesystem root. The broad `*rm -rf*` rule below catches everything
+  # else and says something true about it.
+  - match: "rm -rf /"
+    action: deny
+    reason: "Recursive delete from the filesystem root is blocked."
+  - match: "rm -rf / *"
+    action: deny
+    reason: "Recursive delete from the filesystem root is blocked."
+  # GNU rm refuses `rm -rf /` on its own; --no-preserve-root is the one
+  # spelling it obeys. The rule above is named for the command everybody
+  # quotes, this one is named for the command that actually works.
+  - match: "*--no-preserve-root*"
+    action: deny
+    reason: "--no-preserve-root is the only spelling `rm` obeys at `/`. Blocked."
+  # Broad recursive-force deletes (any target), Unix + PowerShell + cmd
+  # forms. DENY by default: with auto-approving agent UIs, `ask` silently
+  # degrades to `allow`. Relax deliberately, per project, if you need to.
+  - match: "*rm -rf*"
+    action: deny
+    reason: "Recursive force delete blocked by default policy."
+  - match: "*rm -fr*"
+    action: deny
+    reason: "Recursive force delete blocked by default policy."
+  - match: "*Remove-Item*-Recurse*"
+    action: deny
+    reason: "Recursive delete (PowerShell) blocked by default policy."
+  - match: "*Remove-Item*-Force*"
+    action: deny
+    reason: "Forced delete (PowerShell) blocked by default policy."
+  - match: "*del /s*"
+    action: deny
+    reason: "Recursive delete (cmd) blocked by default policy."
+  - match: "*rmdir /s*"
+    action: deny
+    reason: "Recursive delete (cmd) blocked by default policy."
+  - match: "*rd /s*"
+    action: deny
+    reason: "Recursive delete (cmd) blocked by default policy."
+  # A recovery point is the one delete with nothing behind it. Field report,
+  # Sep 2026: an agent wiped a drive, and the parent agent sent to recover it
+  # deleted the day-old shadow copy it was trying to restore. vssadmin and
+  # diskshadow spell it "delete shadows"; wmic spells it "shadowcopy delete";
+  # PowerShell reaches it through Win32_ShadowCopy and .Delete().
+  - match: "*delete shadows*"
+    action: deny
+    reason: "Deleting shadow copies destroys the recovery point itself."
+  - match: "*shadowcopy delete*"
+    action: deny
+    reason: "Deleting shadow copies destroys the recovery point itself."
+  - match: "*Win32_ShadowCopy*Delete*"
+    action: deny
+    reason: "Deleting shadow copies destroys the recovery point itself."
+  # The PowerShell way to delete a WMI/CIM instance - shadow copies are the
+  # common target. `Get-WmiObject Win32_ShadowCopy | ForEach-Object
+  # { $_.Delete() }` is split at the pipe and neither half names both; it
+  # falls to the default, which asks. Known gap, recorded in the test.
+  - match: "*Remove-WmiObject*"
+    action: deny
+    reason: "Removing a WMI instance (a shadow copy, typically) is not recoverable."
+  - match: "*Remove-CimInstance*"
+    action: deny
+    reason: "Removing a CIM instance (a shadow copy, typically) is not recoverable."
+  - match: "kubectl delete*"
+    action: deny
+    reason: "kubectl delete is blocked. Use a manifest change + apply."
+  - match: "*drop table*"
+    action: deny
+    reason: "DROP TABLE is blocked. Archive or rename instead."
+  - match: "*drop database*"
+    action: deny
+    reason: "DROP DATABASE is blocked."
+  - match: "terraform destroy*"
+    action: deny
+    reason: "terraform destroy is blocked by policy."
+  - match: "tofu destroy*"
+    action: deny
+    reason: "tofu destroy is blocked by policy."
+
+  # ---- consequential: human in the loop ----
+  #
+  # RECOVERABILITY INVARIANT (v0.15). A destructive rule may be `ask` only if
+  # something can undo it. If neither Termaxa nor the system can, it denies —
+  # because `ask` under an auto-approving UI is `allow`, and an `allow` you
+  # cannot undo is the failure this tool exists to prevent.
+  #
+  # Recovery paths that count, and who provides them:
+  #   termaxa file snapshot   rm and friends            (backup::rm_targets)
+  #   termaxa pg_dump         psql/mysql destructive    (backup::pg_backup_targets)
+  #   termaxa git ref pin     push --force              (backup::git_force_push_target)
+  #   termaxa tfstate copy    terraform apply/destroy   (backup::tf_state_target)
+  #   git reflog              branch -D, reset --hard   (git's own, ~90 days)
+  #   the registry            npm/cargo publish         (yank; not deletion)
+  #   the remote              gh pr merge               (revert commit)
+  #
+  # `the_starter_policy_has_no_uninsurable_asks` enforces this. A destructive
+  # rule added here without a recovery path fails the build.
+  # `git branch -D` force-deletes an unmerged branch; `-d` refuses unless it is
+  # merged. Until v0.15 a rule could not tell them apart, because matching
+  # lowercased the rule as well as the command — so this asked for both and
+  # took the safer action for the gentler flag.
+  #
+  # A rule can now opt in with `case_sensitive: true`, matched as written, so
+  # these can differ. The opt-in is explicit and rare on purpose: an uppercase
+  # SPELLING alone changes nothing (`*Remove-Item*` still catches
+  # `remove-item`). `-D` still asks rather than denies, because the commits
+  # survive in the reflog for ~90 days and denying outright would block a
+  # routine cleanup; but it says which one it caught.
+  - match: "git branch*-D*"
+    case_sensitive: true
+    action: ask
+    reason: "Force-deleting a branch even if unmerged. Recoverable via git reflog."
+  - match: "git branch*-d*"
+    action: ask
+    reason: "Deleting a merged branch."
+  - match: "git push*"
+    action: ask
+  - match: "terraform apply*"
+    action: ask
+  - match: "tofu apply*"
+    action: ask
+  - match: "docker rm*"
+    action: ask
+  # No recovery path: prune deletes unused images, containers, networks and
+  # (with -a or --volumes) data that nothing else holds a copy of. Termaxa
+  # cannot snapshot a docker volume and docker keeps no undo. Denied rather
+  # than asked, per the invariant above.
+  - match: "docker system prune*"
+    action: deny
+    reason: "docker system prune has no recovery path. Remove specific objects instead."
+  # Raw device writes destroy partition tables and filesystems with nothing
+  # to restore from. Not insurable at any layer.
+  - match: "dd*of=/dev/*"
+    action: deny
+    reason: "Writing to a raw device is not recoverable."
+  - match: "mkfs*"
+    action: deny
+    reason: "Formatting a device is not recoverable."
+  - match: "npm publish*"
+    action: ask
+  - match: "cargo publish*"
+    action: ask
+  - match: "gh pr merge*"
+    action: ask
+  - match: "aws *"
+    action: ask
+  - match: "curl*"
+    action: ask
+  - match: "ssh *"
+    action: ask
+
+  # ---- read-only operations: let the agent work ----
+  - match: "git status*"
+    action: allow
+  - match: "git diff*"
+    action: allow
+  - match: "git log*"
+    action: allow
+  - match: "git branch*"
+    action: allow
+  - match: "git commit*"
+    action: allow
+  # A prefix without its trailing space is a prefix, not a command: `ls*`
+  # also matched `lsof` and `lsblk`, `grep*` also matched `grepdiff`.
+  # `cat *` and `echo *` below always had this right. Bare `ls` needs its own
+  # rule because `ls *` requires the space; bare `cat`/`grep` just read stdin,
+  # so they stay on the default.
+  - match: "ls"
+    action: allow
+  - match: "ls *"
+    action: allow
+  - match: "cat *"
+    action: allow
+  - match: "grep *"
+    action: allow
+  - match: "echo *"
+    action: allow
+  - match: "git remote -v"
+    action: allow
+  - match: "git fetch*"
+    action: allow
+  - match: "terraform plan*"
+    action: allow
+  - match: "terraform init*"
+    action: allow
+  - match: "tofu plan*"
+    action: allow
+  - match: "kubectl get*"
+    action: allow
+  - match: "kubectl describe*"
+    action: allow
+  - match: "docker ps*"
+    action: allow
+
+  # ---- the ordinary dev loop: build, test, lint, run ----
+  # These fell to the default and were asked about every time, and every
+  # time they were approved. An ask that is always approved is not a safety
+  # feature, it is a habit; `termaxa report` now measures that habit. What
+  # a build or a test does is the project's own code, which the gate cannot
+  # read either way - allowing the command changes friction, not safety.
+  # The trailing space or the fixed subcommand keeps each rule a command,
+  # not a prefix: `cargo publish` and `npm publish` are still asked about,
+  # `npm install` still falls to the default.
+  - match: "cargo build*"
+    action: allow
+  - match: "cargo check*"
+    action: allow
+  - match: "cargo test*"
+    action: allow
+  - match: "cargo clippy*"
+    action: allow
+  - match: "cargo fmt*"
+    action: allow
+  - match: "cargo run*"
+    action: allow
+  - match: "cargo doc*"
+    action: allow
+  - match: "cargo bench*"
+    action: allow
+  - match: "npm test*"
+    action: allow
+  - match: "npm run *"
+    action: allow
+  - match: "npx *"
+    action: allow
+  - match: "pnpm test*"
+    action: allow
+  - match: "pnpm run *"
+    action: allow
+  - match: "yarn test*"
+    action: allow
+  - match: "yarn run *"
+    action: allow
+  - match: "bun test*"
+    action: allow
+  - match: "bun run *"
+    action: allow
+  - match: "node *"
+    action: allow
+  - match: "tsc*"
+    action: allow
+  - match: "eslint*"
+    action: allow
+  - match: "prettier*"
+    action: allow
+  - match: "jest*"
+    action: allow
+  - match: "vitest*"
+    action: allow
+  - match: "pytest*"
+    action: allow
+  - match: "python -m pytest*"
+    action: allow
+  - match: "python -m unittest*"
+    action: allow
+  - match: "python3 -m pytest*"
+    action: allow
+  - match: "ruff*"
+    action: allow
+  - match: "black*"
+    action: allow
+  - match: "mypy*"
+    action: allow
+  - match: "go build*"
+    action: allow
+  - match: "go test*"
+    action: allow
+  - match: "go vet*"
+    action: allow
+  - match: "go run*"
+    action: allow
+  - match: "make"
+    action: allow
+  - match: "make build*"
+    action: allow
+  - match: "make test*"
+    action: allow
+  - match: "make check*"
+    action: allow
+  - match: "make lint*"
+    action: allow
+  - match: "dotnet build*"
+    action: allow
+  - match: "dotnet test*"
+    action: allow
+  - match: "mvn test*"
+    action: allow
+  - match: "mvn compile*"
+    action: allow
+  - match: "gradle test*"
+    action: allow
+  - match: "gradle build*"
+    action: allow
+
+# Session circuit breaker (v0.11): if the same destructive intent
+# (file delete / db destroy / git force / infra destroy) is asked or
+# denied `threshold` times in one agent session, further variants are
+# DENIED automatically. Human-approved commands don't count.
+circuit_breaker:
+  enabled: true
+  threshold: 2   # trip on the 3rd attempt
