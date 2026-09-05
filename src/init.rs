@@ -353,6 +353,106 @@ rules:
   - match: "docker ps*"
     action: allow
 
+  # ---- the ordinary dev loop: build, test, lint, run ----
+  # These fell to the default and were asked about every time, and every
+  # time they were approved. An ask that is always approved is not a safety
+  # feature, it is a habit; `termaxa report` now measures that habit. What
+  # a build or a test does is the project's own code, which the gate cannot
+  # read either way - allowing the command changes friction, not safety.
+  # The trailing space or the fixed subcommand keeps each rule a command,
+  # not a prefix: `cargo publish` and `npm publish` are still asked about,
+  # `npm install` still falls to the default.
+  - match: "cargo build*"
+    action: allow
+  - match: "cargo check*"
+    action: allow
+  - match: "cargo test*"
+    action: allow
+  - match: "cargo clippy*"
+    action: allow
+  - match: "cargo fmt*"
+    action: allow
+  - match: "cargo run*"
+    action: allow
+  - match: "cargo doc*"
+    action: allow
+  - match: "cargo bench*"
+    action: allow
+  - match: "npm test*"
+    action: allow
+  - match: "npm run *"
+    action: allow
+  - match: "npx *"
+    action: allow
+  - match: "pnpm test*"
+    action: allow
+  - match: "pnpm run *"
+    action: allow
+  - match: "yarn test*"
+    action: allow
+  - match: "yarn run *"
+    action: allow
+  - match: "bun test*"
+    action: allow
+  - match: "bun run *"
+    action: allow
+  - match: "node *"
+    action: allow
+  - match: "tsc*"
+    action: allow
+  - match: "eslint*"
+    action: allow
+  - match: "prettier*"
+    action: allow
+  - match: "jest*"
+    action: allow
+  - match: "vitest*"
+    action: allow
+  - match: "pytest*"
+    action: allow
+  - match: "python -m pytest*"
+    action: allow
+  - match: "python -m unittest*"
+    action: allow
+  - match: "python3 -m pytest*"
+    action: allow
+  - match: "ruff*"
+    action: allow
+  - match: "black*"
+    action: allow
+  - match: "mypy*"
+    action: allow
+  - match: "go build*"
+    action: allow
+  - match: "go test*"
+    action: allow
+  - match: "go vet*"
+    action: allow
+  - match: "go run*"
+    action: allow
+  - match: "make"
+    action: allow
+  - match: "make build*"
+    action: allow
+  - match: "make test*"
+    action: allow
+  - match: "make check*"
+    action: allow
+  - match: "make lint*"
+    action: allow
+  - match: "dotnet build*"
+    action: allow
+  - match: "dotnet test*"
+    action: allow
+  - match: "mvn test*"
+    action: allow
+  - match: "mvn compile*"
+    action: allow
+  - match: "gradle test*"
+    action: allow
+  - match: "gradle build*"
+    action: allow
+
 # Session circuit breaker (v0.11): if the same destructive intent
 # (file delete / db destroy / git force / infra destroy) is asked or
 # denied `threshold` times in one agent session, further variants are
@@ -1347,6 +1447,49 @@ mod tests {
         let snippet = print_hook_snippet_text();
         assert!(snippet.contains(BASH_MATCHER));
         assert!(snippet.contains(WRITE_MATCHER));
+    }
+
+    /// The ordinary dev loop is allowed, and the commands next to it that
+    /// publish, install or leave the loop are not. An ask that is always
+    /// approved is a habit, not a safety feature; these were that habit.
+    #[test]
+    fn the_dev_loop_is_allowed_and_its_neighbours_are_not() {
+        use crate::policy::{Action, Policy};
+        let p: Policy = serde_yaml::from_str(STARTER_POLICY).unwrap();
+        for cmd in [
+            "cargo build --release",
+            "cargo test -q",
+            "cargo clippy --all-targets -- -D warnings",
+            "npm test",
+            "npm run lint",
+            "npx vitest run",
+            "pytest -x tests/",
+            "python -m pytest",
+            "go test ./...",
+            "make",
+            "make test",
+            "tsc --noEmit",
+            "node scripts/check.js",
+        ] {
+            let d = p.evaluate_command(cmd, &here());
+            assert_eq!(d.action, Action::Allow, "{cmd}: {}", d.reason);
+        }
+        for cmd in [
+            "cargo publish",
+            "npm publish",
+            "npm install left-pad",
+            "make install",
+            "make clean",
+            "node -e \"require('fs').rmSync('.', {recursive: true})\" && rm -rf /",
+        ] {
+            let d = p.evaluate_command(cmd, &here());
+            assert_ne!(d.action, Action::Allow, "{cmd}: {}", d.reason);
+        }
+        // A loop command compounded with a hard stop is still a hard stop.
+        assert_eq!(
+            p.evaluate_command("cargo test && rm -rf /", &here()).action,
+            Action::Deny
+        );
     }
 
     #[test]
