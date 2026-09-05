@@ -612,16 +612,31 @@ pub fn run(
         }
 
         if write_codex_hook {
-            // Codex uses the same PreToolUse contract as Claude Code.
+            // Codex reads `hooks.json` in the Claude Code shape: a matcher on
+            // the tool name, a list of command hooks, `timeout` in seconds.
+            // The flat `{"version": 1, "hooks": {"PreToolUse": [{"command":
+            // ...}]}}` this wrote before Sep 2026 was never a shape Codex
+            // accepted. PreToolUse only: the PostToolUse payload has not been
+            // captured yet, and a hook that answers a shape it has not seen
+            // is the fail-open known-limitation 4 describes.
             let dir_x = dir.join(".codex");
             fs::create_dir_all(&dir_x)?;
             let hooks_path = dir_x.join("hooks.json");
             let hooks = serde_json::json!({
-                "version": 1,
-                "hooks": { "PreToolUse": [ { "command": "termaxa hook" } ] }
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                { "type": "command", "command": "termaxa hook", "timeout": 15 }
+                            ]
+                        }
+                    ]
+                }
             });
             fs::write(&hooks_path, serde_json::to_string_pretty(&hooks)?)?;
             println!("✓ wrote .codex/hooks.json (Codex PreToolUse -> termaxa hook)");
+            println!("  Codex asks you to review and trust a new hook on its next start.");
         }
 
         if write_copilot_hook {
