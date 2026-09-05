@@ -99,6 +99,27 @@ struct Report {
     recent: Vec<(String, String)>,
     risk_score: u32,
     risk_label: &'static str,
+    /// The asks, and what became of them. `approved` counts a `run` ask the
+    /// person answered yes to, or a hook ask followed by an execution
+    /// receipt for the same command in the same session - the honest proxy,
+    /// since the harness never tells the hook what the person said.
+    asks_approved: usize,
+    asks_declined: usize,
+    asks_unanswered: usize,
+    /// Command heads of approved asks with at least two approvals, most
+    /// first: the commands the person keeps saying yes to. An ask that is
+    /// always approved is not a safety feature, it is a habit, and this is
+    /// the list of rules that would end it.
+    habit: Vec<(String, usize)>,
+}
+
+/// Below this many asks the ratio is noise; at or above this share approved,
+/// the report calls it a habit.
+const HABIT_MIN_ASKS: usize = 5;
+const HABIT_MIN_APPROVED_PERCENT: usize = 80;
+
+fn habit_fires(r: &Report) -> bool {
+    r.ask >= HABIT_MIN_ASKS && r.asks_approved * 100 >= r.ask * HABIT_MIN_APPROVED_PERCENT
 }
 
 /// Map a decision (and source) to a terminal mark.
@@ -186,6 +207,43 @@ fn compute(entries: &[&AuditEntry], paths: &Paths) -> Result<Report> {
         .map(|e| (mark_for(&e.decision, &e.source), e.command.clone()))
         .collect();
 
+    // Asks and their outcomes. A `run` ask records the answer; a hook ask
+    // does not, so a later execution receipt for the same command in the
+    // same session stands in for a yes.
+    let (mut asks_approved, mut asks_declined, mut asks_unanswered) = (0, 0, 0);
+    let mut habit_map: HashMap<String, usize> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if e.decision != "ask" {
+            continue;
+        }
+        let approved = match e.approved {
+            Some(v) => v,
+            None => entries[i + 1..].iter().any(|later| {
+                later.decision == "executed"
+                    && later.command == e.command
+                    && later.session == e.session
+            }),
+        };
+        if e.approved == Some(false) {
+            asks_declined += 1;
+        } else if approved {
+            asks_approved += 1;
+            // The head of the command the person actually approved: through
+            // a shell wrapper when there is one (#62), since the rule that
+            // ends the habit names the command inside, not `sh`.
+            let segments = crate::shell::split_segments_deep(&e.command);
+            if let Some(seg) = segments.iter().find(|s| !s.wraps).or(segments.first()) {
+                let tokens = crate::delete::tokenize_public(seg.command());
+                if let Some((head, _)) = crate::delete::resolve_head(&tokens) {
+                    *habit_map.entry(head).or_insert(0) += 1;
+                }
+            }
+        } else {
+            asks_unanswered += 1;
+        }
+    }
+    let mut habit: Vec<(String, usize)> = habit_map.into_iter().filter(|(_, n)| *n >= 2).collect();
+    habit.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let risk_score = (deny as u32) * 3 + (escalated as u32) * 2 + (ask as u32);
     let risk_label = match risk_score {
         0..=2 => "Low",
@@ -215,6 +273,10 @@ fn compute(entries: &[&AuditEntry], paths: &Paths) -> Result<Report> {
         trips_by_intent,
         recent,
         risk_score,
+        asks_approved,
+        asks_declined,
+        asks_unanswered,
+        habit,
         risk_label,
     })
 }
@@ -345,6 +407,12 @@ fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
         red("✗"),
         r.deny
     );
+    if r.ask > 0 {
+        println!(
+            "Asks                {}   approved {} · declined {} · unanswered {}",
+            r.ask, r.asks_approved, r.asks_declined, r.asks_unanswered
+        );
+    }
     println!("Escalated           {}", r.escalated);
     println!("Auto-flow           {}", r.auto_flow);
     println!("Previews            {}", r.impacts.len());
@@ -363,6 +431,29 @@ fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
         println!("{:<20}{}", "breaker trips", r.breaker_trips);
     }
 
+    // Insight: fires when the asks are a habit rather than a decision.
+    if habit_fires(r) {
+        println!("\n{}", bold(&amber("Insight")));
+        println!("{}", dim(line));
+        println!(
+            "{} of {} asks were approved ({}%). An ask that is always approved",
+            r.asks_approved,
+            r.ask,
+            r.asks_approved * 100 / r.ask
+        );
+        println!("is not a safety feature, it is a habit.");
+        if !r.habit.is_empty() {
+            println!("The commands you keep approving:");
+            for (head, n) in &r.habit {
+                println!("• {:<16} {} approvals", head, n);
+            }
+            println!(
+                "An allow rule for each - `{} *` - ends the habit;",
+                r.habit[0].0
+            );
+            println!("scope it to what you actually run. Relaxation is deliberate.");
+        }
+    }
     // Insight: fires when the breaker blocked the SAME intent repeatedly.
     if let Some((label, count)) = r.trips_by_intent.first() {
         if *count >= INSIGHT_THRESHOLD {
@@ -460,12 +551,33 @@ fn print_markdown(r: &Report, roll: &Rollup, session: Option<&str>) {
         "- **Commands:** {} — {} allow / {} ask / {} deny",
         r.total, r.allow, r.ask, r.deny
     );
+    if r.ask > 0 {
+        println!(
+            "- **Asks:** {} — approved {}, declined {}, unanswered {}",
+            r.ask, r.asks_approved, r.asks_declined, r.asks_unanswered
+        );
+    }
     println!("- **Escalated by context:** {}", r.escalated);
     println!("- **Auto-flow:** {} without interruption", r.auto_flow);
     println!("- **Previews:** {}", r.impacts.len());
     println!("- **Backups:** {}", r.backups.len());
     println!("- **Rollbacks:** {}", r.rollbacks);
 
+    if habit_fires(r) {
+        println!("\n## Insight: approval habit\n");
+        println!(
+            "{} of {} asks were approved ({}%). An ask that is always approved is not a safety feature, it is a habit.",
+            r.asks_approved,
+            r.ask,
+            r.asks_approved * 100 / r.ask
+        );
+        for (head, n) in &r.habit {
+            println!(
+                "- `{}` — {} approvals; consider `allow: {} *`, scoped to what you run",
+                head, n, head
+            );
+        }
+    }
     if !r.blocked.is_empty() {
         println!("\n## Blocked\n");
         for b in &r.blocked {
@@ -608,6 +720,86 @@ mod tests {
         assert_eq!(r.risk_score, 3 + 6 + 5);
         assert_eq!(r.risk_label, "High");
         assert_eq!(r.auto_flow, r.allow, "auto-flow is the uninterrupted count");
+    }
+
+    /// The ratio the report never had: how many asks were approved, and by
+    /// which route. A `run` ask carries its answer; a hook ask does not, so
+    /// an execution receipt for the same command in the same session stands
+    /// in for a yes, and one with no receipt is unanswered, not approved.
+    #[test]
+    fn asks_are_counted_by_what_became_of_them() {
+        let mut entries = Vec::new();
+        for i in 0..3 {
+            let mut e = entry("ask", &format!("cargo test -p crate{i}"));
+            e.source = "run".into();
+            e.approved = Some(true);
+            entries.push(e);
+        }
+        let mut declined = entry("ask", "rm -rf ./dist");
+        declined.source = "run".into();
+        declined.approved = Some(false);
+        entries.push(declined);
+        // Hook asks: one followed by its receipt in the same session, one
+        // followed by a receipt in another session, one with none.
+        let mut a = entry("ask", "npm test");
+        a.session = Some("s1".into());
+        entries.push(a);
+        let mut receipt = entry("executed", "npm test");
+        receipt.source = "post".into();
+        receipt.session = Some("s1".into());
+        entries.push(receipt);
+        let mut b = entry("ask", "npm run lint");
+        b.session = Some("s2".into());
+        entries.push(b);
+        let mut other = entry("executed", "npm run lint");
+        other.source = "post".into();
+        other.session = Some("s9".into());
+        entries.push(other);
+        entries.push(entry("ask", "make"));
+        let (r, _tree) = compute_for(&entries);
+        assert_eq!(r.ask, 7, "receipts are not asks");
+        assert_eq!(
+            (r.asks_approved, r.asks_declined, r.asks_unanswered),
+            (4, 1, 2)
+        );
+        assert_eq!(
+            r.habit,
+            vec![("cargo".to_string(), 3)],
+            "a head approved twice or more is a habit; npm was approved once"
+        );
+    }
+
+    /// The insight fires at five asks and four-in-five approved, not below
+    /// either bar, and names the heads that would end it.
+    #[test]
+    fn the_approval_habit_insight_has_a_floor_and_a_threshold() {
+        let approved = |n: usize, cmd: &str| -> Vec<AuditEntry> {
+            (0..n)
+                .map(|_| {
+                    let mut e = entry("ask", cmd);
+                    e.source = "run".into();
+                    e.approved = Some(true);
+                    e
+                })
+                .collect()
+        };
+        // 4 asks, all approved: below the floor.
+        let (r, _t) = compute_for(&approved(4, "cargo test"));
+        assert!(!habit_fires(&r), "four asks are noise");
+        // 5 asks, 4 approved and 1 declined: 80%, fires.
+        let mut entries = approved(4, "cargo test");
+        let mut d = entry("ask", "rm -rf ./dist");
+        d.source = "run".into();
+        d.approved = Some(false);
+        entries.push(d);
+        let (r, _t) = compute_for(&entries);
+        assert!(habit_fires(&r), "{} of {}", r.asks_approved, r.ask);
+        assert_eq!(r.habit[0].0, "cargo");
+        // 5 asks, 3 approved: 60%, does not fire.
+        let mut entries = approved(3, "cargo test");
+        entries.extend((0..2).map(|_| entry("ask", "make")));
+        let (r, _t) = compute_for(&entries);
+        assert!(!habit_fires(&r), "{} of {}", r.asks_approved, r.ask);
     }
 
     #[test]
