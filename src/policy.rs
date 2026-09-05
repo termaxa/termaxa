@@ -619,7 +619,7 @@ impl Policy {
 ///
 /// Reported by Tim Schipper.
 pub fn readings(command: &str) -> Vec<String> {
-    let base = normalize(command);
+    let base = normalize(powershell_command_of(command));
     let toks = crate::intent::tokens(command).join(" ");
     let cased = toks.split_whitespace().collect::<Vec<_>>().join(" ");
     let lowered = cased.to_lowercase();
@@ -632,6 +632,38 @@ pub fn readings(command: &str) -> Vec<String> {
         out.push(cased);
     }
     out
+}
+
+/// The command inside a PowerShell assignment or a leading parenthesis.
+///
+/// Codex on Windows writes `$target = Resolve-Path -LiteralPath .\scratch`
+/// and `(Resolve-Path .\x).Path` (captured live, Sep 5, 2026). The command
+/// is the cmdlet, not the variable it lands in: a head rule like
+/// `Resolve-Path*` should read it, and a hard stop like `rm -rf /*` should
+/// read `$x = rm -rf /` - which fell to the default before this. Only the
+/// first reading is stripped; the other readings keep the spelling as
+/// written, and a deny any reading matches still outranks an allow.
+pub fn powershell_command_of(s: &str) -> &str {
+    let t = s.trim_start();
+    let mut rest = t;
+    if let Some(after_dollar) = t.strip_prefix('$') {
+        let ident_len = after_dollar
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if ident_len > 0 {
+            let after_ident = after_dollar[ident_len..].trim_start();
+            if let Some(after_eq) = after_ident.strip_prefix('=') {
+                if !after_eq.starts_with('=') {
+                    rest = after_eq.trim_start();
+                }
+            }
+        }
+    }
+    while let Some(inner) = rest.strip_prefix('(') {
+        rest = inner.trim_start();
+    }
+    rest
 }
 
 /// Collapse whitespace runs to single spaces, trim, and lowercase.
@@ -1222,6 +1254,59 @@ rules:
             Action::Deny,
             "listing recovery points is not deleting them"
         );
+    }
+
+    /// Codex on Windows speaks PowerShell (captured live, Sep 5, 2026): a
+    /// read-only probe is `$target = Resolve-Path -LiteralPath .\scratch`
+    /// or `Get-Item -LiteralPath .\scratch -Force | Select-Object FullName`.
+    /// Under Codex an ask is a refusal, so the read-only cmdlets are allowed
+    /// and the assignment is read as the command it assigns - which also
+    /// means a hard stop behind an assignment is now a hard stop.
+    #[test]
+    fn a_powershell_assignment_is_judged_by_the_command_it_assigns() {
+        let p = Policy::builtin().unwrap();
+        for cmd in [
+            "$target = Resolve-Path -LiteralPath .\\scratch -ErrorAction Stop",
+            "$t = (Resolve-Path -LiteralPath .\\scratch -ErrorAction Stop).Path",
+            "Get-Item -LiteralPath .\\scratch -Force | Select-Object FullName, PSIsContainer",
+            "Get-ChildItem -Recurse -File | Measure-Object",
+            "Test-Path -LiteralPath .\\scratch -PathType Container",
+        ] {
+            let d = p.evaluate_command(cmd, &here());
+            assert_eq!(d.action, Action::Allow, "{cmd}: {}", d.reason);
+        }
+        for cmd in [
+            "$x = Remove-Item -LiteralPath .\\dist -Recurse -Force",
+            "$x = rm -rf /",
+            "(Get-WmiObject Win32_ShadowCopy).Delete()",
+        ] {
+            let d = p.evaluate_command(cmd, &here());
+            assert_eq!(d.action, Action::Deny, "{cmd}: {}", d.reason);
+        }
+        // A cmdlet whose purpose is to run a script block is not read-only,
+        // and the block can hide a delete: the pipeline is judged by its
+        // most dangerous segment, and `Where-Object` itself is not allowed.
+        assert_eq!(
+            p.evaluate_command(
+                "Get-ChildItem | ForEach-Object { Remove-Item $_ -Recurse }",
+                &here()
+            )
+            .action,
+            Action::Deny
+        );
+        assert_eq!(
+            p.evaluate_command("Get-ChildItem | Where-Object { $_.Length -gt 0 }", &here())
+                .action,
+            Action::Ask
+        );
+        // Codex's first probe also carried `$target.Path` and an `if` block;
+        // those segments are expressions the starter does not name, so the
+        // compound still asks. Stated, not hidden.
+        let d = p.evaluate_command(
+            "$target = Resolve-Path -LiteralPath .\\scratch -ErrorAction Stop; $target.Path; if (-not (Test-Path -LiteralPath $target.Path -PathType Container)) { throw 'no' }",
+            &here(),
+        );
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
     }
 
     #[test]
