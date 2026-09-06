@@ -4,6 +4,11 @@
 2. Cut ONE release-prep commit containing:
    - CHANGELOG.md entry for the new version
    - Cargo.toml version bump (Cargo.lock updates on next build)
+   - README's line counts recounted from the tree (Contributing section):
+     production = every `src/*.rs` line before its `#[cfg(test)]` module;
+     tests = those modules plus `tests/`. crates.io renders the README of
+     the published crate permanently, so a stale number ships forever.
+     (v0.18.0 shipped with counts from Aug 18.)
    - commit message = the release headline, e.g.
      "v0.12.0: plugin registry — termaxa add <tool>"
    This is the commit that gets tagged, so its message becomes the
