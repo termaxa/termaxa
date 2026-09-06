@@ -2,6 +2,131 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.18.0 — the gate reads what the agent actually runs
+
+v0.17 moved who decides. v0.18 reads **what is actually being run** — the
+command inside a shell wrapper, the operand a redirect is not, the dialect
+Codex really speaks, the PowerShell an agent on Windows really writes — and,
+for the first time, `wrap` executes what it approves. Eighteen commits,
+**488 tests on Linux, 420 on Windows**.
+
+The honest headline: **the first real Codex session found the hook speaking
+the wrong contract on every value**, and `wrap` had never executed a command
+in its life. Both are measured and fixed below; the measurements are in the
+tree as tests.
+
+### Added
+
+- **A POSIX shell's `-c` string is read as the command it runs** (#62).
+  `sh -c "cat /dev/null > src/main.rs"` used to fall to the default, preview
+  nothing and take no backup — and the `wrap` shim forwards every command in
+  exactly that shape. Policy, intent, preview, delete, resolve and insurance
+  now read `sh`, `bash`, `dash` and `zsh` strings as segments of their own,
+  four levels deep. Additive: the wrapper stays, so nothing that matched
+  before stops matching. `allow sh*` no longer allows what the shell is told
+  to run.
+- **A wrapper no rule names is transparent** (#68). Under the starter policy
+  every wrapped command was asked, because the wrapper matched nothing and
+  the default outranked the inner allow. Now the string inside decides; a
+  rule that names the wrapper still counts, and `sh script.sh` still falls to
+  the default because the gate cannot read it.
+- **Codex is live-tested** (#74, #75). Measured on Sep 5–6 with codex-cli
+  0.153.4 on Windows: Codex sends no `agent` tag and honours exactly one
+  PreToolUse verdict, `deny`; an explicit `allow` or `ask` fails the hook and
+  falls open to Codex's own prompt, and a deny that exits 2 arrives as "hook
+  exited with code 1". For Codex every allow is now silence, an ask is a deny
+  whose reason says the gate asked and how to add an allow rule, and the exit
+  code stays 0 so the JSON is read. `init --codex` now writes the hooks file
+  in the shape Codex accepts. A hard stop lands in Codex's own UI as "Blocked
+  by hook" with the reason and the blast-radius preview.
+- **PowerShell read-only cmdlets are allowed** (#75): Codex's "Bash" tool on
+  Windows is PowerShell, and under Codex an ask is a refusal. `Get-ChildItem`,
+  `Get-Item`, `Get-Content`, `Resolve-Path`, `Test-Path`, `Select-String` and
+  their read-only neighbours pass; `Where-Object` and `ForEach-Object` do not,
+  because their script block can hide a delete. A `$var = ...` assignment is
+  read as the command it assigns — which also makes `$x = rm -rf /` a hard
+  stop instead of a question.
+- **Two policy keys choose the closed side of the gate** (#70).
+  `unrecognised: deny` refuses a hook payload that looks like a shell tool
+  call the reader could not parse; `backup_failure: deny` refuses a command
+  whose insurance could not be taken. Both default to the cooperative side:
+  right for an unattended run, wrong for a person at a terminal.
+- **Deleting a recovery point is a hard stop** (#70): `vssadmin delete
+  shadows`, `wmic shadowcopy delete`, `Win32_ShadowCopy … Delete`,
+  `Remove-WmiObject`, `Remove-CimInstance`. From a field report in which the
+  agent sent to recover a wiped drive deleted the shadow copy it was
+  restoring from.
+- **`termaxa report` counts what became of each ask** (#71): approved,
+  declined, unanswered — a hook ask credited by the execution receipt in the
+  same session — and names an approval habit at five asks and 80% approved,
+  with the allow rule that would end it. An ask that is always approved is
+  not a safety feature; it is a habit.
+- **The ordinary dev loop is allowed** (#71): build, test, lint and run for
+  cargo, npm/pnpm/yarn/bun, node, tsc, eslint, prettier, jest, vitest,
+  pytest, ruff, black, mypy, go, make, dotnet, mvn and gradle. Publishing
+  still asks; installing and cleaning still fall to the default.
+- **`init` wires the harness it detected and verifies the hook answers
+  before saying Done** (#46).
+
+### Changed
+
+- **A segment knows its own words** (#61): a redirect is never a delete, copy
+  or move operand. `rm -rf ./cache > /dev/null 2>&1` had `/dev/null` as a
+  target; the insurance tried to copy a device, failed, and the command ran
+  uninsured.
+- **The `wrap` shim reads `-c` wherever the shell would** (#69): `bash -lc`
+  (Codex's spelling), `bash -e -c`, `bash --norc -c`, `bash -o pipefail -c`
+  are all gated exactly once, and the shell's own options reach execution.
+- **The Postgres preview footer says why there is no estimate** (#57):
+  denied before spawning, filtered `DELETE`, no `psql`, a database that
+  refused, a reply that could not be read — five different sentences where
+  there was one. `psql` is asked one statement at a time, which also makes
+  the read-only `SET` real on `psql` 14 and earlier.
+- **The preview admits an unresolvable target instead of inventing a path**
+  (#11), and **the preview and the backup name the same file** (#50).
+- **`init --codex` registers PreToolUse only** until Codex's PostToolUse
+  payload has been captured.
+
+### Fixed
+
+- **`wrap` could not execute what it approved** (#65). The runner's own `sh`
+  resolved through the same shim PATH; an allowed command recursed until it
+  was killed, and an asked one asked twice, then refused for lack of stdin.
+  The wrapper now runs the approved command outside the shims. The existing
+  test had pinned a deny and a bypass, never an execution.
+- **The insurance copy hung on a named pipe** (#70): `fs::copy` opens a FIFO
+  for reading and waits for a writer that never comes — inside a hook, the
+  harness waits with it. A pipe, socket or device now fails the copy at once
+  with a reason.
+- **The hook probe died of SIGPIPE** (#76) when the registered command
+  exited before reading its stdin — a race that failed CI once and a
+  container once. The write now reports a broken pipe as "the hook did not
+  read".
+- Three tests read process state they did not own (#51); tree removal is
+  retried before being called litter (#47); clippy 1.98 (#53).
+
+### Known limitations
+
+- **Under Codex an ask is a refusal.** Codex hooks can only deny at
+  PreToolUse; `run` and Claude Code still prompt. Widen the allow list for
+  what you run, and `termaxa report` will tell you which commands you keep
+  approving. Codex's PostToolUse payload is not yet captured, so execution
+  receipts — and the report's ask-outcome credit — do not exist under Codex.
+- **Copilot CLI is still unverified end-to-end.** The dialect parses the
+  documented format; a live capture is the next measurement.
+- **Windows shells are read by shape, not by grammar** (#64). A PowerShell
+  one-liner that carries `$target.Path` or an `if (...) { throw }` block
+  still asks, because those segments are expressions the starter does not
+  name; `cmd /c` and `powershell -Command` wrappers are not yet read the way
+  `sh -c` is.
+- **`wrap` is Unix-only and catches a shell resolved by name**, not
+  `/bin/sh` by absolute path.
+- **The integration harness runs on Unix only** (#59): the Windows job
+  runs the unit tests and the new `codex_dialect` binary; the rest of the
+  integration surface is `#![cfg(unix)]`.
+- **Insurance copies are uncapped and never pruned** (#72), and the copy is
+  not re-checked against the tree just before execution (#73).
+
 ## v0.17.0 — the authority moves
 
 v0.16 stopped treating targets as strings. v0.17 moves **who decides**.
