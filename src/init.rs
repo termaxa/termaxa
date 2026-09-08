@@ -209,6 +209,23 @@ rules:
   - match: "*shadowcopy delete*"
     action: deny
     reason: "Deleting shadow copies destroys the recovery point itself."
+  # A local database is somebody's months of work as often as it is a
+  # throwaway. Field report, Sep 2026: an agent asked to fix a UI ran
+  # `npx supabase db reset` and wiped a database holding months of notes,
+  # tasks and deadlines. These commands drop and recreate; the tools give
+  # no confirmation and no backup.
+  - match: "*db reset*"
+    action: deny
+    reason: "Resetting a database drops every row in it. Dump it first, or run this yourself."
+  - match: "*migrate reset*"
+    action: deny
+    reason: "Resetting migrations drops and recreates the schema. Dump it first, or run this yourself."
+  - match: "*db push*--force-reset*"
+    action: deny
+    reason: "A forced reset drops every row in the database. Dump it first, or run this yourself."
+  - match: "*drizzle-kit drop*"
+    action: deny
+    reason: "Dropping the schema destroys the data under it. Dump it first, or run this yourself."
   - match: "*Win32_ShadowCopy*Delete*"
     action: deny
     reason: "Deleting shadow copies destroys the recovery point itself."
@@ -437,21 +454,11 @@ rules:
     action: allow
   - match: "npm test*"
     action: allow
-  - match: "npm run *"
-    action: allow
-  - match: "npx *"
-    action: allow
   - match: "pnpm test*"
-    action: allow
-  - match: "pnpm run *"
     action: allow
   - match: "yarn test*"
     action: allow
-  - match: "yarn run *"
-    action: allow
   - match: "bun test*"
-    action: allow
-  - match: "bun run *"
     action: allow
   - match: "node *"
     action: allow
@@ -1524,6 +1531,56 @@ mod tests {
     /// The ordinary dev loop is allowed, and the commands next to it that
     /// publish, install or leave the loop are not. An ask that is always
     /// approved is a habit, not a safety feature; these were that habit.
+    /// `npm run lint` and `npx vitest run` left this list when the
+    /// run-anything wildcards did: see the test above.
+    /// v0.18.0 allowed `npx *` and `<pm> run *` on the reasoning that a
+    /// build or test runs the project's own code, which the gate cannot read
+    /// either way. That reasoning holds for a command whose name declares
+    /// what it does (`cargo test`, `go build`) and fails for one whose name
+    /// is a placeholder: `npx` runs an arbitrary package off the network and
+    /// `npm run` runs an arbitrary script. Field report, Sep 2026: an agent
+    /// asked to fix a UI ran `npx supabase db reset` and wiped a database
+    /// holding months of work. Under v0.18.0's starter that command was
+    /// ALLOWED, silently. The wildcards are gone and the reset commands are
+    /// hard stops.
+    #[test]
+    fn a_command_that_runs_anything_is_not_the_dev_loop() {
+        use crate::policy::{Action, Policy};
+        let p: Policy = serde_yaml::from_str(STARTER_POLICY).unwrap();
+        for cmd in [
+            "npx supabase db reset",
+            "supabase db reset",
+            "npx prisma migrate reset",
+            "npx prisma db push --force-reset",
+            "npx drizzle-kit drop",
+            "sh -c \"npx supabase db reset\"",
+        ] {
+            let d = p.evaluate_command(cmd, &here());
+            assert_eq!(d.action, Action::Deny, "{cmd}: {}", d.reason);
+        }
+        // The placeholder heads fall to the default: not allowed, not denied.
+        for cmd in [
+            "npx tsc --noEmit",
+            "npm run build",
+            "npm run db:reset",
+            "yarn run clean",
+        ] {
+            let d = p.evaluate_command(cmd, &here());
+            assert_eq!(d.action, Action::Ask, "{cmd}: {}", d.reason);
+        }
+        // The commands whose name is the command still pass.
+        for cmd in [
+            "npm test",
+            "pnpm test",
+            "cargo test",
+            "go build ./...",
+            "pytest -x",
+        ] {
+            let d = p.evaluate_command(cmd, &here());
+            assert_eq!(d.action, Action::Allow, "{cmd}: {}", d.reason);
+        }
+    }
+
     #[test]
     fn the_dev_loop_is_allowed_and_its_neighbours_are_not() {
         use crate::policy::{Action, Policy};
@@ -1533,8 +1590,6 @@ mod tests {
             "cargo test -q",
             "cargo clippy --all-targets -- -D warnings",
             "npm test",
-            "npm run lint",
-            "npx vitest run",
             "pytest -x tests/",
             "python -m pytest",
             "go test ./...",

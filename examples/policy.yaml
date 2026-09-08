@@ -203,6 +203,23 @@ rules:
   - match: "*shadowcopy delete*"
     action: deny
     reason: "Deleting shadow copies destroys the recovery point itself."
+  # A local database is somebody's months of work as often as it is a
+  # throwaway. Field report, Sep 2026: an agent asked to fix a UI ran
+  # `npx supabase db reset` and wiped a database holding months of notes,
+  # tasks and deadlines. These commands drop and recreate; the tools give
+  # no confirmation and no backup.
+  - match: "*db reset*"
+    action: deny
+    reason: "Resetting a database drops every row in it. Dump it first, or run this yourself."
+  - match: "*migrate reset*"
+    action: deny
+    reason: "Resetting migrations drops and recreates the schema. Dump it first, or run this yourself."
+  - match: "*db push*--force-reset*"
+    action: deny
+    reason: "A forced reset drops every row in the database. Dump it first, or run this yourself."
+  - match: "*drizzle-kit drop*"
+    action: deny
+    reason: "Dropping the schema destroys the data under it. Dump it first, or run this yourself."
   - match: "*Win32_ShadowCopy*Delete*"
     action: deny
     reason: "Deleting shadow copies destroys the recovery point itself."
@@ -431,21 +448,11 @@ rules:
     action: allow
   - match: "npm test*"
     action: allow
-  - match: "npm run *"
-    action: allow
-  - match: "npx *"
-    action: allow
   - match: "pnpm test*"
-    action: allow
-  - match: "pnpm run *"
     action: allow
   - match: "yarn test*"
     action: allow
-  - match: "yarn run *"
-    action: allow
   - match: "bun test*"
-    action: allow
-  - match: "bun run *"
     action: allow
   - match: "node *"
     action: allow
