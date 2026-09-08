@@ -2,6 +2,50 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.18.1 — a command that runs anything is not the dev loop
+
+A regression fix, one day old. v0.18.0 widened the starter policy to allow
+the ordinary build and test loop, and widened it too far.
+
+### Fixed
+
+- **`npx *` and `<pm> run *` are no longer allowed by the starter policy.**
+  Field report, r/ClaudeCode, Sep 5: an agent given a purely UI task ran
+  `npx supabase db reset` and wiped a local database holding months of the
+  author's projects, notes and deadlines. Under v0.18.0's starter that
+  command was **allowed**, silently, by `npx *`. So were `npx prisma migrate
+  reset` and `npx drizzle-kit drop`; `npm run db:reset` was allowed by
+  `npm run *`.
+
+  The reasoning in v0.18.0 was that a build or a test runs the project's own
+  code, which the gate cannot read either way, so allowing it changes
+  friction rather than safety. That holds for a head that names the action —
+  `cargo test`, `go build`, `pytest`. It fails for a head that names a
+  runner: `npx` runs an arbitrary package off the network, `<pm> run` runs an
+  arbitrary script. Removed: `npx *`, `npm run *`, `pnpm run *`,
+  `yarn run *`, `bun run *`. Kept: `npm test`, `pnpm test`, `yarn test`,
+  `bun test`, `node *`, and the whole cargo / go / make / python / dotnet /
+  mvn / gradle loop.
+
+- **A database reset is a hard stop**: `*db reset*`, `*migrate reset*`,
+  `*db push*--force-reset*`, `*drizzle-kit drop*`. A local database is
+  somebody's months of work as often as it is a throwaway, and these tools
+  drop and recreate with no confirmation and no backup of their own.
+
+### If you installed v0.18.0
+
+`termaxa init` writes the starter policy once and never rewrites it, so a
+policy created on v0.18.0 still has the wildcards. Compare your
+`.termaxa/policy.yaml` against `examples/policy.yaml`, or check directly:
+
+    termaxa check "npx supabase db reset"
+
+It should say `deny`. If it says `allow`, delete the `npx *` and
+`<pm> run *` rules from your policy and add the four hard stops above.
+
+The rule this leaves behind: widen an allow list by the head that names the
+action, never by the head that names a runner.
+
 ## v0.18.0 — the gate reads what the agent actually runs
 
 v0.17 moved who decides. v0.18 reads **what is actually being run** — the
