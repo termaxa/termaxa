@@ -483,6 +483,11 @@ impl Tok {
     ///   `costs$5`     a digit after `$` is positional-parameter shaped; in
     ///                 a delete target it is overwhelmingly a filename
     ///
+    /// A digit after the dollar is a positional parameter, not a price:
+    /// `costs$5` expands to `costs` when `$5` is unset, exactly as `$SID`
+    /// does. A filename that really contains a dollar reaches the shell
+    /// escaped or single-quoted, and both are excluded above.
+    ///
     /// Out of scope, deliberately: `$(...)` is command substitution, a
     /// different hazard; `%VAR%` is cmd, where an undefined name stays as
     /// literal text rather than collapsing to empty, so the failure class
@@ -506,7 +511,22 @@ impl Tok {
                 continue;
             }
             if let Some(next) = chars.get(i + 1) {
-                if next.is_ascii_alphabetic() || *next == '_' || *next == '{' {
+                // A name, or a braced form: $SID, $_x, ${1}.
+                //
+                // And the positional and special parameters, which is how a
+                // shell receives an argument: $1..$9, $@, $*, $#, and $?, $$,
+                // $!, $0. anthropics/claude-code#82165 is the whole class in
+                // one line - `find ... -exec sh -c "rm -rf \"$1\"/*" _ {} \;`
+                // with $1 empty, which became `rm -rf /*` on a production
+                // host. Before this, `$1` was read as a literal directory
+                // name, so the preview resolved it, failed to find it, and
+                // said "path does not exist - nothing to delete" about a
+                // command that was about to empty the filesystem. The verdict
+                // was already a hard stop; it is the preview that must not
+                // reassure when it does not know.
+                if next.is_ascii_alphanumeric()
+                    || matches!(next, '_' | '{' | '@' | '*' | '#' | '?' | '$' | '!')
+                {
                     return true;
                 }
             }
@@ -1082,10 +1102,26 @@ mod tests {
         assert!(flagged("rm -rf x/$SID")); // the incident shape
         assert!(flagged("rm -rf \"$SID\"")); // double quotes expand
         assert!(flagged("rm -rf ${SID}")); // braced form
+                                           // Positional and special parameters: how a shell receives an argument.
+                                           // anthropics/claude-code#82165: `sh -c "rm -rf \"$1\"/*"` with $1
+                                           // empty became `rm -rf /*` on a production VPS.
+        assert!(flagged(r#"sh -c "rm -rf \"$1\"/* 2>/dev/null""#));
+        assert!(flagged("rm -rf $1/*"));
+        assert!(flagged("rm -rf $2"));
+        assert!(flagged("rm -rf $@/*"));
+        assert!(flagged("rm -rf $*/x"));
+        assert!(flagged("rm -rf $#/x"));
+        assert!(flagged("rm -rf $$/tmp"));
+        assert!(!flagged("rm -rf 'lit$1'")); // single quotes do not expand
         assert!(!flagged("rm -rf 'lit$SID'")); // single quotes do not
         assert!(!flagged("rm -rf \\$SID")); // escaped, reaches shell literal
         assert!(!flagged(r#"rm -rf "\$SID""#)); // same escape, inside quotes (#50)
-        assert!(!flagged("rm -rf costs$5")); // digit: a filename
+                                                // `costs$5` was asserted UNFLAGGED here on the reading that a digit
+                                                // after a dollar is a price in a filename. That reading is wrong
+                                                // about the shell: `costs$5` expands too, to `costs` when $5 is
+                                                // unset. A file genuinely named that reaches the shell escaped or
+                                                // single-quoted, and both of those are already unflagged above.
+        assert!(flagged("rm -rf costs$5")); // expands like any other parameter
         assert!(!flagged("rm -rf x")); // control
                                        // `$(...)` is command substitution — a different hazard, not this
                                        // detector's claim to make.
