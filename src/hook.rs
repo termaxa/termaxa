@@ -28,6 +28,14 @@ pub enum Dialect {
     /// Claude Code PreToolUse: {"tool_name":"Bash","tool_input":{"command":...}}
     /// -> {"hookSpecificOutput":{"permissionDecision":...}}
     ClaudeCode,
+    /// GitHub Copilot CLI running the hooks it finds in `.claude/settings.json`
+    /// ("repo settings"). It speaks Claude Code's shape - PreToolUse and
+    /// PostToolUse, `tool_name:"Bash"`, `tool_input.command` - but it is
+    /// Copilot, and it reads a non-zero exit as a hook error rather than a
+    /// deny. Captured live Sep 9, 2026: the payload carries a `timestamp`
+    /// string and no `transcript_path`, which is the reverse of Claude Code.
+    /// Rendered in Claude Code's shape; exits 0 on deny; audited as copilot.
+    CopilotRepoSettings,
     /// Cursor beforeShellExecution (v1.7+): {"hook_event_name":"beforeShellExecution","command":...}
     /// -> {"permission":..., "agent_message":...}
     Cursor,
@@ -73,6 +81,7 @@ impl Dialect {
             Dialect::Cursor => "cursor",
             Dialect::Codex => "codex",
             Dialect::Copilot => "copilot",
+            Dialect::CopilotRepoSettings => "copilot",
         }
     }
 }
@@ -224,6 +233,8 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
         return Some(ParsedHook {
             dialect: if looks_codex {
                 Dialect::Codex
+            } else if sent_by_copilot_repo_settings(&v) {
+                Dialect::CopilotRepoSettings
             } else {
                 Dialect::ClaudeCode
             },
@@ -235,6 +246,18 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
     }
 
     None
+}
+
+/// Copilot CLI's Claude-shaped hook payload ("repo settings"), captured live
+/// Sep 9, 2026: `{"hook_event_name":"PreToolUse","session_id":...,
+/// "timestamp":"2026-09-09T22:52:05.667Z","cwd":...,"tool_name":"Bash",
+/// "tool_input":{"command":...,"description":...}}`. Claude Code's own
+/// payload has a `transcript_path` and no `timestamp`; Codex has `turn_id`.
+/// A string timestamp with no transcript is Copilot in Claude's clothing.
+fn sent_by_copilot_repo_settings(v: &serde_json::Value) -> bool {
+    v.get("timestamp").map(|t| t.is_string()).unwrap_or(false)
+        && v.get("transcript_path").is_none()
+        && v.get("turn_id").is_none()
 }
 
 /// A file-write tool call: the agent is about to write to `path`.
@@ -328,6 +351,8 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
         Dialect::Cursor
     } else if looks_codex {
         Dialect::Codex
+    } else if sent_by_copilot_repo_settings(&v) {
+        Dialect::CopilotRepoSettings
     } else {
         Dialect::ClaudeCode
     };
@@ -481,7 +506,7 @@ fn sent_by_codex(v: &serde_json::Value) -> bool {
 /// Decision -> the JSON each agent expects on stdout.
 pub fn render_response(dialect: Dialect, permission: &str, reason: &str) -> String {
     match dialect {
-        Dialect::ClaudeCode => json!({
+        Dialect::ClaudeCode | Dialect::CopilotRepoSettings => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": permission,
@@ -1148,8 +1173,10 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         // JSON on stdout is the documented channel and the exit code stays 0
         // so the JSON is read.
         exit_code: if decision.action == Action::Deny
-            && !matches!(input.dialect, Dialect::Codex | Dialect::Copilot)
-        {
+            && !matches!(
+                input.dialect,
+                Dialect::Codex | Dialect::Copilot | Dialect::CopilotRepoSettings
+            ) {
             2
         } else {
             0
@@ -1386,6 +1413,40 @@ mod tests {
             let raw = format!(r#"{{"toolName":"{tool}","toolArgs":{{"command":"rm -rf /"}}}}"#);
             assert!(parse_input(&raw).is_some(), "{tool} is a shell tool too");
         }
+    }
+
+    /// Copilot CLI running the `.claude/settings.json` hooks ("repo
+    /// settings"), captured live Sep 9, 2026. Claude Code's shape, both
+    /// events, a string `timestamp`, no `transcript_path`. It is Copilot:
+    /// audited as such, answered in Claude's shape, and a deny exits 0
+    /// because Copilot read exit 2 on this path as "(hook errored)" too.
+    #[test]
+    fn copilot_through_repo_settings_is_copilot_in_claudes_shape() {
+        let pre = r#"{"hook_event_name":"PreToolUse","session_id":"a98e1665-3dab-4281-8c73-25659c0fbab7","timestamp":"2026-09-09T22:52:28.560Z","cwd":"C:\\Users\\User\\code\\capture-test","tool_name":"Bash","tool_input":{"command":"Remove-Item -LiteralPath scratch -Recurse -Force","description":"Delete the scratch directory"}}"#;
+        let p = parse_input(pre).expect("the live payload must parse");
+        assert_eq!(p.dialect, Dialect::CopilotRepoSettings);
+        assert_eq!(p.dialect.actor(), "copilot");
+        assert!(!p.is_post);
+        assert_eq!(
+            p.session.as_deref(),
+            Some("a98e1665-3dab-4281-8c73-25659c0fbab7")
+        );
+
+        let post = r#"{"hook_event_name":"PostToolUse","session_id":"a98e1665","timestamp":"2026-09-09T22:52:07.017Z","cwd":"C:\\x","tool_name":"Bash","tool_input":{"command":"echo hi"},"tool_result":{"result_type":"success","text_result_for_llm":"hi\n"}}"#;
+        let p = parse_input(post).expect("post must parse");
+        assert_eq!(p.dialect, Dialect::CopilotRepoSettings);
+        assert!(
+            p.is_post,
+            "PostToolUse arrives on this path; receipts exist under Copilot here"
+        );
+
+        // Claude Code itself: a transcript, no timestamp - untouched.
+        let claude = r#"{"hook_event_name":"PreToolUse","session_id":"s","transcript_path":"/home/u/.claude/projects/x/s.jsonl","cwd":"/repo","tool_name":"Bash","tool_input":{"command":"rm -rf ./x"}}"#;
+        assert_eq!(parse_input(claude).unwrap().dialect, Dialect::ClaudeCode);
+
+        // The answer is Claude's shape.
+        let r = render_response(Dialect::CopilotRepoSettings, "deny", "[termaxa] no");
+        assert!(r.contains("hookSpecificOutput") && r.contains("\"permissionDecision\":\"deny\""));
     }
 
     #[test]

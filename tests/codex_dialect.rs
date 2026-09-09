@@ -277,6 +277,40 @@ fn copilots_powershell_tool_is_read_and_an_allow_is_answered() {
     );
 }
 
+/// Copilot CLI also runs the hooks in `.claude/settings.json` ("repo
+/// settings"), after the `.github/hooks` ones, in Claude Code's shape -
+/// captured live Sep 9, 2026, with a string `timestamp` and no
+/// `transcript_path`. On that path too a non-zero exit was "(hook errored)".
+/// The answer is Claude's shape with exit 0, and the audit names copilot.
+#[test]
+fn a_copilot_deny_through_repo_settings_exits_zero_in_claudes_shape() {
+    let tmp = scratch("copilot-repo-settings");
+    let (home, proj) = (tmp.join("home"), project(&tmp));
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "a98e1665-3dab-4281-8c73-25659c0fbab7",
+        "timestamp": "2026-09-09T22:52:28.560Z",
+        "cwd": proj.display().to_string(),
+        "tool_name": "Bash",
+        "tool_input": { "command": "rm -rf ./scratch", "description": "Delete the scratch directory" }
+    })
+    .to_string();
+    let out = termaxa(&home, &proj, &["hook"], &payload);
+    assert_eq!(
+        out.code, 0,
+        "Copilot reads exit 2 as an error on this path too: {}",
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("hookSpecificOutput")
+            && out.stdout.contains("\"permissionDecision\":\"deny\""),
+        "{}",
+        out.stdout
+    );
+    let log = termaxa(&home, &proj, &["log"], "");
+    assert!(log.stdout.contains("rm -rf ./scratch"), "{}", log.stdout);
+}
+
 #[test]
 fn init_writes_the_hooks_file_codex_reads() {
     let tmp = scratch("init");
