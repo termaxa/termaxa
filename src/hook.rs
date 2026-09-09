@@ -163,8 +163,18 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
     }
 
     // ---- Copilot CLI: toolName + toolArgs (a JSON *string* holding the args) ----
+    //
+    // `shell`, `bash`, `run_in_terminal` are the documented names. The one
+    // Copilot CLI actually sent on Windows (captured Sep 9, 2026) was
+    // `powershell`, with `toolArgs` as an inline object carrying `command`,
+    // `description`, `mode` and `initial_wait`. `pwsh` and `cmd` are the
+    // obvious siblings and are unmeasured; listing them can only widen
+    // what is gated.
     if let Some(tool) = s("toolName") {
-        if tool == "shell" || tool == "bash" || tool == "run_in_terminal" {
+        if matches!(
+            tool.as_str(),
+            "shell" | "bash" | "run_in_terminal" | "powershell" | "pwsh" | "cmd"
+        ) {
             let args_val = match v.get("toolArgs") {
                 Some(serde_json::Value::String(st)) => {
                     serde_json::from_str::<serde_json::Value>(st).unwrap_or(serde_json::Value::Null)
@@ -632,9 +642,25 @@ fn refuse_unrecognised(raw: &str) -> Option<Outcome> {
             hash: None,
         });
     }
+    // A payload with `toolName` is Copilot-shaped (Claude Code, Codex and
+    // Cursor all say `tool_name`), and Copilot reads a deny only as exit-0
+    // JSON in its own shape - anything else is "hook errored", which
+    // `failClosed` still turns into a block but with the reason lost. That
+    // is exactly what the first live Copilot session showed, Sep 9, 2026:
+    // this refusal, in Claude Code's shape with exit 2, reached the user as
+    // "(hook errored)". Everyone else keeps the belt-and-suspenders exit 2.
+    let copilot_shaped = json.get("toolName").is_some();
     Some(Outcome {
-        rendered: Some(render_response(Dialect::ClaudeCode, "deny", &reason)),
-        exit_code: 2,
+        rendered: Some(render_response(
+            if copilot_shaped {
+                Dialect::Copilot
+            } else {
+                Dialect::ClaudeCode
+            },
+            "deny",
+            &reason,
+        )),
+        exit_code: if copilot_shaped { 0 } else { 2 },
         audit_seq: None,
     })
 }
@@ -1110,14 +1136,20 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
 
     Ok(Outcome {
         rendered,
-        // Exit 2 is the belt under the JSON for Cursor and Copilot. Not for
-        // Codex: measured Sep 5, 2026, a Termaxa deny reached codex-cli
+        // Exit 2 is the belt under the JSON for Claude Code and Cursor. Not
+        // for Codex: measured Sep 5, 2026, a Termaxa deny reached codex-cli
         // 0.153.4 on Windows as "hook exited with code 1" - the wrapper that
         // runs the hook flattens a non-zero exit to 1, and Codex treats any
-        // exit other than 0 or 2 as a failed hook, which fails open. The JSON
-        // on stdout is Codex's documented channel; the exit code stays 0 so
-        // the JSON is read.
-        exit_code: if decision.action == Action::Deny && input.dialect != Dialect::Codex {
+        // exit other than 0 or 2 as a failed hook, which fails open. And not
+        // for Copilot: measured Sep 9, 2026, a non-zero exit reached Copilot
+        // CLI as `Denied by preToolUse hook ... (hook errored)` - the block
+        // landed only because `failClosed: true` turns an error into a
+        // denial, and the reason never reached the screen. For both, the
+        // JSON on stdout is the documented channel and the exit code stays 0
+        // so the JSON is read.
+        exit_code: if decision.action == Action::Deny
+            && !matches!(input.dialect, Dialect::Codex | Dialect::Copilot)
+        {
             2
         } else {
             0
@@ -1333,6 +1365,27 @@ mod tests {
     fn shared_shape_without_tag_defaults_to_claude() {
         let raw = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
         assert_eq!(parse_input(raw).unwrap().dialect, Dialect::ClaudeCode);
+    }
+
+    /// The payload Copilot CLI actually sent on Windows, captured live on
+    /// Sep 9, 2026 with TERMAXA_HOOK_DEBUG. The tool is `powershell`, not
+    /// `shell`; `toolArgs` is an inline object; `sessionId` and `timestamp`
+    /// are camelCase and milliseconds; there is no hookEventName at all.
+    #[test]
+    fn copilot_on_windows_calls_its_shell_powershell() {
+        let raw = r#"{"sessionId":"85a696df-84c3-4b99-95cd-4e076f2529d9","timestamp":1788992290306,"cwd":"C:\\Users\\User\\code\\capture-test","toolName":"powershell","toolArgs":{"command":"echo hi","description":"Print the requested greeting","mode":"sync","initial_wait":10}}"#;
+        let p = parse_input(raw).expect("the live Copilot payload must parse");
+        assert_eq!(p.dialect, Dialect::Copilot);
+        assert_eq!(p.command, "echo hi");
+        assert_eq!(
+            p.session.as_deref(),
+            Some("85a696df-84c3-4b99-95cd-4e076f2529d9")
+        );
+        assert!(!p.is_post);
+        for tool in ["pwsh", "cmd"] {
+            let raw = format!(r#"{{"toolName":"{tool}","toolArgs":{{"command":"rm -rf /"}}}}"#);
+            assert!(parse_input(&raw).is_some(), "{tool} is a shell tool too");
+        }
     }
 
     #[test]

@@ -156,7 +156,19 @@ fn copilot_is_recognised_by_every_shell_tool_it_names() {
     let tmp = scratch("copilot");
     let (home, proj) = (tmp.join("home"), project(&tmp, DENIES));
 
-    for tool in ["shell", "bash", "run_in_terminal"] {
+    // `powershell` is the name Copilot CLI actually sent on Windows (captured
+    // Sep 9, 2026); the other three are the documented ones. A Copilot deny
+    // is exit 0 with the verdict in the JSON: Copilot reads a non-zero exit
+    // as "(hook errored)", which failClosed still blocks but with the reason
+    // lost - so the gate is asserted through stdout here, not the exit code.
+    for tool in [
+        "shell",
+        "bash",
+        "run_in_terminal",
+        "powershell",
+        "pwsh",
+        "cmd",
+    ] {
         let out = hook(
             &home,
             &proj,
@@ -168,7 +180,16 @@ fn copilot_is_recognised_by_every_shell_tool_it_names() {
             }),
             &[],
         );
-        assert_eq!(out.code, 2, "{tool} must be gated: {:?}", out.stdout);
+        assert_eq!(
+            out.code, 0,
+            "{tool}: Copilot must not see a non-zero exit: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("\"permissionDecision\":\"deny\""),
+            "{tool} must be gated: {:?}",
+            out.stdout
+        );
     }
 
     // A tool that does not run a shell is not a shell, even carrying a command.

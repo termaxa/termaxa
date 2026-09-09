@@ -102,6 +102,25 @@ fn codex_payload(cwd: &Path, command: &str) -> String {
 }
 
 /// The same command in Claude Code's shape: no `turn_id`, no `model`.
+/// The payload Copilot CLI sent on Windows, captured live on Sep 9, 2026:
+/// the tool is `powershell`, `toolArgs` is an inline object, no
+/// hookEventName.
+fn copilot_payload(cwd: &Path, command: &str) -> String {
+    serde_json::json!({
+        "sessionId": "85a696df-84c3-4b99-95cd-4e076f2529d9",
+        "timestamp": 1788992290306u64,
+        "cwd": cwd.display().to_string(),
+        "toolName": "powershell",
+        "toolArgs": {
+            "command": command,
+            "description": "captured shape",
+            "mode": "sync",
+            "initial_wait": 10
+        }
+    })
+    .to_string()
+}
+
 fn claude_payload(cwd: &Path, command: &str) -> String {
     serde_json::json!({
         "session_id": "s-claude",
@@ -205,6 +224,55 @@ fn a_deny_exits_zero_for_codex_and_two_for_claude_code() {
     assert!(
         out.stdout.contains("\"permissionDecision\":\"deny\""),
         "{}",
+        out.stdout
+    );
+}
+
+/// Copilot CLI read a non-zero exit as `(hook errored)` and blocked only
+/// because `failClosed: true` turns an error into a denial - the reason
+/// never reached the screen. A Copilot deny now exits 0 with the verdict in
+/// Copilot's own JSON shape (top-level `permissionDecision`, no
+/// `hookSpecificOutput` wrapper).
+#[test]
+fn a_copilot_deny_exits_zero_in_copilots_own_shape() {
+    let tmp = scratch("copilot-deny");
+    let (home, proj) = (tmp.join("home"), project(&tmp));
+    std::fs::create_dir_all(proj.join("scratch")).unwrap();
+    std::fs::write(proj.join("scratch").join("a.txt"), "x").unwrap();
+    let out = termaxa(
+        &home,
+        &proj,
+        &["hook"],
+        &copilot_payload(&proj, "rm -rf ./scratch"),
+    );
+    assert_eq!(
+        out.code, 0,
+        "Copilot reads a non-zero exit as a hook error, not a deny: {}",
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("\"permissionDecision\":\"deny\"")
+            && !out.stdout.contains("hookSpecificOutput"),
+        "{}",
+        out.stdout
+    );
+    assert!(proj.join("scratch").join("a.txt").exists());
+}
+
+/// The first live Copilot session was refused on `echo hi`: the tool was
+/// named `powershell`, the parser did not know it, and the policy's
+/// `unrecognised: deny` fired - in Claude Code's JSON shape with exit 2,
+/// which Copilot showed as `(hook errored)`. Now the payload parses and the
+/// allow is a Copilot-shaped allow.
+#[test]
+fn copilots_powershell_tool_is_read_and_an_allow_is_answered() {
+    let tmp = scratch("copilot-allow");
+    let (home, proj) = (tmp.join("home"), project(&tmp));
+    let out = termaxa(&home, &proj, &["hook"], &copilot_payload(&proj, "echo hi"));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        out.stdout.contains("\"permissionDecision\":\"allow\""),
+        "an explicit allow for a matched rule: {}",
         out.stdout
     );
 }

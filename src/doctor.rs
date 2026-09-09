@@ -82,6 +82,16 @@ pub fn run(dir: &Path) -> Result<i32> {
     let claude_settings = dir.join(".claude").join("settings.json");
     let cursor_hooks = dir.join(".cursor").join("hooks.json");
     let codex_hooks = dir.join(".codex").join("hooks.json");
+    // Codex also reads a user-level hooks file, and that is the one the
+    // live sessions of Sep 5-6, 2026 ran through; a Codex wired there is
+    // wired, whatever the project directory holds.
+    let codex_hooks_global = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".codex")
+                .join("hooks.json")
+        });
     let copilot_hooks = dir.join(".github").join("hooks").join("hooks.json");
 
     let mut any_agent = false;
@@ -116,11 +126,16 @@ pub fn run(dir: &Path) -> Result<i32> {
     // Codex / Copilot: only mention when detected, and label them honestly.
     if crate::init::which("codex") {
         any_agent = true;
-        let wired = hook_live(&codex_hooks, dir);
+        let mut wired = hook_live(&codex_hooks, dir);
+        if wired.0 == HookState::Absent {
+            if let Some(g) = &codex_hooks_global {
+                wired = hook_live(g, dir);
+            }
+        }
         report_agent("Codex CLI", wired, "termaxa init --codex", &mut problems);
         println!(
             "    {}",
-            dim("dialect built, not yet verified end-to-end (issue #10)")
+            dim("live-tested Sep 2026 (v0.18); an ask is a refusal under Codex")
         );
     }
     if crate::init::which("copilot") || crate::init::which("gh") {
@@ -135,7 +150,7 @@ pub fn run(dir: &Path) -> Result<i32> {
             );
             println!(
                 "    {}",
-                dim("dialect built, not yet verified end-to-end (issue #10)")
+                dim("dialect read from a live capture (Sep 2026); deny not yet seen in its UI (issue #10)")
             );
         }
     }
