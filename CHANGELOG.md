@@ -2,6 +2,61 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.18.3 — four harnesses live-tested
+
+Claude Code, Cursor, Codex and Copilot CLI have each now run a real
+session under the gate, and each one taught the gate something its
+documentation had not. Issue #10, open since July, is closed.
+
+### Added
+
+- **Copilot CLI is live-tested** (#86, #87). Measured Sep 9–10, 2026 on
+  Windows 11 with Copilot Free. Three things the documented format did not
+  say: the shell tool on Windows is named `powershell`, not `shell`; a
+  non-zero exit is a hook error to Copilot, not a deny — the first session
+  saw `echo hi` refused as "(hook errored)" and the block held only because
+  `failClosed: true` turns an error into a denial; and Copilot runs **two
+  hook files in order**, `.github/hooks/*.json` first and then whatever is
+  in `.claude/settings.json` ("repo settings"), stopping at the first deny.
+  Copilot honours **`ask`**: a Termaxa ask arrives as a "Hook permission
+  request" panel with the reason in it and a Yes/No prompt, which Codex
+  cannot do. After the fix, a real session went: probe asked and approved;
+  `Remove-Item … -Recurse -Force` denied with the reason on screen; the
+  agent tried `& $env:ComSpec /c 'rmdir /s /q …'` on its own and was denied
+  again through the wrapper. The directory survived.
+- **`Dialect::CopilotRepoSettings`** (#87): the repo-settings hook speaks
+  Claude Code's shape — both events, so execution receipts exist under
+  Copilot on that path — with a string `timestamp` and no
+  `transcript_path`. Detected by that, rendered in Claude's shape, exit 0
+  on deny, audited as `copilot` where it had been logged as claude-code.
+- `powershell`, `pwsh` and `cmd` are Copilot shell tools (#86). Only the
+  first is measured; listing the others can only widen what is gated.
+
+### Changed
+
+- **Copilot's deny exits 0** with the verdict in the JSON, on both paths,
+  the same contract as Codex (#74). Claude Code and Cursor keep the
+  belt-and-suspenders exit 2.
+- **The unrecognised-payload refusal speaks the sender's shape** when the
+  payload carries `toolName` (#86), so a future Copilot drift reaches the
+  user with the reason instead of as an error.
+- **`doctor`** no longer says Codex is "not yet verified end-to-end" — it
+  has been since v0.18.0 — and it probes the user-level `~/.codex/hooks.json`
+  as well as the project one, which is the file the live Codex sessions
+  actually ran through (#86).
+
+### Known limitations
+
+- Write hook files **without a byte-order mark**. Windows PowerShell 5.1's
+  `Set-Content -Encoding utf8` adds one, and Copilot then ignores the
+  file and falls back to repo settings. `init` writes its files without
+  one; the README says so for anyone writing them by hand.
+- Copilot's two-file order and stop-on-deny are inferred from three
+  sessions' audit logs, not from documentation.
+- Codex's PostToolUse payload is still uncaptured; under Codex there are
+  no execution receipts. Copilot's exist only through the repo-settings
+  path.
+
 ## v0.18.2 — a positional parameter is a shell variable
 
 ### Fixed
