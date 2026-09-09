@@ -2,6 +2,41 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.18.2 — a positional parameter is a shell variable
+
+### Fixed
+
+- **`$1`, `$@` and their neighbours are now read as variables.**
+  `anthropics/claude-code#82165`, still open: an agent composed
+
+      find /var/www/.../tmp -maxdepth 1 -type d -name "*ache*" \
+        -exec sudo -u www-data sh -c "rm -rf \"$1\"/* 2>/dev/null" _ {} \;
+
+  `$1` was empty at execution, so the shell ran `rm -rf ""/*` — that is,
+  `rm -rf /*` — as root on a production host, detached, with stderr silenced.
+
+  Measured against v0.18.1: the verdict was right and the preview was worse
+  than useless. `has_unexpanded_var` tested `next.is_ascii_alphabetic()`, so
+  it flagged `$SID`, `$HOME` and `${1}` but not `$1`. The resolver then took
+  `$1` for a literal directory name, failed to find it, and reported
+  "(path does not exist — nothing to delete)" about a command that was about
+  to empty the filesystem.
+
+  Positional and special parameters are variables now: `$1`..`$9`, `$@`,
+  `$*`, `$#`, `$?`, `$$`, `$!`, `$0`. That is how a shell receives an
+  argument, which is how `sh -c` and `find -exec` pass one, which is how this
+  class of incident is actually spelled. The same command now reports the
+  target as unresolved and the insurance as not recoverable.
+
+  One existing assertion was wrong and is corrected rather than worked
+  around: `rm -rf costs$5` was asserted unflagged, on the reading that a digit
+  after a dollar is a price in a filename. The shell disagrees — `costs$5`
+  expands to `costs` when `$5` is unset. A filename that really contains a
+  dollar arrives escaped or single-quoted, and both were already excluded.
+
+The verdict never changed: `rm -rf` was and is a hard stop. What changed is
+that the preview no longer reassures when it does not know.
+
 ## v0.18.1 — a command that runs anything is not the dev loop
 
 A regression fix, one day old. v0.18.0 widened the starter policy to allow
