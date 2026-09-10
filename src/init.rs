@@ -147,9 +147,35 @@ rules:
     action: allow
   - match: "cp .termaxa*"
     action: allow
-  - match: "*.termaxa*"
+  # A belt over the path rule in protect.rs for commands whose grammar the
+  # gate does not model (`sed -i`, an editor, `python -c`). Named by what
+  # they hold, because a plain `*.termaxa*` also matched the PATH line
+  # `wrap` itself injects into every shell it starts -
+  # `export PATH=~/.termaxa/shims:...` - and refused Claude Code's own
+  # startup snapshot (Sep 10, 2026). The matcher knows only `*`, so the
+  # separator is spanned by it; `shims/` with the slash is a file inside
+  # the shim directory, while `shims:` in a PATH is not.
+  - match: "*.termaxa*policy*"
     action: deny
     reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+  - match: "*.termaxa*projects*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+  - match: "*.termaxa*backups*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+  - match: "*.termaxa*logs*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+  - match: "*.termaxa*shims/*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+  # Pointing git's hook directory anywhere runs whatever is there on the
+  # next commit. It used to be caught only when the target was inside
+  # `.termaxa`; the hazard is the redirection itself.
+  - match: "*git config*hooksPath*"
+    action: deny
+    reason: "Redirecting git hooks runs arbitrary code on the next commit. Do it yourself."
 
   # ---- destructive: hard stops ----
   - match: "git push*--force*"
@@ -368,6 +394,12 @@ rules:
   - match: "kubectl describe*"
     action: allow
   - match: "docker ps*"
+    action: allow
+  # A variable assignment runs nothing. Claude Code's startup snapshot sets
+  # PATH inside the shell `wrap` hands it (Sep 10, 2026); asking about that
+  # line unattended is a refusal of the agent's own setup. A substitution in
+  # the value (`export X=$(...)`) is still escalated by the context check.
+  - match: "export *"
     action: allow
 
   # ---- PowerShell read-only cmdlets ----

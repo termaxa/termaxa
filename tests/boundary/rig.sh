@@ -162,7 +162,11 @@ mkdir -p "$PROJECT/doomed" && echo "insured contents" > "$PROJECT/doomed/file.tx
 # produced nothing and the assertions below tested a path that did not exist.
 # The control leg caught that; without it this rig would have reported three
 # passes against /nonexistent.
-( cd "$PROJECT" && printf 'y\n' | TERMAXA_HOME="$TERMAXA_HOME" "$BIN" run -- rm -r doomed ) >/dev/null 2>&1
+# An ask is answered only from a terminal since Sep 10, 2026 (a pipe with a
+# `y` in it is not a person - under `wrap`, an agent could have written one).
+# `script` lends the command a pseudo-terminal and forwards this rig's `y`
+# into it, which is how the operator approves.
+( cd "$PROJECT" && printf 'y\n' | script -qec "TERMAXA_HOME='$TERMAXA_HOME' '$BIN' run -- rm -r doomed" /dev/null ) >/dev/null 2>&1
 BK="$(find "$TERMAXA_HOME" -path '*backups*' -name 'file.txt' 2>/dev/null | head -1)"
 if [ -z "$BK" ]; then
   bad "no backup was produced through the real path; the backup assertions could not run"

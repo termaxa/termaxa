@@ -67,6 +67,16 @@ pub fn install_shims(termaxa_home: &Path, termaxa_bin: &Path) -> Result<PathBuf>
     std::fs::set_permissions(&dir, perm)?;
 
     for shell in SHIMMED_SHELLS {
+        // Only a shell that exists gets a shim. A shim for an absent shell
+        // makes the harness believe it has one: Claude Code preferred `zsh`
+        // in a container with no zsh installed, because the shim directory
+        // offered it (Sep 10, 2026).
+        let Some(real) = real_shell(shell, &dir) else {
+            // A shim left behind by an earlier install still advertises
+            // the shell; take it down with the same reasoning.
+            let _ = std::fs::remove_file(dir.join(shell));
+            continue;
+        };
         let path = dir.join(shell);
         // A `-c` string is how a shell is asked to run one command, and it is
         // the form we forward. It may sit in a cluster - `bash -lc` is how
@@ -86,14 +96,20 @@ pub fn install_shims(termaxa_home: &Path, termaxa_bin: &Path) -> Result<PathBuf>
 expect_string=""
 skip_next=""
 for a in "$@"; do
-  if [ -n "$expect_string" ]; then
-    if [ -n "$a" ]; then
-      exec {bin} run -- {shell} "$@"
-    fi
-    break
-  fi
   if [ -n "$skip_next" ]; then
     skip_next=""
+    continue
+  fi
+  if [ -n "$expect_string" ]; then
+    # Options may follow -c (`zsh -c -l "..."` is Claude Code's spelling);
+    # the string is the first operand after them.
+    case "$a" in
+      --) break ;;
+      -o) skip_next=1 ;;
+      -*) ;;
+      "") break ;;
+      *) exec {bin} run -- {shell} "$@" ;;
+    esac
     continue
   fi
   case "$a" in
@@ -106,10 +122,11 @@ for a in "$@"; do
     *) break ;;
   esac
 done
-exec /bin/{shell} "$@"
+exec {real} "$@"
 "#,
             bin = termaxa_bin.display(),
             shell = shell,
+            real = real.display(),
         );
         std::fs::write(&path, script)
             .with_context(|| format!("cannot write shim {}", path.display()))?;
@@ -118,6 +135,23 @@ exec /bin/{shell} "$@"
         std::fs::set_permissions(&path, p)?;
     }
     Ok(dir)
+}
+
+/// The real binary a shim stands in front of, found on PATH outside the shim
+/// directory, or `None` when the shell is not installed at all.
+#[cfg(unix)]
+fn real_shell(shell: &str, shim_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for d in std::env::split_paths(&path) {
+        if d == shim_dir {
+            continue;
+        }
+        let candidate = d.join(shell);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Windows has no `$SHELL` convention and its shim story is different enough
@@ -272,6 +306,13 @@ mod tests {
 
         for shell in SHIMMED_SHELLS {
             let p = dir.join(shell);
+            if real_shell(shell, &dir).is_none() {
+                assert!(
+                    !p.exists(),
+                    "no shim for a shell that is not installed: {shell}"
+                );
+                continue;
+            }
             assert!(p.exists(), "{shell} shim exists");
             let mode = std::fs::metadata(&p).unwrap().permissions().mode();
             assert_eq!(mode & 0o111, 0o111, "{shell} is executable");
@@ -298,9 +339,16 @@ mod tests {
             script.contains("/usr/bin/termaxa run --"),
             "a -c command goes through the runner: {script}"
         );
+        let real = real_shell("sh", &dir).expect("sh exists on any unix test machine");
         assert!(
-            script.contains("exec /bin/sh \"$@\""),
-            "anything else reaches the real shell: {script}"
+            script.contains(&format!("exec {} \"$@\"", real.display())),
+            "anything else reaches the real shell by its resolved path: {script}"
+        );
+        // Options after -c are stepped over; the first operand routes.
+        assert!(
+            script.contains("-o) skip_next=1 ;;")
+                && script.contains("exec /usr/bin/termaxa run --"),
+            "{script}"
         );
         assert!(
             script.contains("exec "),

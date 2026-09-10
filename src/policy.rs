@@ -1374,7 +1374,7 @@ rules:
         // policy the agent had written.
         let d = p.evaluate_command("echo 'default: allow' > .termaxa/policy.yaml", &here());
         assert_eq!(d.action, Action::Deny);
-        assert_eq!(d.matched_rule.as_deref(), Some("*.termaxa*"));
+        assert_eq!(d.matched_rule.as_deref(), Some("*.termaxa*policy*"));
 
         for cmd in [
             "cat /tmp/mine.yaml > .termaxa/policy.yaml",
@@ -1400,7 +1400,7 @@ rules:
         let idx_self = p
             .rules
             .iter()
-            .position(|r| r.label() == "*.termaxa*")
+            .position(|r| r.label() == "*.termaxa*policy*")
             .expect("self-defence rule must exist");
         let idx_echo = p
             .rules
@@ -1495,7 +1495,7 @@ rules:
             "the hook-config denies must outrank the review exceptions"
         );
         assert!(
-            idx("cat .termaxa*") < idx("*.termaxa*"),
+            idx("cat .termaxa*") < idx("*.termaxa*policy*"),
             "the review exceptions must outrank the deny they except"
         );
     }
