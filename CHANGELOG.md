@@ -2,6 +2,60 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.18.4 — the first real agent under `wrap`
+
+`wrap` had executed what it approves since v0.18.0 and had never met a
+real agent. On Sep 10, 2026 it met one: Claude Code 2.1.267, headless,
+`--dangerously-skip-permissions`, in a throwaway container with the hook
+file moved aside so the shim alone was on trial, asked to `rm -rf ./scratch`.
+
+The answer that decides the roadmap: **the shim sees the agent's shell.**
+Claude Code resolves its shell by name, and the shim caught it from the
+startup snapshot onwards — `zsh -c -l "..."`, with the shim directory baked
+into the PATH line inside it. Twelve files survived; exit 0; the agent
+reported "Nothing was deleted", declined to pipe `y` past the gate ("that
+would be auto-answering your own security gate on your behalf"), and
+cleaned up after itself. That paragraph is the receipt.
+
+The same run found four things, all ours, all fixed here (#89).
+
+### Fixed
+
+- **`zsh -c -l "cmd"` was read as the command `-l`.** A shell accepts
+  options in any order; Claude Code puts `-l` after `-c`; the reading took
+  the token after the flag. Every command the agent ran was an unmatched
+  ask. Both the policy reading and the shim's own walk now step over
+  options (and `-o arg`) after `-c` to the first operand.
+- **An unattended ask was a hang.** The runner prompted on stdin; the
+  harness's pipe never closed, so the prompt blocked until Claude Code gave
+  up at 120 s. And that pipe is writable by the agent — a `y` in it is not a
+  person. **An ask now requires a terminal on stdin**; anything else is
+  refused at once with the reason. A person at a terminal is unchanged.
+  Scripts that approved by piping `y` into `termaxa run` will now be
+  refused, deliberately; use a terminal, or an allow rule.
+- **The self-protection rule refused the agent's own startup.** The
+  starter's `*.termaxa*` deny matched the PATH line `wrap` injects into
+  every shell it starts (`export PATH=~/.termaxa/shims:...`). The belt
+  over `protect.rs` is now named by what it holds — `policy`, `projects`,
+  `backups`, `logs`, `shims/` — and `git config core.hooksPath` is its own
+  hard stop rather than a side effect. `export *` is allowed: an
+  assignment runs nothing, and a substitution in the value is still
+  escalated.
+- **`wrap` shimmed a shell that was not installed**, and Claude Code chose
+  the shell the shim advertised. A shim is installed only for a shell found
+  on PATH outside the shim directory, execs that resolved path, and a stale
+  shim for an absent shell is removed.
+
+### Known limitations
+
+- An ask abandoned mid-prompt at a real terminal still leaves no audit
+  entry. Unattended asks are refused now, so the case is narrower.
+- The measurement was one harness. Codex under `wrap` is a separate run.
+- Claude Code's startup snapshot writes under `~/.claude` through a
+  variable path (`>| "$SNAPSHOT_FILE"`), which the gate reads as an
+  overwrite it cannot resolve and asks about — refused unattended. Claude
+  Code carries on without the snapshot; noted, not yet decided.
+
 ## v0.18.3 — four harnesses live-tested
 
 Claude Code, Cursor, Codex and Copilot CLI have each now run a real
