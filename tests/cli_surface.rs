@@ -23,6 +23,50 @@ fn termaxa(home: &Path, cwd: &Path, args: &[&str], stdin: &str) -> Output {
     run_termaxa(home, cwd, args, stdin, None)
 }
 
+/// Like `termaxa`, but the answer arrives the way a person's does: through a
+/// terminal. An ask is answered only from a tty since Sep 10, 2026 - under
+/// `wrap`, a harness's pipe never closed and the prompt blocked for two
+/// minutes, and the agent noted it could have piped `y` into the same
+/// stdin. A pipe carrying `y` is refused; this helper hands the child a
+/// pseudo-terminal and types into it, which is the one path that approves.
+fn termaxa_tty(home: &Path, cwd: &Path, args: &[&str], answer: &str) -> Output {
+    use std::os::unix::io::FromRawFd;
+    let (mut master, mut slave) = (0i32, 0i32);
+    let rc = unsafe {
+        // Apple's binding declares the termios and winsize pointers `*mut`,
+        // glibc's `*const`; a `*mut` null coerces to either.
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty must succeed on a unix test machine");
+    // SAFETY: both fds were just created by openpty and are owned here.
+    let slave_file = unsafe { std::fs::File::from_raw_fd(slave) };
+    let mut master_file = unsafe { std::fs::File::from_raw_fd(master) };
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_termaxa"));
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("TERMAXA_HOME", home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::from(slave_file))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().expect("the binary must be runnable");
+    drop(cmd); // the parent's copy of the slave closes here
+    let _ = master_file.write_all(answer.as_bytes());
+    let out = child.wait_with_output().expect("the child must exit");
+    drop(master_file);
+    Output {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: out.status.code().unwrap_or(-1),
+    }
+}
+
 fn run_termaxa(
     home: &Path,
     cwd: &Path,
@@ -245,7 +289,7 @@ fn the_log_says_what_became_of_each_command() {
     // Allowed and executed: an exit code, but no approval to report.
     termaxa(&home, &proj, &["run", "--", "sh", "-c", "exit 3"], "");
     // Asked, and approved: both.
-    termaxa(&home, &proj, &["run", "--", "echo", "yes-please"], "y\n");
+    termaxa_tty(&home, &proj, &["run", "--", "echo", "yes-please"], "y\n");
     // Asked, and declined: nothing ran.
     termaxa(&home, &proj, &["run", "--", "echo", "no-thanks"], "n\n");
 
@@ -320,7 +364,7 @@ fn stats_stays_quiet_about_denials_when_there_are_none() {
 /// to guesswork.
 fn take_a_backup(home: &Path, proj: &Path) -> String {
     std::fs::write(proj.join("doomed.txt"), "precious\n").expect("file must be writable");
-    let deleted = termaxa(home, proj, &["run", "--", "rm", "doomed.txt"], "y\n");
+    let deleted = termaxa_tty(home, proj, &["run", "--", "rm", "doomed.txt"], "y\n");
     assert_eq!(
         deleted.code, 0,
         "the delete itself must succeed.\nstdout: {}\nstderr: {}",
@@ -441,13 +485,20 @@ fn wrap_executes_what_it_allows() {
 
 /// #65, the asked half: through the wrapper an approved delete asked twice
 /// and then refused for lack of stdin, leaving the file in place and no
-/// backup. Now it asks once, insures, and executes.
+/// backup. Then (Sep 10, 2026, the first real agent under `wrap`) the ask
+/// blocked for two minutes on a harness pipe that never closed, and the
+/// agent itself pointed out that piping `y` into the same stdin would have
+/// cleared its own gate. So: an ask is answered only from a terminal. Through
+/// the wrapper with a pipe for stdin, an asked delete is refused at once,
+/// with the reason, the file untouched, and nothing hangs. A person at a
+/// terminal is exercised by the `run` tests through a pseudo-terminal.
 #[test]
-fn wrap_executes_what_it_approves_after_insuring_it() {
-    let tmp = scratch("wrap-approve");
+fn wrap_refuses_an_ask_when_nobody_is_at_a_terminal() {
+    let tmp = scratch("wrap-unattended");
     let (home, proj) = (tmp.join("home"), project(&tmp));
     std::fs::write(proj.join("doomed.txt"), "precious").unwrap();
 
+    let started = std::time::Instant::now();
     let out = termaxa_within(
         &home,
         &proj,
@@ -456,21 +507,23 @@ fn wrap_executes_what_it_approves_after_insuring_it() {
         30,
     );
     assert!(
-        !proj.join("doomed.txt").exists(),
-        "the approved delete must have run\nstdout: {}\nstderr: {}",
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "an unanswerable ask must not wait for an answer"
+    );
+    assert!(
+        proj.join("doomed.txt").exists(),
+        "a `y` on a pipe is not a person: the delete must not have run\nstdout: {}\nstderr: {}",
         out.stdout,
         out.stderr
     );
-    let asks = out.stdout.matches("Proceed?").count() + out.stderr.matches("Proceed?").count();
-    assert_eq!(
-        asks, 1,
-        "asked exactly once\nstdout: {}\nstderr: {}",
-        out.stdout, out.stderr
-    );
-    let backups = termaxa(&home, &proj, &["backups"], "").stdout;
     assert!(
-        backups.contains("rm -rf ./doomed.txt"),
-        "the backup was taken before the delete ran: {backups}"
+        out.stderr.contains("needs a human at a terminal"),
+        "the refusal says why: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("Proceed?") && !out.stderr.contains("Proceed?"),
+        "no prompt is printed where nobody can answer it"
     );
 }
 
@@ -620,7 +673,7 @@ fn a_failed_backup_proceeds_by_default_and_is_refused_by_policy() {
     };
 
     let junk = make_target();
-    let out = termaxa(&home, &proj, &["run", "--", "rm", "-rf", "./junk"], "y\n");
+    let out = termaxa_tty(&home, &proj, &["run", "--", "rm", "-rf", "./junk"], "y\n");
     assert!(
         !junk.exists(),
         "default: the approved delete ran uninsured\n{}{}",
@@ -639,7 +692,7 @@ fn a_failed_backup_proceeds_by_default_and_is_refused_by_policy() {
     std::fs::write(&policy, text).unwrap();
 
     let junk = make_target();
-    let out = termaxa(&home, &proj, &["run", "--", "rm", "-rf", "./junk"], "y\n");
+    let out = termaxa_tty(&home, &proj, &["run", "--", "rm", "-rf", "./junk"], "y\n");
     assert!(
         junk.exists(),
         "deny: the uninsured delete did not run\n{}{}",

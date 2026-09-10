@@ -92,38 +92,54 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
                 }
                 println!("└");
             }
-            print!("Proceed? [y/N] ");
-            io::stdout().flush()?;
-            let mut line = String::new();
-            let read = io::stdin().read_line(&mut line)?;
-
-            // NO ONE TO ASK is not the same as a refusal, and saying
-            // "declined" when nobody declined is a lie the user cannot debug.
-            // `read_line` returns Ok(0) on a closed or non-interactive stdin -
-            // which is exactly what a `wrap` shim hands us, since the agent
-            // is not a person at a terminal.
-            //
-            // The verdict is unchanged: an `ask` nobody can answer must not
-            // run. Falling through to the y/N match would already have
-            // declined, by accident of an empty string failing to equal "y";
-            // this makes it a decision with a message that fits (#48 - a gate
-            // whose refusals are unexplainable gets uninstalled).
-            if read == 0 {
+            // An answer has to come from a person at a terminal. Under
+            // `wrap`, the agent's Bash tool hands us a pipe that never
+            // closes: the prompt blocked for 120 s until the harness gave
+            // up (Claude Code, Sep 10, 2026) - and the agent itself noted
+            // it could have piped `y` into the same stdin. Both end here:
+            // no terminal, no ask, refused with the reason. A pipe with a
+            // `y` in it is not a human.
+            if !stdin_is_terminal() {
                 eprintln!(
-                    "termaxa: this needs a human and stdin is not interactive — \
-                     refused rather than run unasked."
+                    "termaxa: this needs a human at a terminal and stdin is not one \
+                     (a pipe, a harness, a script) — refused rather than run unasked. \
+                     Add an allow rule, or run it yourself."
                 );
                 (Some(false), None)
-            } else if matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
-                if insure(&mut backup_id) {
-                    let code = execute(argv)?;
-                    (Some(true), Some(code))
+            } else {
+                print!("Proceed? [y/N] ");
+                io::stdout().flush()?;
+                let mut line = String::new();
+                let read = io::stdin().read_line(&mut line)?;
+
+                // NO ONE TO ASK is not the same as a refusal, and saying
+                // "declined" when nobody declined is a lie the user cannot debug.
+                // `read_line` returns Ok(0) on a closed or non-interactive stdin -
+                // which is exactly what a `wrap` shim hands us, since the agent
+                // is not a person at a terminal.
+                //
+                // The verdict is unchanged: an `ask` nobody can answer must not
+                // run. Falling through to the y/N match would already have
+                // declined, by accident of an empty string failing to equal "y";
+                // this makes it a decision with a message that fits (#48 - a gate
+                // whose refusals are unexplainable gets uninstalled).
+                if read == 0 {
+                    eprintln!(
+                        "termaxa: this needs a human and stdin is not interactive — \
+                     refused rather than run unasked."
+                    );
+                    (Some(false), None)
+                } else if matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+                    if insure(&mut backup_id) {
+                        let code = execute(argv)?;
+                        (Some(true), Some(code))
+                    } else {
+                        (Some(false), None)
+                    }
                 } else {
+                    eprintln!("termaxa: declined.");
                     (Some(false), None)
                 }
-            } else {
-                eprintln!("termaxa: declined.");
-                (Some(false), None)
             }
         }
         Action::Allow => {
@@ -169,6 +185,20 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     })?;
 
     Ok(exit_code.unwrap_or(1))
+}
+
+/// Whether stdin is a terminal - the only place an answer to an ask can come
+/// from. A pipe from a harness never closes, and a pipe from an agent can
+/// carry a `y`; neither is a person.
+#[cfg(unix)]
+fn stdin_is_terminal() -> bool {
+    // SAFETY: isatty on a constant fd is a pure query with no side effects.
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
+#[cfg(not(unix))]
+fn stdin_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 /// Rebuild a display/analysis string from argv WITHOUT losing token

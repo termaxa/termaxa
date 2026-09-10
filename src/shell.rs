@@ -375,7 +375,23 @@ fn wrapped_command(seg: &Segment) -> Option<(String, String)> {
             continue;
         }
         if !tok.starts_with("--") && tok[1..].contains('c') {
-            let script = tokens.get(i + 1)?;
+            // The string is the first operand after the options, not the
+            // token after `-c`: a shell accepts options in any order, and
+            // Claude Code spells its shell `zsh -c -l "..."` (measured
+            // Sep 10, 2026, under `wrap`). Reading `-l` as the command made
+            // every command the agent ran an unmatched ask.
+            let mut j = i + 1;
+            while let Some(t) = tokens.get(j) {
+                if t == "--" {
+                    j += 1;
+                    break;
+                }
+                if t == "-" || !t.starts_with('-') {
+                    break;
+                }
+                j += if t == "-o" { 2 } else { 1 };
+            }
+            let script = tokens.get(j)?;
             if script.trim().is_empty() {
                 return None;
             }
@@ -691,6 +707,32 @@ mod tests {
 
     /// #62. A POSIX shell's -c string is read as segments of its own,
     /// after the wrapper, each marked with the wrapper it came through.
+    /// Claude Code spells its shell `zsh -c -l "..."`, options after `-c`
+    /// (captured under `wrap`, Sep 10, 2026). The string is the first
+    /// operand after the options, whichever side of `-c` they sit on.
+    #[test]
+    fn options_after_dash_c_are_stepped_over() {
+        for cmd in [
+            r#"zsh -c -l "rm -rf ./dist""#,
+            r#"bash -c -e -o pipefail "rm -rf ./dist""#,
+            r#"sh -c -- "rm -rf ./dist""#,
+        ] {
+            let segs = split_segments_deep(cmd);
+            assert!(
+                segs.iter().any(|s| s.command().contains("rm -rf ./dist")
+                    && !s.command().starts_with("zsh")
+                    && !s.command().starts_with("bash")
+                    && !s.command().starts_with("sh")),
+                "the inner command must be its own segment for {cmd}: {:?}",
+                segs.iter()
+                    .map(|s| s.command().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+        // Nothing after the options is not a -c string.
+        assert_eq!(split_segments_deep("sh -c -l").len(), 1);
+    }
+
     #[test]
     fn a_posix_shell_c_string_is_read_as_its_own_segments() {
         let segs = split_segments_deep(r#"sh -c "cat /dev/null > src/main.rs""#);
