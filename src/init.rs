@@ -379,6 +379,54 @@ rules:
     action: allow
   - match: "echo *"
     action: allow
+  # Read-only Unix filters and probes. The demo video's own hero shot was an
+  # ask on `head -5`; Claude Code's first act in a session is `bash -c env`
+  # (Sep 10, 2026, under `wrap`), and an unattended ask on that is a session
+  # that never starts. Filters that only read stdin stay on the default in
+  # their bare form, as `cat` and `grep` do. `sort` and `uniq` are left out on
+  # purpose: `sort -o FILE` and `uniq IN OUT` write a file with no redirect
+  # for the gate to see. `env` is bare only - `env CMD` runs CMD, and an
+  # allow list widens by the head that names the action, never the runner.
+  - match: "head *"
+    action: allow
+  - match: "tail *"
+    action: allow
+  - match: "wc *"
+    action: allow
+  - match: "cut *"
+    action: allow
+  - match: "diff *"
+    action: allow
+  - match: "stat *"
+    action: allow
+  - match: "du"
+    action: allow
+  - match: "du *"
+    action: allow
+  - match: "pwd"
+    action: allow
+  - match: "pwd *"
+    action: allow
+  - match: "which *"
+    action: allow
+  - match: "date"
+    action: allow
+  - match: "date +*"
+    action: allow
+  - match: "env"
+    action: allow
+  - match: "printenv"
+    action: allow
+  - match: "printenv *"
+    action: allow
+  - match: "uname"
+    action: allow
+  - match: "uname *"
+    action: allow
+  - match: "id"
+    action: allow
+  - match: "id *"
+    action: allow
   - match: "git remote -v"
     action: allow
   - match: "git fetch*"

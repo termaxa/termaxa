@@ -538,7 +538,7 @@ impl Tok {
 /// `tokenize`, keeping provenance instead of discarding it. The `text` field
 /// of every token is byte-identical to what `tokenize` returns — consumers
 /// like `resolve_head` see exactly the strings they always did.
-fn tokenize_detailed(s: &str) -> Vec<Tok> {
+pub(crate) fn tokenize_detailed(s: &str) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;

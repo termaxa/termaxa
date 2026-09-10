@@ -390,7 +390,12 @@ impl Policy {
             // its own string had earned - every command through the `wrap`
             // shim was asked. The string decides; `deny sh *` still counts,
             // because that rule names the wrapper. Decision of 2026-09-03.
-            if seg.wraps && d.matched_rule.is_none() {
+            // Harness scaffolding is transparent on the same terms: Claude
+            // Code's `shopt -u extglob … && eval '<cmd>' …` fell to the
+            // default on `shopt` and outranked the verdict on `<cmd>`, so
+            // routed through `wrap` every command it ran was refused
+            // (Sep 10, 2026). The command inside the eval decides.
+            if (seg.wraps || seg.scaffold) && d.matched_rule.is_none() {
                 continue;
             }
             let replace = match &worst {
@@ -409,9 +414,10 @@ impl Policy {
             }
         }
         let Some((i, d)) = worst else {
-            // Every segment was an unnamed wrapper - only reachable if the
-            // depth limit cut the reading off with nothing inside. Judge the
-            // whole line as typed.
+            // Every segment was an unnamed wrapper or scaffolding with no
+            // command inside - a `-c` string that is all preamble, or the
+            // depth limit cutting the reading off. Judge the whole line as
+            // typed, which is the default for a line nobody named.
             return self.evaluate(command, ctx);
         };
         Decision {
@@ -1143,6 +1149,76 @@ rules:
         let d = policy.evaluate_command(r#"sh -c "ls -la""#, &here());
         assert_eq!(d.action, Action::Ask, "{}", d.reason);
         assert!(d.reason.contains("(inside sh -c)"), "{}", d.reason);
+    }
+
+    /// Claude Code's Bash tool call as it arrives through `wrap` (Sep 10,
+    /// 2026, verbatim from the audit log): the starter judges the command
+    /// inside the `eval`, not the `shopt`/`setopt` preamble that used to
+    /// fall to the default and refuse every command the agent ran. A read
+    /// is allowed and the reason names it; a delete is denied; the zsh form
+    /// and the form that sources a snapshot read the same; and a preamble
+    /// that is not the measured one falls back to the default - closed.
+    #[test]
+    fn claude_codes_tool_call_is_judged_by_the_command_inside_the_eval() {
+        let starter = Policy::builtin().unwrap();
+        let bash = |cmd: &str| {
+            format!(
+                r#"bash -c -l "shopt -u extglob 2>/dev/null || true && {{ \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; }} >/dev/null 2>&1 || true && eval '{cmd}' < /dev/null && pwd -P >| /tmp/claude-c32c-cwd""#
+            )
+        };
+        let d = starter.evaluate_command(&bash("ls -la /home/dev/proj/"), &here());
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        assert!(
+            d.reason.contains("`ls -la /home/dev/proj/` (inside eval)"),
+            "the reason names the agent's command: {}",
+            d.reason
+        );
+        let d = starter.evaluate_command(&bash("rm -rf ./scratch"), &here());
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        assert!(d.reason.contains("Recursive force delete"), "{}", d.reason);
+        let d = starter.evaluate_command(&bash("env"), &here());
+        assert_eq!(
+            d.action,
+            Action::Allow,
+            "Claude Code's first act: {}",
+            d.reason
+        );
+        let d = starter.evaluate_command(&bash("no-such-command-tmx"), &here());
+        assert_eq!(
+            d.action,
+            Action::Ask,
+            "an unknown command still asks: {}",
+            d.reason
+        );
+
+        let zsh = r#"zsh -c -l "setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'git status' < /dev/null && pwd -P >| /tmp/claude-b1de-cwd""#;
+        let d = starter.evaluate_command(zsh, &here());
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        assert!(
+            d.reason.contains("`git status` (inside eval)"),
+            "{}",
+            d.reason
+        );
+
+        let sourced = r#"bash -c "source /home/dev/.claude/shell-snapshots/snapshot-bash-1789077199590-d2kylp.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'cat README.md' < /dev/null && pwd -P >| /tmp/claude-0a1b-cwd""#;
+        let d = starter.evaluate_command(sourced, &here());
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+
+        // Drift fails closed: a preamble the reading does not know is a
+        // segment the default applies to, and the refusal names it.
+        let drifted =
+            r#"bash -c "shopt -u extglob nullglob 2>/dev/null || true && eval 'ls' < /dev/null""#;
+        let d = starter.evaluate_command(drifted, &here());
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
+        assert!(
+            d.reason.contains("`shopt -u extglob nullglob"),
+            "{}",
+            d.reason
+        );
+        // And a `source` of anything but the harness's own snapshot is judged.
+        let foreign = r#"bash -c "source /home/dev/.claude/shell-snapshots/../../.bashrc 2>/dev/null || true && eval 'ls' < /dev/null""#;
+        let d = starter.evaluate_command(foreign, &here());
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
     }
 
     /// A wrapper no rule names is transparent: `sh -c "echo hi"` is allowed

@@ -16,10 +16,16 @@
 //! at all, does not pass through anything. That residue is real and belongs
 //! in the same table that sells the rung.
 //!
-//! NO HARNESS IS CLAIMED AS COVERED (#20, #45). Whether a given agent's shell
-//! tool resolves `sh` through `PATH` or hardcodes `/bin/sh` is an empirical
-//! question about that agent, and nobody here has watched one do it. `doctor`
-//! reports what is wired; it does not promise what an unobserved harness will
+//! NO HARNESS IS CLAIMED AS COVERED UNTIL WATCHED (#20, #45). Whether a
+//! given agent's shell tool resolves `sh` through `PATH` or hardcodes
+//! `/bin/sh` is an empirical question about that agent. One has been watched
+//! (Sep 10, 2026, `strace -f -e trace=execve` on a wrapped headless session):
+//! Claude Code looks for zsh on `PATH` and at four absolute paths, and with
+//! none found runs `/bin/bash` by absolute path — nothing on `PATH` sees it.
+//! It honours `CLAUDE_CODE_SHELL`, so `run` sets that to the `bash` shim and
+//! the same session then went through the shim on every call. A harness that
+//! hardcodes its shell and offers no such setting is outside this mechanism,
+//! and `doctor` reports what is wired, not what an unobserved harness will
 //! do. Measured, then written — not the reverse.
 //!
 //! WHY THE SHIM DIR IS OPERATOR-OWNED FROM THE START (#51). A directory on
@@ -239,6 +245,19 @@ fn is_executable_file(p: &Path) -> bool {
     std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
 
+/// The shell the agent is told to use: the `bash` shim when bash is
+/// installed, else the `sh` shim. Claude Code accepts only a bash or zsh
+/// path in `CLAUDE_CODE_SHELL` and `$SHELL`; other harnesses that read
+/// `$SHELL` get a shim either way.
+pub(crate) fn agent_shell(shim_dir: &Path) -> PathBuf {
+    let bash = shim_dir.join("bash");
+    if bash.is_file() {
+        bash
+    } else {
+        shim_dir.join("sh")
+    }
+}
+
 /// Launch `argv` with the shims in front of it.
 pub fn run(argv: &[String], termaxa_home: &Path) -> Result<i32> {
     if argv.is_empty() {
@@ -250,10 +269,34 @@ pub fn run(argv: &[String], termaxa_home: &Path) -> Result<i32> {
     let existing = std::env::var("PATH").unwrap_or_default();
     let path = format!("{}{}{}", dir.display(), path_separator(), existing);
 
+    // Claude Code never resolves bash through PATH. Measured Sep 10, 2026
+    // under strace: it probes zsh at four absolute paths and then runs
+    // `/bin/bash` by absolute path for its snapshot and every Bash tool
+    // call, so on a box without zsh the shim saw nothing and `rm -rf
+    // ./scratch` ran with no audit entry, three times. It does honour
+    // `CLAUDE_CODE_SHELL` (documented: a path to a bash or zsh binary), and
+    // reads `$SHELL` only when that names bash or zsh - the `sh` shim it was
+    // handed is neither. So both point at the `bash` shim when there is one,
+    // and the same run then went through the shim four times out of four.
+    // An operator value that points outside the shim directory is
+    // overridden and said so: a wrapper that silently routes nothing is the
+    // failure this repairs.
+    let shell = agent_shell(&dir);
+    if let Some(prev) = std::env::var_os("CLAUDE_CODE_SHELL") {
+        if Path::new(&prev) != shell {
+            eprintln!(
+                "termaxa wrap: CLAUDE_CODE_SHELL was {}; set to {} so Claude Code's shell is the gate",
+                Path::new(&prev).display(),
+                shell.display()
+            );
+        }
+    }
+
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .env("PATH", path)
-        .env("SHELL", dir.join("sh"))
+        .env("SHELL", &shell)
+        .env("CLAUDE_CODE_SHELL", &shell)
         // A marker the gate can see, so a shimmed command is distinguishable
         // in the record from one that arrived by hook. Not a security
         // control - anything in the child can unset it - which is why it is
@@ -295,6 +338,25 @@ fn path_separator() -> &'static str {
 mod tests {
     use super::*;
     use crate::testutil::TempTree;
+
+    /// Claude Code takes a shell from `CLAUDE_CODE_SHELL` or `$SHELL` only
+    /// when the path names bash or zsh, so the agent is told to use the
+    /// `bash` shim; with no bash on the machine it is told the `sh` shim,
+    /// which other harnesses still honour.
+    #[cfg(unix)]
+    #[test]
+    fn the_agent_is_told_to_use_the_bash_shim() {
+        let t = TempTree::new("wrap-agent-shell");
+        let dir = install_shims(t.path(), Path::new("/usr/bin/termaxa")).unwrap();
+        assert_eq!(
+            agent_shell(&dir),
+            dir.join("bash"),
+            "bash exists on any unix test machine"
+        );
+        let empty = t.path().join("no-shims");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(agent_shell(&empty), empty.join("sh"));
+    }
 
     #[cfg(unix)]
     #[test]

@@ -151,7 +151,7 @@ Supervised mode (v0.17) is not a switch from "unsafe" to "safe". It is one of fo
 |---|---|---|---|
 | **hook** (basic, default, all platforms) | the harness invokes the hook | the agent's own user | edit the policy and hook configs (advised against by the self-defence rules and the write matcher), delete the record, bypass via any non-hooked execution path |
 | **hook + modes** (Unix, no daemon) | same | the agent's user, but policy and configs operator-owned | delete or edit the record and the backups; bypass via non-hooked paths |
-| **wrapped** (`termaxa wrap -- <agent>`) | every command run *through a shell* reaches the gate, hooked or not | the agent's user | tamper with the record; escape via tools that execute without spawning through the wrapper — an absolute `/bin/sh`, or a direct `execve` |
+| **wrapped** (`termaxa wrap -- <agent>`) | every command run *through a shell resolved by name* reaches the gate, hooked or not; Claude Code is pointed at the shim through `CLAUDE_CODE_SHELL` | the agent's user | tamper with the record; escape via tools that execute without spawning through the wrapper — an absolute `/bin/sh`, or a direct `execve` |
 | **supervised** (wrap + daemon + modes) | wrapped | **the operator's user** | attempt commands, each of which is denied and recorded; social-engineer the human; anything root-adjacent the OS itself permits |
 
 Two things worth reading off that table rather than around it.

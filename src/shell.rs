@@ -336,18 +336,133 @@ fn expand_into(out: &mut Vec<Segment>, segments: Vec<Segment>, via: Option<&str>
         if let Some(v) = via {
             seg.via = Some(v.to_string());
         }
+        // Scaffolding is only ever a harness's, and a harness only ever
+        // speaks through a `-c` string; typed at the top level, the same
+        // words are a person's command and are judged as one.
+        seg.scaffold = via.is_some() && harness_scaffold(&seg);
         let inner = if depth < MAX_WRAP_DEPTH {
-            wrapped_command(&seg)
+            wrapped_command(&seg).or_else(|| wrapped_eval(&seg))
         } else {
             None
         };
         seg.wraps = inner.is_some();
         out.push(seg);
         if let Some((shell, script)) = inner {
-            let label = format!("{shell} -c");
+            let label = if shell == "eval" {
+                "eval".to_string()
+            } else {
+                format!("{shell} -c")
+            };
             expand_into(out, split_segments(&script), Some(&label), depth + 1);
         }
     }
+}
+
+/// The pieces Claude Code puts around every Bash tool call, as it sends
+/// them (2.1.267 and 2.1.268, Sep 10, 2026). Matched on the segment's own
+/// words with a leading backslash dropped (`\builtin` is how it spells the
+/// builtin), so a redirect the piece carries — `2>/dev/null`, `>/dev/null
+/// 2>&1` — does not enter the comparison. The `pwd -P` line is the one
+/// piece that writes: a fresh `/tmp/claude-<hex>-cwd` per call, which is
+/// how the harness learns the directory the command left the shell in.
+fn harness_scaffold(seg: &Segment) -> bool {
+    let words: Vec<String> = crate::delete::tokenize_public(seg.command())
+        .into_iter()
+        .map(|w| w.trim_start_matches('\\').to_string())
+        .collect();
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    match w.as_slice() {
+        ["shopt", "-u", "extglob"]
+        | ["setopt", "NO_EXTENDED_GLOB", "NO_BARE_GLOB_QUAL"]
+        | ["true"]
+        | ["{", "builtin", "unalias", "--", "unsetenv"]
+        | ["builtin", "unset", "-f", "--", "unsetenv"]
+        | ["}"] => true,
+        ["source", path] => is_claude_snapshot(path),
+        ["pwd", "-P"] => {
+            seg.redirects.len() == 1
+                && seg.redirects[0].truncates
+                && is_claude_cwd_file(&seg.redirects[0].target)
+        }
+        _ => false,
+    }
+}
+
+/// `<home>/.claude/shell-snapshots/snapshot-<shell>-<digits>-<id>.sh`, the
+/// file Claude Code writes at startup and sources before every command.
+/// `source` runs whatever the file holds, so transparency here is only for
+/// that file's own name: no `..` anywhere, and the three-part name exactly.
+fn is_claude_snapshot(path: &str) -> bool {
+    let Some((dir, file)) = path.rsplit_once('/') else {
+        return false;
+    };
+    if !dir.ends_with("/.claude/shell-snapshots") || dir.split('/').any(|c| c == "..") {
+        return false;
+    }
+    let Some(mid) = file
+        .strip_prefix("snapshot-")
+        .and_then(|r| r.strip_suffix(".sh"))
+    else {
+        return false;
+    };
+    let parts: Vec<&str> = mid.splitn(3, '-').collect();
+    parts.len() == 3
+        && parts[0].chars().all(|c| c.is_ascii_alphanumeric())
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+        && parts[2].chars().all(|c| c.is_ascii_alphanumeric())
+        && parts.iter().all(|p| !p.is_empty())
+}
+
+/// `/tmp/claude-<hex>-cwd`, the one file the preamble writes: where the
+/// command left the shell, for the harness to read back. Nothing else.
+fn is_claude_cwd_file(target: &str) -> bool {
+    target
+        .strip_prefix("/tmp/claude-")
+        .and_then(|r| r.strip_suffix("-cwd"))
+        .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// `eval '<string>'` with exactly one operand that arrived inside single
+/// quotes is the string, run as a command line: the shell expands nothing
+/// in single quotes, so the text is the command verbatim. Read the same way
+/// as a `-c` string, under the label `eval`. Claude Code runs the agent's
+/// command through exactly this form. An `eval` with a double-quoted or
+/// bare operand may expand before it runs and is not read; it stays a
+/// segment the policy judges as typed, which is the default for `eval`.
+fn wrapped_eval(seg: &Segment) -> Option<(String, String)> {
+    let toks = crate::delete::tokenize_detailed(seg.command());
+    let words: Vec<String> = toks.iter().map(|t| t.text.clone()).collect();
+    let (head, at) = crate::delete::resolve_head(&words)?;
+    if head != "eval" || toks.len() != at + 2 {
+        return None;
+    }
+    let arg = &toks[at + 1];
+    if !arg.single_quoted || arg.text.trim().is_empty() {
+        return None;
+    }
+    Some((head, arg.text.clone()))
+}
+
+/// The command as the context check should read it: the segments that
+/// decide, joined, with unnamed wrappers and harness scaffolding left out.
+/// Claude Code's preamble carries `unset -f`, and read raw it was a
+/// "destructive flag" on every command the agent ran, escalating each
+/// allowed one to an ask (Sep 10, 2026). What remains here is what the
+/// policy judged. A command with nothing to leave out is returned as typed.
+pub fn context_text(command: &str) -> String {
+    let segs = split_segments_deep(command);
+    if segs.len() <= 1 {
+        return command.to_string();
+    }
+    let kept: Vec<&str> = segs
+        .iter()
+        .filter(|s| !s.wraps && !s.scaffold)
+        .map(|s| s.text.as_str())
+        .collect();
+    if kept.is_empty() {
+        return command.to_string();
+    }
+    kept.join("; ")
 }
 
 /// The shell and the string, when this segment is a POSIX shell running a
@@ -434,6 +549,19 @@ pub struct Segment {
     /// decides, not the policy default applied to `sh` (#65, decision of
     /// 2026-09-03).
     pub wraps: bool,
+    /// True when this segment is scaffolding a harness puts around the
+    /// command it actually runs. Claude Code sends every Bash tool call as
+    /// `shopt -u extglob 2>/dev/null || true && { \builtin unalias --
+    /// 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true
+    /// && eval '<cmd>' < /dev/null && pwd -P >| /tmp/claude-<hex>-cwd`, with
+    /// `setopt …` under zsh and a `source ~/.claude/shell-snapshots/….sh`
+    /// in front when its snapshot exists (measured Sep 10, 2026, under
+    /// `wrap`). Each of those pieces is recognised by exact form, and only
+    /// inside a `-c` string; the policy treats it as transparent unless a
+    /// rule names it, the same way it treats an unnamed wrapper. The
+    /// command inside the `eval` decides. Anything the harness changes in
+    /// that preamble stops matching and falls back to the default: closed.
+    pub scaffold: bool,
 }
 
 impl Segment {
@@ -532,6 +660,7 @@ fn flush(
             redirects: std::mem::take(redirects),
             via: None,
             wraps: false,
+            scaffold: false,
         });
     } else {
         // Nothing but whitespace between separators: whatever the redirect
@@ -789,6 +918,133 @@ mod tests {
         assert_eq!(segs[0].redirects[0].target, "out.log");
         assert!(segs[1].redirects.is_empty());
         assert_eq!(&*segs[1], "echo hi");
+    }
+
+    /// Claude Code's Bash tool call, verbatim from the audit log of the first
+    /// routed session (Sep 10, 2026): every piece around the `eval` is
+    /// scaffolding, the `eval` is a wrapper, and the agent's command follows
+    /// it as segments of its own. The zsh form and the form with a snapshot
+    /// to source are read the same way. The preamble's `unset -f` is left
+    /// out of the text the context check reads.
+    #[test]
+    fn claude_codes_preamble_is_scaffolding_and_its_eval_is_read() {
+        let bash = r#"bash -c -l "shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'ls -la /home/dev/proj/ 2>&1; echo \"--- scratch check ---\"; ls -la /home/dev/proj/scratch 2>&1' < /dev/null && pwd -P >| /tmp/claude-c32c-cwd""#;
+        let segs = split_segments_deep(bash);
+        let texts: Vec<&str> = segs.iter().map(|s| &**s).collect();
+        assert_eq!(
+            texts,
+            [
+                bash,
+                "shopt -u extglob 2>/dev/null",
+                "true",
+                r"{ \builtin unalias -- 'unsetenv'",
+                r"\builtin unset -f -- 'unsetenv'",
+                "} >/dev/null 2>&1",
+                "true",
+                r#"eval 'ls -la /home/dev/proj/ 2>&1; echo "--- scratch check ---"; ls -la /home/dev/proj/scratch 2>&1' < /dev/null"#,
+                "ls -la /home/dev/proj/ 2>&1",
+                r#"echo "--- scratch check ---""#,
+                "ls -la /home/dev/proj/scratch 2>&1",
+                "pwd -P >| /tmp/claude-c32c-cwd",
+            ]
+        );
+        let scaffold: Vec<bool> = segs.iter().map(|s| s.scaffold).collect();
+        assert_eq!(
+            scaffold,
+            [false, true, true, true, true, true, true, false, false, false, false, true]
+        );
+        assert!(
+            segs[0].wraps && segs[7].wraps,
+            "the shell and the eval are wrappers"
+        );
+        assert_eq!(segs[8].via.as_deref(), Some("eval"));
+        assert_eq!(segs[10].via.as_deref(), Some("eval"));
+        assert_eq!(
+            context_text(bash),
+            r#"ls -la /home/dev/proj/ 2>&1; echo "--- scratch check ---"; ls -la /home/dev/proj/scratch 2>&1"#,
+            "the context check reads the agent's command, not the preamble"
+        );
+        assert!(!context_text(bash).contains("unset -f"));
+
+        let zsh = r#"zsh -c -l "setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'rm -rf ./scratch' < /dev/null && pwd -P >| /tmp/claude-b1de-cwd""#;
+        let segs = split_segments_deep(zsh);
+        let inner: Vec<&str> = segs
+            .iter()
+            .filter(|s| !s.wraps && !s.scaffold)
+            .map(|s| &**s)
+            .collect();
+        assert_eq!(inner, ["rm -rf ./scratch"]);
+        assert_eq!(context_text(zsh), "rm -rf ./scratch");
+
+        let sourced = r#"bash -c "source /home/dev/.claude/shell-snapshots/snapshot-bash-1789077199590-d2kylp.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && eval 'git status' < /dev/null && pwd -P >| /tmp/claude-0a1b-cwd""#;
+        let segs = split_segments_deep(sourced);
+        assert!(segs[1].scaffold, "sourcing its own snapshot: {}", &*segs[1]);
+        let inner: Vec<&str> = segs
+            .iter()
+            .filter(|s| !s.wraps && !s.scaffold)
+            .map(|s| &**s)
+            .collect();
+        assert_eq!(inner, ["git status"]);
+    }
+
+    /// What the scaffolding reading leaves alone: the same words typed at
+    /// the top level, a preamble that drifted, a `source` of anything but
+    /// the harness's own snapshot, a `pwd` writing anywhere else, and an
+    /// `eval` whose operand the shell could still expand.
+    #[test]
+    fn what_the_scaffolding_reading_leaves_alone() {
+        for top in ["shopt -u extglob", "true", "pwd -P >| /tmp/claude-c32c-cwd"] {
+            let segs = split_segments_deep(top);
+            assert!(!segs[0].scaffold, "typed at the top level: {top}");
+        }
+        for inside in [
+            "shopt -u extglob nullglob 2>/dev/null",
+            "setopt NO_EXTENDED_GLOB 2>/dev/null",
+            r"\\builtin unset -f -- 'rm'",
+            "source /home/dev/.bashrc 2>/dev/null",
+            "source /home/dev/.claude/shell-snapshots/../../.bashrc 2>/dev/null",
+            "pwd -P >| /home/dev/notes.txt",
+            "pwd -P >> /tmp/claude-c32c-cwd",
+            "pwd >| /tmp/claude-c32c-cwd",
+        ] {
+            let segs = split_segments_deep(&format!(r#"bash -c "{inside}""#));
+            assert_eq!(segs.len(), 2, "{inside}");
+            assert!(!segs[1].scaffold, "not the measured form: {inside}");
+        }
+        // The snapshot path check is on the path, not on the word `source`.
+        let ok = split_segments_deep(
+            r#"bash -c "source /Users/x/.claude/shell-snapshots/snapshot-zsh-1-abc.sh 2>/dev/null""#,
+        );
+        assert!(ok[1].scaffold);
+
+        for not_read in [
+            r#"eval "$cmd""#,
+            "eval $cmd",
+            "eval 'ls' 'more'",
+            "eval",
+            "eval ''",
+        ] {
+            let segs = split_segments_deep(not_read);
+            assert_eq!(segs.len(), 1, "{not_read}");
+            assert!(!segs[0].wraps, "{not_read}");
+        }
+        // A single-quoted eval is read wherever it stands, and a wrapper
+        // inside the eval is read on too.
+        let segs = split_segments_deep("eval 'sh -c \"rm -rf ./dist\"'");
+        let texts: Vec<&str> = segs.iter().map(|s| &**s).collect();
+        assert_eq!(
+            texts,
+            [
+                "eval 'sh -c \"rm -rf ./dist\"'",
+                "sh -c \"rm -rf ./dist\"",
+                "rm -rf ./dist"
+            ]
+        );
+        assert_eq!(segs[1].via.as_deref(), Some("eval"));
+        assert_eq!(segs[2].via.as_deref(), Some("sh -c"));
+        // A line with nothing to leave out reads as typed.
+        assert_eq!(context_text("git push --force"), "git push --force");
+        assert_eq!(context_text("ls && rm -rf x"), "ls; rm -rf x");
     }
 
     /// What is deliberately not read: a script file, a bare `-c`, a shell

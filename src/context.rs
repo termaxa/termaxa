@@ -9,8 +9,17 @@ pub struct Signal {
 }
 
 /// Gather cheap, local context signals. Never fails; absence of signal is fine.
+///
+/// The signals are read off the command the policy judged - unnamed
+/// wrappers and harness scaffolding left out - not off the raw line. Claude
+/// Code's preamble says `unset -f` on every Bash tool call; read raw, that
+/// was a destructive flag escalating every allowed command to an ask
+/// (Sep 10, 2026, under `wrap`). A flag on the agent's own command is still
+/// found: it is inside the part that is kept.
 pub fn gather(command: &str) -> Vec<Signal> {
     let mut signals = Vec::new();
+    let command = crate::shell::context_text(command);
+    let command = command.as_str();
     let cmd_lc = command.to_lowercase();
 
     // Git branch awareness: pushing/committing while on a protected branch.
@@ -183,6 +192,39 @@ mod tests {
             matched_rule: None,
             reason: "because".into(),
         }
+    }
+
+    /// Claude Code's preamble carries `unset -f`; read raw it was a
+    /// destructive flag on every command the agent ran, and every allow
+    /// became an ask (Sep 10, 2026). The signals come off the command the
+    /// policy judged: no flag for `ls`, and the agent's own `-rf` is still
+    /// found inside the eval.
+    #[test]
+    fn a_harness_preamble_is_not_a_destructive_flag_on_the_agents_command() {
+        let form = |cmd: &str| {
+            format!(
+                r#"bash -c -l "shopt -u extglob 2>/dev/null || true && {{ \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; }} >/dev/null 2>&1 || true && eval '{cmd}' < /dev/null && pwd -P >| /tmp/claude-c32c-cwd""#
+            )
+        };
+        let quiet = gather(&form("ls -la /home/dev/proj/"));
+        assert!(
+            quiet
+                .iter()
+                .all(|s| !s.label.starts_with("destructive flag")),
+            "{quiet:?}"
+        );
+        let loud = gather(&form("rm -rf ./scratch"));
+        assert!(
+            loud.iter()
+                .any(|s| s.label == "destructive flag detected: -rf" && s.escalate),
+            "{loud:?}"
+        );
+        // A plain command reads as it always did.
+        let plain = gather("git push --force origin main");
+        assert!(
+            plain.iter().any(|s| s.label.contains("--force")),
+            "{plain:?}"
+        );
     }
 
     /// THE PRECEDENCE, pinned in every direction so it cannot be misread.

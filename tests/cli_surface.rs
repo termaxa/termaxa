@@ -574,6 +574,73 @@ fn wrap_reads_a_c_wherever_the_shell_would() {
     );
 }
 
+/// Sep 10, 2026, under strace: Claude Code probes zsh at four absolute
+/// paths and then runs `/bin/bash` by absolute path, so the shim on `PATH`
+/// saw nothing and an unattended `rm -rf ./scratch` ran with no audit
+/// entry. It honours `CLAUDE_CODE_SHELL` and reads `$SHELL` only when that
+/// names bash or zsh. So the wrapped agent is handed the `bash` shim in
+/// both, and an operator value pointing elsewhere is overridden and said.
+#[test]
+fn wrap_hands_the_agent_the_bash_shim_by_name() {
+    let tmp = scratch("wrap-agent-shell");
+    let (home, proj) = (tmp.join("home"), project(&tmp));
+    std::fs::write(
+        proj.join(".termaxa").join("policy.yaml"),
+        "version: 1\ndefault: ask\nrules:\n  - match: \"sh*\"\n    action: allow\n  \
+         - match: \"echo*\"\n    action: allow\n",
+    )
+    .unwrap();
+    let out = termaxa_within(
+        &home,
+        &proj,
+        &[
+            "wrap",
+            "--",
+            "sh",
+            "-c",
+            "echo shell=$SHELL claude=$CLAUDE_CODE_SHELL",
+        ],
+        "",
+        30,
+    );
+    let shim = home.join("shims").join("bash");
+    let want = format!("shell={} claude={}", shim.display(), shim.display());
+    assert!(
+        out.stdout.contains(&want),
+        "want `{want}`\nstdout: {}\nstderr: {}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("CLAUDE_CODE_SHELL was"),
+        "nothing to override, nothing said: {}",
+        out.stderr
+    );
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_termaxa"));
+    let out = cmd
+        .args(["wrap", "--", "sh", "-c", "echo claude=$CLAUDE_CODE_SHELL"])
+        .current_dir(&proj)
+        .env("TERMAXA_HOME", &home)
+        .env("NO_COLOR", "1")
+        .env("CLAUDE_CODE_SHELL", "/opt/homebrew/bin/bash")
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary must be runnable");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        stdout.contains(&format!("claude={}", shim.display())),
+        "the operator's value is overridden: {stdout}"
+    );
+    assert!(
+        stderr.contains("CLAUDE_CODE_SHELL was /opt/homebrew/bin/bash; set to"),
+        "and the override is said: {stderr}"
+    );
+}
+
 /// The fail-mode knob. A payload that looks like a shell tool call but that
 /// the reader cannot parse passes through by default (exit 0, no decision),
 /// exactly as it always did; under `unrecognised: deny` it is refused with a
