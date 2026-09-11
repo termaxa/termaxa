@@ -578,10 +578,13 @@ fn wrap_reads_a_c_wherever_the_shell_would() {
 /// paths and then runs `/bin/bash` by absolute path, so the shim on `PATH`
 /// saw nothing and an unattended `rm -rf ./scratch` ran with no audit
 /// entry. It honours `CLAUDE_CODE_SHELL` and reads `$SHELL` only when that
-/// names bash or zsh. So the wrapped agent is handed the `bash` shim in
-/// both, and an operator value pointing elsewhere is overridden and said.
+/// names bash or zsh. So the wrapped agent is handed, in both, the shim for
+/// the shell it would have chosen itself - zsh when the machine has one,
+/// else bash (Sep 11: v0.18.5 handed a zsh machine the bash shim and moved
+/// the agent to `bash -l`). An operator value naming one of the shims is
+/// kept; one pointing elsewhere is overridden and said.
 #[test]
-fn wrap_hands_the_agent_the_bash_shim_by_name() {
+fn wrap_hands_the_agent_the_shim_for_its_own_shell_by_name() {
     let tmp = scratch("wrap-agent-shell");
     let (home, proj) = (tmp.join("home"), project(&tmp));
     std::fs::write(
@@ -603,7 +606,12 @@ fn wrap_hands_the_agent_the_bash_shim_by_name() {
         "",
         30,
     );
-    let shim = home.join("shims").join("bash");
+    let shims = home.join("shims");
+    let shim = if shims.join("zsh").is_file() {
+        shims.join("zsh")
+    } else {
+        shims.join("bash")
+    };
     let want = format!("shell={} claude={}", shim.display(), shim.display());
     assert!(
         out.stdout.contains(&want),
@@ -617,27 +625,44 @@ fn wrap_hands_the_agent_the_bash_shim_by_name() {
         out.stderr
     );
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_termaxa"));
-    let out = cmd
-        .args(["wrap", "--", "sh", "-c", "echo claude=$CLAUDE_CODE_SHELL"])
-        .current_dir(&proj)
-        .env("TERMAXA_HOME", &home)
-        .env("NO_COLOR", "1")
-        .env("CLAUDE_CODE_SHELL", "/opt/homebrew/bin/bash")
-        .stdin(Stdio::null())
-        .output()
-        .expect("the binary must be runnable");
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
+    let run = |value: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_termaxa"));
+        let out = cmd
+            .args(["wrap", "--", "sh", "-c", "echo claude=$CLAUDE_CODE_SHELL"])
+            .current_dir(&proj)
+            .env("TERMAXA_HOME", &home)
+            .env("NO_COLOR", "1")
+            .env("CLAUDE_CODE_SHELL", value)
+            .stdin(Stdio::null())
+            .output()
+            .expect("the binary must be runnable");
+        (
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    let (stdout, stderr) = run("/opt/homebrew/bin/bash");
     assert!(
         stdout.contains(&format!("claude={}", shim.display())),
-        "the operator's value is overridden: {stdout}"
+        "an outside value is overridden: {stdout}"
     );
     assert!(
         stderr.contains("CLAUDE_CODE_SHELL was /opt/homebrew/bin/bash; set to"),
         "and the override is said: {stderr}"
+    );
+
+    // The operator pointing at one of the shims is choosing a shell inside
+    // the gate, and is kept - the sh shim exists on every machine.
+    let own = shims.join("sh");
+    let (stdout, stderr) = run(&own.display().to_string());
+    assert!(
+        stdout.contains(&format!("claude={}", own.display())),
+        "the operator's own shim is kept: {stdout}"
+    );
+    assert!(
+        !stderr.contains("CLAUDE_CODE_SHELL was"),
+        "and nothing is said: {stderr}"
     );
 }
 

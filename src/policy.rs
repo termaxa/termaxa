@@ -1183,6 +1183,22 @@ rules:
             "Claude Code's first act: {}",
             d.reason
         );
+        // Refused on `cd` under `wrap`, Sep 11, 2026: a read-only command
+        // with one word in it that had no rule.
+        let d = starter.evaluate_command(
+            &bash(
+                r#"ls -la /home/dev/proj/scratch; echo "---git-tracked---"; cd /home/dev/proj && git ls-files scratch"#,
+            ),
+            &here(),
+        );
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        let d = starter.evaluate_command("git tag -d v1.0", &here());
+        assert_eq!(
+            d.action,
+            Action::Ask,
+            "a tag delete stays on the default: {}",
+            d.reason
+        );
         let d = starter.evaluate_command(&bash("no-such-command-tmx"), &here());
         assert_eq!(
             d.action,

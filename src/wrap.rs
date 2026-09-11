@@ -245,17 +245,40 @@ fn is_executable_file(p: &Path) -> bool {
     std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
 
-/// The shell the agent is told to use: the `bash` shim when bash is
-/// installed, else the `sh` shim. Claude Code accepts only a bash or zsh
-/// path in `CLAUDE_CODE_SHELL` and `$SHELL`; other harnesses that read
-/// `$SHELL` get a shim either way.
+/// The shell the agent is told to use: the shim for the shell it would have
+/// chosen on its own. Claude Code looks for zsh first and bash second
+/// (measured Sep 10, 2026), and on a Mac the user's PATH and aliases live in
+/// `~/.zshrc`; v0.18.5 handed every such machine the `bash` shim and moved
+/// the agent to `bash -l` (measured Sep 11: zsh installed, not one zsh probe,
+/// five bash spawns). So: the `zsh` shim when a real zsh exists - the shim
+/// is only written when one does - else the `bash` shim, else the `sh` shim.
+/// The agent keeps its environment; only the gate is inserted. Claude Code
+/// accepts only a bash or zsh path in `CLAUDE_CODE_SHELL` and `$SHELL`;
+/// other harnesses that read `$SHELL` get a shim either way.
 pub(crate) fn agent_shell(shim_dir: &Path) -> PathBuf {
-    let bash = shim_dir.join("bash");
-    if bash.is_file() {
-        bash
-    } else {
-        shim_dir.join("sh")
+    for name in ["zsh", "bash"] {
+        let shim = shim_dir.join(name);
+        if shim.is_file() {
+            return shim;
+        }
     }
+    shim_dir.join("sh")
+}
+
+/// The shell to hand the agent, given what the operator set. A
+/// `CLAUDE_CODE_SHELL` that already names one of the shims is the operator
+/// choosing a shell inside the gate, and is kept as is. Anything else -
+/// unset, or a path outside the shim directory - becomes [`agent_shell`],
+/// and the override is returned so `run` can say so: a wrapper that silently
+/// routes nothing is the failure this repairs.
+pub(crate) fn chosen_shell(shim_dir: &Path, operator: Option<&Path>) -> (PathBuf, Option<PathBuf>) {
+    if let Some(op) = operator {
+        if op.parent() == Some(shim_dir) && op.is_file() {
+            return (op.to_path_buf(), None);
+        }
+        return (agent_shell(shim_dir), Some(op.to_path_buf()));
+    }
+    (agent_shell(shim_dir), None)
 }
 
 /// Launch `argv` with the shims in front of it.
@@ -274,22 +297,21 @@ pub fn run(argv: &[String], termaxa_home: &Path) -> Result<i32> {
     // `/bin/bash` by absolute path for its snapshot and every Bash tool
     // call, so on a box without zsh the shim saw nothing and `rm -rf
     // ./scratch` ran with no audit entry, three times. It does honour
-    // `CLAUDE_CODE_SHELL` (documented: a path to a bash or zsh binary), and
-    // reads `$SHELL` only when that names bash or zsh - the `sh` shim it was
-    // handed is neither. So both point at the `bash` shim when there is one,
-    // and the same run then went through the shim four times out of four.
-    // An operator value that points outside the shim directory is
-    // overridden and said so: a wrapper that silently routes nothing is the
-    // failure this repairs.
-    let shell = agent_shell(&dir);
-    if let Some(prev) = std::env::var_os("CLAUDE_CODE_SHELL") {
-        if Path::new(&prev) != shell {
-            eprintln!(
-                "termaxa wrap: CLAUDE_CODE_SHELL was {}; set to {} so Claude Code's shell is the gate",
-                Path::new(&prev).display(),
-                shell.display()
-            );
-        }
+    // `CLAUDE_CODE_SHELL` (documented: a path to a bash or zsh binary, taken
+    // over its own detection), and reads `$SHELL` only when that names bash
+    // or zsh - the `sh` shim it was handed is neither. So both point at the
+    // shim for the shell it would have chosen itself (`agent_shell`), and the
+    // same run then went through the shim five times out of five. An
+    // operator value naming one of the shims is kept; one pointing outside
+    // the shim directory is overridden and said so.
+    let operator = std::env::var_os("CLAUDE_CODE_SHELL").map(PathBuf::from);
+    let (shell, overridden) = chosen_shell(&dir, operator.as_deref());
+    if let Some(prev) = overridden {
+        eprintln!(
+            "termaxa wrap: CLAUDE_CODE_SHELL was {}; set to {} so Claude Code's shell is the gate",
+            prev.display(),
+            shell.display()
+        );
     }
 
     let mut cmd = std::process::Command::new(&argv[0]);
@@ -339,23 +361,70 @@ mod tests {
     use super::*;
     use crate::testutil::TempTree;
 
-    /// Claude Code takes a shell from `CLAUDE_CODE_SHELL` or `$SHELL` only
-    /// when the path names bash or zsh, so the agent is told to use the
-    /// `bash` shim; with no bash on the machine it is told the `sh` shim,
-    /// which other harnesses still honour.
+    /// The agent is told to use the shim for the shell it would have chosen
+    /// itself: zsh when a real zsh exists (the shim is only written when one
+    /// does), else bash, else sh. Pinned on a synthetic shim directory so it
+    /// does not depend on what the test machine has installed, and once on
+    /// the real one, where the answer is whichever of zsh and bash exists.
     #[cfg(unix)]
     #[test]
-    fn the_agent_is_told_to_use_the_bash_shim() {
+    fn the_agent_is_told_to_use_the_shim_for_the_shell_it_would_have_chosen() {
         let t = TempTree::new("wrap-agent-shell");
+        let fake = t.path().join("fake-shims");
+        std::fs::create_dir_all(&fake).unwrap();
+        for name in ["sh", "bash", "zsh"] {
+            std::fs::write(fake.join(name), "#!/bin/sh\n").unwrap();
+        }
+        assert_eq!(agent_shell(&fake), fake.join("zsh"));
+        std::fs::remove_file(fake.join("zsh")).unwrap();
+        assert_eq!(agent_shell(&fake), fake.join("bash"));
+        std::fs::remove_file(fake.join("bash")).unwrap();
+        assert_eq!(agent_shell(&fake), fake.join("sh"));
+
         let dir = install_shims(t.path(), Path::new("/usr/bin/termaxa")).unwrap();
+        let want = if dir.join("zsh").is_file() {
+            dir.join("zsh")
+        } else {
+            dir.join("bash")
+        };
+        assert_eq!(agent_shell(&dir), want);
+    }
+
+    /// An operator value that already names one of the shims is the operator
+    /// choosing a shell inside the gate, and is kept. A value outside the
+    /// shim directory - or naming a shim that does not exist - is replaced
+    /// and reported. Unset is the default.
+    #[cfg(unix)]
+    #[test]
+    fn an_operators_shim_is_kept_and_anything_else_is_overridden_and_said() {
+        let t = TempTree::new("wrap-chosen-shell");
+        let fake = t.path().join("fake-shims");
+        std::fs::create_dir_all(&fake).unwrap();
+        for name in ["sh", "bash", "zsh"] {
+            std::fs::write(fake.join(name), "#!/bin/sh\n").unwrap();
+        }
+        assert_eq!(chosen_shell(&fake, None), (fake.join("zsh"), None));
         assert_eq!(
-            agent_shell(&dir),
-            dir.join("bash"),
-            "bash exists on any unix test machine"
+            chosen_shell(&fake, Some(&fake.join("bash"))),
+            (fake.join("bash"), None),
+            "the operator's own shim is kept"
         );
-        let empty = t.path().join("no-shims");
-        std::fs::create_dir_all(&empty).unwrap();
-        assert_eq!(agent_shell(&empty), empty.join("sh"));
+        assert_eq!(
+            chosen_shell(&fake, Some(&fake.join("sh"))),
+            (fake.join("sh"), None)
+        );
+        let outside = Path::new("/opt/homebrew/bin/bash");
+        assert_eq!(
+            chosen_shell(&fake, Some(outside)),
+            (fake.join("zsh"), Some(outside.to_path_buf())),
+            "outside the shim directory: replaced and reported"
+        );
+        let missing = fake.join("fish");
+        assert_eq!(
+            chosen_shell(&fake, Some(&missing)),
+            (fake.join("zsh"), Some(missing.clone())),
+            "a shim that does not exist is not a shim"
+        );
     }
 
     #[cfg(unix)]

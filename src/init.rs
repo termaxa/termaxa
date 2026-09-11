@@ -427,6 +427,39 @@ rules:
     action: allow
   - match: "id *"
     action: allow
+  # `cd` runs nothing, and an agent under `wrap` was refused on
+  # `cd /home/dev/proj && git ls-files scratch` (Sep 11, 2026) - a read-only
+  # command, refused unattended on the one word in it that had no rule. The
+  # git heads below never write the tree: `ls-files`, `show`, `rev-parse`,
+  # `blame`, `describe`, `stash list`, `config --get`, a bare `remote`, and
+  # `tag` in its listing forms only (`git tag -d` deletes, so `tag *` stays
+  # on the default).
+  - match: "cd"
+    action: allow
+  - match: "cd *"
+    action: allow
+  - match: "git ls-files*"
+    action: allow
+  - match: "git show*"
+    action: allow
+  - match: "git rev-parse*"
+    action: allow
+  - match: "git blame*"
+    action: allow
+  - match: "git describe*"
+    action: allow
+  - match: "git stash list*"
+    action: allow
+  - match: "git config --get*"
+    action: allow
+  - match: "git remote"
+    action: allow
+  - match: "git tag"
+    action: allow
+  - match: "git tag -l*"
+    action: allow
+  - match: "git tag --list*"
+    action: allow
   - match: "git remote -v"
     action: allow
   - match: "git fetch*"
