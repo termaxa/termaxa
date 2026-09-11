@@ -2,6 +2,58 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.18.6 — the agent keeps its own shell
+
+v0.18.5 handed every wrapped agent the `bash` shim whenever bash existed.
+Measured Sep 11, 2026 in the #91 container with zsh installed: Claude Code
+took `CLAUDE_CODE_SHELL` over its own detection — not one zsh probe — and
+ran everything through `bash -l`. On a Linux box without zsh that was the
+fix working; on a machine with zsh, which is every Mac, it moved the agent
+off the shell it would have chosen, and a `PATH` or alias that lives in
+`~/.zshrc` was gone for it.
+
+### Fixed
+
+- **`wrap` names the shim for the shell the agent would have chosen
+  itself** (#96): the `zsh` shim when a real zsh exists (it is only written
+  when one does), else `bash`, else `sh` — Claude Code's own order. A
+  `CLAUDE_CODE_SHELL` that already names one of the shims is kept as the
+  operator's choice; a path outside the shim directory is still overridden
+  and said. Measured after in the same container: five spawns through
+  `shims/zsh`, the tool calls arriving as `zsh -c -l "setopt
+  NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL … eval '…'"` and judged by the command
+  inside — `ls` allowed and executed, `rm -rf ./scratch` denied with no
+  shell spawned for it, twelve files intact. The `setopt` reading's first
+  live receipt; v0.18.5 had it only in the suite.
+- **The wrap tests read an explicit search path** (#97). CI run 191 failed
+  on macOS in a wrap test with "sh exists on any unix test machine": the
+  test binary's `isolating_path` guard had rewritten the process `PATH` on
+  another thread while the test walked it. Environment variables are
+  process-global. `install_shims_on` and `real_shell_on` take the search
+  path as an argument; with `PATH=/nonexistent` forced for the whole
+  binary, all seven wrap tests pass. Production reads `PATH` as before.
+
+### Added
+
+- **`cd` and git's read-only heads in the starter** (#96): `cd`, `cd *`,
+  `git ls-files*`, `git show*`, `git rev-parse*`, `git blame*`,
+  `git describe*`, `git stash list*`, `git config --get*`, a bare
+  `git remote`, and `git tag` in its listing forms only (`git tag -d`
+  deletes, so `tag *` stays on the default). The receipt: an agent under
+  `wrap` refused unattended on `cd /home/dev/proj && git ls-files scratch`
+  — a read-only command, refused on the one word in it that had no rule.
+  168 rules become 181. `init` never rewrites an existing policy: add them
+  by hand or regenerate.
+
+### Known limitations
+
+- The startup snapshot is still refused under `wrap` (#94). The zsh form
+  is 149 segments and falls to the default on the assignment itself; the
+  bash form's 42 draw the unresolvable-target refusal on `head -n 1000 >>
+  "$SNAPSHOT_FILE"`. Claude Code carries on without it.
+- Measured on Claude Code, on Linux with and without zsh. Codex under
+  `wrap` is a separate run.
+
 ## v0.18.5 — `wrap` is told where Claude Code's shell is, and reads what it sends
 
 `wrap` had never seen Claude Code. v0.18.4 said it had; the correction is
