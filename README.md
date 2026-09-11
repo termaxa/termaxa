@@ -423,7 +423,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ## Contributing
 
-Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is dependency-light Rust: ~11,800 lines of production code in `src/`, plus ~13,800 lines of tests (unit tests live beside the code they test; `tests/` holds the integration ones). More test than product, on purpose — `src/policy.rs` and `src/preview.rs` are the best places to start reading, and the test module at the bottom of each file explains what the code is defending against.
+Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is dependency-light Rust: ~11,900 lines of production code in `src/`, plus ~13,900 lines of tests (unit tests live beside the code they test; `tests/` holds the integration ones). More test than product, on purpose — `src/policy.rs` and `src/preview.rs` are the best places to start reading, and the test module at the bottom of each file explains what the code is defending against.
 
 If you can make an agent get past the gate in a way that isn't already documented above, that's the most useful contribution you can make: [open an issue](https://github.com/termaxa/termaxa/issues) or email security@termaxa.com.
 
