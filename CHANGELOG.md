@@ -2,6 +2,83 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.18.5 — `wrap` is told where Claude Code's shell is, and reads what it sends
+
+`wrap` had never seen Claude Code. v0.18.4 said it had; the correction is
+under that entry below. Measured Sep 10, 2026 under `strace -f -e
+trace=execve` in a fresh Ubuntu 24.04 container with no zsh (Claude Code
+2.1.268, headless): Claude Code probes zsh at four absolute paths, then runs
+`/bin/bash` by absolute path for its startup snapshot and every Bash tool
+call, which nothing on `PATH` can see. An unattended `rm -rf ./scratch`
+deleted twelve files with no audit entry — three times untraced, once
+traced (#91).
+
+### Fixed
+
+- **`wrap` hands the agent the `bash` shim by name** (#92). Claude Code
+  honours `CLAUDE_CODE_SHELL` (a bash or zsh path) and reads `$SHELL` only
+  when that names bash or zsh; the `sh` shim it was handed was neither.
+  `SHELL` and `CLAUDE_CODE_SHELL` now both point at the `bash` shim (the
+  `sh` shim on a machine with no bash). An operator value pointing outside
+  the shim directory is overridden and one line says so — a wrapper that
+  silently routes nothing is the failure this repairs.
+- **Claude Code's preamble is read as the scaffolding it is** (#92). Every
+  Bash tool call arrives as `shopt -u extglob 2>/dev/null || true && {
+  \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; }
+  >/dev/null 2>&1 || true && eval '<cmd>' < /dev/null && pwd -P >|
+  /tmp/claude-<hex>-cwd` (`setopt …` under zsh, a `source` of its own
+  snapshot in front when one exists). Routed through the shim, the gate
+  read `shopt` as the command, found no rule, and refused every one of
+  them. The pieces are recognised by exact form, only inside a `-c`
+  string, and are transparent unless a rule names them, as an unnamed
+  wrapper is; `eval '<single-quoted>'` is read as the command line it is,
+  and the command inside decides. `source` is transparent only for the
+  harness's own snapshot file name, with no `..` anywhere; the cwd file is
+  `/tmp/claude-<hex>-cwd` exactly. A preamble that is not the measured one
+  stays an unmatched ask, and the refusal names it.
+- **The context check reads the judged command** (#92). The preamble's
+  `unset -f` was a "destructive flag" on every command, escalating each
+  allowed one to an ask. `-rf` inside the eval is still found.
+
+### Added
+
+- **The starter allows the read-only Unix filters and probes** (#92):
+  `head *`, `tail *`, `wc *`, `cut *`, `diff *`, `stat *`, `du`, `du *`,
+  `pwd`, `pwd *`, `which *`, `date`, `date +*`, `env`, `printenv`,
+  `printenv *`, `uname`, `uname *`, `id`, `id *`. Claude Code's first act
+  in a session is `bash -c env`; the demo video's own hero shot was an ask
+  on `head -5`. `env` is bare only — `env CMD` runs CMD, and an allow list
+  widens by the head that names the action, never the runner. `sort` and
+  `uniq` are left out: `sort -o FILE` and `uniq IN OUT` write a file with
+  no redirect for the gate to see. 148 rules become 168. `init` never
+  rewrites an existing policy: add them by hand or regenerate.
+
+### Measured
+
+Same container, this build, policy regenerated, `unrecognised: deny` and
+`backup_failure: deny`, hook file aside, no `CLAUDE_CODE_SHELL` in the
+environment, Claude Code asked to `rm -rf ./scratch`: five shell spawns,
+every one through the shim and into `termaxa run`; `env` and the `ls`
+calls allowed and executed; the delete denied — "Recursive force delete
+blocked by default policy" — with no real shell spawned for it; twelve
+files intact; the agent: "I stopped rather than routing around the block
+with an equivalent command." With the hook file present as well, the two
+modes coexist: Claude Code runs hook commands through `/bin/sh` by
+absolute path, which never touches the shim, and each call is judged by
+both.
+
+### Known limitations
+
+- The startup snapshot is still refused: `SNAPSHOT_FILE=<path>` is
+  assigned on the string's first line and used as `>| "$SNAPSHOT_FILE"`
+  throughout, and the gate does not yet resolve a variable assigned
+  earlier in the same string. Claude Code carries on without it, adding
+  `-l`. Its own issue.
+- Measured on one harness, on Linux without zsh. The zsh path with this
+  build, and Codex under `wrap`, are separate runs.
+- A denied delete inside a wrapper is reported against the whole line —
+  the existing tie-break — not against the `rm` inside the eval.
+
 ## v0.18.4 — the first real agent under `wrap`
 
 `wrap` had executed what it approves since v0.18.0 and had never met a
@@ -55,6 +132,26 @@ The same run found four things, all ours, all fixed here (#89).
   variable path (`>| "$SNAPSHOT_FILE"`), which the gate reads as an
   overwrite it cannot resolve and asks about — refused unattended. Claude
   Code carries on without the snapshot; noted, not yet decided.
+
+### Correction, Sep 11, 2026
+
+The claim above that the shim sees Claude Code's shell was wrong, and the
+measurement it rested on was an artefact. Under v0.18.3 the shim directory
+advertised a `zsh` that did not exist; Claude Code found it on `PATH` and
+used it. The fix in this release stopped offering absent shells, and with
+no zsh on the box Claude Code (2.1.267, 2.1.268) runs `/bin/bash` by
+absolute path for its startup snapshot and every Bash tool call, which
+nothing on `PATH` can see. Measured the same day, same container, on
+v0.18.4: three unattended `rm -rf ./scratch` runs deleted the files with
+zero audit entries, and a fourth under `strace -f -e trace=execve` shows
+four absolute-path probes for zsh, then `/bin/bash`, then `/usr/bin/rm`,
+and no exec of the shim. On a box with zsh the shim is hit, and the gate
+then refuses every command on Claude Code's own preamble (`setopt …`,
+`shopt -u extglob …`), which is the other half of the same defect. The
+snapshot line above is also wrong: it is refused as an unresolvable
+target, not asked about, with default knobs too. Tracked in #91, fixed in
+v0.18.5 (#92): `wrap` sets `CLAUDE_CODE_SHELL` to its shim, which Claude
+Code honours, and the preamble is read as scaffolding.
 
 ## v0.18.3 — four harnesses live-tested
 

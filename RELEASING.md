@@ -8,7 +8,15 @@
      production = every `src/*.rs` line before its `#[cfg(test)]` module;
      tests = those modules plus `tests/`. crates.io renders the README of
      the published crate permanently, so a stale number ships forever.
-     (v0.18.0 shipped with counts from Aug 18.)
+     (v0.18.0 shipped with counts from Aug 18.) Count with exactly this,
+     in PowerShell — the marker must match the whole line, because an
+     indented `#[cfg(test)]` on a test-only helper (audit.rs, preview.rs,
+     resolve.rs, testutil.rs) is not the test module and moves ~480 lines
+     if it is taken for one (v0.18.5):
+       $prod=0; $tests=0
+       Get-ChildItem src\*.rs | ForEach-Object { $l=[IO.File]::ReadAllLines($_.FullName); $i=[array]::IndexOf($l,'#[cfg(test)]'); if ($i -lt 0) { $prod+=$l.Count } else { $prod+=$i; $tests+=$l.Count-$i } }
+       Get-ChildItem tests -Recurse -Filter *.rs | ForEach-Object { $tests+=[IO.File]::ReadAllLines($_.FullName).Count }
+       "production $prod  tests $tests"
    - commit message = the release headline, e.g.
      "v0.12.0: plugin registry — termaxa add <tool>"
    This is the commit that gets tagged, so its message becomes the
