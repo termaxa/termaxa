@@ -61,6 +61,23 @@ pub fn shim_dir(termaxa_home: &Path) -> PathBuf {
 /// rather than nesting under it.
 #[cfg(unix)]
 pub fn install_shims(termaxa_home: &Path, termaxa_bin: &Path) -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    install_shims_on(termaxa_home, termaxa_bin, &path)
+}
+
+/// [`install_shims`] with the search path given rather than read from the
+/// process. The tests use this: environment variables are process-global,
+/// the test binary's `isolating_path` guard rewrites `PATH` to a directory
+/// holding only the test binary while it runs, and a wrap test walking
+/// `PATH` for `sh` on another thread at that moment found nothing (CI run
+/// 191, macOS, Sep 12, 2026). A search path that arrives as an argument
+/// cannot be rewritten under the test.
+#[cfg(unix)]
+pub fn install_shims_on(
+    termaxa_home: &Path,
+    termaxa_bin: &Path,
+    path: &std::ffi::OsStr,
+) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = shim_dir(termaxa_home);
@@ -77,7 +94,7 @@ pub fn install_shims(termaxa_home: &Path, termaxa_bin: &Path) -> Result<PathBuf>
         // makes the harness believe it has one: Claude Code preferred `zsh`
         // in a container with no zsh installed, because the shim directory
         // offered it (Sep 10, 2026).
-        let Some(real) = real_shell(shell, &dir) else {
+        let Some(real) = real_shell_on(shell, &dir, path) else {
             // A shim left behind by an earlier install still advertises
             // the shell; take it down with the same reasoning.
             let _ = std::fs::remove_file(dir.join(shell));
@@ -143,12 +160,16 @@ exec {real} "$@"
     Ok(dir)
 }
 
-/// The real binary a shim stands in front of, found on PATH outside the shim
-/// directory, or `None` when the shell is not installed at all.
+/// The real binary a shim stands in front of, found on the given search path
+/// outside the shim directory, or `None` when the shell is not installed at
+/// all.
 #[cfg(unix)]
-fn real_shell(shell: &str, shim_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for d in std::env::split_paths(&path) {
+fn real_shell_on(
+    shell: &str,
+    shim_dir: &std::path::Path,
+    path: &std::ffi::OsStr,
+) -> Option<std::path::PathBuf> {
+    for d in std::env::split_paths(path) {
         if d == shim_dir {
             continue;
         }
@@ -361,6 +382,26 @@ mod tests {
     use super::*;
     use crate::testutil::TempTree;
 
+    /// The search path the shell tests use, so a `PATH` rewritten by another
+    /// test's guard on another thread cannot make `sh` vanish mid-test.
+    #[cfg(unix)]
+    const SEARCH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+    #[cfg(unix)]
+    fn shims(home: &Path) -> PathBuf {
+        install_shims_on(
+            home,
+            Path::new("/usr/bin/termaxa"),
+            std::ffi::OsStr::new(SEARCH),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn real(shell: &str, dir: &Path) -> Option<PathBuf> {
+        real_shell_on(shell, dir, std::ffi::OsStr::new(SEARCH))
+    }
+
     /// The agent is told to use the shim for the shell it would have chosen
     /// itself: zsh when a real zsh exists (the shim is only written when one
     /// does), else bash, else sh. Pinned on a synthetic shim directory so it
@@ -381,7 +422,7 @@ mod tests {
         std::fs::remove_file(fake.join("bash")).unwrap();
         assert_eq!(agent_shell(&fake), fake.join("sh"));
 
-        let dir = install_shims(t.path(), Path::new("/usr/bin/termaxa")).unwrap();
+        let dir = shims(t.path());
         let want = if dir.join("zsh").is_file() {
             dir.join("zsh")
         } else {
@@ -433,11 +474,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let t = TempTree::new("wrap-shims");
         let home = t.path();
-        let dir = install_shims(home, Path::new("/usr/bin/termaxa")).unwrap();
+        let dir = shims(home);
 
         for shell in SHIMMED_SHELLS {
             let p = dir.join(shell);
-            if real_shell(shell, &dir).is_none() {
+            if real(shell, &dir).is_none() {
                 assert!(
                     !p.exists(),
                     "no shim for a shell that is not installed: {shell}"
@@ -463,14 +504,14 @@ mod tests {
     #[test]
     fn the_shim_routes_dash_c_and_passes_everything_else_through() {
         let t = TempTree::new("wrap-script");
-        let dir = install_shims(t.path(), Path::new("/usr/bin/termaxa")).unwrap();
+        let dir = shims(t.path());
         let script = std::fs::read_to_string(dir.join("sh")).unwrap();
 
         assert!(
             script.contains("/usr/bin/termaxa run --"),
             "a -c command goes through the runner: {script}"
         );
-        let real = real_shell("sh", &dir).expect("sh exists on any unix test machine");
+        let real = real("sh", &dir).expect("sh exists on any unix test machine");
         assert!(
             script.contains(&format!("exec {} \"$@\"", real.display())),
             "anything else reaches the real shell by its resolved path: {script}"
@@ -507,7 +548,7 @@ mod tests {
     fn an_approved_command_runs_outside_the_shims() {
         use std::os::unix::fs::PermissionsExt;
         let t = TempTree::new("wrap-outside");
-        let dir = install_shims(t.path(), Path::new("/usr/bin/termaxa")).unwrap();
+        let dir = shims(t.path());
         let real = t.dir("realbin");
         std::fs::write(real.join("sh"), "#!/bin/sh\nexit 0\n").unwrap();
         let mut p = std::fs::metadata(real.join("sh")).unwrap().permissions();
@@ -559,7 +600,7 @@ mod tests {
     #[test]
     fn an_absolute_path_shell_is_outside_what_a_path_shim_can_reach() {
         let t = TempTree::new("wrap-residue");
-        let dir = install_shims(t.path(), Path::new("/usr/bin/termaxa")).unwrap();
+        let dir = shims(t.path());
 
         // The shim answers to the NAME. That is the whole mechanism.
         assert!(dir.join("sh").exists());
