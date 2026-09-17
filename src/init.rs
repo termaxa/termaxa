@@ -804,7 +804,10 @@ pub fn run(
             // ...}]}}` this wrote before Sep 2026 was never a shape Codex
             // accepted. PreToolUse only: the PostToolUse payload has not been
             // captured yet, and a hook that answers a shape it has not seen
-            // is the fail-open known-limitation 4 describes.
+            // is the fail-open known-limitation 4 describes. The matcher
+            // covers `apply_patch` as well as `Bash` (#1, #95): the hook
+            // reads a patch's file headers, and the payload that carries them
+            // is what the capture is for.
             let dir_x = dir.join(".codex");
             fs::create_dir_all(&dir_x)?;
             let hooks_path = dir_x.join("hooks.json");
@@ -812,7 +815,7 @@ pub fn run(
                 "hooks": {
                     "PreToolUse": [
                         {
-                            "matcher": "Bash",
+                            "matcher": "Bash|apply_patch",
                             "hooks": [
                                 { "type": "command", "command": "termaxa hook", "timeout": 15 }
                             ]
@@ -947,12 +950,14 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
         println!("✓ installed PreToolUse write-tool hook in .claude/settings.json");
     }
 
-    // PostToolUse receipt hook (feeds the breaker's approved-ask exclusion).
-    // Same command; Termaxa branches on the event name internally.
+    // PostToolUse receipt hooks (the Bash one feeds the breaker's
+    // approved-ask exclusion). Same command; Termaxa branches on the event
+    // name internally.
     //
-    // Bash only. A receipt for a file write would record something the circuit
-    // breaker cannot count and the report cannot rank, so registering it would
-    // buy a log line and a process spawn per edit.
+    // The write matcher is registered here too (#95): a write a path rule
+    // named gets a receipt with the hash of what is on disk afterwards, the
+    // half of the record the shell path has always had. A write nothing
+    // names is a process spawn and no line, the same as at PreToolUse.
     let post = settings
         .as_object_mut()
         .context("settings.json root must be an object")?
@@ -966,6 +971,9 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
         .context("PostToolUse must be an array")?;
     if ensure_hook(post_arr, BASH_MATCHER) {
         println!("✓ installed PostToolUse hook in .claude/settings.json");
+    }
+    if ensure_hook(post_arr, WRITE_MATCHER) {
+        println!("✓ installed PostToolUse write-tool hook in .claude/settings.json");
     }
 
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
@@ -1027,7 +1035,7 @@ fn print_hook_snippet_text() -> String {
     let snippet = json!({
         "hooks": {
             "PreToolUse": [entry(BASH_MATCHER), entry(WRITE_MATCHER)],
-            "PostToolUse": [entry(BASH_MATCHER)],
+            "PostToolUse": [entry(BASH_MATCHER), entry(WRITE_MATCHER)],
         }
     });
     format!(
@@ -1594,8 +1602,8 @@ mod tests {
         let settings = proj.join(".claude").join("settings.json");
         assert_eq!(pre_matchers(&settings), vec![BASH_MATCHER, WRITE_MATCHER]);
 
-        // The write matcher is a gate, not a receipt: a file write that already
-        // happened tells the breaker nothing, so PostToolUse stays Bash-only.
+        // The write matcher is registered at PostToolUse as well (#95): a
+        // write a path rule named gets a receipt with the hash afterwards.
         let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
         let post: Vec<&str> = v["hooks"]["PostToolUse"]
             .as_array()
@@ -1603,7 +1611,7 @@ mod tests {
             .iter()
             .map(|e| e["matcher"].as_str().unwrap_or_default())
             .collect();
-        assert_eq!(post, vec![BASH_MATCHER]);
+        assert_eq!(post, vec![BASH_MATCHER, WRITE_MATCHER]);
     }
 
     /// The upgrade case. A settings file written before the write matcher

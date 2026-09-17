@@ -124,6 +124,27 @@ pub fn take(termaxa_dir: &Path, command: &str, cwd: &Path) -> Result<Option<Back
     Ok(None)
 }
 
+/// Insurance for a native file write (#95): the paths the harness is about
+/// to overwrite, edit or delete, copied aside under `subject` as the record's
+/// command. Paths that do not exist yet have nothing to insure and are
+/// skipped; `Ok(None)` when nothing existed. Same store, same manifest, same
+/// `rollback`, same budget as a shell delete.
+pub fn take_target(
+    termaxa_dir: &Path,
+    subject: &str,
+    paths: &[PathBuf],
+) -> Result<Option<BackupRecord>> {
+    let existing: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
+    if existing.is_empty() {
+        return Ok(None);
+    }
+    let (ts_ms, ts) = now();
+    let id = format!("b-{}", ts_ms);
+    let record = backup_files(termaxa_dir, &id, &ts, subject, &existing)?;
+    append_manifest(termaxa_dir, &record)?;
+    Ok(Some(record))
+}
+
 fn take_segment(
     termaxa_dir: &Path,
     segment: &crate::shell::Segment,

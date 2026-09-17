@@ -341,6 +341,77 @@ fn resolved_targets(
 }
 
 impl Policy {
+    /// The `match_path` rule that decides for these targets, if any: the
+    /// most severe, and among equals the earliest, over every target whose
+    /// role changes the file. Shared by the shell path (`evaluate`) and the
+    /// native-write path (`evaluate_targets`), so a path rule means the same
+    /// thing whichever door the write comes through (#95).
+    fn path_rule_for(
+        &self,
+        targets: &[crate::resolve::ResolvedTarget],
+    ) -> Option<(usize, &Rule, String, crate::resolve::TargetRole)> {
+        let mut path_hit: Option<(usize, &Rule, String, crate::resolve::TargetRole)> = None;
+        for (idx, rule) in self.rules.iter().enumerate() {
+            if rule.match_path.is_none() {
+                continue;
+            }
+            for t in targets {
+                // A path rule protects a file from being CHANGED, so it looks
+                // only at roles that change one. `cp .env backup.txt` reads
+                // .env and leaves it exactly as it was; denying that is the
+                // same false positive the `*.env*` string pattern produced,
+                // arriving through a new door (PR #27). `mv .env dst` DOES
+                // fire, because a move removes its source - which is the
+                // whole reason the extractor reports roles rather than a
+                // flat list of paths.
+                if !t.role.is_destructive() {
+                    continue;
+                }
+                let Some(p) = &t.resolved else { continue };
+                if rule.matches_path(&p.display().to_string()) {
+                    let better = match &path_hit {
+                        None => true,
+                        Some((bi, br, _, _)) => {
+                            severity(rule.action) > severity(br.action)
+                                || (severity(rule.action) == severity(br.action) && idx < *bi)
+                        }
+                    };
+                    if better {
+                        path_hit = Some((idx, rule, t.display(), t.role));
+                    }
+                    break;
+                }
+            }
+        }
+        path_hit
+    }
+
+    /// A native file write, judged by its targets alone (#95). There is no
+    /// command string, so only `match_path` rules apply, and the policy
+    /// default never does: `None` means no rule named the target and the
+    /// gate says nothing - the harness's own permission flow stays as it
+    /// was (#48: a gate that fires on ordinary work gets uninstalled).
+    /// `Some` is the path rule's verdict, rendered with the same sentence
+    /// the shell path uses, so `.env` denied through `Write` reads like
+    /// `.env` denied through `echo >`.
+    pub fn evaluate_targets(&self, targets: &[crate::resolve::ResolvedTarget]) -> Option<Decision> {
+        let (_, rule, target, role) = self.path_rule_for(targets)?;
+        Some(Decision {
+            action: rule.action,
+            source: DecisionSource::ExplicitRule,
+            matched_rule: Some(rule.label()),
+            reason: format!(
+                "target `{}` ({}) — {}",
+                target,
+                role.effect(),
+                rule.reason.clone().unwrap_or_else(|| format!(
+                    "matched path rule `{}`",
+                    rule.match_path.clone().unwrap_or_default()
+                ))
+            ),
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read policy file {}", path.display()))?;
@@ -544,39 +615,7 @@ impl Policy {
         // A `match_path` rule fires if ANY target matches, and the reason
         // names which one: a command with several targets is one command, and
         // the human approving it needs to know which path tripped the gate.
-        let mut path_hit: Option<(usize, &Rule, String, crate::resolve::TargetRole)> = None;
-        for (idx, rule) in self.rules.iter().enumerate() {
-            if rule.match_path.is_none() {
-                continue;
-            }
-            for t in &targets {
-                // A path rule protects a file from being CHANGED, so it looks
-                // only at roles that change one. `cp .env backup.txt` reads
-                // .env and leaves it exactly as it was; denying that is the
-                // same false positive the `*.env*` string pattern produced,
-                // arriving through a new door (PR #27). `mv .env dst` DOES
-                // fire, because a move removes its source - which is the
-                // whole reason the extractor reports roles rather than a
-                // flat list of paths.
-                if !t.role.is_destructive() {
-                    continue;
-                }
-                let Some(p) = &t.resolved else { continue };
-                if rule.matches_path(&p.display().to_string()) {
-                    let better = match &path_hit {
-                        None => true,
-                        Some((bi, br, _, _)) => {
-                            severity(rule.action) > severity(br.action)
-                                || (severity(rule.action) == severity(br.action) && idx < *bi)
-                        }
-                    };
-                    if better {
-                        path_hit = Some((idx, rule, t.display(), t.role));
-                    }
-                    break;
-                }
-            }
-        }
+        let path_hit = self.path_rule_for(&targets);
 
         // An unresolved target carrying a sensitive shape fails closed. NOT a
         // short-circuit: it enters the same most-severe-wins tournament as

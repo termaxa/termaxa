@@ -271,9 +271,93 @@ fn sent_by_copilot_repo_settings(v: &serde_json::Value) -> bool {
 pub struct FileWrite {
     pub dialect: Dialect,
     pub tool: String,
+    /// The first target's path; `targets` has all of them.
     pub path: String,
     pub cwd: String,
     pub session: Option<String>,
+    /// Every path the call touches, with what it does to each (#95). One
+    /// for `Write`/`Edit`; one per `*** Add File` / `*** Update File` /
+    /// `*** Delete File` for a patch.
+    pub targets: Vec<WriteTarget>,
+    /// A `PostToolUse` event: the write already happened. The gate records
+    /// a receipt for it when a path rule names the target, and nothing
+    /// otherwise.
+    pub post: bool,
+}
+
+/// What a native write does to one path, read from the tool's verb and, for
+/// a patch, its hunk headers. Whether a `Write` creates or overwrites is
+/// decided at the gate against the filesystem; the verb alone cannot say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind {
+    /// `Write`, `Edit`, `*** Update File`: the content changes.
+    Write,
+    /// `create_file`, `*** Add File`: a new file, nothing existing at risk.
+    Add,
+    /// `*** Delete File`: removed.
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteTarget {
+    pub path: String,
+    pub kind: WriteKind,
+}
+
+/// The files a Codex-style patch names. The grammar is the documented one:
+/// `*** Begin Patch` … `*** Add File: p` / `*** Update File: p` (optionally
+/// followed by `*** Move to: q`) / `*** Delete File: p` … `*** End Patch`.
+/// A move removes its source, which is how the resolver reads `mv`. Found
+/// in any string field of the tool input, so the field name Codex uses is
+/// not something this has to have seen; the payload itself still has to be
+/// captured before the harness is claimed as covered (#1).
+pub fn patch_targets(text: &str) -> Vec<WriteTarget> {
+    let mut out = Vec::new();
+    if !text.contains("*** Begin Patch") {
+        return out;
+    }
+    for line in text.lines() {
+        let line = line.trim_end();
+        if let Some(p) = line.strip_prefix("*** Add File: ") {
+            out.push(WriteTarget {
+                path: p.trim().to_string(),
+                kind: WriteKind::Add,
+            });
+        } else if let Some(p) = line.strip_prefix("*** Update File: ") {
+            out.push(WriteTarget {
+                path: p.trim().to_string(),
+                kind: WriteKind::Write,
+            });
+        } else if let Some(p) = line.strip_prefix("*** Delete File: ") {
+            out.push(WriteTarget {
+                path: p.trim().to_string(),
+                kind: WriteKind::Delete,
+            });
+        } else if let Some(moved) = line.strip_prefix("*** Move to: ") {
+            // The file just updated leaves its old path: the previous
+            // target becomes a delete of the source, and the new path a
+            // write.
+            if let Some(last) = out.last_mut() {
+                let src = std::mem::take(&mut last.path);
+                last.path = moved.trim().to_string();
+                last.kind = WriteKind::Write;
+                out.push(WriteTarget {
+                    path: src,
+                    kind: WriteKind::Delete,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn strings_in(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(a) => a.iter().for_each(|x| strings_in(x, out)),
+        serde_json::Value::Object(o) => o.values().for_each(|x| strings_in(x, out)),
+        _ => {}
+    }
 }
 
 /// Names that mean the tool writes. Matched as substrings, case-folded, so a
@@ -310,15 +394,14 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
 
-    // Pre only. A write that already happened cannot be gated, and a receipt
-    // for it would give the circuit breaker nothing it can count.
+    // A write that already happened cannot be gated; it can be receipted
+    // (#95), the way a shell command's PostToolUse is. `afterShellExecution`
+    // is the shell path's and not a write event.
     let event = s("hook_event_name").map(|e| e.to_lowercase());
-    if matches!(
-        event.as_deref(),
-        Some("posttooluse") | Some("aftershellexecution")
-    ) {
+    if event.as_deref() == Some("aftershellexecution") {
         return None;
     }
+    let post = event.as_deref() == Some("posttooluse");
 
     let tool = s("tool_name").or_else(|| s("toolName"))?;
     let folded = tool.to_lowercase();
@@ -334,10 +417,27 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
         None => v.get("tool_input")?.clone(),
     };
 
-    let path = PATH_FIELDS
-        .iter()
-        .find_map(|k| args.get(k).and_then(|p| p.as_str()))
-        .filter(|p| !p.is_empty())?;
+    // A patch names its files in its own text; everything else names one
+    // path in a field.
+    let mut strings = Vec::new();
+    strings_in(&args, &mut strings);
+    let mut targets: Vec<WriteTarget> = strings.iter().flat_map(|t| patch_targets(t)).collect();
+    if targets.is_empty() {
+        let path = PATH_FIELDS
+            .iter()
+            .find_map(|k| args.get(k).and_then(|p| p.as_str()))
+            .filter(|p| !p.is_empty())?;
+        let kind = if folded.contains("create") {
+            WriteKind::Add
+        } else {
+            WriteKind::Write
+        };
+        targets.push(WriteTarget {
+            path: path.to_string(),
+            kind,
+        });
+    }
+    let path = targets[0].path.clone();
 
     let is_cursor = v.get("cursor_version").is_some() || v.get("conversation_id").is_some();
     let looks_codex = s("agent")
@@ -360,7 +460,9 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
     Some(FileWrite {
         dialect,
         tool,
-        path: path.to_string(),
+        path,
+        targets,
+        post,
         cwd: s("cwd")
             .or_else(|| s("workingDirectory"))
             .or_else(|| {
@@ -404,21 +506,304 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
         exit_code: 0,
         audit_seq: None,
     };
-    let Some(protected) = crate::protect::classify(&w.cwd, &w.path) else {
+    // The gate's own files first, whatever the policy says: this does not
+    // depend on a policy existing or parsing, and a write that lands in
+    // `.termaxa/` or a hook config is refused before anything else is read.
+    if !w.post {
+        for t in &w.targets {
+            if let Some(protected) = crate::protect::classify(&w.cwd, &t.path) {
+                return protected_write(w, &t.path, protected);
+            }
+        }
+    }
+
+    // Then the consequence engine, on the targets alone (#95). No command
+    // string, so only `match_path` rules apply and the default never does:
+    // with no rule naming a target the gate says nothing, and the harness's
+    // own permission flow is left exactly as it was. A verdict here reads
+    // like the shell path's, because it is the shell path's path-rule
+    // tournament on the same resolved targets.
+    let start_dir = start_dir_of(&w.cwd);
+    let Ok(paths) = crate::paths::resolve_from(&start_dir) else {
         return silent;
     };
+    let Ok(policy) = Policy::load(&paths.policy_file()) else {
+        return silent;
+    };
+    let ctx = crate::resolve::EvalContext::from_paths(&start_dir, &paths);
+    let resolved: Vec<crate::resolve::ResolvedTarget> = w
+        .targets
+        .iter()
+        .map(|t| {
+            let role = match t.kind {
+                WriteKind::Delete => crate::resolve::TargetRole::Removed,
+                WriteKind::Write | WriteKind::Add => crate::resolve::TargetRole::Destination,
+            };
+            crate::resolve::target(&t.path, role, &ctx)
+        })
+        .collect();
+    let Some(decision) = policy.evaluate_targets(&resolved) else {
+        return silent;
+    };
+    let subject = format!(
+        "{} {}",
+        w.tool,
+        w.targets
+            .iter()
+            .map(|t| t.path.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let existing: Vec<std::path::PathBuf> = resolved
+        .iter()
+        .filter_map(|t| t.resolved.clone())
+        .filter(|p| p.exists())
+        .collect();
 
-    let subject = format!("{} {}", w.tool, w.path);
+    // The write already happened: a receipt, with the hash of what is on
+    // disk now, for the record that is not the agent's own account. Only
+    // for a target a rule names, like the decision it pairs with.
+    if w.post {
+        let after = existing
+            .first()
+            .and_then(|p| crate::fingerprint::of_file(p))
+            .map(|h| format!("sha256 after {h}"));
+        append_write_entry(
+            w,
+            &paths,
+            "post",
+            "executed",
+            None,
+            &subject,
+            "post-execution receipt",
+            after,
+            None,
+            Some(true),
+        );
+        return silent;
+    }
+
+    // What the write would cost, in the reason the harness shows and in the
+    // record: a delete's contents, an overwrite's size.
+    let cost = resolved.iter().zip(&w.targets).find_map(|(t, wt)| {
+        let p = t.resolved.as_ref()?;
+        if !p.exists() {
+            return None;
+        }
+        match wt.kind {
+            WriteKind::Delete if p.is_dir() => {
+                let scan = crate::delete::scan_budgeted(p);
+                Some(format!(
+                    "{}{} files across {} directories",
+                    scan.files,
+                    if scan.capped { "+" } else { "" },
+                    scan.dirs
+                ))
+            }
+            _ => std::fs::metadata(p)
+                .ok()
+                .map(|m| format!("{} B on disk", m.len())),
+        }
+    });
+    let reason_shown = match &cost {
+        Some(c) => format!("[termaxa] {} · {}", decision.reason, c),
+        None => format!("[termaxa] {}", decision.reason),
+    };
+
+    match decision.action {
+        Action::Deny => {
+            append_write_entry(
+                w,
+                &paths,
+                "hook",
+                "deny",
+                decision.matched_rule.clone(),
+                &subject,
+                &decision.reason,
+                cost,
+                None,
+                None,
+            );
+            crate::notify::maybe_send(&policy, "deny", &subject, &decision.reason, "hook");
+            Outcome {
+                rendered: Some(render_response(w.dialect, "deny", &reason_shown)),
+                exit_code: if matches!(w.dialect, Dialect::Copilot | Dialect::CopilotRepoSettings) {
+                    0
+                } else {
+                    2
+                },
+                audit_seq: None,
+            }
+        }
+        Action::Ask => {
+            append_write_entry(
+                w,
+                &paths,
+                "hook",
+                "ask",
+                decision.matched_rule.clone(),
+                &subject,
+                &decision.reason,
+                cost,
+                None,
+                None,
+            );
+            crate::notify::maybe_send(&policy, "ask", &subject, &decision.reason, "hook");
+            Outcome {
+                rendered: Some(render_response(w.dialect, "ask", &reason_shown)),
+                exit_code: 0,
+                audit_seq: None,
+            }
+        }
+        Action::Allow => {
+            // Insurance before the harness writes: the existing file or tree,
+            // copied aside under the same store `rollback` reads, under the
+            // same budget as a shell delete. A failed copy is reported in the
+            // record and, under `backup_failure: deny`, refuses the write.
+            let (backup, insurance_failed) =
+                match crate::backup::take_target(&paths.state_dir, &subject, &existing) {
+                    Ok(rec) => (rec.map(|r| r.id), None),
+                    Err(e) => (None, Some(e.to_string())),
+                };
+            if let Some(e) = insurance_failed {
+                if policy.backup_failure == crate::policy::BackupFailure::Deny {
+                    let reason = format!(
+                        "insurance failed ({e}) and the policy sets `backup_failure: deny` — an uninsured write does not run"
+                    );
+                    append_write_entry(
+                        w,
+                        &paths,
+                        "hook",
+                        "deny",
+                        decision.matched_rule.clone(),
+                        &subject,
+                        &reason,
+                        cost,
+                        None,
+                        None,
+                    );
+                    return Outcome {
+                        rendered: Some(render_response(
+                            w.dialect,
+                            "deny",
+                            &format!("[termaxa] {reason}"),
+                        )),
+                        exit_code: if matches!(
+                            w.dialect,
+                            Dialect::Copilot | Dialect::CopilotRepoSettings
+                        ) {
+                            0
+                        } else {
+                            2
+                        },
+                        audit_seq: None,
+                    };
+                }
+            }
+            let before = existing
+                .first()
+                .filter(|p| p.is_file())
+                .and_then(|p| crate::fingerprint::of_file(p))
+                .map(|h| format!("sha256 before {h}"));
+            let preview = match (&cost, before) {
+                (Some(c), Some(b)) => Some(format!("{c}; {b}")),
+                (Some(c), None) => Some(c.clone()),
+                (None, b) => b,
+            };
+            append_write_entry(
+                w,
+                &paths,
+                "hook",
+                "allow",
+                decision.matched_rule.clone(),
+                &subject,
+                &decision.reason,
+                preview,
+                backup,
+                None,
+            );
+            Outcome {
+                rendered: if is_silent(w.dialect, &decision) {
+                    None
+                } else {
+                    Some(render_response(w.dialect, "allow", &reason_shown))
+                },
+                exit_code: 0,
+                audit_seq: None,
+            }
+        }
+    }
+}
+
+fn start_dir_of(cwd: &str) -> std::path::PathBuf {
+    if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() {
+        std::path::PathBuf::from(cwd)
+    } else {
+        std::env::current_dir().unwrap_or_default()
+    }
+}
+
+/// One audit line for a native write, in the shape the shell path's lines
+/// take, so `report` and `log` read them the same way.
+#[allow(clippy::too_many_arguments)]
+fn append_write_entry(
+    w: &FileWrite,
+    paths: &crate::paths::Paths,
+    source: &str,
+    decision: &str,
+    matched_rule: Option<String>,
+    subject: &str,
+    reason: &str,
+    preview: Option<String>,
+    backup: Option<String>,
+    approved: Option<bool>,
+) {
+    let Ok(log) = AuditLog::new(&paths.state_dir) else {
+        return;
+    };
+    let (ts_ms, ts) = now();
+    let _ = log.append(&AuditEntry {
+        ts_ms,
+        ts,
+        source: source.into(),
+        actor: Some(w.dialect.actor().to_string()),
+        decided_by: if source == "post" {
+            None
+        } else {
+            Some(
+                crate::policy::DecisionSource::ExplicitRule
+                    .as_str()
+                    .to_string(),
+            )
+        },
+        command: subject.to_string(),
+        decision: decision.into(),
+        matched_rule,
+        reason: reason.to_string(),
+        signals: vec![],
+        escalated: false,
+        session: w.session.clone(),
+        backup,
+        preview,
+        intent: None,
+        approved,
+        exit_code: None,
+        cwd: w.cwd.clone(),
+        prev: None,
+        hash: None,
+    });
+}
+
+/// Refuse a write to the gate's own configuration - the rule that predates
+/// the policy path and does not depend on it.
+fn protected_write(w: &FileWrite, path: &str, protected: crate::protect::Protected) -> Outcome {
+    let subject = format!("{} {}", w.tool, path);
     let reason = format!("[termaxa] {}", protected.reason);
 
     // Audit best-effort, and never at the cost of the block: if the state dir
     // cannot be resolved there is nowhere to write the record, and a deny that
     // went unrecorded is still a deny.
-    let start_dir = if !w.cwd.is_empty() && std::path::Path::new(&w.cwd).is_dir() {
-        std::path::PathBuf::from(&w.cwd)
-    } else {
-        std::env::current_dir().unwrap_or_default()
-    };
+    let start_dir = start_dir_of(&w.cwd);
     if let Ok(paths) = crate::paths::resolve_from(&start_dir) {
         if let Ok(log) = AuditLog::new(&paths.state_dir) {
             let (ts_ms, ts) = now();
@@ -1523,6 +1908,192 @@ mod tests {
         assert_eq!(verdict(&nb), Some("termaxa-state"));
     }
 
+    /// #95: a native write goes through the consequence engine on its
+    /// targets. Against a policy with path rules: a write to `.env` is
+    /// denied with the shell path's sentence and the file's size; a write
+    /// to a file a rule allows is insured first and recorded with its hash;
+    /// the `PostToolUse` for it is a receipt with the hash of what is on
+    /// disk now; a write nothing names is silence and no record; a delete
+    /// through a patch is read as one. The starter's own `.env` rule is the
+    /// one under test, so the policy is the starter plus one allow.
+    #[test]
+    fn a_native_write_is_judged_by_its_targets_and_silent_when_nothing_names_them() {
+        let env = crate::testutil::TestEnv::new("hook-native-write");
+        let proj = env.project("proj");
+        let anchor = "  - match_path: \"*/.env\"\n";
+        assert!(
+            crate::init::STARTER_POLICY.contains(anchor),
+            "the starter's .env rule"
+        );
+        let policy = crate::init::STARTER_POLICY.replacen(
+            anchor,
+            "  - match_path: \"*/notes/*\"\n    action: allow\n  - match_path: \"*/.env\"\n",
+            1,
+        );
+        std::fs::write(proj.join(".termaxa").join("policy.yaml"), policy).unwrap();
+        std::fs::write(proj.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::create_dir_all(proj.join("notes")).unwrap();
+        std::fs::write(proj.join("notes").join("a.txt"), "hello\n").unwrap();
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::write(proj.join("src").join("x.rs"), "fn main() {}\n").unwrap();
+        let payload = |event: &str, tool: &str, path: &std::path::Path| {
+            json!({
+                "cwd": proj.display().to_string(),
+                "hook_event_name": event,
+                "session_id": "s-native",
+                "tool_name": tool,
+                "tool_input": { "file_path": path.display().to_string(), "content": "x" }
+            })
+            .to_string()
+        };
+        let paths = crate::paths::resolve_from(&proj).unwrap();
+        let entries = || {
+            crate::audit::AuditLog::new(&paths.state_dir)
+                .unwrap()
+                .read_last(50)
+                .unwrap_or_default()
+        };
+
+        // Denied, with the path rule's own sentence and the size.
+        let w = parse_file_write(&payload("PreToolUse", "Write", &proj.join(".env"))).unwrap();
+        let out = gate_file_write(&w);
+        assert_eq!(out.exit_code, 2);
+        let rendered = out.rendered.expect("a deny is rendered");
+        assert!(
+            rendered.contains("\"permissionDecision\":\"deny\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Writing to or removing .env"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("B on disk"), "{rendered}");
+        let last = entries().last().cloned().expect("a deny is recorded");
+        assert_eq!(last.decision, "deny");
+        assert!(last.command.starts_with("Write "), "{}", last.command);
+        assert_eq!(last.source, "hook");
+
+        // Allowed by a path rule: insured first, recorded with the hash.
+        let w = parse_file_write(&payload(
+            "PreToolUse",
+            "Edit",
+            &proj.join("notes").join("a.txt"),
+        ))
+        .unwrap();
+        let out = gate_file_write(&w);
+        assert_eq!(out.exit_code, 0);
+        let rendered = out
+            .rendered
+            .expect("an explicit allow is emitted for Claude Code");
+        assert!(
+            rendered.contains("\"permissionDecision\":\"allow\""),
+            "{rendered}"
+        );
+        let last = entries().last().cloned().unwrap();
+        assert_eq!(last.decision, "allow");
+        let backup = last
+            .backup
+            .clone()
+            .expect("insured before the harness writes");
+        let record = crate::backup::list(&paths.state_dir)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == backup)
+            .expect("the backup is in the manifest");
+        assert!(record.command.starts_with("Edit "), "{}", record.command);
+        assert!(
+            last.preview
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sha256 before"),
+            "{:?}",
+            last.preview
+        );
+
+        // The receipt, after the harness wrote.
+        std::fs::write(proj.join("notes").join("a.txt"), "hello world\n").unwrap();
+        let w = parse_file_write(&payload(
+            "PostToolUse",
+            "Edit",
+            &proj.join("notes").join("a.txt"),
+        ))
+        .unwrap();
+        assert!(w.post);
+        let out = gate_file_write(&w);
+        assert!(out.rendered.is_none());
+        let last = entries().last().cloned().unwrap();
+        assert_eq!(last.source, "post");
+        assert_eq!(last.decision, "executed");
+        assert!(
+            last.preview
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sha256 after"),
+            "{:?}",
+            last.preview
+        );
+
+        // Nothing names src/x.rs: silence, and no record.
+        let before = entries().len();
+        let w = parse_file_write(&payload(
+            "PreToolUse",
+            "Write",
+            &proj.join("src").join("x.rs"),
+        ))
+        .unwrap();
+        let out = gate_file_write(&w);
+        assert_eq!(out.exit_code, 0);
+        assert!(out.rendered.is_none());
+        assert_eq!(entries().len(), before, "no rule, no line");
+
+        // A patch's delete of `.env` is a delete of `.env`.
+        let patch = format!(
+            "*** Begin Patch\n*** Delete File: {}\n*** End Patch\n",
+            proj.join(".env").display()
+        );
+        let raw = json!({
+            "cwd": proj.display().to_string(),
+            "hook_event_name": "PreToolUse",
+            "turn_id": "t-1",
+            "tool_name": "apply_patch",
+            "tool_input": { "input": patch }
+        })
+        .to_string();
+        let w = parse_file_write(&raw).unwrap();
+        assert_eq!(w.dialect, Dialect::Codex);
+        assert_eq!(w.targets[0].kind, WriteKind::Delete);
+        let out = gate_file_write(&w);
+        assert_eq!(out.exit_code, 2);
+        let rendered = out.rendered.unwrap();
+        assert!(rendered.contains("(removed)"), "{rendered}");
+        assert!(
+            rendered.contains("Writing to or removing .env"),
+            "{rendered}"
+        );
+    }
+
+    /// The patch grammar as documented: add, update, delete, and a move
+    /// that removes its source. Text without the header names nothing.
+    #[test]
+    fn a_patch_names_its_files_and_a_move_removes_its_source() {
+        let text = "*** Begin Patch\n*** Add File: new.txt\n+hi\n*** Update File: a.txt\n*** Move to: b.txt\n@@\n-x\n+y\n*** Delete File: gone.txt\n*** End Patch\n";
+        let t = patch_targets(text);
+        let got: Vec<(&str, WriteKind)> = t.iter().map(|x| (x.path.as_str(), x.kind)).collect();
+        assert_eq!(
+            got,
+            [
+                ("new.txt", WriteKind::Add),
+                ("b.txt", WriteKind::Write),
+                ("a.txt", WriteKind::Delete),
+                ("gone.txt", WriteKind::Delete),
+            ]
+        );
+        assert!(
+            patch_targets("*** Delete File: x").is_empty(),
+            "no header, no patch"
+        );
+    }
+
     /// An ordinary edit must produce no decision at all, not an `allow`.
     /// Asserting `allow` on every file an agent writes would be Termaxa
     /// answering a question it has no way to form an opinion about, and at the
@@ -1588,7 +2159,13 @@ mod tests {
             "tool_input": { "file_path": "/repo/.termaxa/policy.yaml" }
         })
         .to_string();
-        assert!(parse_file_write(&raw).is_none());
+        // It parses as a write event that already happened (#95): the gate
+        // records a receipt when a rule names the target and never decides.
+        let w = parse_file_write(&raw).expect("a post write parses");
+        assert!(w.post);
+        let out = gate_file_write(&w);
+        assert_eq!(out.exit_code, 0);
+        assert!(out.rendered.is_none(), "a receipt has no verdict to render");
     }
 
     #[test]

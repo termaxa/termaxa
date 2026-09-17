@@ -327,7 +327,9 @@ fn init_writes_the_hooks_file_codex_reads() {
     );
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let group = &v["hooks"]["PreToolUse"][0];
-    assert_eq!(group["matcher"], "Bash", "{v}");
+    // `Bash|apply_patch` since #95: the hook reads a patch's file headers,
+    // and the matcher is what lets the payload reach it.
+    assert_eq!(group["matcher"], "Bash|apply_patch", "{v}");
     let hook = &group["hooks"][0];
     assert_eq!(hook["type"], "command", "{v}");
     assert_eq!(hook["command"], "termaxa hook", "{v}");
