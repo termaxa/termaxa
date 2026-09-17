@@ -637,6 +637,15 @@ rules:
 circuit_breaker:
   enabled: true
   threshold: 2   # trip on the 3rd attempt
+# Insurance copies (#72). A backup is removed only when it is BOTH outside
+# the `keep` most recent AND older than `days`; everything else stays. Each
+# insured command removes at most one, so the hook stays fast;
+# `termaxa backups --prune` removes all of them at once. The copy itself is
+# refused above the preview's budget (5,000 files), with the preview's own
+# words, so a "NOT recoverable" preview is never followed by a copy.
+# retention:
+#   keep: 50
+#   days: 30
 "#;
 
 pub fn run(

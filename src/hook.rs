@@ -1031,7 +1031,13 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     let mut backup_id: Option<String> = None;
     if !is_probe && decision.action != Action::Deny {
         match crate::backup::take(&paths.state_dir, &command, std::path::Path::new(&input.cwd)) {
-            Ok(Some(rec)) => backup_id = Some(rec.id),
+            Ok(Some(rec)) => {
+                backup_id = Some(rec.id);
+                // Retention (#72): one eligible backup at most, so the hook
+                // never does a backlog's worth of deleting while the harness
+                // waits. Best effort, like the take itself.
+                let _ = crate::backup::prune(&paths.state_dir, policy.retention, Some(1));
+            }
             Ok(None) => {}
             // Best effort by default: the failure is not even reported here,
             // because a hook has no terminal to report to. Under

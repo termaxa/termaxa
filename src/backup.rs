@@ -395,16 +395,27 @@ fn backup_files(
     command: &str,
     paths: &[PathBuf],
 ) -> Result<BackupRecord> {
+    // The same budget the preview counts under, checked before a single
+    // byte is copied: above it the preview has already said "NOT
+    // recoverable", and a copy that then runs for minutes inside the hook -
+    // and lands on disk, uncapped - was the Jul 9 receipt (#72). Refusing
+    // here is a backup failure like any other, so `backup_failure` decides.
+    for p in paths {
+        if crate::delete::scan_budgeted(p).capped {
+            bail!("{} — {}", p.display(), crate::delete::too_large_to_copy());
+        }
+    }
     let dir = backups_dir(termaxa_dir)?.join(id);
     fs::create_dir_all(&dir)?;
     let mut saved = Vec::new();
+    let mut longest = 0usize;
     for p in paths {
         let name = p
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "item".into());
         let dest = dir.join(&name);
-        copy_recursive(p, &dest)?;
+        copy_recursive(p, &dest, &mut longest)?;
         saved.push(serde_json::json!({
             "original": p.canonicalize().unwrap_or_else(|_| p.clone()).display().to_string(),
             "saved_as": dest.display().to_string(),
@@ -415,18 +426,23 @@ fn backup_files(
         ts: ts.into(),
         kind: "files".into(),
         command: command.into(),
-        data: serde_json::json!({ "items": saved }),
+        // `longest_path` is the length of the longest path the copy wrote,
+        // so `backups` can say when a backup exceeds Windows' 260-character
+        // limit and only `rollback` can read it (Rust writes and reads
+        // extended-length paths; Explorer and PowerShell do not walk them).
+        data: serde_json::json!({ "items": saved, "longest_path": longest }),
         note: format!("{} path(s) copied to {}", paths.len(), dir.display()),
     })
 }
 
-fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
+fn copy_recursive(src: &Path, dst: &Path, longest: &mut usize) -> Result<()> {
+    *longest = (*longest).max(dst.as_os_str().len());
     if src.is_dir() {
         fs::create_dir_all(dst)?;
         make_private(dst, true)?;
         for entry in fs::read_dir(src)? {
             let entry = entry?;
-            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+            copy_recursive(&entry.path(), &dst.join(entry.file_name()), longest)?;
         }
     } else {
         // Only a regular file is copied. `fs::copy` on a FIFO opens it for
@@ -510,10 +526,110 @@ pub fn list(termaxa_dir: &Path) -> Result<Vec<BackupRecord>> {
         .collect())
 }
 
+/// The ids of backups a prune record says were removed. The manifest stays
+/// append-only: a prune is one more record, of kind `prune`, and this is
+/// how the listing and `restore` know what is gone.
+pub fn pruned_ids(records: &[BackupRecord]) -> std::collections::HashSet<String> {
+    records
+        .iter()
+        .filter(|r| r.kind == "prune")
+        .filter_map(|r| r.data["removed"].as_array())
+        .flatten()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect()
+}
+
+/// What a prune removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Pruned {
+    pub removed: Vec<String>,
+    /// Backups that were eligible and left in place because `limit` was hit.
+    pub remaining: usize,
+}
+
+/// Apply the retention rule (#72): a backup is eligible only when it is
+/// both outside the `keep` most recent and older than `days`. Eligible
+/// backups are removed oldest first, up to `limit` of them (`None` for all),
+/// their directories deleted and one `prune` record appended naming them.
+/// A `take` calls this with a limit of one, so the hook does the bounded
+/// amount of deletion each time and never a whole backlog at once;
+/// `termaxa backups --prune` calls it with no limit. Kinds that keep nothing
+/// on disk (`git-ref`) are never pruned: their record is the whole backup.
+pub fn prune(
+    termaxa_dir: &Path,
+    retention: crate::policy::Retention,
+    limit: Option<usize>,
+) -> Result<Pruned> {
+    let records = list(termaxa_dir)?;
+    let gone = pruned_ids(&records);
+    let mut live: Vec<&BackupRecord> = records
+        .iter()
+        .filter(|r| r.kind != "prune" && r.kind != "git-ref" && !gone.contains(&r.id))
+        .collect();
+    // Newest first, by the millisecond stamp in the id (`b-<ms>`); the
+    // timestamp string is for people.
+    let stamp = |r: &BackupRecord| -> u128 {
+        r.id.strip_prefix("b-")
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0)
+    };
+    live.sort_by_key(|r| std::cmp::Reverse(stamp(r)));
+    let (now_ms, ts) = now();
+    let cutoff = now_ms.saturating_sub(u128::from(retention.days) * 86_400_000);
+    let mut eligible: Vec<&BackupRecord> = live
+        .iter()
+        .skip(retention.keep)
+        .filter(|r| stamp(r) < cutoff)
+        .copied()
+        .collect();
+    eligible.reverse(); // oldest first
+    let take_n = limit.unwrap_or(eligible.len()).min(eligible.len());
+    let remaining = eligible.len() - take_n;
+    let mut removed = Vec::new();
+    for r in eligible.into_iter().take(take_n) {
+        let dir = backups_dir(termaxa_dir)?.join(&r.id);
+        if dir.exists() {
+            fs::remove_dir_all(&dir).with_context(|| format!("cannot remove {}", dir.display()))?;
+        }
+        removed.push(r.id.clone());
+    }
+    if !removed.is_empty() {
+        let (ts_ms, _) = now();
+        append_manifest(
+            termaxa_dir,
+            &BackupRecord {
+                id: format!("p-{ts_ms}"),
+                ts,
+                kind: "prune".into(),
+                command: String::new(),
+                data: serde_json::json!({
+                    "removed": removed,
+                    "keep": retention.keep,
+                    "days": retention.days,
+                }),
+                note: format!(
+                    "{} backup(s) pruned (retention: keep {}, {} days)",
+                    removed.len(),
+                    retention.keep,
+                    retention.days
+                ),
+            },
+        )?;
+    }
+    Ok(Pruned { removed, remaining })
+}
+
 /// Restore a backup by id. `confirm` is the caller's y/N gate result —
 /// restores are writes and get the same respect as any other write.
 pub fn restore(termaxa_dir: &Path, id: &str) -> Result<String> {
-    let record = list(termaxa_dir)?
+    let records = list(termaxa_dir)?;
+    if pruned_ids(&records).contains(id) {
+        bail!(
+            "backup `{}` was pruned by the retention rule and cannot be restored — see `termaxa backups`",
+            id
+        );
+    }
+    let record = records
         .into_iter()
         .find(|r| r.id == id)
         .with_context(|| format!("no backup with id `{}` — see `termaxa backups`", id))?;
@@ -571,7 +687,8 @@ pub fn restore(termaxa_dir: &Path, id: &str) -> Result<String> {
             for item in items {
                 let original = PathBuf::from(item["original"].as_str().context("bad record")?);
                 let saved = PathBuf::from(item["saved_as"].as_str().context("bad record")?);
-                copy_recursive(&saved, &original)?;
+                let mut longest = 0usize;
+                copy_recursive(&saved, &original, &mut longest)?;
                 n += 1;
             }
             Ok(format!("{} path(s) restored to original locations", n))
@@ -1050,7 +1167,8 @@ mod tests {
         let (send, recv) = std::sync::mpsc::channel();
         let src = tree.clone();
         std::thread::spawn(move || {
-            let _ = send.send(copy_recursive(&src, &dst).map_err(|e| e.to_string()));
+            let mut longest = 0usize;
+            let _ = send.send(copy_recursive(&src, &dst, &mut longest).map_err(|e| e.to_string()));
         });
         let result = recv
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -1065,6 +1183,153 @@ mod tests {
     /// on 2026-09-02 before this test existed: "backup failed (the source
     /// path is neither a regular file nor a symlink to a regular file);
     /// proceeding — command was approved", then `(no backups yet)`.
+    /// #72: the copy runs under the preview's budget. A tree the preview
+    /// calls "NOT recoverable" is refused with the same words before a byte
+    /// is copied, nothing is left under `backups/`, and the manifest gains
+    /// nothing; `backup_failure` then decides, as for any failed backup.
+    #[test]
+    fn a_tree_over_the_copy_budget_is_refused_with_the_previews_words() {
+        let tmp = TempTree::new("bk-budget");
+        let state = tmp.dir("state");
+        let big = tmp.dir("big");
+        for i in 0..5_001 {
+            std::fs::write(big.join(format!("f{i}")), "x").unwrap();
+        }
+        let command = format!("rm -rf {}", big.display());
+        let err = take(&state, &command, &test_cwd()).expect_err("over the budget: refused");
+        assert!(
+            err.to_string()
+                .contains("too large to copy (5,000+ files) — NOT recoverable"),
+            "{err}"
+        );
+        assert!(
+            !state.join("backups").join("manifest.jsonl").exists(),
+            "a refused copy records nothing"
+        );
+        let stray: Vec<_> = std::fs::read_dir(state.join("backups"))
+            .map(|d| d.flatten().collect())
+            .unwrap_or_default();
+        assert!(stray.is_empty(), "nothing is left on disk: {stray:?}");
+        // The same command, one file under the budget, is insured as before.
+        let small = tmp.dir("small");
+        std::fs::write(small.join("a"), "x").unwrap();
+        let record = take(&state, &format!("rm -rf {}", small.display()), &test_cwd())
+            .unwrap()
+            .expect("under the budget: insured");
+        let longest = record.data["longest_path"].as_u64().expect("recorded");
+        assert!(
+            longest as usize
+                >= state
+                    .join("backups")
+                    .join(&record.id)
+                    .join("small")
+                    .join("a")
+                    .as_os_str()
+                    .len(),
+            "the longest path written is recorded: {longest}"
+        );
+    }
+
+    /// #72: retention. A backup is pruned only when it is both beyond the
+    /// `keep` most recent and older than `days`; a take removes at most one,
+    /// `--prune` removes all; the manifest stays append-only and says what
+    /// went; a pruned id cannot be restored; `git-ref` records are never
+    /// pruned, since the record is the whole backup.
+    #[test]
+    fn retention_prunes_only_what_is_both_old_and_beyond_keep_and_says_so() {
+        use crate::policy::Retention;
+        let tmp = TempTree::new("bk-retention");
+        let state = tmp.dir("state");
+        let (now_ms, ts) = now();
+        let day = 86_400_000u128;
+        // Four file backups at 40, 30, 20 and 10 days old, plus a git ref.
+        let ages = [40u128, 30, 20, 10];
+        let mut ids = Vec::new();
+        for age in ages {
+            let id = format!("b-{}", now_ms - age * day);
+            let dir = backups_dir(&state).unwrap().join(&id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("item"), "x").unwrap();
+            append_manifest(
+                &state,
+                &BackupRecord {
+                    id: id.clone(),
+                    ts: ts.clone(),
+                    kind: "files".into(),
+                    command: "rm -rf x".into(),
+                    data: serde_json::json!({"items": []}),
+                    note: "1 path(s) copied".into(),
+                },
+            )
+            .unwrap();
+            ids.push(id);
+        }
+        let git_id = format!("b-{}", now_ms - 50 * day);
+        append_manifest(
+            &state,
+            &BackupRecord {
+                id: git_id.clone(),
+                ts: ts.clone(),
+                kind: "git-ref".into(),
+                command: "git push --force".into(),
+                data: serde_json::json!({"sha": "abc", "remote": "origin", "target": "main"}),
+                note: "ref pinned".into(),
+            },
+        )
+        .unwrap();
+
+        // keep 2, 25 days: the 40- and 30-day-old ones are eligible (beyond
+        // the newest two AND older than 25 days); the 20-day-old one is
+        // beyond `keep` but young, and stays.
+        let rule = Retention { keep: 2, days: 25 };
+        let first = prune(&state, rule, Some(1)).unwrap();
+        assert_eq!(
+            first.removed,
+            [ids[0].clone()],
+            "oldest first, one at a time"
+        );
+        assert_eq!(first.remaining, 1);
+        assert!(!backups_dir(&state).unwrap().join(&ids[0]).exists());
+        assert!(backups_dir(&state).unwrap().join(&ids[1]).exists());
+
+        let rest = prune(&state, rule, None).unwrap();
+        assert_eq!(rest.removed, [ids[1].clone()]);
+        assert_eq!(rest.remaining, 0);
+        for kept in &ids[2..] {
+            assert!(
+                backups_dir(&state).unwrap().join(kept).exists(),
+                "{kept} stays"
+            );
+        }
+        assert_eq!(prune(&state, rule, None).unwrap(), Pruned::default());
+
+        let records = list(&state).unwrap();
+        let prunes: Vec<_> = records.iter().filter(|r| r.kind == "prune").collect();
+        assert_eq!(
+            prunes.len(),
+            2,
+            "one record per prune that removed something"
+        );
+        assert!(
+            prunes[1].note.contains("keep 2, 25 days"),
+            "{}",
+            prunes[1].note
+        );
+        let gone = pruned_ids(&records);
+        assert!(gone.contains(&ids[0]) && gone.contains(&ids[1]));
+        assert!(!gone.contains(&git_id), "a git ref is never pruned");
+        assert_eq!(records.iter().filter(|r| r.id == git_id).count(), 1);
+
+        let err = restore(&state, &ids[0]).expect_err("a pruned backup cannot be restored");
+        assert!(err.to_string().contains("was pruned"), "{err}");
+
+        // Everything young or within `keep` survives the default rule.
+        assert_eq!(
+            prune(&state, Retention::default(), None).unwrap(),
+            Pruned::default()
+        );
+    }
+
     #[test]
     fn a_delete_with_its_stderr_silenced_is_still_insured() {
         let tmp = TempTree::new("bk-silenced");

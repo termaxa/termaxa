@@ -223,6 +223,44 @@ pub struct Policy {
     /// failed on `/dev/null` and a directory deleted with no backup behind it.
     #[serde(default, skip_serializing_if = "BackupFailure::is_default")]
     pub backup_failure: BackupFailure,
+    /// Retention for insurance copies under the state directory (#72). A
+    /// backup is removed only when it is both outside the `keep` most recent
+    /// and older than `days`; everything else stays. A `take` removes at
+    /// most one, so the hook stays fast; `termaxa backups --prune` removes
+    /// all of them at once. Defaults: keep 50, days 30.
+    #[serde(default, skip_serializing_if = "Retention::is_default")]
+    pub retention: Retention,
+}
+
+/// See `Policy::retention`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Retention {
+    #[serde(default = "default_keep")]
+    pub keep: usize,
+    #[serde(default = "default_days")]
+    pub days: u64,
+}
+
+fn default_keep() -> usize {
+    50
+}
+fn default_days() -> u64 {
+    30
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            keep: default_keep(),
+            days: default_days(),
+        }
+    }
+}
+
+impl Retention {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 fn default_version() -> u32 {
@@ -777,6 +815,15 @@ mod schema_and_severity_tests {
     fn an_omitted_field_gets_the_documented_default() {
         let minimal = policy_from("default: ask\nrules: []\n");
         assert_eq!(minimal.version, 1, "version 1 is the current schema");
+        assert_eq!(
+            minimal.retention,
+            Retention { keep: 50, days: 30 },
+            "#72's defaults"
+        );
+        let tuned = policy_from("default: ask\nrules: []\nretention:\n  keep: 5\n  days: 7\n");
+        assert_eq!(tuned.retention, Retention { keep: 5, days: 7 });
+        let half = policy_from("default: ask\nrules: []\nretention:\n  days: 1\n");
+        assert_eq!(half.retention, Retention { keep: 50, days: 1 });
 
         let notifying = policy_from(
             "default: ask\nrules: []\nnotify:\n  webhook: https://example.invalid/hook\n",

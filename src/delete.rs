@@ -173,10 +173,7 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
                 lines.push(format!("  insurance   : {} (automatic on run/hook)", plan));
             }
             Some(_) => {
-                lines.push(format!(
-                    "  ✗ insurance : too large to copy ({}+ files) — NOT recoverable",
-                    fmt_num(MAX_FILES)
-                ));
+                lines.push(format!("  ✗ insurance : {}", too_large_to_copy()));
                 worst_first.push("NOT recoverable".into());
                 uninsurable = true;
             }
@@ -957,6 +954,18 @@ pub fn scan_budgeted(root: &Path) -> Scan {
 // ---------------------------------------------------------------------------
 // formatting
 // ---------------------------------------------------------------------------
+
+/// The words the preview uses for a tree over the copy budget. The insurance
+/// engine refuses with the same words, so a "NOT recoverable" preview is
+/// never followed by a copy (#72: a Jul 9 backup held a whole `.gradle`
+/// cache, copied synchronously inside the hook after a preview that had
+/// already said it could not be).
+pub fn too_large_to_copy() -> String {
+    format!(
+        "too large to copy ({}+ files) — NOT recoverable",
+        fmt_num(MAX_FILES)
+    )
+}
 
 fn fmt_num(n: usize) -> String {
     let s = n.to_string();

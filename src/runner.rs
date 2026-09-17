@@ -54,6 +54,13 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
             Ok(Some(rec)) => {
                 println!("🛟 backup {} — {}", rec.id, rec.note);
                 *backup_id = Some(rec.id);
+                // Retention (#72): one eligible backup at most per take.
+                if let Ok(done) = crate::backup::prune(&paths.state_dir, policy.retention, Some(1))
+                {
+                    for id in done.removed {
+                        println!("{}", crate::ui::dim(&format!("   pruned {id} (retention)")));
+                    }
+                }
                 true
             }
             Ok(None) => true, // nothing to insure

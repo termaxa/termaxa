@@ -107,7 +107,12 @@ enum Cmd {
     /// Aggregate statistics from the audit log
     Stats,
     /// List backups taken by the insurance engine
-    Backups,
+    Backups {
+        /// Remove every backup the retention rule allows (see `retention:`
+        /// in the policy); a `take` removes at most one per command
+        #[arg(long)]
+        prune: bool,
+    },
     /// Restore a backup by id (see `termaxa backups`)
     Rollback { id: String },
     /// Show where policy and state live for this project
@@ -468,22 +473,54 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Backups => {
+        Cmd::Backups { prune } => {
             let p = paths::resolve()?;
+            if prune {
+                let policy = Policy::load(&p.policy_file())?;
+                let done = backup::prune(&p.state_dir, policy.retention, None)?;
+                if done.removed.is_empty() {
+                    println!(
+                        "nothing to prune (retention: keep {}, {} days)",
+                        policy.retention.keep, policy.retention.days
+                    );
+                } else {
+                    println!("pruned {}: {}", done.removed.len(), done.removed.join(", "));
+                }
+                return Ok(0);
+            }
             let records = backup::list(&p.state_dir)?;
             if records.is_empty() {
                 println!("{}", ui::dim("(no backups yet)"));
                 return Ok(0);
             }
+            let gone = backup::pruned_ids(&records);
             for r in records {
+                if r.kind == "prune" {
+                    println!("{}  {}  [prune]  {}", r.id, ui::dim(&r.ts), r.note);
+                    continue;
+                }
+                let pruned = if gone.contains(&r.id) {
+                    "  (pruned)"
+                } else {
+                    ""
+                };
                 println!(
-                    "{}  {}  [{}]  {}\n    insures: {}",
+                    "{}  {}  [{}]  {}{}\n    insures: {}",
                     r.id,
                     ui::dim(&r.ts),
                     r.kind,
                     r.note,
+                    ui::dim(pruned),
                     ui::dim(&r.command)
                 );
+                if let Some(n) = r.data["longest_path"].as_u64() {
+                    if n >= 260 {
+                        println!(
+                            "    paths up to {n} characters exceed Windows' 260-character limit; \
+                             only `termaxa rollback` can read this backup"
+                        );
+                    }
+                }
             }
             Ok(0)
         }
