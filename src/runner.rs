@@ -206,7 +206,7 @@ fn stdin_is_terminal() -> bool {
 /// downstream tokenizers (previews, backups) see the original structure.
 /// A naive `join(" ")` flattens `-c "TRUNCATE users"` into three words —
 /// which is how v0.6 initially failed to insure a truncate.
-fn shell_join(argv: &[String]) -> String {
+pub(crate) fn shell_join(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
             if a.is_empty()

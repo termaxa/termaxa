@@ -4,7 +4,7 @@
 
 **Run AI coding agents with confidence.**
 
-Termaxa gates the shell commands an agent runs — previews the blast radius, backs up first, blocks the dangerous ones, and escalates repeat offenders. It's a cooperative windshield, not a sandbox.
+Termaxa is a Rust command-line gate for the shell commands a coding agent runs: it previews the blast radius, backs up first, blocks the dangerous ones, and keeps a record the agent cannot rewrite. No model, no service, no account — a hook for Claude Code, Codex, Cursor and Copilot, or a wrapper for anything else. It's a cooperative windshield, not a sandbox.
 
 [![CI](https://github.com/termaxa/termaxa/actions/workflows/ci.yml/badge.svg)](https://github.com/termaxa/termaxa/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/termaxa/termaxa?display_name=tag)](https://github.com/termaxa/termaxa/releases)

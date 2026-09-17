@@ -332,14 +332,39 @@ pub fn split_segments_deep(s: &str) -> Vec<Segment> {
 }
 
 fn expand_into(out: &mut Vec<Segment>, segments: Vec<Segment>, via: Option<&str>, depth: usize) {
+    // A variable assigned earlier in the same command line, in the clear, is
+    // not unknown: `SNAPSHOT_FILE=/home/dev/.claude/…` on line one and
+    // `>| "$SNAPSHOT_FILE"` on line four name the same file. The bindings
+    // are collected in order and substituted, textually and once, into the
+    // segments after them; nothing crosses into a nested `-c` string (its
+    // own pass starts empty) and nothing comes from the environment.
+    // A name assigned twice is the later value from that point on, which
+    // is what the shell would do.
+    let mut bindings: Vec<(String, String)> = Vec::new();
+    let mut inner: Vec<Segment> = Vec::new();
     for mut seg in segments {
         if let Some(v) = via {
             seg.via = Some(v.to_string());
         }
+        if !bindings.is_empty() {
+            substitute_bindings(&mut seg, &bindings);
+        }
+        if let Some((name, value)) = simple_assignment(&seg) {
+            bindings.retain(|(n, _)| n != &name);
+            bindings.push((name, value));
+            seg.binds = true;
+        }
+        inner.push(seg);
+    }
+    let snapshot = via.is_some() && claude_snapshot_inner(&inner).is_some();
+    for mut seg in inner {
         // Scaffolding is only ever a harness's, and a harness only ever
         // speaks through a `-c` string; typed at the top level, the same
-        // words are a person's command and are judged as one.
-        seg.scaffold = via.is_some() && harness_scaffold(&seg);
+        // words are a person's command and are judged as one. Claude Code's
+        // startup snapshot is scaffolding as a whole: recognised by its
+        // first line and by every one of its writes going to the file that
+        // line names (`claude_snapshot`).
+        seg.scaffold = via.is_some() && (snapshot || harness_scaffold(&seg));
         let inner = if depth < MAX_WRAP_DEPTH {
             wrapped_command(&seg).or_else(|| wrapped_eval(&seg))
         } else {
@@ -356,6 +381,167 @@ fn expand_into(out: &mut Vec<Segment>, segments: Vec<Segment>, via: Option<&str>
             expand_into(out, split_segments(&script), Some(&label), depth + 1);
         }
     }
+}
+
+/// `NAME=value` or `export NAME=value` and nothing else: the name a shell
+/// identifier, the value a literal — after the tokenizer's quote stripping,
+/// no `$`, no backtick, no glob character, no whitespace and no shell
+/// operator character — so substituting it into a later segment can change
+/// which file that segment names and nothing about how it splits. Anything
+/// else (`X=$Y`, `X=$(…)`, `X=*.log`, `X="a b"`, an assignment in front of a
+/// command, a compound) binds nothing and reads as it always did.
+fn simple_assignment(seg: &Segment) -> Option<(String, String)> {
+    if !seg.redirects.is_empty() {
+        return None;
+    }
+    let toks = crate::delete::tokenize_detailed(seg.command());
+    let (word, exported) = match toks.as_slice() {
+        [w] => (w, false),
+        [e, w] if e.text == "export" => (w, true),
+        _ => return None,
+    };
+    let _ = exported;
+    let (name, value) = word.text.split_once('=')?;
+    let ident = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ident {
+        return None;
+    }
+    // The raw text of the value decides, not the stripped one: `"$Y"` and
+    // `$(…)` both strip to something that looks literal.
+    let raw_value = seg
+        .command()
+        .split_once('=')
+        .map(|(_, v)| v.trim())
+        .unwrap_or("");
+    const FORBIDDEN: &[char] = &[
+        '$', '`', '*', '?', '[', ';', '&', '|', '<', '>', '(', ')', ' ', '\t', '\n', '\\',
+    ];
+    if raw_value.contains(FORBIDDEN) {
+        return None;
+    }
+    if !word.single_quoted && value.contains(FORBIDDEN) {
+        return None;
+    }
+    Some((name.to_string(), value.to_string()))
+}
+
+/// Replace `$NAME` and `${NAME}` for each bound name in the segment's text
+/// and redirect targets. `$NAME` only where the name ends: `$NAMEX` is a
+/// different variable and stays as written.
+fn substitute_bindings(seg: &mut Segment, bindings: &[(String, String)]) {
+    // `$NAME` and `${NAME}` outside single quotes; inside them the shell
+    // expands nothing, so the text stays what it is. `$NAMEX` is a different
+    // name and stays too.
+    fn subst(text: &str, name: &str, value: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut in_single = false;
+        let mut i = 0;
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\\' && !in_single && i + 1 < chars.len() {
+                out.push(c);
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_single = !in_single;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            if c == '$' && !in_single {
+                let rest: String = chars[i + 1..].iter().collect();
+                if let Some(after) = rest.strip_prefix('{') {
+                    if let Some(tail) = after.strip_prefix(name) {
+                        if tail.starts_with('}') {
+                            out.push_str(value);
+                            i += 1 + 1 + name.chars().count() + 1;
+                            continue;
+                        }
+                    }
+                } else if let Some(tail) = rest.strip_prefix(name) {
+                    if !tail.chars().next().is_some_and(ident) {
+                        out.push_str(value);
+                        i += 1 + name.chars().count();
+                        continue;
+                    }
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+    if !seg.text.contains('$') {
+        return;
+    }
+    for (name, value) in bindings {
+        seg.text = subst(&seg.text, name, value);
+        for r in &mut seg.redirects {
+            r.target = subst(&r.target, name, value);
+        }
+    }
+}
+
+/// Claude Code's startup snapshot, run once per session as
+/// `bash -c -l "SNAPSHOT_FILE=<path> …"` (42 segments) or the zsh form
+/// (149): the first segment binds `SNAPSHOT_FILE` to the harness's own
+/// snapshot file name (`is_claude_snapshot`), and every write in the string
+/// goes to that file and nowhere else. Sourcing the user's rc and reading
+/// aliases, functions and options into that file is what the script does;
+/// judged segment by segment it was an unmatched ask on the assignment line
+/// or a refused write on a head with no rule, and every wrapped session
+/// opened with a refusal. Recognised whole, its segments are scaffolding:
+/// transparent unless a rule names one — a hard stop inside a drifted
+/// snapshot still fires — and, with nothing named, allowed under the reason
+/// `claude_snapshot` returns. A write anywhere else, or a first line that
+/// is not that binding, and the string is not a snapshot: judged as before.
+fn claude_snapshot_inner(inner: &[Segment]) -> Option<(String, usize)> {
+    let first = inner.first()?;
+    if !first.binds {
+        return None;
+    }
+    let (name, path) = simple_assignment(first)?;
+    if name != "SNAPSHOT_FILE" || !is_claude_snapshot(&path) {
+        return None;
+    }
+    for seg in inner {
+        for r in &seg.redirects {
+            if r.target.trim_matches('"') != path {
+                return None;
+            }
+        }
+    }
+    Some((path, inner.len()))
+}
+
+/// The snapshot, seen from a deep split: the segments inside the first
+/// wrapper. `Some((path, segments))` when they are Claude Code's startup
+/// snapshot as `claude_snapshot_inner` defines it.
+pub fn claude_snapshot(segs: &[Segment]) -> Option<(String, usize)> {
+    let wrapper = segs.first()?;
+    if !wrapper.wraps {
+        return None;
+    }
+    let label = format!(
+        "{} -c",
+        crate::delete::tokenize_public(wrapper.command()).first()?
+    );
+    let inner: Vec<Segment> = segs
+        .iter()
+        .skip(1)
+        .filter(|s| s.via.as_deref() == Some(label.as_str()))
+        .cloned()
+        .collect();
+    claude_snapshot_inner(&inner)
 }
 
 /// The pieces Claude Code puts around every Bash tool call, as it sends
@@ -448,7 +634,8 @@ fn wrapped_eval(seg: &Segment) -> Option<(String, String)> {
 /// Claude Code's preamble carries `unset -f`, and read raw it was a
 /// "destructive flag" on every command the agent ran, escalating each
 /// allowed one to an ask (Sep 10, 2026). What remains here is what the
-/// policy judged. A command with nothing to leave out is returned as typed.
+/// policy judged. A command with nothing to leave out is returned as typed;
+/// one with nothing left after leaving out is empty.
 pub fn context_text(command: &str) -> String {
     let segs = split_segments_deep(command);
     if segs.len() <= 1 {
@@ -456,12 +643,13 @@ pub fn context_text(command: &str) -> String {
     }
     let kept: Vec<&str> = segs
         .iter()
-        .filter(|s| !s.wraps && !s.scaffold)
+        .filter(|s| !s.wraps && !s.scaffold && !s.binds)
         .map(|s| s.text.as_str())
         .collect();
-    if kept.is_empty() {
-        return command.to_string();
-    }
+    // Nothing left to judge - a `-c` string that is all preamble, or the
+    // startup snapshot recognised whole - is nothing to read signals off:
+    // returning the raw line here would hand `declare -f` and `unset -f`
+    // back to the flag scan the reading just took them out of.
     kept.join("; ")
 }
 
@@ -562,6 +750,16 @@ pub struct Segment {
     /// command inside the `eval` decides. Anything the harness changes in
     /// that preamble stops matching and falls back to the default: closed.
     pub scaffold: bool,
+    /// True when this segment is nothing but a simple assignment,
+    /// `NAME=value` or `export NAME=value`, with a literal path-like value.
+    /// It runs nothing; the value it binds has already been substituted into
+    /// the segments after it (see `expand_into`), so the policy treats it as
+    /// transparent unless a rule names it, and the context check leaves it
+    /// out. Claude Code's startup snapshot opens with one
+    /// (`SNAPSHOT_FILE=<path>`, then 41 or 148 segments using it), and read
+    /// as an unmatched segment it was the whole reason the zsh form fell to
+    /// the default (Sep 12, 2026, #94).
+    pub binds: bool,
 }
 
 impl Segment {
@@ -661,6 +859,7 @@ fn flush(
             via: None,
             wraps: false,
             scaffold: false,
+            binds: false,
         });
     } else {
         // Nothing but whitespace between separators: whatever the redirect
@@ -985,6 +1184,159 @@ mod tests {
             .map(|s| &**s)
             .collect();
         assert_eq!(inner, ["git status"]);
+    }
+
+    /// Claude Code's startup snapshot, in the shape the record holds (Sep
+    /// 10–12, 2026): the first line binds `SNAPSHOT_FILE`, every write goes
+    /// there, and the heredoc bodies are the harness's own text. The binding
+    /// substitutes into every later segment, the assignment segment is
+    /// transparent, the snapshot is recognised whole, and a write anywhere
+    /// else or a different first line makes it an ordinary string again.
+    #[test]
+    fn a_variable_bound_earlier_in_the_string_resolves_and_the_snapshot_is_recognised() {
+        let script = concat!(
+            "SNAPSHOT_FILE=/home/dev/.claude/shell-snapshots/snapshot-bash-1789080866426-67di03.sh\n",
+            "      source \"/home/dev/.bashrc\" < /dev/null\n",
+            "      # First, create/clear the snapshot file\n",
+            "      echo \"# Snapshot file\" >| \"$SNAPSHOT_FILE\"\n",
+            "      echo \"unalias -a 2>/dev/null || true\" >> \"$SNAPSHOT_FILE\"\n",
+            "      cat >> \"$SNAPSHOT_FILE\" << 'RIPGREP_FUNC_END'\n",
+            "  function rg {\n",
+            "  local _cc_bin=\"${CLAUDE_CODE_EXECPATH:-}\"\n",
+            "  [[ -x $_cc_bin ]] || _cc_bin=/home/dev/.local/bin/claude\n",
+            "  if [[ ! -x $_cc_bin ]]; then command rg ${1+\"$@\"}; return; fi\n",
+            "}\n",
+            "RIPGREP_FUNC_END\n",
+            "      declare -f | head -n 1000 >> \"$SNAPSHOT_FILE\"\n",
+            "      cat >> \"$SNAPSHOT_FILE\" << 'PATH_END_f5fnw4s2sag'\n",
+            "export PATH=/home/dev/.termaxa/shims:/home/dev/.local/bin:/usr/bin:/bin\n",
+            "PATH_END_f5fnw4s2sag\n",
+            "      if [ ! -f \"$SNAPSHOT_FILE\" ]; then\n",
+            "        echo \"Error: Snapshot file was not created at $SNAPSHOT_FILE\" >&2\n",
+            "        exit 1\n",
+            "      fi\n",
+        );
+        let path = "/home/dev/.claude/shell-snapshots/snapshot-bash-1789080866426-67di03.sh";
+        let argv: Vec<String> = ["bash", "-c", "-l", script]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let command = crate::runner::shell_join(&argv);
+        let segs = split_segments_deep(&command);
+        assert!(segs[0].wraps);
+        assert!(
+            segs[1].binds,
+            "the first inner segment binds: {}",
+            &*segs[1]
+        );
+        assert_eq!(&*segs[1], &format!("SNAPSHOT_FILE={path}"));
+        let writes: Vec<&str> = segs
+            .iter()
+            .flat_map(|s| s.redirects.iter())
+            .map(|r| r.target.as_str())
+            .collect();
+        assert!(!writes.is_empty());
+        assert!(
+            writes.iter().all(|t| t.trim_matches('"') == path),
+            "every write resolved to the bound path: {writes:?}"
+        );
+        assert!(
+            segs.iter().skip(1).all(|s| s.scaffold),
+            "recognised whole: every inner segment is scaffolding"
+        );
+        let (found, n) = claude_snapshot(&segs).expect("the snapshot is recognised");
+        assert_eq!(found, path);
+        assert_eq!(n, segs.len() - 1);
+        assert!(
+            !context_text(&command).contains("-f"),
+            "{}",
+            context_text(&command)
+        );
+
+        // A second binding of the same name is the later value from then on.
+        let segs = split_segments_deep("X=/a; echo one > $X; X=/b; echo two > $X");
+        let targets: Vec<&str> = segs
+            .iter()
+            .flat_map(|s| s.redirects.iter())
+            .map(|r| r.target.as_str())
+            .collect();
+        assert_eq!(targets, ["/a", "/b"]);
+
+        // A write anywhere else: not a snapshot, judged as before.
+        let drifted = script.replace(
+            "declare -f | head -n 1000 >> \"$SNAPSHOT_FILE\"",
+            "declare -f | head -n 1000 >> /home/dev/.bashrc",
+        );
+        let argv: Vec<String> = ["bash", "-c", "-l", drifted.as_str()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let segs = split_segments_deep(&crate::runner::shell_join(&argv));
+        assert!(claude_snapshot(&segs).is_none());
+        assert!(segs.iter().skip(1).any(|s| !s.scaffold));
+
+        // A first line binding some other name, or a path outside the
+        // harness's own: not a snapshot.
+        for first in [
+            "SNAPSHOT_FILE=/home/dev/notes.sh",
+            "OTHER=/home/dev/.claude/shell-snapshots/snapshot-bash-1-a.sh",
+            "SNAPSHOT_FILE=/home/dev/.claude/shell-snapshots/../../x/snapshot-bash-1-a.sh",
+        ] {
+            let cmd = format!(r#"bash -c "{first}; echo hi >| \"$SNAPSHOT_FILE\"""#);
+            assert!(
+                claude_snapshot(&split_segments_deep(&cmd)).is_none(),
+                "{first}"
+            );
+        }
+    }
+
+    /// What binds and what does not: a literal path-like value binds, with
+    /// or without `export`, quoted or bare, empty included; anything the
+    /// shell would still expand, glob or split does not; single quotes keep
+    /// a `$` literal; a name that merely starts with the bound one is not it.
+    #[test]
+    fn only_a_literal_assignment_binds_and_only_outside_single_quotes() {
+        let bound = |cmd: &str| -> Vec<String> {
+            split_segments_deep(cmd)
+                .iter()
+                .filter(|s| !s.binds)
+                .map(|s| s.text.clone())
+                .collect()
+        };
+        assert_eq!(bound("X=/tmp/a; rm -rf $X"), ["rm -rf /tmp/a"]);
+        assert_eq!(bound("export X=/tmp/a; rm -rf ${X}/b"), ["rm -rf /tmp/a/b"]);
+        assert_eq!(bound("X='/tmp/a'; rm -rf $X"), ["rm -rf /tmp/a"]);
+        assert_eq!(bound("X=\"/tmp/a\"; rm -rf $X"), ["rm -rf /tmp/a"]);
+        assert_eq!(
+            bound("X=; rm -rf $X/*"),
+            ["rm -rf /*"],
+            "an empty value binds"
+        );
+        assert_eq!(bound("X=/tmp/a; rm -rf $XY"), ["rm -rf $XY"]);
+        assert_eq!(bound("X=/tmp/a; rm -rf '$X'"), ["rm -rf '$X'"]);
+        for not_bound in [
+            "X=$Y; rm -rf $X",
+            "X=$(pwd); rm -rf $X",
+            "X=`pwd`; rm -rf $X",
+            "X=*.log; rm -rf $X",
+            "X=\"a b\"; rm -rf $X",
+            "X=/tmp/a rm -rf $X",
+            "if true; then X=/tmp/a; fi; rm -rf $X",
+        ] {
+            let segs = split_segments_deep(not_bound);
+            let last = segs.last().unwrap();
+            assert!(
+                last.text.contains("$X"),
+                "{not_bound}: nothing bound, read as written: {}",
+                last.text
+            );
+        }
+        // A binding does not cross into a nested `-c` string.
+        let segs = split_segments_deep(r#"X=/tmp/a; sh -c "rm -rf $X""#);
+        let inner = segs.iter().find(|s| s.via.is_some()).unwrap();
+        assert!(inner.text.contains("$X"), "{}", inner.text);
+        assert!(!split_segments_deep("rm -rf x")[0].binds);
+        assert!(split_segments_deep("X=1")[0].binds);
     }
 
     /// What the scaffolding reading leaves alone: the same words typed at

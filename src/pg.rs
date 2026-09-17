@@ -666,8 +666,14 @@ fn read_table_list(words: &[String], mut i: usize) -> (Vec<String>, usize) {
             break;
         }
         let trailing_comma = w.ends_with(',');
-        if let Some(t) = clean_ident(w) {
-            tables.push(t);
+        // `a,b` in one word is a list too: `TRUNCATE a,b` had reached the
+        // gate as a single identifier that `clean_ident` rejected, so the
+        // statement previewed and insured nothing (the known gap of #14's
+        // era, closed here).
+        for part in w.split(',') {
+            if let Some(t) = clean_ident(part) {
+                tables.push(t);
+            }
         }
         i += 1;
         if !trailing_comma && !words.get(i).map(|n| n == ",").unwrap_or(false) {
@@ -919,17 +925,17 @@ mod tests {
     /// in delete.rs: "path syntax must never decide whether a safety net
     /// exists". Here it is comma spacing.
     #[test]
-    fn a_comma_without_a_space_is_a_known_gap_with_no_insurance_beneath() {
-        assert!(
-            parse_destructive("TRUNCATE a,b").is_empty(),
-            "if this starts parsing, the gap closed and this test should be \
-             inverted rather than deleted"
-        );
-        assert!(parse_destructive("DROP TABLE a,b").is_empty());
-
-        // The spaced spelling of the same statement is read in full, which is
-        // what makes the difference a spelling rather than a limitation.
+    fn a_comma_without_a_space_was_a_known_gap_and_is_now_closed() {
+        // Inverted, as the test that pinned the gap asked: `a,b` in one word
+        // is the same list as `a, b`.
+        assert_eq!(truncate_of("TRUNCATE a,b").0, ["a", "b"]);
+        assert_eq!(truncate_of("TRUNCATE a,b,c CASCADE").0, ["a", "b", "c"]);
+        assert!(truncate_of("TRUNCATE a,b,c CASCADE").1);
         assert_eq!(truncate_of("TRUNCATE a, b").0, ["a", "b"]);
+        match parse_destructive("DROP TABLE a,b").as_slice() {
+            [Destructive::DropTable { tables, .. }] => assert_eq!(tables, &["a", "b"]),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

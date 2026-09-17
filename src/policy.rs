@@ -395,7 +395,9 @@ impl Policy {
             // default on `shopt` and outranked the verdict on `<cmd>`, so
             // routed through `wrap` every command it ran was refused
             // (Sep 10, 2026). The command inside the eval decides.
-            if (seg.wraps || seg.scaffold) && d.matched_rule.is_none() {
+            // A segment that is only a simple assignment runs nothing and
+            // its value is already in the segments after it (#94).
+            if (seg.wraps || seg.scaffold || seg.binds) && d.matched_rule.is_none() {
                 continue;
             }
             let replace = match &worst {
@@ -411,6 +413,28 @@ impl Policy {
             };
             if replace {
                 worst = Some((i, d));
+            }
+        }
+        // Claude Code's startup snapshot, recognised whole (#94): a first
+        // line binding `SNAPSHOT_FILE` to the harness's own file and every
+        // write going there. Its segments were transparent above, so a rule
+        // that names one of them - a hard stop inside a drifted snapshot -
+        // still decided; with nothing named, or only allows, the snapshot
+        // is allowed and the reason says what it is. Only `wrap` ever sees
+        // it: the hook sees tool calls, and this is the harness starting.
+        if let Some((path, n)) = crate::shell::claude_snapshot(&segments) {
+            let allowed = worst
+                .as_ref()
+                .is_none_or(|(_, d)| d.action == Action::Allow);
+            if allowed {
+                return Decision {
+                    action: Action::Allow,
+                    source: DecisionSource::Context,
+                    matched_rule: None,
+                    reason: format!(
+                        "Claude Code startup snapshot ({n} segments): writes only to `{path}`"
+                    ),
+                };
             }
         }
         let Some((i, d)) = worst else {
@@ -1235,6 +1259,71 @@ rules:
         let foreign = r#"bash -c "source /home/dev/.claude/shell-snapshots/../../.bashrc 2>/dev/null || true && eval 'ls' < /dev/null""#;
         let d = starter.evaluate_command(foreign, &here());
         assert_eq!(d.action, Action::Ask, "{}", d.reason);
+    }
+
+    /// Claude Code's startup snapshot through the starter (#94): allowed as
+    /// a whole with a reason that says what it is; a hard stop inside a
+    /// drifted one still fires; a write anywhere else makes it an ordinary
+    /// string that falls to the default. And the binding pass on its own:
+    /// `X=; rm -rf $X/*` is now the root delete it is, where it used to be
+    /// an unresolved target.
+    #[test]
+    fn claude_codes_startup_snapshot_is_allowed_whole_and_drift_fails_closed() {
+        let starter = Policy::builtin().unwrap();
+        let script = concat!(
+            "SNAPSHOT_FILE=/home/dev/.claude/shell-snapshots/snapshot-zsh-1789155309665-c8orq4.sh\n",
+            "      # No user config file to source\n",
+            "      echo \"# Snapshot file\" >| \"$SNAPSHOT_FILE\"\n",
+            "      echo \"unalias -a 2>/dev/null || true\" >> \"$SNAPSHOT_FILE\"\n",
+            "      cat >> \"$SNAPSHOT_FILE\" << 'PKILL_FUNC_END'\n",
+            "unalias pkill 2>/dev/null || true\n",
+            "function pkill {\n",
+            "  command pkill ${1+\"$@\"}\n",
+            "}\n",
+            "PKILL_FUNC_END\n",
+            "      declare -f | head -n 1000 >> \"$SNAPSHOT_FILE\"\n",
+            "      if [ ! -f \"$SNAPSHOT_FILE\" ]; then\n",
+            "        echo \"Error: Snapshot file was not created at $SNAPSHOT_FILE\" >&2\n",
+            "        exit 1\n",
+            "      fi\n",
+        );
+        let join = |script: &str| {
+            let argv: Vec<String> = ["zsh", "-c", "-l", script]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            crate::runner::shell_join(&argv)
+        };
+        let d = starter.evaluate_command(&join(script), &here());
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        assert!(
+            d.reason.starts_with("Claude Code startup snapshot (")
+                && d.reason.ends_with("snapshot-zsh-1789155309665-c8orq4.sh`"),
+            "{}",
+            d.reason
+        );
+
+        let with_a_hard_stop = script.replace("      exit 1\n", "      rm -rf ./dist\n");
+        let d = starter.evaluate_command(&join(&with_a_hard_stop), &here());
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        assert!(d.reason.contains("Recursive force delete"), "{}", d.reason);
+
+        let writing_elsewhere = script.replace(
+            "declare -f | head -n 1000 >> \"$SNAPSHOT_FILE\"",
+            "declare -f | head -n 1000 >> /home/dev/.zshrc",
+        );
+        let d = starter.evaluate_command(&join(&writing_elsewhere), &here());
+        assert_ne!(d.action, Action::Allow, "{}", d.reason);
+        assert!(!d.reason.contains("startup snapshot"), "{}", d.reason);
+
+        let d = starter.evaluate_command("X=; rm -rf $X/*", &here());
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        let d = starter.evaluate_command("X=$Y; rm -rf $X", &here());
+        assert!(
+            !d.reason.contains("X=") || d.action != Action::Allow,
+            "{}",
+            d.reason
+        );
     }
 
     /// A wrapper no rule names is transparent: `sh -c "echo hi"` is allowed

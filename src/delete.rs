@@ -252,12 +252,9 @@ pub fn extract_targets_detailed(command: &str) -> Vec<Tok> {
             continue;
         }
         let texts: Vec<String> = tokens.iter().map(|t| t.text.clone()).collect();
-        let Some((head, at)) = resolve_head(&texts) else {
+        let Some((head, at)) = delete_head(&texts) else {
             continue;
         };
-        if !is_delete_command(&head) {
-            continue;
-        }
 
         // Targets start after the command, not after token zero: with a
         // wrapper present those are different positions, and reading from
@@ -288,7 +285,7 @@ pub fn is_flag(head: &str, token: &str) -> bool {
         // POSIX-only: `-` introduces options, a leading `/` is a path.
         // `rm -rf /c` must keep `/c` as a target — that is a whole-drive
         // delete, the command that most needs a preview and a backup.
-        "rm" | "unlink" => token.starts_with('-'),
+        "rm" | "unlink" | "git rm" => token.starts_with('-'),
         // PowerShell: -Recurse, -Force, -Path. Never `/`.
         "remove-item" | "ri" => token.starts_with('-'),
         // cmd-family: /s /q /f are switches. But "a leading slash means a
@@ -431,8 +428,36 @@ fn is_env_assignment(token: &str) -> bool {
 pub fn is_delete_command(head: &str) -> bool {
     matches!(
         head,
-        "rm" | "rmdir" | "del" | "rd" | "unlink" | "remove-item" | "ri"
+        "rm" | "rmdir" | "del" | "rd" | "unlink" | "remove-item" | "ri" | "git rm"
     )
+}
+
+/// The delete a command line performs, as `(head, at)`: the head the
+/// targets belong to and the index of the token the targets follow. For
+/// `rm` and its relatives that is `resolve_head`; for `git rm` it is the
+/// two-word head `git rm` at the position of `rm`, so `git rm -r scratch`
+/// names `scratch` the way `rm -r scratch` does. Issue #80: Claude Code
+/// spelled a delete `git rm` five times out of five, and the gate read a
+/// `git` command with no target - no preview, no insurance, no path rule.
+/// `git rm --cached` removes from the index and leaves the file, and is not
+/// a delete here. `None` when the command deletes nothing.
+pub fn delete_head(tokens: &[String]) -> Option<(String, usize)> {
+    let (head, at) = resolve_head(tokens)?;
+    if head == "git" {
+        let sub = tokens.get(at + 1)?;
+        if sub != "rm" {
+            return None;
+        }
+        if tokens[at + 2..].iter().any(|t| t == "--cached") {
+            return None;
+        }
+        return Some(("git rm".to_string(), at + 1));
+    }
+    if is_delete_command(&head) {
+        Some((head, at))
+    } else {
+        None
+    }
 }
 
 /// Minimal tokenizer that respects single and double quotes. We cannot reuse
@@ -1020,6 +1045,32 @@ mod tests {
             vec!["./dist", "./build"]
         );
         assert!(extract_targets("sh clean.sh ./dist").is_empty());
+    }
+
+    /// #80: `git rm` is a delete. Its targets are named the way `rm`'s are,
+    /// through flags and `-r`; `--cached` removes from the index only and
+    /// is not a delete; a `git` command that is not `rm` names nothing.
+    #[test]
+    fn git_rm_is_a_delete_and_git_rm_cached_is_not() {
+        let names = |cmd: &str| -> Vec<String> {
+            extract_targets_detailed(cmd)
+                .into_iter()
+                .map(|t| t.text)
+                .collect()
+        };
+        assert_eq!(names("git rm scratch/f1.txt"), ["scratch/f1.txt"]);
+        assert_eq!(names("git rm -r scratch"), ["scratch"]);
+        assert_eq!(
+            names("git rm -rf --quiet scratch docs"),
+            ["scratch", "docs"]
+        );
+        assert_eq!(names("git rm -r --cached scratch"), Vec::<String>::new());
+        assert_eq!(names("git status"), Vec::<String>::new());
+        assert_eq!(
+            delete_head(&["git".into(), "rm".into(), "-r".into(), "x".into()]),
+            Some(("git rm".to_string(), 1))
+        );
+        assert_eq!(delete_head(&["git".into(), "add".into(), "x".into()]), None);
     }
 
     #[test]

@@ -374,10 +374,7 @@ fn rm_targets(tokens: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
     // Same head resolution the classifier and the preview use. When these
     // disagreed, a command could be CLASSIFIED destructive and take no
     // insurance - gated without a net, which is worse than missing both.
-    let (head, at) = crate::delete::resolve_head(tokens)?;
-    if !crate::delete::is_delete_command(&head) {
-        return None;
-    }
+    let (head, at) = crate::delete::delete_head(tokens)?;
     let paths: Vec<PathBuf> = tokens[at + 1..]
         .iter()
         .filter(|t| !crate::delete::is_flag(&head, t))

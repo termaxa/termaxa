@@ -100,7 +100,7 @@ rules:
   # `git diff .env`, even `vim .env.sample`. Reading a file is ordinary work.
   - match_path: "*/.env"
     action: deny
-    reason: "Overwriting .env destroys credentials that are not in the repo."
+    reason: "Writing to or removing .env destroys credentials that are not in the repo."
   - match: "*> /etc/*"
     action: deny
     reason: "Overwriting a system config file."

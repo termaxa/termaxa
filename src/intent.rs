@@ -149,7 +149,13 @@ fn classify_segment_named(segment: &str) -> Option<Intent> {
     // --- file deletes: unix rm, PowerShell Remove-Item + aliases, cmd del ---
     // PowerShell aliases: rm, ri, del, erase, rd all map to Remove-Item.
     let delete_cmds = ["rm", "ri", "del", "erase", "rd", "rmdir", "remove-item"];
-    if delete_cmds.contains(&first) {
+    // `git rm -r` / `git rm -f` delete from the working tree the way `rm`
+    // does (#80); `--cached` only touches the index. Read past the `git`.
+    let git_rm = first == "git"
+        && lc.get(1).map(String::as_str) == Some("rm")
+        && !lc.iter().any(|t| t == "--cached");
+    let lc: Vec<String> = if git_rm { lc[1..].to_vec() } else { lc };
+    if delete_cmds.contains(&first) || git_rm {
         let recursive = lc.iter().skip(1).any(|t| {
             t == "-recurse"
                 || t == "/s"
@@ -707,6 +713,27 @@ mod tests {
     }
 
     // --- classification ---
+
+    /// #80: `git rm -r` and `git rm -f` are the recursive or forced delete
+    /// they spell; a plain `git rm file` is a delete without the flag, like
+    /// `rm file`; `--cached` touches the index only.
+    #[test]
+    fn git_rm_counts_like_rm_when_recursive_or_forced() {
+        assert_eq!(
+            classify_command("git rm -r scratch"),
+            Some(Intent::FileDelete)
+        );
+        assert_eq!(
+            classify_command("git rm -rf scratch"),
+            Some(Intent::FileDelete)
+        );
+        assert_eq!(
+            classify_command("git rm --force scratch/f1.txt"),
+            Some(Intent::FileDelete)
+        );
+        assert_eq!(classify_command("git rm scratch/f1.txt"), None);
+        assert_eq!(classify_command("git rm -r --cached scratch"), None);
+    }
 
     #[test]
     fn classifies_unix_rm() {
