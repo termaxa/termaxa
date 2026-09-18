@@ -666,6 +666,47 @@ fn wrap_hands_the_agent_the_shim_for_its_own_shell_by_name() {
     );
 }
 
+/// `termaxa demo` is the real `check` and `log` on a throwaway project: the
+/// starter denying a recursive delete with its blast radius, a path rule on
+/// `.env`, an ask with insurance planned, and the record. Nothing left
+/// behind under the temp directory.
+#[test]
+fn demo_runs_the_real_gate_on_a_throwaway_project() {
+    let tmp = scratch("demo");
+    let home = tmp.join("home");
+    let out = termaxa_within(&home, &tmp, &["demo"], "", 60);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    for expected in [
+        "12 files across 1 directory",
+        "*rm -rf*",
+        "path:*/.env",
+        "Writing to or removing .env",
+        "rm scratch/f1.txt",
+        "[check] rm -rf ./scratch",
+    ] {
+        assert!(
+            out.stdout.contains(expected),
+            "want `{expected}` in:\n{}",
+            out.stdout
+        );
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(home.join("demo"))
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("project-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftovers.is_empty(),
+        "the project is removed afterwards: {leftovers:?}"
+    );
+}
+
 /// The fail-mode knob. A payload that looks like a shell tool call but that
 /// the reader cannot parse passes through by default (exit 0, no decision),
 /// exactly as it always did; under `unrecognised: deny` it is refused with a

@@ -3,6 +3,7 @@ use crate::context;
 use crate::policy::{Action, Policy};
 use anyhow::{bail, Result};
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 
 /// `termaxa run -- <cmd...>`: gatekept execution from the CLI.
@@ -45,6 +46,13 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     // harness's, not the command's. Threaded explicitly so that distinction
     // is visible rather than relying on an ambient default inside resolve.
     let run_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // #73: what the delete targets look like now, so that what runs is what
+    // was judged. Between the verdict, the prompt a person answers, and the
+    // copy, the tree can change; the re-check just before `execute` refuses
+    // if it did, naming the counts, and the person re-runs to see the new
+    // preview.
+    let judged = crate::delete::target_signature(&command, &run_cwd);
+    let mut recheck_refusal: Option<String> = None;
     let mut backup_id: Option<String> = None;
     // Returns whether the command may go on to run. A failed backup proceeds
     // with a warning by default; a policy that sets `backup_failure: deny`
@@ -138,8 +146,14 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
                     (Some(false), None)
                 } else if matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
                     if insure(&mut backup_id) {
-                        let code = execute(argv)?;
-                        (Some(true), Some(code))
+                        if let Some(why) = changed_since(&command, &run_cwd, judged.as_ref()) {
+                            eprintln!("termaxa: {why}");
+                            recheck_refusal = Some(why);
+                            (Some(false), None)
+                        } else {
+                            let code = execute(argv)?;
+                            (Some(true), Some(code))
+                        }
                     } else {
                         (Some(false), None)
                     }
@@ -151,12 +165,29 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         }
         Action::Allow => {
             if insure(&mut backup_id) {
-                let code = execute(argv)?;
-                (None, Some(code))
+                if let Some(why) = changed_since(&command, &run_cwd, judged.as_ref()) {
+                    eprintln!("termaxa: {why}");
+                    recheck_refusal = Some(why);
+                    (Some(false), None)
+                } else {
+                    let code = execute(argv)?;
+                    (None, Some(code))
+                }
             } else {
                 (Some(false), None)
             }
         }
+    };
+    // A refused re-check is recorded as the refusal it was, not as the
+    // verdict that preceded it.
+    let decision = match recheck_refusal {
+        Some(why) => crate::policy::Decision {
+            action: Action::Deny,
+            source: crate::policy::DecisionSource::Context,
+            matched_rule: decision.matched_rule.clone(),
+            reason: why,
+        },
+        None => decision,
     };
 
     let intent_label = crate::intent::classify_command(&command).map(|i| i.label().to_string());
@@ -227,6 +258,30 @@ pub(crate) fn shell_join(argv: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// #73: the target set re-scanned under the same budget and compared with
+/// what was judged. `Some(reason)` when it differs; `None` when it is the
+/// same, when there was nothing to compare (no delete targets, or a tree
+/// over the budget both times), and when the budget was hit now but not
+/// then - that last case is a change too, and is said so.
+fn changed_since(
+    command: &str,
+    cwd: &Path,
+    judged: Option<&crate::delete::TargetSignature>,
+) -> Option<String> {
+    let judged = judged?;
+    match crate::delete::target_signature(command, cwd) {
+        Some(now) if now == *judged => None,
+        Some(now) => Some(format!(
+            "the target set changed since it was judged ({} files across {} directories then, {} across {} now) — refused; run it again to see the new preview",
+            judged.files, judged.dirs, now.files, now.dirs
+        )),
+        None => Some(format!(
+            "the target set changed since it was judged ({} files across {} directories then, past the scan budget now) — refused; run it again to see the new preview",
+            judged.files, judged.dirs
+        )),
+    }
 }
 
 fn execute(argv: &[String]) -> Result<i32> {
@@ -307,6 +362,51 @@ mod tests {
             shell_join(&argv(&["cat", "C:\\tmp dir\\x"])),
             "cat \"C:\\\\tmp dir\\\\x\""
         );
+    }
+
+    /// #73: the target set is signed when the command is judged and
+    /// re-signed just before it runs. Unchanged: runs. A file added,
+    /// removed or rewritten in between: refused, with both counts in the
+    /// reason. No delete targets, or a tree past the scan budget both
+    /// times: nothing to compare, runs as today.
+    #[test]
+    fn a_target_set_that_changed_since_it_was_judged_is_refused_and_says_so() {
+        let tmp = TempTree::new("recheck");
+        let cwd = tmp.dir("proj");
+        let scratch = tmp.dir("proj/scratch");
+        for i in 1..=3 {
+            std::fs::write(scratch.join(format!("f{i}")), "x").unwrap();
+        }
+        let judged = crate::delete::target_signature("rm -rf scratch", &cwd)
+            .expect("three files: a signature");
+        assert_eq!((judged.files, judged.dirs), (3, 1));
+        assert_eq!(
+            changed_since("rm -rf scratch", &cwd, Some(&judged)),
+            None,
+            "unchanged: runs"
+        );
+
+        std::fs::write(scratch.join("f4"), "x").unwrap();
+        let why = changed_since("rm -rf scratch", &cwd, Some(&judged)).expect("a file arrived");
+        assert!(
+            why.contains("3 files across 1 directories then, 4 across 1 now"),
+            "{why}"
+        );
+        assert!(why.contains("refused"), "{why}");
+
+        // A rewrite with the same count is still a change: size and mtime
+        // are in the signature.
+        let judged = crate::delete::target_signature("rm -rf scratch", &cwd).unwrap();
+        std::fs::write(scratch.join("f1"), "longer content").unwrap();
+        assert!(changed_since("rm -rf scratch", &cwd, Some(&judged)).is_some());
+
+        // Nothing to compare: no delete target, or none that exists.
+        assert_eq!(crate::delete::target_signature("git status", &cwd), None);
+        assert_eq!(
+            crate::delete::target_signature("rm -rf nothing-here", &cwd),
+            None
+        );
+        assert_eq!(changed_since("git status", &cwd, None), None);
     }
 
     #[cfg(unix)]

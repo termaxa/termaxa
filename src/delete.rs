@@ -955,6 +955,76 @@ pub fn scan_budgeted(root: &Path) -> Scan {
 // formatting
 // ---------------------------------------------------------------------------
 
+/// What the delete targets of `command` look like right now, bounded (#73):
+/// every existing target, walked under the preview's own file and time
+/// budget, each entry's relative path, size and mtime folded into one
+/// sha256, with the counts beside it. Taken once when the command is
+/// judged and again just before it runs; if the two differ, what would be
+/// deleted is not what was previewed and copied, and the runner refuses
+/// rather than delete it. `None` when the command deletes nothing, or when
+/// the walk hits the budget - above it the preview already says the tree is
+/// too large to insure, and the same rule applies to re-checking it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetSignature {
+    pub files: usize,
+    pub dirs: usize,
+    pub digest: String,
+}
+
+pub fn target_signature(command: &str, cwd: &Path) -> Option<TargetSignature> {
+    let start = Instant::now();
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    let mut bytes: Vec<u8> = Vec::new();
+    let roots: Vec<PathBuf> = extract_targets(command)
+        .iter()
+        .map(|t| resolve_path_in(t, cwd))
+        .filter(|p| p.exists())
+        .collect();
+    if roots.is_empty() {
+        return None;
+    }
+    for root in &roots {
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            if files >= MAX_FILES || start.elapsed() > MAX_TIME {
+                return None;
+            }
+            let meta = match std::fs::symlink_metadata(&dir) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let rel = dir.strip_prefix(root).unwrap_or(&dir).display().to_string();
+            if meta.is_dir() {
+                dirs += 1;
+                bytes.extend_from_slice(rel.as_bytes());
+                bytes.push(b'/');
+                let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+                    Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
+                    Err(_) => continue,
+                };
+                entries.sort();
+                stack.extend(entries.into_iter().rev());
+            } else {
+                files += 1;
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                bytes.extend_from_slice(rel.as_bytes());
+                bytes.extend_from_slice(format!("\0{}\0{}\n", meta.len(), mtime).as_bytes());
+            }
+        }
+    }
+    Some(TargetSignature {
+        files,
+        dirs,
+        digest: crate::fingerprint::sha256_hex(&bytes),
+    })
+}
+
 /// The words the preview uses for a tree over the copy budget. The insurance
 /// engine refuses with the same words, so a "NOT recoverable" preview is
 /// never followed by a copy (#72: a Jul 9 backup held a whole `.gradle`

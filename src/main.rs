@@ -2,6 +2,7 @@ mod audit;
 mod backup;
 mod context;
 mod delete;
+mod demo;
 mod doctor;
 mod fingerprint;
 mod hook;
@@ -106,6 +107,8 @@ enum Cmd {
     },
     /// Aggregate statistics from the audit log
     Stats,
+    /// The gate on a throwaway project: three checks and the record, in twenty seconds
+    Demo,
     /// List backups taken by the insurance engine
     Backups {
         /// Remove every backup the retention rule allows (see `retention:`
@@ -473,6 +476,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Demo => demo::run(),
         Cmd::Backups { prune } => {
             let p = paths::resolve()?;
             if prune {
