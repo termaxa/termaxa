@@ -16,14 +16,14 @@ Termaxa works by *cooperative interception*: it sees commands that flow through 
 
 - An agent (or process) that calls the real binary directly (`/usr/bin/git`), bypassing the hook.
 - Commands run through a language runtime, a subshell Termaxa didn't parse, or an execution path outside the harness.
-- **An agent's own native file/edit tools.** Observed in live testing: a Cursor agent, blocked on shell deletes, switched to its built-in file-delete tool and removed ~20 files that never passed through the shell hook — so Termaxa never saw them, gated them, or backed them up. Any agent tool that acts on the filesystem without going through a shell command is outside the gate.
+- **An agent's own native file/edit tools, where no path rule names the file.** Since v0.19 a `Write`/`Edit` (and a patch's `*** Delete File`) is judged by its target against the `match_path` rules, with insurance and a receipt when one fires; a file no rule names gets no decision, and the policy default does not apply. Observed in live testing before that: a Cursor agent, blocked on shell deletes, switched to its built-in file-delete tool and removed ~20 files that never passed through the shell hook. A harness whose write payloads have not been captured is not claimed as covered (`docs/dialects.md`).
 - Anything on a machine where the hook isn't installed.
 
 If your threat model includes an agent *actively trying to evade you*, you need OS-level isolation — containers, seccomp, VMs, restricted credentials. Termaxa is complementary to those, not a replacement. **Run both.** Termaxa is the windshield; a sandbox is the seatbelt.
 
 **Termaxa is an enforcement and recovery layer, not an isolation layer.** It can decide what an intercepted action should do, explain the consequence before it happens, preserve recoverability, and record what happened. It does not make an untrusted agent unable to act outside the interception boundary. Everything below follows from that sentence.
 
-Supervised mode (v0.17) does not change it. It moves *who decides and who holds the record* outside the agent's reach, which is a real and measurable improvement to what the audit is worth — and it leaves the interception boundary exactly where it was. An agent's native file tools bypass a supervised gate precisely as they bypass a basic one.
+Supervised mode (v0.17) does not change it. It moves *who decides and who holds the record* outside the agent's reach, which is a real and measurable improvement to what the audit is worth — and it leaves the interception boundary exactly where it was. An agent's native file tools reach a supervised gate precisely as they reach a basic one: through the path rules that name the file, and not otherwise.
 
 ### Where the line is, and what it costs
 

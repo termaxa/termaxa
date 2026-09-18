@@ -2,6 +2,80 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.19.0 — native writes reach the gate, the snapshot opens the session, and what runs is what was judged
+
+Four PRs, one release, each measured in the same container that measured
+#91 (Ubuntu 24.04, Claude Code 2.1.268, zsh installed, the starter plus
+`unrecognised: deny` and `backup_failure: deny`).
+
+### Added
+
+- **Native file writes reach the consequence engine** (#101, #95, the first
+  piece of #83). The write matcher has delivered every `Write`, `Edit`,
+  `MultiEdit` and `NotebookEdit` since #20; the gate answered with silence
+  unless the target was its own file. Now the path-rule tournament is one
+  function shared by the shell path and `Policy::evaluate_targets`, and a
+  native write is judged by its targets alone: only `match_path` rules
+  apply, never a string rule and never the policy default, so a file no
+  rule names gets no decision and the harness's own flow stays as it was
+  (#48). A deny carries what the write would cost; an allow is insured
+  first through the same store `rollback` reads and recorded with `sha256
+  before`; `init` registers the write matcher at `PostToolUse` too, and a
+  named write gets a receipt with `sha256 after`. A patch is read by its
+  `*** Add File` / `*** Update File` / `*** Delete File` / `*** Move to`
+  headers from whatever field carries it, and `init --codex` registers
+  `Bash|apply_patch`; Codex is not claimed as covered until its payload is
+  captured. Measured through the hook, Sep 18: an `Edit` to `notes/a.txt`
+  under a `*/notes/*` allow was insured (`termaxa backups` lists it) and
+  receipted; an `Edit` to `.env` was denied with the starter's own sentence
+  and `23 B on disk`, quoted back by the agent; the file unchanged.
+- **A variable bound earlier in the same command line resolves, and Claude
+  Code's startup snapshot is read whole** (#99, #94). Simple assignments
+  (`NAME=value`, `export NAME=value`, a literal path-like value) are
+  substituted into the segments after them, outside single quotes, once,
+  never into a nested `-c` string; the assignment segment runs nothing and
+  is transparent. `X=; rm -rf $X/*` is the root delete it is. A `-c` string
+  whose first line binds `SNAPSHOT_FILE` to the harness's own file and whose
+  every write goes there is the startup snapshot: allowed whole under a
+  reason that says so, with a hard stop inside a drifted one still firing.
+  Measured under `wrap`, Sep 18: `✓ [run] zsh -c -l "SNAPSHOT_FILE=…` —
+  `Claude Code startup snapshot (148 segments): writes only to …` — and
+  every tool call after it arriving with the snapshot sourced. The first
+  wrapped session that opens without a refusal.
+- **`git rm` is a delete** (#99, #80): targets, preview, insurance and
+  path rules read as for `rm`; `-r`/`-f` count; `--cached` is not a delete.
+- **Insurance copies are capped and pruned** (#100, #72). The copy refuses
+  above the preview's own budget with the preview's own words, so a "NOT
+  recoverable" preview is never followed by a copy; a `retention` key
+  (defaults keep 50 / 30 days, both conditions required) prunes at most one
+  backup per insured command and all of them under `termaxa backups
+  --prune`; every prune is a manifest record; a pruned id cannot be
+  restored; a backup past 260 characters says only `rollback` can read it.
+- **The target set is re-checked just before a command runs** (#102, #73).
+  `run` signs the delete targets (paths, sizes, mtimes, under the preview's
+  budget) when the command is judged and again before `execute`; a change
+  is refused with both counts in the reason and recorded as the refusal.
+- **`termaxa demo`** (#102): the real `check` and `log` on a throwaway
+  project under `~/.termaxa/demo/`, removed afterwards — a recursive delete
+  denied with its blast radius, `.env` denied by a path rule, a single-file
+  delete asked with insurance planned, and the record.
+- **`CONTRIBUTING.md` and `docs/dialects.md`** (#102): the working rules,
+  the gate, where things live; how to capture a harness, what each honours,
+  what is not captured yet.
+- **`TRUNCATE a,b`** is the same list as `TRUNCATE a, b` (#99); the `.env`
+  path rule's reason says "Writing to or removing" (#99); the README's
+  first sentence says what the thing is (#99).
+
+### Known limitations
+
+- Codex `apply_patch`, Codex `PostToolUse`, and Cursor's `Write`/`Delete`
+  payloads are not captured; the readers exist, the harnesses are not
+  claimed. Codex under `wrap` is a separate run.
+- A native write no path rule names is silence: no preview, no insurance,
+  no line. That is the design, and `docs/dialects.md` says so.
+- The hook cannot re-check a target set at execution time; it answers
+  before the harness executes. #73's re-check is `run`'s.
+
 ## v0.18.6 — the agent keeps its own shell
 
 v0.18.5 handed every wrapped agent the `bash` shim whenever bash existed.
