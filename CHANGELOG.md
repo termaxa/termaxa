@@ -2,6 +2,42 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.19.1 — a patch is a write, not a command
+
+Captured Sep 19, 2026 in the same container as v0.19.0's measurements
+(codex-cli 0.155.1, `codex exec` with the hook trusted): Codex sends
+`apply_patch` with the whole patch text in `tool_input.command`, the field
+a shell command lives in. v0.19.0's hook read it as a shell command,
+`*** Begin Patch` became an unmatched segment, and the whole call was
+refused as an ask — whatever the patch touched. Fail closed, wrong reading.
+
+### Fixed
+
+- **A tool whose name carries a write verb is read as a write before it is
+  read as a command** (#104). Codex's patch reads as its files with their
+  kinds (write, add, delete), one call and one verdict; the starter's `.env`
+  path rule denies the captured patch with the sentence naming the file, and
+  the record says `apply_patch …`, not `*** Begin Patch`. `Bash` never
+  matches a write verb, so shell commands are unaffected. The captured
+  payload, session fields and all, is the fixture test.
+
+### Added
+
+- **`init --codex` registers `PostToolUse`** (#104), captured the same day
+  in Claude Code's shape and receipted by the existing path.
+
+### Measured, and recorded in `docs/dialects.md`
+
+- **`wrap` does not reach Codex.** Under `strace`, every Codex spawn is
+  `execve("/bin/bash", ["/bin/bash", "-lc", …])` by absolute path — the
+  account's login shell, `$SHELL` ignored — and the audit log stays empty.
+  Codex's configuration covers the environment and login-ness, not the
+  shell binary, so there is no lever like `CLAUDE_CODE_SHELL`; its hooks
+  are the way in. (In that run `scratch` survived because Codex 0.155.1
+  itself rejected `rm -rf`, not because of the gate.)
+- Both Codex shapes come off the not-captured list. Cursor's `Write` and
+  `Delete` payloads remain on it.
+
 ## v0.19.0 — native writes reach the gate, the snapshot opens the session, and what runs is what was judged
 
 Four PRs, one release, each measured in the same container that measured
