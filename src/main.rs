@@ -233,8 +233,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
             // command would run - the one surface where they legitimately
             // coincide.
             let cwd = std::env::current_dir().unwrap_or_default();
-            let base = policy.evaluate_command(&cmd, &resolve::EvalContext::at(cwd));
-            let signals = context::gather(&cmd);
+            let ctx = resolve::EvalContext::at(cwd);
+            let base = policy.evaluate_command(&cmd, &ctx);
+            let signals =
+                context::gather_with(&cmd, &|inner| policy.allows_explicitly(inner, &ctx));
             let (decision, escalated) = context::apply(base, &signals);
 
             let root = resolved.as_ref().and_then(|p| p.project_dir.parent());

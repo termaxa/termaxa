@@ -1328,7 +1328,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // the harness spawned it.
     let ctx = crate::resolve::EvalContext::from_paths(&start_dir, &paths);
     let base = policy.evaluate_command(&command, &ctx);
-    let signals = context::gather(&command);
+    let signals = context::gather_with(&command, &|inner| policy.allows_explicitly(inner, &ctx));
     let (mut decision, escalated) = context::apply(base, &signals);
 
     // Destructive-intent classification (v0.11) — recorded on every entry so

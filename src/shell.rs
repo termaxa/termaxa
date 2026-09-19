@@ -872,6 +872,78 @@ fn flush(
 }
 
 /// Does the command contain command substitution we cannot see inside?
+/// The inner text of every command substitution in `s`: `$(…)` with its
+/// parentheses balanced, and `` `…` ``. Single quotes hide both, as they do
+/// for `has_substitution`. An unbalanced `$(` yields the rest of the string,
+/// which no policy will allow, and that is the right answer for a
+/// substitution the reader cannot see the end of.
+pub fn substitutions(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut in_single = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                in_single = !in_single;
+                i += 1;
+            }
+            '`' if !in_single => {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != '`' {
+                    j += 1;
+                }
+                out.push(chars[start..j].iter().collect());
+                i = j + 1;
+            }
+            '$' if !in_single && chars.get(i + 1) == Some(&'(') => {
+                let start = i + 2;
+                let mut depth = 1;
+                let mut j = start;
+                let mut inner_single = false;
+                while j < chars.len() {
+                    match chars[j] {
+                        '\'' => inner_single = !inner_single,
+                        '(' if !inner_single => depth += 1,
+                        ')' if !inner_single => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                out.push(chars[start..j.min(chars.len())].iter().collect());
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// A substitution that is data rather than a command: `cat` fed a heredoc
+/// with a quoted delimiter (`cat <<'EOF' … EOF`), which the shell expands
+/// nothing inside. Claude Code writes every commit message this way
+/// (`git commit -m "$(cat <<'EOF' … EOF)"`), and read as an unanalyzable
+/// substitution it escalated every commit to an ask (replay of Sep 20,
+/// 2026).
+pub fn is_literal_heredoc(inner: &str) -> bool {
+    let t = inner.trim_start();
+    let Some(rest) = t.strip_prefix("cat") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(rest) = rest.strip_prefix("<<") else {
+        return false;
+    };
+    let rest = rest.trim_start_matches('-').trim_start();
+    rest.starts_with('\'') || rest.starts_with('"')
+}
+
 pub fn has_substitution(s: &str) -> bool {
     let chars: Vec<char> = s.chars().collect();
     let mut in_single = false;
@@ -1184,6 +1256,37 @@ mod tests {
             .map(|s| &**s)
             .collect();
         assert_eq!(inner, ["git status"]);
+    }
+
+    /// What `substitutions` sees: each `$(…)` with its parentheses balanced,
+    /// each backtick pair, nothing inside single quotes, and an unbalanced
+    /// `$(` as the rest of the line. And what a literal heredoc is: `cat`
+    /// with a quoted delimiter, in either quote, with or without `-`.
+    #[test]
+    fn substitutions_are_extracted_balanced_and_a_quoted_heredoc_is_literal() {
+        assert_eq!(
+            substitutions("git log origin/$(git branch --show-current) -1"),
+            ["git branch --show-current"]
+        );
+        assert_eq!(
+            substitutions("echo $(dirname $(pwd)) `whoami`"),
+            ["dirname $(pwd)", "whoami"]
+        );
+        assert_eq!(substitutions("echo '$(not one)'"), Vec::<String>::new());
+        assert_eq!(substitutions("echo $(unbalanced"), ["unbalanced"]);
+        assert_eq!(
+            substitutions("git commit -m \"$(cat <<'EOF'\nfeat: x (y)\nEOF\n)\""),
+            ["cat <<'EOF'\nfeat: x (y)\nEOF\n"]
+        );
+        assert!(is_literal_heredoc("cat <<'EOF'\nbody\nEOF\n"));
+        assert!(is_literal_heredoc("cat <<\"EOF\"\nbody\nEOF\n"));
+        assert!(is_literal_heredoc("cat <<-'EOF'\n\tbody\n\tEOF\n"));
+        assert!(
+            !is_literal_heredoc("cat <<EOF\n$HOME\nEOF\n"),
+            "unquoted: expands"
+        );
+        assert!(!is_literal_heredoc("cat file"));
+        assert!(!is_literal_heredoc("rm -rf /"));
     }
 
     /// Claude Code's startup snapshot, in the shape the record holds (Sep

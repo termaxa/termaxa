@@ -16,7 +16,20 @@ pub struct Signal {
 /// was a destructive flag escalating every allowed command to an ask
 /// (Sep 10, 2026, under `wrap`). A flag on the agent's own command is still
 /// found: it is inside the part that is kept.
+/// `gather_with` reading nothing: every substitution is a signal. The
+/// production paths pass the policy's `allows_explicitly`; the tests here
+/// use this form where readability is not what they test.
+#[cfg(test)]
 pub fn gather(command: &str) -> Vec<Signal> {
+    gather_with(command, &|_| false)
+}
+
+/// `gather`, with the caller saying which substitutions it can read.
+/// A `$(…)` whose inner command the policy would explicitly allow (`git
+/// branch --show-current`, `cat <<'EOF' … EOF`) is not "contents not
+/// analyzable": the gate just analyzed it. The signal stays for any
+/// substitution that is not readable, and for an unbalanced one.
+pub fn gather_with(command: &str, readable: &dyn Fn(&str) -> bool) -> Vec<Signal> {
     let mut signals = Vec::new();
     let command = crate::shell::context_text(command);
     let command = command.as_str();
@@ -67,13 +80,19 @@ pub fn gather(command: &str) -> Vec<Signal> {
         }
     }
 
-    // Command substitution: contents cannot be statically analyzed, so the
-    // presence alone is a reason to put a human in the loop.
+    // Command substitution: contents the gate cannot read are a reason to
+    // put a human in the loop. Contents it can read and would allow are
+    // not; a quoted heredoc is data and needs no reading at all.
     if crate::shell::has_substitution(command) {
-        signals.push(Signal {
-            label: "command substitution ($(...) or ``) — contents not analyzable".into(),
-            escalate: true,
-        });
+        let unreadable = crate::shell::substitutions(command)
+            .into_iter()
+            .any(|inner| !(crate::shell::is_literal_heredoc(&inner) || readable(&inner)));
+        if unreadable {
+            signals.push(Signal {
+                label: "command substitution ($(...) or ``) — contents not analyzable".into(),
+                escalate: true,
+            });
+        }
     }
 
     signals

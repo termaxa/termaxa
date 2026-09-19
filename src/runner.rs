@@ -17,7 +17,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     let ctx =
         crate::resolve::EvalContext::from_paths(std::env::current_dir().unwrap_or_default(), paths);
     let base = policy.evaluate_command(&command, &ctx);
-    let signals = context::gather(&command);
+    let signals = context::gather_with(&command, &|inner| policy.allows_explicitly(inner, &ctx));
     let (decision, escalated) = context::apply(base, &signals);
 
     println!("┌ termaxa");
