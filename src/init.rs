@@ -802,18 +802,27 @@ pub fn run(
             // the tool name, a list of command hooks, `timeout` in seconds.
             // The flat `{"version": 1, "hooks": {"PreToolUse": [{"command":
             // ...}]}}` this wrote before Sep 2026 was never a shape Codex
-            // accepted. PreToolUse only: the PostToolUse payload has not been
-            // captured yet, and a hook that answers a shape it has not seen
-            // is the fail-open known-limitation 4 describes. The matcher
-            // covers `apply_patch` as well as `Bash` (#1, #95): the hook
-            // reads a patch's file headers, and the payload that carries them
-            // is what the capture is for.
+            // accepted. PostToolUse as well since Sep 19, 2026: its payload
+            // was captured (codex-cli 0.155.1) and is Claude Code's shape
+            // (`hook_event_name`, `tool_name`, `tool_input.command`,
+            // `tool_response`), so the receipt path already reads it. The
+            // matcher covers `apply_patch` as well as `Bash` (#1, #95): the
+            // patch text arrives in `tool_input.command`, captured the same
+            // day.
             let dir_x = dir.join(".codex");
             fs::create_dir_all(&dir_x)?;
             let hooks_path = dir_x.join("hooks.json");
             let hooks = serde_json::json!({
                 "hooks": {
                     "PreToolUse": [
+                        {
+                            "matcher": "Bash|apply_patch",
+                            "hooks": [
+                                { "type": "command", "command": "termaxa hook", "timeout": 15 }
+                            ]
+                        }
+                    ],
+                    "PostToolUse": [
                         {
                             "matcher": "Bash|apply_patch",
                             "hooks": [

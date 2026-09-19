@@ -1145,6 +1145,19 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         }
     }
 
+    // A patch before the shell reader (Sep 19, 2026, captured): Codex sends
+    // `apply_patch` with the patch text in `tool_input.command`, the field a
+    // shell command lives in, and the shell reader took it — `*** Begin
+    // Patch` became an unmatched segment and the whole call was refused as
+    // an ask, whatever the patch touched. A tool whose name carries a write
+    // verb and whose input names files is a write, and goes to the write
+    // reader first; `Bash` never matches a write verb, so shell commands
+    // are unaffected.
+    if let Some(w) = parse_file_write(&buf) {
+        if w.tool.to_lowercase().contains("patch") {
+            return Ok(gate_file_write(&w));
+        }
+    }
     let input = match parse_input(&buf) {
         Some(p) => p,
         None => {
@@ -2070,6 +2083,78 @@ mod tests {
             rendered.contains("Writing to or removing .env"),
             "{rendered}"
         );
+    }
+
+    /// Codex's `apply_patch`, as captured Sep 19, 2026 (codex-cli 0.155.1,
+    /// `codex exec` with the hook trusted): `tool_name` is `apply_patch` and
+    /// the patch text is in `tool_input.command` — the shell command's field.
+    /// The shell reader took it first and refused the whole call on
+    /// `*** Begin Patch` as an unmatched segment. It is a write: four files
+    /// with their kinds, judged by their targets, the `.env` update denied by
+    /// the starter's path rule and the reason naming it.
+    #[test]
+    fn codex_apply_patch_as_captured_is_a_write_not_a_shell_command() {
+        let env = crate::testutil::TestEnv::new("hook-codex-patch");
+        let proj = env.project("proj");
+        std::fs::write(
+            proj.join(".termaxa").join("policy.yaml"),
+            crate::init::STARTER_POLICY,
+        )
+        .unwrap();
+        std::fs::write(proj.join(".env"), "API_KEY=not-a-real-key\n").unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {p}/notes/a.txt\n@@\n+third line\n*** Add File: {p}/notes/new.txt\n+hello\n*** Delete File: {p}/scratch/f1.txt\n*** Update File: {p}/.env\n@@\n+TOKEN=abc123\n*** End Patch",
+            p = proj.display()
+        );
+        let raw = json!({
+            "session_id": "01a0b8e9-81bf-76b3-854d-26c19b158a66",
+            "turn_id": "01a0b8e9-8238-7c30-ba8e-7f176ab8dbb5",
+            "transcript_path": "/home/dev/.codex/sessions/2026/09/19/rollout-2026-09-19T09-05-06-01a0b8e9-81bf-76b3-854d-26c19b158a66.jsonl",
+            "cwd": proj.display().to_string(),
+            "hook_event_name": "PreToolUse",
+            "model": "gpt-5.6-terra",
+            "permission_mode": "bypassPermissions",
+            "tool_name": "apply_patch",
+            "tool_input": { "command": patch },
+            "tool_use_id": "exec-8a701845-99cd-4c47-8600-f2d397d64709"
+        })
+        .to_string();
+        let w = parse_file_write(&raw).expect("a patch is a write");
+        assert_eq!(w.dialect, Dialect::Codex);
+        let kinds: Vec<(String, WriteKind)> = w
+            .targets
+            .iter()
+            .map(|t| (t.path.rsplit('/').next().unwrap().to_string(), t.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("a.txt".to_string(), WriteKind::Write),
+                ("new.txt".to_string(), WriteKind::Add),
+                ("f1.txt".to_string(), WriteKind::Delete),
+                (".env".to_string(), WriteKind::Write),
+            ]
+        );
+        let out = decide(&raw).unwrap();
+        assert_eq!(out.exit_code, 2, "the .env update is denied");
+        let rendered = out.rendered.expect("a deny is rendered");
+        assert!(
+            rendered.contains("Writing to or removing .env"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Begin Patch"),
+            "read as a write, not a shell command: {rendered}"
+        );
+        let paths = crate::paths::resolve_from(&proj).unwrap();
+        let last = crate::audit::AuditLog::new(&paths.state_dir)
+            .unwrap()
+            .read_last(1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(last.command.starts_with("apply_patch "), "{}", last.command);
+        assert_eq!(last.decision, "deny");
     }
 
     /// The patch grammar as documented: add, update, delete, and a move

@@ -330,6 +330,10 @@ fn init_writes_the_hooks_file_codex_reads() {
     // `Bash|apply_patch` since #95: the hook reads a patch's file headers,
     // and the matcher is what lets the payload reach it.
     assert_eq!(group["matcher"], "Bash|apply_patch", "{v}");
+    // PostToolUse since the Sep 19 capture: Claude Code's shape, receipted.
+    let post = &v["hooks"]["PostToolUse"][0];
+    assert_eq!(post["matcher"], "Bash|apply_patch", "{v}");
+    assert_eq!(post["hooks"][0]["command"], "termaxa hook", "{v}");
     let hook = &group["hooks"][0];
     assert_eq!(hook["type"], "command", "{v}");
     assert_eq!(hook["command"], "termaxa hook", "{v}");

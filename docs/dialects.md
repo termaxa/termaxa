@@ -24,7 +24,7 @@ bytes.
 | Harness | `init` flag | File written | Events | Honours |
 | --- | --- | --- | --- | --- |
 | Claude Code | `--claude-code` | `.claude/settings.json` | `PreToolUse` and `PostToolUse` on `Bash` and on `Write\|Edit\|MultiEdit\|NotebookEdit` | `allow`, `ask`, `deny`; no output means no opinion |
-| Codex CLI | `--codex` | `.codex/hooks.json` | `PreToolUse` on `Bash\|apply_patch` | `deny` only: an explicit `allow` is rejected, an `ask` is a refusal, a failed hook falls open to Codex's own prompt |
+| Codex CLI | `--codex` | `.codex/hooks.json` | `PreToolUse` and `PostToolUse` on `Bash\|apply_patch` | `deny` only: an explicit `allow` is rejected, an `ask` is a refusal, a failed hook falls open to Codex's own prompt. Headless (`codex exec`) a hook runs only once trusted, or with `--dangerously-bypass-hook-trust` |
 | Cursor | `--cursor` | `.cursor/hooks.json` | `preToolUse` / `postToolUse` (3.11), `beforeShellExecution` (older) | `permission` in the JSON; exit 2 blocks; other non-zero exits fail open |
 | Copilot CLI | `--copilot` | `.github/hooks/hooks.json`; also reads `.claude/settings.json` as repo settings | `toolName` / `toolArgs` (arguments as a JSON string) | top-level `permissionDecision`; a non-zero exit is a hook error, so a deny exits 0 |
 
@@ -32,7 +32,11 @@ A harness with no hooks runs under `termaxa wrap -- <agent>` (Unix), which
 puts shims for `sh`, `bash` and `zsh` on `PATH` and hands the agent the shim
 for the shell it would have chosen. Claude Code takes it from
 `CLAUDE_CODE_SHELL`, which `wrap` sets; a harness that hardcodes its shell
-and offers no such setting is outside this mechanism.
+and offers no such setting is outside this mechanism. Codex is one, measured
+Sep 19, 2026 under `strace`: it runs the account's login shell by absolute
+path (`/bin/bash -lc` here, `/bin/zsh -lc` on a Mac), ignores `$SHELL`, and
+its configuration covers the environment and login-ness, not the binary.
+`wrap` records nothing for Codex; its hooks are the way in.
 
 ## The response shapes
 
@@ -68,10 +72,19 @@ regardless of policy. Everything else is judged by its target against the
 patch (`*** Begin Patch` … `*** Delete File:` …) is read by its file headers
 from whatever field carries it.
 
+## Codex, as captured (Sep 19, 2026, codex-cli 0.155.1)
+
+`PreToolUse` and `PostToolUse` arrive in Claude Code's shape: `session_id`,
+`turn_id`, `transcript_path`, `cwd`, `hook_event_name`, `model`,
+`permission_mode`, `tool_name`, `tool_input`, `tool_use_id`, and on the post
+event `tool_response`. `apply_patch` is `tool_name: "apply_patch"` with the
+whole patch text in `tool_input.command` — the field a shell command lives
+in, which is why the hook reads a tool with a write verb before it reads a
+command. One patch can carry several files; it is one call and gets one
+verdict, the most severe among its targets.
+
 ## What is not captured yet
 
-- Codex's `PostToolUse` payload, and its `apply_patch` payload. The matcher
-  is registered; the shapes are not claimed.
 - Cursor's `Write` and `Delete` tool payloads under `preToolUse`.
 - Any harness's silence semantics beyond Claude Code and Codex.
 
