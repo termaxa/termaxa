@@ -347,6 +347,12 @@ rules:
   - match: "ssh *"
     action: ask
 
+  # `find -delete` removes everything it matches with nothing copied first:
+  # a hard stop, above the allows like every other one (Sep 20, 2026 replay).
+  - match: "*find* -delete*"
+    action: deny
+    reason: "find -delete removes everything it matches and nothing is copied first. Delete named paths with rm instead."
+
   # ---- read-only operations: let the agent work ----
   - match: "git status*"
     action: allow
@@ -355,6 +361,10 @@ rules:
   - match: "git log*"
     action: allow
   - match: "git branch*"
+    action: allow
+  # Staging never destroys anything. Two asks on `git add` in the replay of
+  # Sep 20, 2026, from a starter that had every other read-only git head.
+  - match: "git add*"
     action: allow
   - match: "git commit*"
     action: allow
@@ -384,6 +394,34 @@ rules:
   - match: "head *"
     action: allow
   - match: "tail *"
+    action: allow
+  # `find` reads unless it deletes or runs something; those spellings are
+  # named first so the allow below cannot cover them (`*rm -rf*` and the
+  # `find -delete` hard stop above still decide theirs). `sed -n`
+  # prints; `sed -i` edits in place with no redirect for the gate to see and
+  # stays on the default, as `sort -o` does. Both asked on ordinary work in
+  # the Sep 20, 2026 replay.
+  - match: "*find* -exec*"
+    action: ask
+    reason: "find -exec runs a command per match; the command decides."
+  - match: "*find* -ok*"
+    action: ask
+    reason: "find -ok runs a command per match; the command decides."
+  - match: "find *"
+    action: allow
+  - match: "sed -n *"
+    action: allow
+  # The gate's own read-only subcommands; `backups --prune` and `rollback`
+  # change things and stay on the default.
+  - match: "termaxa log*"
+    action: allow
+  - match: "termaxa backups"
+    action: allow
+  - match: "termaxa report*"
+    action: allow
+  - match: "termaxa doctor*"
+    action: allow
+  - match: "termaxa check *"
     action: allow
   - match: "wc *"
     action: allow
