@@ -2,6 +2,41 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.19.2 — Cursor's Delete is a delete
+
+Captured Sep 19, 2026 on Windows (cursor 3.11.25): Cursor's file tools
+arrive as `tool_name: "Write"` / `"Delete"` with `tool_input.file_path`, no
+`cwd`, the project only in `workspace_roots`, a BOM in front, and
+`postToolUse` carrying `tool_output`. `Delete` was no verb the hook's write
+reader knew, so the payload parsed as nothing, fell to the
+unrecognised-payload knob, and passed through by default: the file was
+deleted with no line, and a `match_path` rule would not have stopped it.
+That is the Cursor case SECURITY.md has carried since live testing, seen
+through the hook.
+
+### Fixed
+
+- **`delete` and `remove` are write verbs, of kind delete** (#106). A
+  Cursor `Delete` is judged by its target like any native write: `.env`
+  denied with the starter's sentence and `(removed)`; a file nothing names
+  silent but seen, and receipted on `postToolUse`. The captured payloads
+  are the fixture.
+
+### Added
+
+- **`init --cursor` registers `preToolUse` / `postToolUse` on `Write|Delete`**
+  (#106) beside `beforeShellExecution` / `afterShellExecution`; `Shell`
+  stays on the latter so a command is not gated twice. Cursor reloads the
+  file on its own; an existing `.cursor/hooks.json` is rewritten by `init`.
+
+### The capture list
+
+Every harness on the record now has its shell and its file-tool payloads
+captured: Claude Code, Codex (`apply_patch`, `PostToolUse`), Cursor
+(`Write`, `Delete`), Copilot CLI (shell). What is not captured: silence
+semantics beyond Claude Code and Codex, and Copilot's file tools if it has
+hookable ones. `docs/dialects.md` holds every shape.
+
 ## v0.19.1 — a patch is a write, not a command
 
 Captured Sep 19, 2026 in the same container as v0.19.0's measurements
