@@ -25,7 +25,7 @@ bytes.
 | --- | --- | --- | --- | --- |
 | Claude Code | `--claude-code` | `.claude/settings.json` | `PreToolUse` and `PostToolUse` on `Bash` and on `Write\|Edit\|MultiEdit\|NotebookEdit` | `allow`, `ask`, `deny`; no output means no opinion |
 | Codex CLI | `--codex` | `.codex/hooks.json` | `PreToolUse` and `PostToolUse` on `Bash\|apply_patch` | `deny` only: an explicit `allow` is rejected, an `ask` is a refusal, a failed hook falls open to Codex's own prompt. Headless (`codex exec`) a hook runs only once trusted, or with `--dangerously-bypass-hook-trust` |
-| Cursor | `--cursor` | `.cursor/hooks.json` | `preToolUse` / `postToolUse` (3.11), `beforeShellExecution` (older) | `permission` in the JSON; exit 2 blocks; other non-zero exits fail open |
+| Cursor | `--cursor` | `.cursor/hooks.json` | `beforeShellExecution` / `afterShellExecution` for the shell; `preToolUse` / `postToolUse` on `Write\|Delete` for the file tools (3.11) | `permission` in the JSON; exit 2 blocks; other non-zero exits fail open |
 | Copilot CLI | `--copilot` | `.github/hooks/hooks.json`; also reads `.claude/settings.json` as repo settings | `toolName` / `toolArgs` (arguments as a JSON string) | top-level `permissionDecision`; a non-zero exit is a hook error, so a deny exits 0 |
 
 A harness with no hooks runs under `termaxa wrap -- <agent>` (Unix), which
@@ -83,9 +83,22 @@ in, which is why the hook reads a tool with a write verb before it reads a
 command. One patch can carry several files; it is one call and gets one
 verdict, the most severe among its targets.
 
+## Cursor's file tools, as captured (Sep 19, 2026, cursor 3.11.25)
+
+`preToolUse` and `postToolUse` with `tool_name: "Write"` or `"Delete"`,
+`tool_input.file_path` absolute, no `cwd` — the project is only in
+`workspace_roots`, as a URI (`/C:/Users/…`), which the reader normalises —
+plus `conversation_id`, `generation_id`, `model`, `tool_use_id`,
+`session_id`, `cursor_version`, `user_email`, `transcript_path`, and a UTF-8
+BOM in front of every payload. The post event adds `tool_output` (a JSON
+string: `{"file_path":…,"success":true}` for a write,
+`{"file_path":…,"deleted":true}` for a delete) and `duration`. `Delete` had
+no verb the reader knew before this capture and passed through by default;
+it is a delete, judged by its target.
+
 ## What is not captured yet
 
-- Cursor's `Write` and `Delete` tool payloads under `preToolUse`.
 - Any harness's silence semantics beyond Claude Code and Codex.
+- Copilot CLI's file tools, if it has hookable ones.
 
 Each of those is one capture away. Send it.

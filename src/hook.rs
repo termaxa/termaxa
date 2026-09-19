@@ -371,8 +371,8 @@ fn strings_in(v: &serde_json::Value, out: &mut Vec<String>) {
 /// direction. Read-shaped tools carry none of these verbs, which is what keeps
 /// `Read` on `.termaxa/policy.yaml` from being refused — reading the policy is
 /// allowed on the shell path too.
-const WRITE_VERBS: [&str; 7] = [
-    "write", "edit", "create", "patch", "replace", "notebook", "save",
+const WRITE_VERBS: [&str; 9] = [
+    "write", "edit", "create", "patch", "replace", "notebook", "save", "delete", "remove",
 ];
 
 /// Field names that carry the target path, across dialects.
@@ -427,7 +427,13 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
             .iter()
             .find_map(|k| args.get(k).and_then(|p| p.as_str()))
             .filter(|p| !p.is_empty())?;
-        let kind = if folded.contains("create") {
+        // Cursor's `Delete` (captured Sep 19, 2026, cursor 3.11.25:
+        // `tool_name: "Delete"`, `tool_input.file_path`) was no verb the
+        // reader knew, fell to the unrecognised-payload knob, and passed
+        // through by default: a file gone with no line. It is a delete.
+        let kind = if folded.contains("delete") || folded.contains("remove") {
+            WriteKind::Delete
+        } else if folded.contains("create") {
             WriteKind::Add
         } else {
             WriteKind::Write
@@ -2155,6 +2161,96 @@ mod tests {
             .unwrap();
         assert!(last.command.starts_with("apply_patch "), "{}", last.command);
         assert_eq!(last.decision, "deny");
+    }
+
+    /// Cursor 3.11.25's file tools, as captured Sep 19, 2026: `Write` and
+    /// `Delete` with `tool_input.file_path`, no `cwd`, the project only in
+    /// `workspace_roots` as a URI, a BOM in front, `postToolUse` carrying
+    /// `tool_output`. `Delete` was no verb the reader knew and passed through
+    /// by default; now it is a delete, judged by its target: `.env` denied
+    /// with the starter's sentence, a file nothing names silent but seen.
+    #[test]
+    fn cursors_delete_as_captured_is_a_delete_judged_by_its_target() {
+        let env = crate::testutil::TestEnv::new("hook-cursor-delete");
+        let proj = env.project("proj");
+        std::fs::write(
+            proj.join(".termaxa").join("policy.yaml"),
+            crate::init::STARTER_POLICY,
+        )
+        .unwrap();
+        std::fs::write(proj.join(".env"), "API_KEY=not-a-real-key\n").unwrap();
+        std::fs::write(proj.join("doomed.txt"), "delete me\n").unwrap();
+        let root_uri = format!("/{}", proj.display().to_string().trim_start_matches('/'));
+        let captured = |event: &str, tool: &str, path: &std::path::Path, output: Option<&str>| {
+            let mut v = json!({
+                "conversation_id": "d5f9745a-9bff-460d-8765-2e06e21c8a87",
+                "generation_id": "4b738bcb-881f-4206-adb6-98c7da15bc53",
+                "model": "composer-2.5",
+                "tool_name": tool,
+                "tool_input": { "file_path": path.display().to_string() },
+                "tool_use_id": "tool_826b057a-9cfa-462c-bbb7-fbbefdf209b",
+                "session_id": "d5f9745a-9bff-460d-8765-2e06e21c8a87",
+                "hook_event_name": event,
+                "cursor_version": "3.11.25",
+                "workspace_roots": [root_uri],
+                "user_email": "user@example.com",
+                "transcript_path": "c:\\Users\\User\\.cursor\\projects\\x\\agent-transcripts\\d5f9745a.jsonl"
+            });
+            if let Some(o) = output {
+                v["tool_output"] = json!(o);
+                v["duration"] = json!(16.205);
+            }
+            format!("\u{feff}{v}")
+        };
+
+        let w = parse_file_write(&captured("preToolUse", "Delete", &proj.join(".env"), None))
+            .expect("a Delete is a write event");
+        assert_eq!(w.dialect, Dialect::Cursor);
+        assert_eq!(w.targets[0].kind, WriteKind::Delete);
+        assert!(!w.cwd.is_empty(), "the project comes from workspace_roots");
+        let out = gate_file_write(&w);
+        assert_eq!(out.exit_code, 2, "the .env delete is denied");
+        let rendered = out.rendered.expect("a deny is rendered for Cursor");
+        assert!(rendered.contains("\"permission\":\"deny\""), "{rendered}");
+        assert!(
+            rendered.contains("Writing to or removing .env"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("(removed)"), "{rendered}");
+        assert!(proj.join(".env").exists());
+
+        let w = parse_file_write(&captured(
+            "preToolUse",
+            "Delete",
+            &proj.join("doomed.txt"),
+            None,
+        ))
+        .unwrap();
+        let out = gate_file_write(&w);
+        assert_eq!(out.exit_code, 0);
+        assert!(
+            out.rendered.is_none(),
+            "nothing names it: silent, and seen rather than unrecognised"
+        );
+
+        let w = parse_file_write(&captured(
+            "postToolUse",
+            "Delete",
+            &proj.join("doomed.txt"),
+            Some(r#"{"file_path":"doomed.txt","deleted":true}"#),
+        ))
+        .unwrap();
+        assert!(w.post);
+        assert_eq!(gate_file_write(&w).exit_code, 0);
+
+        let w = parse_file_write(&captured(
+            "preToolUse",
+            "Write",
+            &proj.join("notes").join("a.txt"),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(w.targets[0].kind, WriteKind::Write);
     }
 
     /// The patch grammar as documented: add, update, delete, and a move
