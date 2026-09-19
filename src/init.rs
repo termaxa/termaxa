@@ -780,15 +780,23 @@ pub fn run(
                 .and_then(|p| p.to_str().map(str::to_string))
                 .unwrap_or_else(|| "termaxa".to_string());
             let cmd = format!("{} hook", exe);
+            // The shell events as before, and the file tools since the Sep 19,
+            // 2026 capture (cursor 3.11.25): `Write` and `Delete` arrive on
+            // `preToolUse` / `postToolUse` with `tool_input.file_path` and
+            // the project in `workspace_roots`, and are judged by their
+            // target like any native write. `Shell` is left to
+            // `beforeShellExecution`, so a command is not gated twice.
             let hooks = serde_json::json!({
                 "version": 1,
                 "hooks": {
                     "beforeShellExecution": [ { "command": cmd } ],
-                    "afterShellExecution": [ { "command": cmd } ]
+                    "afterShellExecution": [ { "command": cmd } ],
+                    "preToolUse": [ { "command": cmd, "matcher": "Write|Delete" } ],
+                    "postToolUse": [ { "command": cmd, "matcher": "Write|Delete" } ]
                 }
             });
             fs::write(&hooks_path, serde_json::to_string_pretty(&hooks)?)?;
-            println!("✓ wrote .cursor/hooks.json (before + after ShellExecution -> termaxa hook)");
+            println!("✓ wrote .cursor/hooks.json (before + after ShellExecution, pre + post ToolUse on Write|Delete -> termaxa hook)");
             println!("  NOTE: restart Cursor after this so it reloads hook config.");
         }
 
