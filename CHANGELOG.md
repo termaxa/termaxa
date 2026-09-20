@@ -2,6 +2,58 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.19.3 — replay your own transcripts, and what the first replay asked about
+
+The first batched release: two PRs, nothing in them a wrong verdict in a
+shipped version. Sep 20, 2026: every `command` in the Claude Code and
+Codex transcripts on one machine (19 files, 59 commands) replayed through
+`termaxa check` against the starter, no execution, five minutes. A small
+and biased sample, so not an ask ratio; but each ask is a command that
+asked, and the ones that should not have are fixed here.
+
+### Added
+
+- **`termaxa replay [paths…]`** (#109): every command your agents have run
+  on this machine, from their transcripts (`~/.claude/projects`,
+  `~/.codex/sessions` by default), judged the way `check` decides — policy,
+  context, readable substitutions — with no previews, no insurance, no
+  audit lines and nothing executed. The tally with percentages, the
+  distinct asks and denies with counts and reasons. The honest answer to
+  "how often will this get in my way?" before installing.
+- **`termaxa log --follow`** (`-f`) (#109): the tail, then every entry as it
+  is written.
+- **Starter rules from the replay** (#108, #109; 181 → 193): `git add*`;
+  `find *`, with `find -delete` a hard stop and `find -exec`/`-ok` asks;
+  `sed -n *`; the gate's own read-only subcommands (`log`, `backups`,
+  `report`, `doctor`, `check`); a bare `echo`. `init` never rewrites an
+  existing policy: add them by hand or regenerate.
+
+### Fixed
+
+- **A substitution the policy can read is not "not analyzable"** (#108).
+  `$(git branch --show-current)` matched an allow and was escalated to ask
+  because `$(…)` was a signal on sight. Each substitution's inner text is
+  now extracted and the signal stays only for one the policy would not
+  explicitly allow. A quoted heredoc (`$(cat <<'EOF' … EOF)`, Claude Code's
+  spelling for every commit message) expands nothing and is read as data.
+  `$(curl …)`, `$(rm …)`, an unquoted heredoc and anything unmatched
+  escalate as before. Known: a heredoc *body* that spells a hard stop still
+  trips it; fail closed.
+- **The Linux release asset is a static musl build** (#109). The glibc
+  build needed 2.39 and would not start on Debian 12 or Ubuntu 22.04
+  (found Sep 19 building the playground image). Same asset name; CI builds
+  it on every push.
+
+### Elsewhere
+
+- **The playground**: `play.termaxa.com` runs the real gate on a throwaway
+  project, check only, nothing executed. Try to get a destructive command
+  past it; the four published advisories are the solved challenges.
+- **Method**: the replay is the ask-ratio instrument. Its first run was
+  against a stale 0.18.4 (three installs on one machine; Scoop's shim won)
+  and was wrong by exactly the v0.18.6 allows. The machine that measures
+  runs what it ships.
+
 ## v0.19.2 — Cursor's Delete is a delete
 
 Captured Sep 19, 2026 on Windows (cursor 3.11.25): Cursor's file tools
