@@ -4,6 +4,8 @@
 
 **Run AI coding agents with confidence.**
 
+**Try it in ten seconds, nothing installed:** [play.termaxa.com](https://play.termaxa.com) runs the real gate on a throwaway project. Try to get a destructive command past it.
+
 Termaxa is a Rust command-line gate for the shell commands a coding agent runs: it previews the blast radius, backs up first, blocks the dangerous ones, and keeps a record the agent cannot rewrite. No model, no service, no account — a hook for Claude Code, Codex, Cursor and Copilot, or a wrapper for anything else. It's a cooperative windshield, not a sandbox.
 
 [![CI](https://github.com/termaxa/termaxa/actions/workflows/ci.yml/badge.svg)](https://github.com/termaxa/termaxa/actions/workflows/ci.yml)

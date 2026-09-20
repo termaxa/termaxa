@@ -19,7 +19,7 @@ pub struct Signal {
 /// `gather_with` reading nothing: every substitution is a signal. The
 /// production paths pass the policy's `allows_explicitly`; the tests here
 /// use this form where readability is not what they test.
-#[cfg(test)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn gather(command: &str) -> Vec<Signal> {
     gather_with(command, &|_| false)
 }

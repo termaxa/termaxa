@@ -14,6 +14,7 @@ mod pg;
 mod policy;
 mod preview;
 mod protect;
+mod replay;
 mod report;
 mod resolve;
 mod runner;
@@ -89,6 +90,9 @@ enum Cmd {
         /// Number of entries to show
         #[arg(short, long, default_value_t = 20)]
         n: usize,
+        /// Keep printing new entries as they are written (Ctrl-C to stop)
+        #[arg(short = 'f', long)]
+        follow: bool,
         /// Filter by decision: allow | ask | deny
         #[arg(long)]
         decision: Option<String>,
@@ -109,6 +113,14 @@ enum Cmd {
     Stats,
     /// The gate on a throwaway project: three checks and the record, in twenty seconds
     Demo,
+    /// Judge every command your agents have run on this machine, from their transcripts, executing nothing
+    Replay {
+        /// Transcript directories or files (default: ~/.claude/projects and ~/.codex/sessions)
+        paths: Vec<std::path::PathBuf>,
+        /// List every distinct ask and deny, not the 25 most frequent
+        #[arg(long)]
+        all: bool,
+    },
     /// List backups taken by the insurance engine
     Backups {
         /// Remove every backup the retention rule allows (see `retention:`
@@ -357,12 +369,74 @@ fn dispatch(cli: Cli) -> Result<i32> {
         }
         Cmd::Log {
             n,
+            follow,
             decision,
             source,
             json,
         } => {
             let p = paths::resolve()?;
             let log = audit::AuditLog::new(&p.state_dir)?;
+            let print_entry = |e: &audit::AuditEntry| {
+                if json {
+                    println!("{}", serde_json::to_string(e).unwrap_or_default());
+                    return;
+                }
+                let mark = ui::mark(&e.decision, &e.source);
+                let outcome = match (e.approved, e.exit_code) {
+                    (Some(true), Some(code)) => format!("  → approved, exit {}", code),
+                    (Some(false), _) => "  → not run".to_string(),
+                    (None, Some(code)) => format!("  → exit {}", code),
+                    _ => String::new(),
+                };
+                let sess = e
+                    .session
+                    .as_deref()
+                    .map(|s| format!(" ({})", &s[..s.len().min(8)]))
+                    .unwrap_or_default();
+                println!(
+                    "{} {} [{}{}] {} — {}{}{}",
+                    ui::dim(&e.ts),
+                    mark,
+                    e.source,
+                    sess,
+                    e.command,
+                    e.reason,
+                    if e.escalated {
+                        format!("  {}", ui::amber("⚠ escalated"))
+                    } else {
+                        String::new()
+                    },
+                    outcome
+                );
+            };
+            let matches = |e: &audit::AuditEntry| {
+                decision.as_deref().is_none_or(|d| e.decision == d)
+                    && source.as_deref().is_none_or(|s| e.source == s)
+            };
+            if follow {
+                // Print the tail, then poll for new entries: the log is
+                // append-only and each entry carries its own timestamp, so
+                // "new" is "after the last one printed". Half a second is
+                // fast enough for a pane and cheap enough to leave running.
+                let all = log.read_last(100_000)?;
+                let shown: Vec<&audit::AuditEntry> = all.iter().filter(|e| matches(e)).collect();
+                for e in shown.iter().skip(shown.len().saturating_sub(n)) {
+                    print_entry(e);
+                }
+                // The log is append-only: everything past the count already
+                // read is new.
+                let mut seen = all.len();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let all = log.read_last(100_000).unwrap_or_default();
+                    for e in all.iter().skip(seen) {
+                        if matches(e) {
+                            print_entry(e);
+                        }
+                    }
+                    seen = seen.max(all.len());
+                }
+            }
             // Read generously, filter, then trim to n — so filters don't starve.
             let entries: Vec<_> = log
                 .read_last(100_000)?
@@ -479,6 +553,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Cmd::Demo => demo::run(),
+        Cmd::Replay { paths, all } => replay::run(paths, all),
         Cmd::Backups { prune } => {
             let p = paths::resolve()?;
             if prune {

@@ -69,6 +69,23 @@ jobs:
   # blocking every PR on a known gap means fixing it under time pressure or
   # deleting the assertion. The gap is fixed, so the exemption goes with it -
   # an allowance that outlives its reason is how a rig becomes decorative.
+  musl:
+    name: linux asset (musl, static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build the asset the release ships
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: It is static and it runs
+        run: |
+          file target/x86_64-unknown-linux-musl/release/termaxa | grep -q static
+          target/x86_64-unknown-linux-musl/release/termaxa --version
   boundary:
     name: privilege boundary (second real user)
     runs-on: ubuntu-latest

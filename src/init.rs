@@ -389,6 +389,10 @@ rules:
     action: allow
   - match: "echo *"
     action: allow
+  # A bare `echo` prints a blank line; it asked in the Sep 20, 2026 replay
+  # in the middle of an otherwise allowed compound.
+  - match: "echo"
+    action: allow
   # Read-only Unix filters and probes. The demo video's own hero shot was an
   # ask on `head -5`; Claude Code's first act in a session is `bash -c env`
   # (Sep 10, 2026, under `wrap`), and an unattended ask on that is a session
