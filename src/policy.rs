@@ -750,6 +750,19 @@ pub fn readings(command: &str) -> Vec<String> {
     if !out.contains(&cased) {
         out.push(cased);
     }
+    // Git's global options stepped over (`git -C /x push --force` reads as
+    // `git push --force`), so a rule written for the subcommand sees it.
+    // A reading can only add matches, and a deny any reading matches still
+    // outranks an allow.
+    if let Some(stripped) =
+        crate::delete::git_without_global_options(&crate::intent::tokens(command))
+    {
+        let s = stripped.join(" ");
+        let l = s.to_lowercase();
+        if !out.contains(&l) {
+            out.push(l);
+        }
+    }
     out
 }
 
@@ -1431,6 +1444,86 @@ rules:
         ] {
             let d = verdict(still_denied);
             assert_eq!(d.action, Action::Deny, "{still_denied}: {}", d.reason);
+        }
+    }
+
+    /// Git's global options before the subcommand (Sep 24, 2026): `git -C
+    /// /x push --force` fell to the default, hard stop and all, because no
+    /// rule saw past the `-C`. The stripped reading makes every git rule
+    /// apply; a deny still outranks an allow; and a subcommand the starter
+    /// does not name still asks.
+    #[test]
+    fn gits_global_options_are_stepped_over_by_every_rule() {
+        let starter = Policy::builtin().unwrap();
+        let ctx = here();
+        let v = |c: &str| starter.evaluate_command(c, &ctx);
+        assert_eq!(
+            v("git -C /home/dev/proj push --force origin main").action,
+            Action::Deny
+        );
+        // The starter has no `reset --hard` rule (an ask either way); the
+        // reading's guarantee is that the verdict is the plain form's.
+        assert_eq!(
+            v("git --git-dir=/x/.git --work-tree=/x reset --hard HEAD~3").action,
+            v("git reset --hard HEAD~3").action
+        );
+        assert_eq!(
+            v("git -c core.pager=cat -C /x push -f origin main").action,
+            Action::Deny
+        );
+        // The short and refspec spellings of force, found asking here.
+        assert_eq!(v("git push -f origin main").action, Action::Deny);
+        assert_eq!(v("git push origin main -f").action, Action::Deny);
+        assert_eq!(v("git push origin +main").action, Action::Deny);
+        assert_eq!(v("git push origin main").action, Action::Ask);
+        assert_eq!(v("git -C /home/dev/proj status").action, Action::Allow);
+        assert_eq!(
+            v("git -C /home/dev/proj ls-files scratch").action,
+            Action::Allow
+        );
+        assert_eq!(
+            v("git --no-pager -C /x log --oneline -5").action,
+            Action::Allow
+        );
+        assert_eq!(v("git -C /x check-ignore -v scratch").action, Action::Allow);
+        assert_eq!(v("git -C /x filter-branch --all").action, Action::Ask);
+        assert_eq!(v("head").action, Action::Allow);
+        assert_eq!(
+            crate::intent::classify_command("git -C /x push --force origin main"),
+            Some(crate::intent::Intent::GitDestructive)
+        );
+        assert_eq!(
+            crate::delete::delete_head(&[
+                "git".into(),
+                "-C".into(),
+                "/x".into(),
+                "rm".into(),
+                "-r".into(),
+                "scratch".into()
+            ]),
+            Some(("git rm".to_string(), 3))
+        );
+    }
+
+    /// The Cursor forum's Windows incident (Sep 17, 2026, ticket T-F90960):
+    /// a nested `cmd /c "rmdir /s /q "…""` whose quoting collapsed so `rmdir`
+    /// received `\`, the drive root, and most of D: was gone. Every spelling
+    /// of it is denied by the verb, which is the point: the hard stop does
+    /// not need to get the path right.
+    #[test]
+    fn a_collapsed_quote_rmdir_is_denied_in_every_spelling() {
+        let starter = Policy::builtin().unwrap();
+        let ctx = here();
+        for c in [
+            r#"cmd /c "rmdir /s /q \"d:\Projects\1_Freelancer\49 - Build a 360 Camera with Raspberry PI 5\New Project_aio_spec_pages\"""#,
+            r#"cmd /c "rmdir /s /q "d:\Projects\1_Freelancer\49 - Build a 360 Camera with Raspberry PI 5\New Project_aio_spec_pages"""#,
+            r#"rmdir /s /q "d:\Projects\x\New Project_aio_spec_pages\""#,
+            r#"rmdir /s /q \"#,
+            r#"rd /s /q \"#,
+            r#"Remove-Item -Recurse -Force D:\"#,
+        ] {
+            let d = starter.evaluate_command(c, &ctx);
+            assert_eq!(d.action, Action::Deny, "{c}: {}", d.reason);
         }
     }
 

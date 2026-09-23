@@ -407,6 +407,77 @@ pub fn resolve_head(tokens: &[String]) -> Option<(String, usize)> {
     }
 }
 
+/// Git's global options come BEFORE the subcommand, and a rule written for
+/// the subcommand never sees them: `git -C /home/dev/proj push --force
+/// origin main` matched no rule at all and fell to the default, hard stop
+/// and all (measured Sep 24, 2026, from a live Herdr session where Claude
+/// Code spelled every git call with `-C <path>`). This returns the tokens
+/// with those options removed, so `git -C /x push --force` reads as `git
+/// push --force` wherever git is read: the readings, the classifier, the
+/// delete head. `None` when there is nothing to strip.
+pub fn git_without_global_options(tokens: &[String]) -> Option<Vec<String>> {
+    let (head, at) = resolve_head(tokens)?;
+    if head != "git" {
+        return None;
+    }
+    let mut i = at + 1;
+    let mut stripped = false;
+    while let Some(t) = tokens.get(i) {
+        let takes_value = matches!(
+            t.as_str(),
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--exec-path"
+                | "--super-prefix"
+                | "--config-env"
+        );
+        let inline_value = t.starts_with("--git-dir=")
+            || t.starts_with("--work-tree=")
+            || t.starts_with("--namespace=")
+            || t.starts_with("--exec-path=")
+            || t.starts_with("--super-prefix=")
+            || t.starts_with("--config-env=")
+            || t.starts_with("--list-cmds=")
+            || t.starts_with("--attr-source=");
+        let bare = matches!(
+            t.as_str(),
+            "--no-pager"
+                | "--paginate"
+                | "-p"
+                | "-P"
+                | "--bare"
+                | "--literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+                | "--no-optional-locks"
+                | "--no-replace-objects"
+                | "--no-lazy-fetch"
+                | "--no-advice"
+                | "--html-path"
+                | "--man-path"
+                | "--info-path"
+        );
+        if takes_value {
+            i += 2;
+            stripped = true;
+        } else if inline_value || bare {
+            i += 1;
+            stripped = true;
+        } else {
+            break;
+        }
+    }
+    if !stripped {
+        return None;
+    }
+    let mut out: Vec<String> = tokens[..=at].to_vec();
+    out.extend_from_slice(&tokens[i.min(tokens.len())..]);
+    Some(out)
+}
+
 /// `FOO=bar` before a command name is an environment assignment, not the
 /// command. Guarded against paths that merely contain `=`: the name half must
 /// be a plain identifier.
@@ -439,6 +510,13 @@ pub fn is_delete_command(head: &str) -> bool {
 /// `git rm --cached` removes from the index and leaves the file, and is not
 /// a delete here. `None` when the command deletes nothing.
 pub fn delete_head(tokens: &[String]) -> Option<(String, usize)> {
+    // `git -C /x rm -r scratch` is `git rm -r scratch` in another directory;
+    // the delete head is read off the stripped form, and the target index
+    // is translated back to the caller's tokens.
+    if let Some(stripped) = git_without_global_options(tokens) {
+        let offset = tokens.len() - stripped.len();
+        return delete_head(&stripped).map(|(h, at)| (h, if at > 0 { at + offset } else { at }));
+    }
     let (head, at) = resolve_head(tokens)?;
     if head == "git" {
         let sub = tokens.get(at + 1)?;

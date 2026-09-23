@@ -458,7 +458,28 @@ fn backup_files(
 
 fn copy_recursive(src: &Path, dst: &Path, longest: &mut usize) -> Result<()> {
     *longest = (*longest).max(dst.as_os_str().len());
-    if src.is_dir() {
+    // A link is copied as a link, never followed. The preview counts a
+    // link as one entry and does not walk into it; the copy used to branch
+    // on `is_dir()`, which follows links, so a directory holding a link into
+    // a large live tree passed the size cap as a handful of files and then
+    // copied the whole live tree behind the link - the Sep 20, 2026
+    // junction incident's mechanism, inside the insurance (found Sep 21).
+    // On restore the same rule recreates the link rather than a directory.
+    let meta =
+        fs::symlink_metadata(src).with_context(|| format!("cannot stat {}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            let target = fs::read_link(src)?;
+            std::os::unix::fs::symlink(&target, dst)
+                .with_context(|| format!("cannot recreate link {}", dst.display()))?;
+        }
+        // On Windows a junction or symlink needs a privilege the hook may
+        // not have; it is left out of the copy rather than followed, which
+        // is the safe side: nothing behind it is touched or duplicated.
+        return Ok(());
+    }
+    if meta.is_dir() {
         fs::create_dir_all(dst)?;
         make_private(dst, true)?;
         for entry in fs::read_dir(src)? {
@@ -1248,6 +1269,67 @@ mod tests {
                     .as_os_str()
                     .len(),
             "the longest path written is recorded: {longest}"
+        );
+    }
+
+    /// The junction incident's mechanism, inside the insurance (Sep 21,
+    /// 2026): a directory of three files holding a link to a forty-file
+    /// live tree. The preview says four entries; the copy must copy four,
+    /// the link as a link, and never the forty behind it. Restoring puts
+    /// the link back as a link.
+    #[cfg(unix)]
+    #[test]
+    fn the_insurance_copy_keeps_a_link_as_a_link_and_never_follows_it() {
+        let tmp = TempTree::new("bk-link");
+        let state = tmp.dir("state");
+        let live = tmp.dir("live/data");
+        for i in 0..40 {
+            std::fs::write(live.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let mirror = tmp.dir("mirror");
+        for i in 0..3 {
+            std::fs::write(mirror.join(format!("m{i}.txt")), "m").unwrap();
+        }
+        std::os::unix::fs::symlink("../live", mirror.join("junction")).unwrap();
+        let record = take(&state, &format!("rm -rf {}", mirror.display()), &test_cwd())
+            .unwrap()
+            .expect("insured");
+        let saved = std::path::PathBuf::from(record.data["items"][0]["saved_as"].as_str().unwrap());
+        let mut files = 0;
+        let mut links = 0;
+        let mut stack = vec![saved.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let ft = e.file_type().unwrap();
+                if ft.is_symlink() {
+                    links += 1;
+                } else if ft.is_dir() {
+                    stack.push(e.path());
+                } else {
+                    files += 1;
+                }
+            }
+        }
+        assert_eq!(
+            (files, links),
+            (3, 1),
+            "three files and the link, nothing behind it"
+        );
+        assert_eq!(
+            std::fs::read_link(saved.join("junction")).unwrap(),
+            std::path::PathBuf::from("../live")
+        );
+        // Restore into an empty original: the link comes back as a link.
+        std::fs::remove_dir_all(&mirror).unwrap();
+        restore(&state, &record.id).unwrap();
+        assert!(std::fs::symlink_metadata(mirror.join("junction"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_dir(live).unwrap().count(),
+            40,
+            "the live tree was never touched"
         );
     }
 
