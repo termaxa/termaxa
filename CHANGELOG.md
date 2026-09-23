@@ -2,6 +2,50 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.19.4 — every spelling of a force push, and every spelling of git
+
+Two wrong verdicts in a shipped starter, both found Sep 24, 2026, so this
+ships the day they were found (#112).
+
+### Fixed
+
+- **`git push -f` and `git push origin +main` were asks.** The hard stop
+  was spelled `git push*--force*`, so only the long form was denied while
+  the short form and the refspec form fell to the general `git push*` ask.
+  The classifier has always counted every spelling; the policy now does
+  too. An ordinary push still asks.
+- **Git's global options defeated every git rule.** Claude Code spells its
+  git calls `git -C <path> …` (live Herdr session, Sep 20), and no rule saw
+  past the `-C`: `git -C /x ls-files scratch` asked, and `git -C /x push
+  --force origin main` was an ask, hard stop and all. Git's global options
+  (`-C`, `-c`, `--git-dir=`, `--work-tree=`, `--no-pager`, …) are now
+  stepped over wherever git is read: the policy's readings, the intent
+  classifier, and the delete head, so `git -C /x rm -r scratch` is the
+  delete it is. The guarantee is the plain form's verdict, whatever it is.
+- **The insurance copy followed links.** The preview counts a link as one
+  entry and does not walk into it (measured on Windows with a real
+  junction); the size cap uses that walk; but the copy branched on
+  `is_dir()`, which follows links, so a directory holding a link into a
+  large live tree passed the cap as a handful of entries and then copied
+  the whole tree behind it, uncapped, and a rollback would have put the
+  link back as a real directory. That is the mechanism of the Sep 20
+  incident that deleted 48,218 live files through directory junctions,
+  inside our own insurance. A link is now copied as a link (Unix) or left
+  out rather than followed (Windows), and restored as a link.
+
+### Added
+
+- Starter rules (193 → 198): the three force-push spellings; bare `head`;
+  `git check-ignore*`. `init` never rewrites an existing policy: add them
+  by hand or regenerate.
+- The collapsed-quote `rmdir /s /q` from the Cursor forum (Sep 17, most of
+  a D: drive gone) as a regression test in six spellings, all denied by the
+  verb; the hard stop does not need to get the path right.
+- **SECURITY.md** says plainly that a script is not read: `python
+  remover.py` is an ask with no preview, no insurance, and a record that
+  names the interpreter, and that is the biggest thing a shell gate cannot
+  see.
+
 ## v0.19.3 — replay your own transcripts, and what the first replay asked about
 
 The first batched release: two PRs, nothing in them a wrong verdict in a
