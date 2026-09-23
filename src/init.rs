@@ -181,6 +181,17 @@ rules:
   - match: "git push*--force*"
     action: deny
     reason: "Force pushes are blocked by policy. Open a PR instead."
+  # The short and the refspec spellings do the same thing (Sep 24, 2026:
+  # `git push -f origin main` was an ask while `--force` was a deny).
+  - match: "git push* -f *"
+    action: deny
+    reason: "Force pushes are blocked by policy. Open a PR instead."
+  - match: "git push* -f"
+    action: deny
+    reason: "Force pushes are blocked by policy. Open a PR instead."
+  - match: "git push* +*"
+    action: deny
+    reason: "Force pushes are blocked by policy. Open a PR instead."
   # The filesystem root, and only the root. `rm -rf /*` would be a WILDCARD
   # matching every absolute path — `rm -rf /home/me/project/.git` included —
   # and would then explain itself as "delete from root", which is the right
@@ -403,6 +414,10 @@ rules:
   # allow list widens by the head that names the action, never the runner.
   - match: "head *"
     action: allow
+  # A bare `head` reads stdin; it asked mid-compound in a live Herdr
+  # session, Sep 20, 2026.
+  - match: "head"
+    action: allow
   - match: "tail *"
     action: allow
   # `find` reads unless it deletes or runs something; those spellings are
@@ -481,6 +496,8 @@ rules:
   - match: "cd *"
     action: allow
   - match: "git ls-files*"
+    action: allow
+  - match: "git check-ignore*"
     action: allow
   - match: "git show*"
     action: allow

@@ -141,6 +141,9 @@ fn classify_segment_named(segment: &str) -> Option<Intent> {
     // delete extractor and the insurance layer normalize it. Reading token
     // zero raw is what made `sudo rm -rf x`, `/bin/rm -rf x` and
     // `C:\Windows\System32\del.exe /s /q x` all classify as nothing.
+    // `git -C /x push --force` is a force push; the global options before
+    // the subcommand are stepped over before anything below reads `sub`.
+    let toks = crate::delete::git_without_global_options(&toks).unwrap_or(toks);
     let (head, at) = crate::delete::resolve_head(&toks)?;
     let first = head.as_str();
     // Arguments begin after the command, which is `at`, not 0.
