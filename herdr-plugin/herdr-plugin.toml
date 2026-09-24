@@ -1,0 +1,53 @@
+# Termaxa for Herdr: the gate for the shell commands your agents run.
+# https://github.com/termaxa/termaxa  ·  install with `herdr plugin install termaxa/termaxa`
+id = "termaxa.gate"
+name = "Termaxa"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Run an agent under the Termaxa gate, tail its record, and see why a pane went red."
+platforms = ["linux", "macos"]
+
+# Split a pane beside the current one and start Claude Code under
+# `termaxa wrap`: every shell it runs is judged, previewed, insured and
+# recorded. Needs `termaxa` and `claude` on PATH.
+[[actions]]
+id = "gate-claude"
+title = "Termaxa: Claude Code under the gate"
+contexts = ["pane", "workspace"]
+command = ["./bin/gate.sh", "claude"]
+
+# Codex and Cursor use their hooks, not the wrapper: `termaxa init` wires
+# the hook in this project, then the agent starts in a new pane.
+[[actions]]
+id = "gate-codex"
+title = "Termaxa: Codex with its hook"
+contexts = ["pane", "workspace"]
+command = ["./bin/gate.sh", "codex"]
+
+# Open the record pane for this workspace by hand.
+[[actions]]
+id = "record"
+title = "Termaxa: show the record"
+contexts = ["pane", "workspace"]
+command = ["./bin/open-record.sh"]
+
+# The record is the event source: follow it for every workspace project and
+# react to a refusal the moment it is written. Measured Sep 20, 2026: under
+# `wrap` a refusal does not change the agent's detected status, so a status
+# hook alone never fires.
+[[startup]]
+command = ["./bin/watch.sh"]
+
+# And the status hook as well, for the harnesses where a refusal does stop
+# the agent (Codex through its hook: an ask it cannot answer is a refusal).
+# Whichever fires first reports; the other sees the same entry and skips it.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./bin/on-status.sh"]
+
+# The record: `termaxa log --follow` in the workspace's project.
+[[panes]]
+id = "record"
+title = "Termaxa record"
+placement = "overlay"
+command = ["./bin/record.sh"]
