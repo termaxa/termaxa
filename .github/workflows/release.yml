@@ -98,3 +98,32 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  # Opens the winget update PR on microsoft/winget-pkgs from the published
+  # release, so no one runs `wingetcreate` by hand. Needs a classic PAT
+  # with `public_repo` in the WINGET_TOKEN secret (it pushes to the
+  # devdoc83/winget-pkgs fork and opens the PR); the first package
+  # submission (#424831) took 55 days of human validation, updates are
+  # auto-validated and usually merge within a day. Skipped, not failed, when
+  # the token is absent, so a release never depends on it.
+  winget:
+    name: winget update PR
+    needs: release
+    runs-on: windows-latest
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - name: Version without the v
+        id: ver
+        shell: bash
+        run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Open the winget PR
+        if: ${{ env.WINGET_TOKEN != '' }}
+        uses: vedantmgoyal9/winget-releaser@main
+        with:
+          identifier: Termaxa.Termaxa
+          version: ${{ steps.ver.outputs.v }}
+          release-tag: ${{ github.ref_name }}
+          installers-regex: 'termaxa-windows-x86_64\.exe$'
+          token: ${{ secrets.WINGET_TOKEN }}
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
