@@ -111,6 +111,9 @@ jobs:
     needs: release
     runs-on: windows-latest
     if: ${{ !contains(github.ref_name, '-') }}
+    # A courtesy job, not part of the release: the assets are published by
+    # the job before it, and a winget hiccup must not paint the release red.
+    continue-on-error: true
     steps:
       - name: Version without the v
         id: ver
@@ -123,6 +126,11 @@ jobs:
           identifier: Termaxa.Termaxa
           version: ${{ steps.ver.outputs.v }}
           release-tag: ${{ github.ref_name }}
+          # The winget-pkgs fork is under the maintainer's account, not the
+          # org: the default (`github.repository_owner` = termaxa) made the
+          # first run fail with "Could not resolve to a Repository with the
+          # name 'termaxa/winget-pkgs'" (v0.19.5, Sep 27, 2026).
+          fork-user: devdoc83
           installers-regex: 'termaxa-windows-x86_64\.exe$'
           token: ${{ secrets.WINGET_TOKEN }}
         env:
