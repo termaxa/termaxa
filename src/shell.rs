@@ -703,9 +703,12 @@ fn is_claude_cwd_file(target: &str) -> bool {
 /// quotes is the string, run as a command line: the shell expands nothing
 /// in single quotes, so the text is the command verbatim. Read the same way
 /// as a `-c` string, under the label `eval`. Claude Code runs the agent's
-/// command through exactly this form. An `eval` with a double-quoted or
-/// bare operand may expand before it runs and is not read; it stays a
-/// segment the policy judges as typed, which is the default for `eval`.
+/// command through exactly this form. Since Sep 27, 2026 a double-quoted
+/// single operand is read the same way: it may expand `$…` before it runs,
+/// but reading the literal is fail-closed (a deny any reading matches wins,
+/// an unresolvable head still asks), and measured against Claude Code's own
+/// matcher `eval "<denied cmd>"` runs there, so the literal is worth
+/// reading. A bare multi-word `eval a b c` stays a segment judged as typed.
 fn wrapped_eval(seg: &Segment) -> Option<(String, String)> {
     let toks = crate::delete::tokenize_detailed(seg.command());
     let words: Vec<String> = toks.iter().map(|t| t.text.clone()).collect();
@@ -714,7 +717,14 @@ fn wrapped_eval(seg: &Segment) -> Option<(String, String)> {
         return None;
     }
     let arg = &toks[at + 1];
-    if !arg.single_quoted || arg.text.trim().is_empty() {
+    if arg.text.trim().is_empty() {
+        return None;
+    }
+    // A single-quoted operand expands nothing and is read as is. A
+    // double-quoted or bare operand is read only when it contains nothing
+    // the shell would expand first: `eval "gh repo delete x"` is that
+    // command, `eval "$cmd"` is whatever `$cmd` holds and stays unread.
+    if !arg.single_quoted && (arg.text.contains('$') || arg.text.contains('`')) {
         return None;
     }
     Some((head, arg.text.clone()))

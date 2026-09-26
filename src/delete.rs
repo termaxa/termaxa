@@ -352,7 +352,14 @@ pub fn command_head(token: &str) -> String {
 /// splitter produced; and `time` / `strace` / `watch`, which are diagnostic
 /// wrappers no agent has been observed reaching for in this codebase's field
 /// reports. Add them when something observes one, not before.
-const COMMAND_WRAPPERS: [&str; 6] = ["sudo", "doas", "env", "command", "nohup", "nice"];
+const COMMAND_WRAPPERS: [&str; 7] = ["sudo", "doas", "env", "command", "nohup", "nice", "xargs"];
+
+/// The wrappers that add no privilege: what they run is what the user's own
+/// string rule should see. `sudo`/`doas` are left out of the string-rule
+/// reading on purpose — a rule that allows `apt-get install*` should not
+/// allow it under sudo — while the hard stops, spelled with a leading `*`,
+/// see through everything.
+const UNPRIVILEGED_WRAPPERS: [&str; 5] = ["env", "command", "nohup", "nice", "xargs"];
 
 /// Flags on a wrapper that consume the FOLLOWING token as their value. Without
 /// this, `sudo -u alice rm -rf x` reads `alice` as the command name and the
@@ -365,6 +372,29 @@ fn wrapper_flag_takes_value(wrapper: &str, flag: &str) -> bool {
         ),
         "env" => matches!(flag, "-u" | "--unset" | "-S" | "--split-string"),
         "nice" => matches!(flag, "-n" | "--adjustment"),
+        // `xargs -I {} rm -rf {}`: the classic spelling that hides the verb
+        // behind a pipe (measured against Claude Code's own matcher, Sep 27,
+        // 2026: `… | xargs -I{} <denied cmd> {}` runs there). `-I{}` attached
+        // is one token and is skipped as a flag; `-I {}` takes the next.
+        "xargs" => matches!(
+            flag,
+            "-I" | "-i"
+                | "-n"
+                | "-P"
+                | "-L"
+                | "-l"
+                | "-d"
+                | "-a"
+                | "-E"
+                | "-e"
+                | "-s"
+                | "--max-args"
+                | "--max-procs"
+                | "--delimiter"
+                | "--arg-file"
+                | "--replace"
+                | "--max-lines"
+        ),
         _ => false,
     }
 }
@@ -404,6 +434,77 @@ pub fn resolve_head(tokens: &[String]) -> Option<(String, usize)> {
                 break;
             }
         }
+    }
+}
+
+/// The tokens with leading environment assignments, unprivileged wrappers
+/// (`env`, `command`, `nohup`, `nice`, `xargs` and their own flags) and a
+/// leading backslash stepped over, so a user's string rule sees the command
+/// they run: `GH_CONFIG_DIR=/x gh repo delete …`, `env gh repo delete …`,
+/// `\gh repo delete …` and `… | xargs -I{} gh repo delete {}` all read as
+/// `gh repo delete …`. Measured Sep 27, 2026 against a `gh repo delete*`
+/// deny: the plain form was denied and every one of these was an ask,
+/// because the head resolver knew the spellings and the string rules did
+/// not (the same shape as `git -C`). `None` when nothing was stepped over.
+/// Privilege wrappers are not stepped over here; see `UNPRIVILEGED_WRAPPERS`.
+pub fn without_unprivileged_wrappers(tokens: &[String]) -> Option<Vec<String>> {
+    let mut i = 0;
+    loop {
+        let tok = tokens.get(i)?;
+        if is_env_assignment(tok) {
+            i += 1;
+            continue;
+        }
+        let head = command_head(tok);
+        if !UNPRIVILEGED_WRAPPERS.contains(&head.as_str()) {
+            break;
+        }
+        let wrapper = head;
+        i += 1;
+        while let Some(t) = tokens.get(i) {
+            if t.starts_with('-') {
+                if wrapper_flag_takes_value(&wrapper, t) {
+                    i += 1;
+                }
+                i += 1;
+            } else if is_env_assignment(t) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    let mut out: Vec<String> = tokens[i..].to_vec();
+    let mut changed = i > 0;
+    if let Some(first) = out.first_mut() {
+        if let Some(stripped) = first.strip_prefix('\\') {
+            *first = stripped.to_string();
+            changed = true;
+        }
+    }
+    if changed && !out.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Like `without_unprivileged_wrappers`, but `sudo`/`doas` (with their own
+/// flags) are stepped over too. For deny rules only: see `Policy::evaluate`.
+pub fn without_any_wrappers(tokens: &[String]) -> Option<Vec<String>> {
+    let (_, at) = resolve_head(tokens)?;
+    let mut out: Vec<String> = tokens[at..].to_vec();
+    let mut changed = at > 0;
+    if let Some(first) = out.first_mut() {
+        if let Some(stripped) = first.strip_prefix('\\') {
+            *first = stripped.to_string();
+            changed = true;
+        }
+    }
+    if changed && !out.is_empty() {
+        Some(out)
+    } else {
+        None
     }
 }
 

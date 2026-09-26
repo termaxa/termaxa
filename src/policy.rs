@@ -605,6 +605,26 @@ impl Policy {
         // spelling still allows.
         let views = readings(command);
         let mut best: Option<(usize, &Rule)> = None;
+        // A privilege wrapper is transparent to a DENY only: `sudo gh repo
+        // delete …` must hit a `gh repo delete*` deny, while an allow written
+        // for `apt-get install*` must not admit `sudo apt-get install`. The
+        // reading through sudo/doas is therefore matched against deny rules
+        // and nothing else.
+        let privileged = crate::delete::without_any_wrappers(&crate::intent::tokens(command))
+            .map(|t| t.join(" ").to_lowercase());
+        if let Some(pv) = privileged
+            .as_deref()
+            .filter(|pv| !views.iter().any(|v| v == pv))
+        {
+            if let Some((idx, rule)) = self
+                .rules
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.action == Action::Deny && r.matches(pv))
+            {
+                best = Some((idx, rule));
+            }
+        }
         for v in &views {
             if let Some((idx, rule)) = self.rules.iter().enumerate().find(|(_, r)| r.matches(v)) {
                 best = Some(match best {
@@ -756,13 +776,28 @@ pub fn readings(command: &str) -> Vec<String> {
     // `git push --force`), so a rule written for the subcommand sees it.
     // A reading can only add matches, and a deny any reading matches still
     // outranks an allow.
-    if let Some(stripped) =
-        crate::delete::git_without_global_options(&crate::intent::tokens(command))
-    {
+    let toks = crate::intent::tokens(command);
+    if let Some(stripped) = crate::delete::git_without_global_options(&toks) {
         let s = stripped.join(" ");
         let l = s.to_lowercase();
         if !out.contains(&l) {
             out.push(l);
+        }
+    }
+    // Environment assignments, unprivileged wrappers and a leading backslash
+    // stepped over (`GH_CONFIG_DIR=/x gh …`, `env gh …`, `\gh …`, `xargs -I{}
+    // gh …` read as `gh …`), and git's options stepped over on top of that.
+    if let Some(stripped) = crate::delete::without_unprivileged_wrappers(&toks) {
+        let s = stripped.join(" ");
+        let l = s.to_lowercase();
+        if !out.contains(&l) {
+            out.push(l);
+        }
+        if let Some(g) = crate::delete::git_without_global_options(&stripped) {
+            let l = g.join(" ").to_lowercase();
+            if !out.contains(&l) {
+                out.push(l);
+            }
         }
     }
     out
@@ -1446,6 +1481,59 @@ rules:
         ] {
             let d = verdict(still_denied);
             assert_eq!(d.action, Action::Deny, "{still_denied}: {}", d.reason);
+        }
+    }
+
+    /// A user's string rule sees the command through the spellings the head
+    /// resolver already knew (Sep 27, 2026, measured against a `gh repo
+    /// delete*` deny while answering a team's open question about their own
+    /// Claude Code deny list): an environment assignment in front, `env`,
+    /// `command`, a backslash, a `-c` string, a double-quoted `eval`, and
+    /// `xargs`. Claude Code's matcher, measured the same day, catches the
+    /// first four and lets the last three run. A privilege wrapper is
+    /// transparent to a deny and opaque to an allow.
+    #[test]
+    fn a_string_rule_sees_through_every_spelling_the_resolver_knows() {
+        let policy: Policy = serde_yaml::from_str(
+            "default: ask\nrules:\n  - match: \"gh repo delete*\"\n    action: deny\n    reason: no\n  - match: \"apt-get install*\"\n    action: allow\n  - match: \"ls\"\n    action: allow\n",
+        )
+        .unwrap();
+        let ctx = here();
+        let v = |c: &str| policy.evaluate_command(c, &ctx).action;
+        for c in [
+            "gh repo delete org/x --yes",
+            "GH_CONFIG_DIR=/x gh repo delete org/x --yes",
+            "env gh repo delete org/x --yes",
+            "command gh repo delete org/x --yes",
+            "\\gh repo delete org/x --yes",
+            "sh -c \"gh repo delete org/x --yes\"",
+            "eval \"gh repo delete org/x --yes\"",
+            "echo org/x | xargs -I{} gh repo delete {} --yes",
+            "echo org/x | xargs -I {} gh repo delete {} --yes",
+            "sudo gh repo delete org/x --yes",
+            "sudo -u alice gh repo delete org/x --yes",
+        ] {
+            assert_eq!(v(c), Action::Deny, "{c}");
+        }
+        // An allow does not leak through a privilege wrapper; the plain form
+        // and the unprivileged wrappers allow.
+        assert_eq!(v("apt-get install x"), Action::Allow);
+        assert_eq!(v("env apt-get install x"), Action::Allow);
+        assert_eq!(v("sudo apt-get install x"), Action::Ask);
+        assert_eq!(v("sudo ls"), Action::Ask);
+        assert_eq!(v("gh repo view org/x"), Action::Ask);
+        // The hard stops see through everything, as before.
+        let starter = Policy::builtin().unwrap();
+        for c in [
+            "xargs -I{} rm -rf {}",
+            "sudo -u root rm -rf /",
+            "eval \"rm -rf /\"",
+        ] {
+            assert_eq!(
+                starter.evaluate_command(c, &ctx).action,
+                Action::Deny,
+                "{c}"
+            );
         }
     }
 
