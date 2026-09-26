@@ -470,6 +470,18 @@ rules:
     action: allow
   - match: "printenv *"
     action: allow
+  # The shell's own read-only tests and lookups: a harness probes its
+  # environment with these at startup (Claude Code 2.1.280, Sep 24, 2026).
+  - match: "command -v *"
+    action: allow
+  - match: "test *"
+    action: allow
+  - match: "[ *"
+    action: allow
+  - match: "[[ *"
+    action: allow
+  - match: "printf *"
+    action: allow
   - match: "uname"
     action: allow
   - match: "uname *"

@@ -349,7 +349,14 @@ fn expand_into(out: &mut Vec<Segment>, segments: Vec<Segment>, via: Option<&str>
         if !bindings.is_empty() {
             substitute_bindings(&mut seg, &bindings);
         }
-        if let Some((name, value)) = simple_assignment(&seg) {
+        let (keyword_only, keyword_stripped) = strip_control_keywords(&mut seg);
+        if keyword_only {
+            seg.keyword = true;
+        }
+        // An assignment under a condition or in a loop body (`then X=…`,
+        // `do X=…`) may never run, so it does not bind (#94's rule): the
+        // segments after it are read as written.
+        if let Some((name, value)) = simple_assignment(&seg).filter(|_| !keyword_stripped) {
             bindings.retain(|(n, _)| n != &name);
             bindings.push((name, value));
             seg.binds = true;
@@ -433,6 +440,90 @@ fn simple_assignment(seg: &Segment) -> Option<(String, String)> {
 /// Replace `$NAME` and `${NAME}` for each bound name in the segment's text
 /// and redirect targets. `$NAME` only where the name ends: `$NAMEX` is a
 /// different variable and stays as written.
+/// Shell control flow is not a command. Returns true when the segment was
+/// nothing but keywords (a `for`/`case`/`select` header, or `do`, `done`,
+/// `then`, `else`, `fi`, `esac`, `{`, `}` alone) and is therefore
+/// transparent; otherwise strips leading keywords and a leading `!` so the
+/// command that follows is what gets judged, and returns false. A `for`
+/// header's word list is data, not commands: `for f in a b c` runs nothing
+/// until its `do`, which is its own segment.
+fn strip_control_keywords(seg: &mut Segment) -> (bool, bool) {
+    const HEADERS: [&str; 3] = ["for", "case", "select"];
+    const LEADING: [&str; 8] = ["do", "then", "else", "elif", "if", "while", "until", "!"];
+    const ALONE: [&str; 6] = ["done", "fi", "esac", "}", ";;", "do"];
+    let text = seg.text.trim().to_string();
+    let text = text.as_str();
+    let first = text.split_whitespace().next().unwrap_or("");
+    if first.is_empty() {
+        return (false, false);
+    }
+    if HEADERS.contains(&first) {
+        // `for x in …` / `select x in …`: the whole segment is the header
+        // (its words are data). A `case` header is only `case WORD in`;
+        // `case x in a) rm -rf /` carries a body after the pattern, and
+        // that body is judged (found by the first test of this function).
+        if first != "case" || text.ends_with(" in") {
+            return (true, false);
+        }
+        if let Some(close) = text.find(')') {
+            let body = text[close + 1..].trim().to_string();
+            if body.is_empty() {
+                return (true, false);
+            }
+            seg.command = seg
+                .command
+                .find(')')
+                .map(|i| seg.command[i + 1..].trim().to_string())
+                .unwrap_or_else(|| body.clone());
+            seg.text = body;
+            return (false, true);
+        }
+        return (true, false);
+    }
+    // A `case` arm's pattern (`a)`, `*)`, `--force|-f)`) before its command.
+    if first.ends_with(')') && !first.contains('(') && text.split_whitespace().nth(1).is_some() {
+        let body = text[first.len()..].trim().to_string();
+        seg.command = seg
+            .command
+            .trim()
+            .strip_prefix(first)
+            .map(|c| c.trim_start().to_string())
+            .unwrap_or_else(|| body.clone());
+        seg.text = body;
+        let (only, _) = strip_control_keywords(seg);
+        return (only, true);
+    }
+    if ALONE.contains(&first) && text.split_whitespace().nth(1).is_none() {
+        return (true, false);
+    }
+    let mut rest = text;
+    let mut stripped = false;
+    loop {
+        let head = rest.split_whitespace().next().unwrap_or("");
+        if LEADING.contains(&head) {
+            rest = rest[head.len()..].trim_start();
+            stripped = true;
+            if rest.is_empty() {
+                return (true, false);
+            }
+        } else {
+            break;
+        }
+    }
+    if stripped {
+        let prefix = text[..text.len() - rest.len()].to_string();
+        let rest = rest.to_string();
+        // `command` is `text` without its redirections; the keyword sat at
+        // the front of both, so the same prefix comes off it.
+        seg.command = match seg.command.trim().strip_prefix(prefix.trim_end()) {
+            Some(c) => c.trim_start().to_string(),
+            None => rest.clone(),
+        };
+        seg.text = rest;
+    }
+    (false, stripped)
+}
+
 fn substitute_bindings(seg: &mut Segment, bindings: &[(String, String)]) {
     // `$NAME` and `${NAME}` outside single quotes; inside them the shell
     // expands nothing, so the text stays what it is. `$NAMEX` is a different
@@ -760,6 +851,16 @@ pub struct Segment {
     /// as an unmatched segment it was the whole reason the zsh form fell to
     /// the default (Sep 12, 2026, #94).
     pub binds: bool,
+    /// True when the segment was nothing but shell control flow: `for c in
+    /// npm yarn pnpm`, `done`, `fi`, `then`, `{`. Such a segment runs
+    /// nothing; the commands it governs are segments of their own. Claude
+    /// Code 2.1.280's startup probe (`sh -c "uname -s … for c in npm yarn
+    /// pnpm; do command -v …; done"`) was refused on the `for` line, which
+    /// matched no rule and fell to the default (measured in a live Herdr
+    /// session, Sep 24, 2026). A leading keyword before a command (`do
+    /// command -v x`, `then echo`, `if [ -f x ]`) is stripped so the
+    /// command is what is judged; `do rm -rf x` is still `rm -rf x`.
+    pub keyword: bool,
 }
 
 impl Segment {
@@ -860,6 +961,7 @@ fn flush(
             wraps: false,
             scaffold: false,
             binds: false,
+            keyword: false,
         });
     } else {
         // Nothing but whitespace between separators: whatever the redirect
