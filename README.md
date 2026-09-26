@@ -2,7 +2,9 @@
 
 # 🛡 Termaxa
 
-**Run AI coding agents with confidence.**
+**The agent's own prompt shows you the command it wants to run. Termaxa shows you the consequence.**
+
+The files, the rows, the commit a force push would lose: previewed before anything runs, backed up first, the dangerous few blocked, and every decision in a record the agent cannot rewrite.
 
 **Try it in ten seconds, nothing installed:** [play.termaxa.com](https://play.termaxa.com) runs the real gate on a throwaway project. Try to get a destructive command past it.
 
@@ -448,7 +450,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ## Contributing
 
-Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is dependency-light Rust: ~13,600 lines of production code in `src/`, plus ~15,200 lines of tests (unit tests live beside the code they test; `tests/` holds the integration ones). More test than product, on purpose — `src/policy.rs` and `src/preview.rs` are the best places to start reading, and the test module at the bottom of each file explains what the code is defending against.
+Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is dependency-light Rust: ~13,800 lines of production code in `src/`, plus ~15,400 lines of tests (unit tests live beside the code they test; `tests/` holds the integration ones). More test than product, on purpose — `src/policy.rs` and `src/preview.rs` are the best places to start reading, and the test module at the bottom of each file explains what the code is defending against.
 
 If you can make an agent get past the gate in a way that isn't already documented above, that's the most useful contribution you can make: [open an issue](https://github.com/termaxa/termaxa/issues) or email security@termaxa.com.
 

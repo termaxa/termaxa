@@ -2,7 +2,58 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.19.5 — the spellings a rule does not see
+
+**In plain words:** control-flow keywords (`for`, `do`, `done`, `if`, `then`, `fi`) no longer make the gate ask; a rule you write now matches the command in every spelling the gate can read (`X=1 gh …`, `env gh …`, `\gh …`, `sh -c "gh …"`, `eval "gh …"`, `… | xargs gh …`, and `sudo gh …` for a deny); five read-only shell built-ins are allowed by default.
+
+A batch of two code PRs (#117, #118) plus the docs, the plugin's move
+in-tree and the winget automation, released before Show HN so a fresh
+install carries the current starter.
+
+### Fixed
+
+- **A string rule sees through every spelling the resolver knows** (#118).
+  Measured Sep 27 while answering a team's open question about their own
+  Claude Code deny list: with a `gh repo delete*` deny, the plain form was
+  denied and `GH_CONFIG_DIR=/x gh …`, `env gh …`, `\gh …`, `eval "gh …"`
+  and `… | xargs -I{} gh …` were asks, because the head resolver knew the
+  spellings and the string rules did not (the `git -C` shape again). Every
+  such reading now feeds the string rules; `xargs` is a wrapper with its
+  flags; a double-quoted `eval` that expands nothing is read as the command
+  it is; and `sudo`/`doas` are transparent to a deny only, so an allow for
+  `apt-get install*` still does not admit `sudo apt-get install`. For the
+  record, Claude Code's own matcher (2.1.281 and 2.1.283) catches the env
+  prefix, `env`, `command` and the backslash and lets `sh -c`, `eval` and
+  `xargs` run.
+- **Control-flow keywords no longer ask** (#117). Claude Code's startup
+  probe (`sh -c "uname -s … for c in npm yarn pnpm; do command -v …; done"`)
+  was refused on `for c in npm yarn pnpm`, which matched no rule (live Herdr
+  session, Sep 24). A `for`/`case`/`select` header, and `do`, `done`,
+  `then`, `else`, `fi`, `esac` alone, run nothing and are transparent; a
+  leading `do`/`then`/`if`/`while`/`until`/`!` or a `case` arm's `pattern)`
+  is stripped so the command it governs is what is judged. `do rm -rf "$f"`
+  is still `rm -rf`, `case x in a) rm -rf /;; esac` is denied rather than
+  swallowed by its header (the test found that before it shipped), and an
+  assignment under a condition still does not bind (#94's rule).
+
+### Added
+
+- Starter rules (198 → 203): `command -v *`, `test *`, `[ *`, `[[ *`,
+  `printf *`. `init` never rewrites an existing policy: add them by hand or
+  regenerate.
+- The Herdr plugin lives in-tree under `herdr-plugin/` (#115):
+  `herdr plugin install termaxa/termaxa`. Excluded from the crate.
+- The winget update PR opens itself from each release (#116).
+
+### Docs
+
+- README and SECURITY.md current as of v0.19.4 (#114); the README opens on
+  the consequence line, the gate inside the agent, and the playground.
+- From this entry on, each release starts with an "In plain words" line.
+
 ## v0.19.4 — every spelling of a force push, and every spelling of git
+
+**In plain words:** `git push -f` and `git push origin +main` are now denied like `--force`; `git -C <dir> …` no longer slips past every git rule; a backup never follows a symlink or junction into a bigger tree.
 
 Two wrong verdicts in a shipped starter, both found Sep 24, 2026, so this
 ships the day they were found (#112).
@@ -47,6 +98,8 @@ ships the day they were found (#112).
   see.
 
 ## v0.19.3 — replay your own transcripts, and what the first replay asked about
+
+**In plain words:** `termaxa replay` judges every command your agents ever ran, from their transcripts; `termaxa log -f` follows the record; the Linux binary now runs on any distro; eleven ordinary commands stopped asking.
 
 The first batched release: two PRs, nothing in them a wrong verdict in a
 shipped version. Sep 20, 2026: every `command` in the Claude Code and
@@ -100,6 +153,8 @@ asked, and the ones that should not have are fixed here.
 
 ## v0.19.2 — Cursor's Delete is a delete
 
+**In plain words:** Cursor's file-delete tool was passing through the gate unjudged; it is now read as the delete it is.
+
 Captured Sep 19, 2026 on Windows (cursor 3.11.25): Cursor's file tools
 arrive as `tool_name: "Write"` / `"Delete"` with `tool_input.file_path`, no
 `cwd`, the project only in `workspace_roots`, a BOM in front, and
@@ -134,6 +189,8 @@ semantics beyond Claude Code and Codex, and Copilot's file tools if it has
 hookable ones. `docs/dialects.md` holds every shape.
 
 ## v0.19.1 — a patch is a write, not a command
+
+**In plain words:** Codex's `apply_patch` was being refused as an unreadable shell command; it is now read as the file writes it contains. Codex is gated by its hooks, not by `termaxa wrap`.
 
 Captured Sep 19, 2026 in the same container as v0.19.0's measurements
 (codex-cli 0.155.1, `codex exec` with the hook trusted): Codex sends
