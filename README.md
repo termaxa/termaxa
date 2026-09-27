@@ -24,9 +24,9 @@ Your AI agent wants to run `git push --force`, `DROP TABLE users`, `terraform ap
 
 <div align="center">
 
-<img src="https://termaxa.com/hero-claude-code.gif" alt="Claude Code asks to force-push; Termaxa answers inside the agent's own prompt with the commit the remote would lose and the backup it already took" width="800">
+<img src="https://termaxa.com/termaxa-claude-code.gif" alt="A real Claude Code session with its own approvals switched off: it inspects scratch/ freely, tries rm -rf ./scratch, and Termaxa's hook stops it with the reason and the 12 files; the agent declines to route around it" width="800">
 
-*Inside the agent, not beside it: Claude Code asks to force-push, the gate answers in its own prompt with what the remote would lose and the backup already taken. Nothing staged.*
+*Inside the agent, not beside it: a real Claude Code session with its own approvals switched off. The inspection runs without a prompt; the `rm -rf` is stopped with the reason and the 12 files it would have taken, and the agent declines to route around it. Recorded on termaxa 0.19.5.*
 
 </div>
 
