@@ -8,9 +8,7 @@ The files, the rows, the commit a force push would lose: previewed before anythi
 
 **Try it in ten seconds, nothing installed:** [play.termaxa.com](https://play.termaxa.com) runs the real gate on a throwaway project. Try to get a destructive command past it.
 
-<img src="https://termaxa.com/hero-claude-code.gif" alt="Claude Code asks to force-push; Termaxa answers inside the agent's own prompt with the commit the remote would lose and the backup it already took" width="800">
-
-*Inside the agent, not beside it: Claude Code asks to force-push, the gate answers in its own prompt with what the remote would lose and the backup already taken. Nothing staged.*
+<img src="https://termaxa.com/termaxa-deny.gif" alt="An agent asks to run rm -rf ./scratch; Termaxa shows the target, 12 files, the backup it took, and denies it, while the red bar of the allow/ask/deny meter lights up" width="800">
 
 Termaxa is a Rust command-line gate for the shell commands a coding agent runs: it previews the blast radius, backs up first, blocks the dangerous ones, and keeps a record the agent cannot rewrite. No model, no service, no account — a hook for Claude Code, Codex, Cursor and Copilot, or a wrapper for anything else. It's a cooperative windshield, not a sandbox.
 
@@ -23,6 +21,14 @@ Termaxa is a Rust command-line gate for the shell commands a coding agent runs: 
 ---
 
 Your AI agent wants to run `git push --force`, `DROP TABLE users`, `terraform apply`, `rm -rf`. Most of the time it's right. Sometimes it isn't. Today your only options are *supervise every command* (which defeats the point of an agent) or *trust it blindly* (which defeats your Friday).
+
+<div align="center">
+
+<img src="https://termaxa.com/hero-claude-code.gif" alt="Claude Code asks to force-push; Termaxa answers inside the agent's own prompt with the commit the remote would lose and the backup it already took" width="800">
+
+*Inside the agent, not beside it: Claude Code asks to force-push, the gate answers in its own prompt with what the remote would lose and the backup already taken. Nothing staged.*
+
+</div>
 
 Termaxa is a third option: a gate the agent's commands pass through. It reads a policy you wrote, shows you what's actually about to happen, backs up what's about to change, and records everything. Hooks for **Claude Code**, **Codex**, **Cursor** and **Copilot CLI**, all live-tested; `termaxa wrap` for a harness without hooks; a standalone CLI anywhere. Running agents in [Herdr](https://herdr.dev)? `herdr plugin install termaxa/termaxa` puts the gate, the record and the reason a pane went red in the multiplexer ([the plugin](herdr-plugin/)).
 
@@ -295,6 +301,8 @@ OPA decides allow/deny well. It has no execution previews, no automatic backups,
 ## In Herdr
 
 [Herdr](https://herdr.dev) is a terminal multiplexer for running several agents at once. The plugin in [`herdr-plugin/`](herdr-plugin/) gives it three things: an action that starts Claude Code (or Codex, through its hook) in a new pane under the gate; a pane that follows the project's record live; and a watcher that puts the gate's verdict on the sidebar (`termaxa deny`, with the command and reason) and opens the record beside the agent the moment it is refused. Measured in a live Herdr 0.9.1 session; the two Herdr facts it depends on (plugin commands do not get your login PATH; a plugin pane starts in the plugin root) are in its README.
+
+<img src="https://termaxa.com/termaxa-herdr.gif" alt="In a multiplexer, one action starts Claude Code under the gate; the refused rm -rf shows on the sidebar as termaxa deny, and the record opens beside the agent" width="800">
 
 ```bash
 herdr plugin install termaxa/termaxa

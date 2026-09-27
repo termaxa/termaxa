@@ -3,6 +3,8 @@
 A [Herdr](https://herdr.dev) plugin for [Termaxa](https://github.com/termaxa/termaxa),
 the gate for the shell commands AI coding agents run. Three things:
 
+<img src="https://termaxa.com/termaxa-herdr.gif" alt="One action starts Claude Code under the gate; a refused rm -rf shows on the sidebar as termaxa deny, and the record opens beside the agent" width="800">
+
 - **Run an agent under the gate.** An action that splits a pane beside the
   current one and starts Claude Code under `termaxa wrap`, so every shell
   command it runs is previewed, insured, judged and recorded. A second
