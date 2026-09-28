@@ -2,6 +2,47 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.19.6 — the option beside the one a rule was written for
+
+**In plain words:** a command allowed for reading (`sed -n`, `find`, `git diff`/`log`/`show`/`branch`, inline `node`) no longer runs without a prompt when an option makes it write a file, overwrite a branch or run a command; the file it would write is previewed and backed up first; and a push that deletes remote branches says which, instead of "nothing to push".
+
+Security release for [GHSA-36jf-95xr-37f2](https://github.com/termaxa/termaxa/security/advisories/GHSA-36jf-95xr-37f2)
+(Moderate), reported privately by Tim Schipper
+([AraneaDev](https://github.com/AraneaDev)) against v0.19.5 and extended
+while reproducing it. One code PR (#123), released the same day it merged,
+under the rule that wrong verdicts ship immediately. The advisory lists how
+long each form was exposed, with both endpoints.
+
+### Fixed
+
+- **An option that writes or runs turns a reading allow into an ask.**
+  Starter rules written for the reading form of a command also allowed
+  forms that write or run: `git branch -M`/`-C`, `find -fprint`/`-fprintf`,
+  `git diff`/`log`/`show --output`, `sed -n -i`, inline `node -e` (the
+  report), and `find -fls`, sed's `w` command and `s///w` flag, and sed's
+  `e` command, which runs any shell command (found while reproducing). A
+  context signal now reads each segment's own words, through wrappers, `-c`
+  strings and git's global options, and names the option in the ask. A new
+  sed reader follows the arguments and the script, and treats a script it
+  cannot follow as able to do anything. The reading forms still pass.
+- **The file they write is previewed and backed up.** The output file of
+  each of those options, and of `psql -o`, is a target now: the preview
+  shows what it loses, and the backup copies it before the command runs,
+  the way a `> file` redirect is handled.
+- **A push that removes refs says which.** `git push origin :ref`,
+  `--delete`, `--prune` and `--mirror` asked, but the preview compared the
+  current branch with its upstream and said "nothing to push". It reads the
+  refspecs now: a delete names the branch, its last fetched tip and the
+  commits only it holds, and a single deleted branch is pinned before the
+  push, like a force push. `--prune` is scoped to the wildcard refspecs
+  given, since a plain refspec prunes nothing (git's own `--dry-run` agrees);
+  a prune or mirror that would remove something is uninsurable and denied.
+
+### Docs
+
+- SECURITY.md's line on scripts matches the starter: `python` and `bash`
+  scripts ask, `node <file>` is in the dev loop, and inline node code asks.
+
 ## v0.19.5 — the spellings a rule does not see
 
 **In plain words:** control-flow keywords (`for`, `do`, `done`, `if`, `then`, `fi`) no longer make the gate ask; a rule you write now matches the command in every spelling the gate can read (`X=1 gh …`, `env gh …`, `\gh …`, `sh -c "gh …"`, `eval "gh …"`, `… | xargs gh …`, and `sudo gh …` for a deny); five read-only shell built-ins are allowed by default.
