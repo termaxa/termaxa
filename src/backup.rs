@@ -80,7 +80,7 @@ fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
     // report and the mechanism disagreeing is the bug shape this release
     // keeps finding; found by roadmap 2.2, which is the first caller to ask
     // `plan` about a write.
-    if let Some(paths) = overwrite_paths(&segment.redirects, cwd) {
+    if let Some(paths) = all_overwrite_paths(&segment.redirects, &tokens, cwd) {
         return Some(format!(
             "copy {} path(s) to .termaxa/backups before they are overwritten",
             paths.len()
@@ -166,7 +166,7 @@ fn take_segment(
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else if let Some(state) = tf_state_target(&tokens) {
         backup_files(termaxa_dir, &id, &ts, command, &[state])?
-    } else if let Some(paths) = overwrite_paths(redirects, cwd) {
+    } else if let Some(paths) = all_overwrite_paths(redirects, &tokens, cwd) {
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else {
         return Ok(None);
@@ -184,6 +184,18 @@ fn git_force_push_target(tokens: &[String]) -> Option<(String, String)> {
     if tokens.first().map(|t| t.as_str()) != Some("git")
         || tokens.get(1).map(|t| t.as_str()) != Some("push")
     {
+        return None;
+    }
+    // A push that deletes one remote branch is insured the way a force push
+    // is: the ref it removes is pinned first. Several deletions, a prune
+    // or a mirror are not pinned, and their preview says so (Tim Schipper,
+    // Sep 27, 2026: nothing was pinned and the preview described an
+    // ordinary push).
+    if let Some(fx) = crate::preview::push_ref_effects(tokens) {
+        if fx.deletes.len() == 1 && fx.prune.is_empty() && !fx.mirror {
+            let name = fx.deletes[0].trim_start_matches("refs/heads/").to_string();
+            return Some((fx.remote, name));
+        }
         return None;
     }
     let force = tokens
@@ -377,6 +389,42 @@ fn backup_pg(
 /// Only files that already EXIST are insurable. `> newfile` creates rather than
 /// destroys, and backing up a path with no contents is noise in the manifest.
 /// Appends (`>>`) are excluded here by `Overwrite::truncates`.
+/// Existing files a command writes through its own options (`find -fprint`,
+/// `git … --output`, `sed -i`/`w`, `psql -o`), insured the way a redirect's
+/// target is: copied before the command runs.
+fn option_overwrite_paths(tokens: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
+    let (head, at) = crate::delete::resolve_head(tokens)?;
+    let paths: Vec<PathBuf> = crate::resolve::option_write_targets(&head, &tokens[at + 1..])
+        .iter()
+        .map(|p| crate::delete::resolve_path_in(p, cwd))
+        .filter(|p| p.is_file())
+        .collect();
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths)
+    }
+}
+
+/// A redirect's targets and an option's written files, together, each once.
+fn all_overwrite_paths(
+    redirects: &[crate::shell::Overwrite],
+    tokens: &[String],
+    cwd: &Path,
+) -> Option<Vec<PathBuf>> {
+    let mut paths = overwrite_paths(redirects, cwd).unwrap_or_default();
+    for p in option_overwrite_paths(tokens, cwd).unwrap_or_default() {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths)
+    }
+}
+
 fn overwrite_paths(redirects: &[crate::shell::Overwrite], cwd: &Path) -> Option<Vec<PathBuf>> {
     let paths: Vec<PathBuf> = redirects
         .iter()
@@ -990,6 +1038,47 @@ mod tests {
 
     fn tokens_of(command: &str) -> Vec<String> {
         crate::pg::shell_tokens(command)
+    }
+
+    /// A file written through an option is insured the way a redirect's
+    /// target is: `plan` says so, and `take` copies it first.
+    #[test]
+    fn a_file_written_through_an_option_is_copied_first() {
+        let (_t, dir) = scratch("opt-write");
+        for c in [
+            "sed -n -i 's/x/y/' f.txt",
+            "find . -type f -fprint f.txt",
+            "git diff --output=f.txt",
+            "psql -o f.txt -c 'select 1'",
+        ] {
+            let p = plan(c, &dir).unwrap_or_else(|| panic!("{c}: no plan"));
+            assert!(p.starts_with("copy 1 path(s)"), "{c}: {p}");
+        }
+        assert_eq!(plan("find . -name '*.txt' -print", &dir), None);
+    }
+
+    /// A push that deletes one remote branch pins it, the way a force
+    /// push does; several deletions, a prune or a mirror do not claim to.
+    #[test]
+    fn a_single_remote_branch_delete_is_pinned_and_a_set_is_not() {
+        for c in [
+            "git push --delete origin old",
+            "git push origin :old",
+            "git push -d origin refs/heads/old",
+        ] {
+            assert_eq!(
+                git_force_push_target(&tokens_of(c)),
+                Some(("origin".to_string(), "old".to_string())),
+                "{c}"
+            );
+        }
+        for c in [
+            "git push --delete origin a b",
+            "git push --mirror origin",
+            "git push --prune origin main",
+        ] {
+            assert_eq!(git_force_push_target(&tokens_of(c)), None, "{c}");
+        }
     }
 
     #[test]

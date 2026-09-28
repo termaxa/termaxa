@@ -271,6 +271,11 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
             "dd" => out.extend(dd_targets(args)),
             _ => {}
         }
+        out.extend(
+            option_write_targets(&head, args)
+                .into_iter()
+                .map(|p| (p, TargetRole::Destination)),
+        );
     }
 
     out.sort();
@@ -278,6 +283,81 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
     out.into_iter()
         .map(|(raw, role)| target(&raw, role, ctx))
         .collect()
+}
+
+/// Files a command writes through its own options rather than through a
+/// redirect. Reported by Tim Schipper (Sep 27, 2026): `command_targets` had
+/// no extractor for any of these, so neither the overwrite preview nor the
+/// backup saw the file a `find -fprint`, `git diff --output`, `sed -n -i` or
+/// `psql -o` was about to truncate. `args` are the words after the command.
+/// Devices (`/dev/stdout`) are not files anyone loses.
+pub fn option_write_targets(head: &str, args: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match head {
+        "find" | "gfind" => {
+            let mut i = 0;
+            while i < args.len() {
+                if matches!(
+                    args[i].as_str(),
+                    "-fprint" | "-fprint0" | "-fprintf" | "-fls"
+                ) {
+                    if let Some(f) = args.get(i + 1) {
+                        out.push(f.clone());
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+        }
+        "sed" | "gsed" => {
+            let inv = crate::sed::parse_args(args);
+            if inv.in_place {
+                out.extend(inv.files.iter().filter(|f| f.as_str() != "-").cloned());
+            }
+            if !inv.sandbox {
+                for s in &inv.scripts {
+                    out.extend(crate::sed::effects(s).writes);
+                }
+            }
+        }
+        "git" => {
+            let mut full = vec!["git".to_string()];
+            full.extend(args.iter().cloned());
+            let g = crate::delete::git_without_global_options(&full).unwrap_or(full);
+            let mut i = 2;
+            while i < g.len() {
+                if let Some(v) = g[i].strip_prefix("--output=") {
+                    out.push(v.to_string());
+                } else if g[i] == "--output" {
+                    if let Some(v) = g.get(i + 1) {
+                        out.push(v.clone());
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+        }
+        "psql" => {
+            let mut i = 0;
+            while i < args.len() {
+                let a = args[i].as_str();
+                if a == "-o" || a == "--output" {
+                    if let Some(v) = args.get(i + 1) {
+                        out.push(v.clone());
+                    }
+                    i += 1;
+                } else if let Some(v) = a.strip_prefix("--output=") {
+                    out.push(v.to_string());
+                } else if a.len() > 2 && a.starts_with("-o") && !a.starts_with("--") {
+                    out.push(a[2..].to_string());
+                }
+                i += 1;
+            }
+        }
+        _ => {}
+    }
+    out.retain(|p| !p.is_empty() && !p.starts_with("/dev/"));
+    out
 }
 
 /// `cp`/`mv` grammar: operands are sources except the last, which is the
@@ -448,6 +528,47 @@ fn has_unexpanded_var(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_files_an_option_writes_are_named() {
+        let w = |head: &str, args: &[&str]| {
+            option_write_targets(
+                head,
+                &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            w("find", &[".", "-type", "f", "-fprint", "out.txt"]),
+            vec!["out.txt"]
+        );
+        assert_eq!(
+            w("find", &[".", "-fprintf", "out.txt", "%p\\n"]),
+            vec!["out.txt"]
+        );
+        assert_eq!(
+            w("git", &["-C", "/x", "diff", "--output=o.txt"]),
+            vec!["o.txt"]
+        );
+        assert_eq!(
+            w("git", &["show", "--output", "o.txt", "HEAD"]),
+            vec!["o.txt"]
+        );
+        assert_eq!(
+            w("sed", &["-n", "-i", "s/a/b/", "f1", "f2"]),
+            vec!["f1", "f2"]
+        );
+        assert_eq!(w("sed", &["-n", "w out.log", "in.txt"]), vec!["out.log"]);
+        assert_eq!(
+            w("psql", &["-d", "app", "-o", "q.txt", "-c", "select 1"]),
+            vec!["q.txt"]
+        );
+        assert_eq!(w("psql", &["--output=q.txt"]), vec!["q.txt"]);
+        // Reading forms name nothing, and a device is not a file anyone loses.
+        assert!(w("find", &[".", "-name", "*.rs", "-print"]).is_empty());
+        assert!(w("git", &["diff", "--stat"]).is_empty());
+        assert!(w("sed", &["-n", "1,5p", "f"]).is_empty());
+        assert!(w("sed", &["-n", "w /dev/stdout", "f"]).is_empty());
+    }
+
     use super::*;
     use crate::testutil::TempTree;
 

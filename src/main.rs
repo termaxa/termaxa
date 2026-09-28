@@ -18,6 +18,7 @@ mod replay;
 mod report;
 mod resolve;
 mod runner;
+mod sed;
 mod shell;
 mod supervise;
 #[cfg(test)]

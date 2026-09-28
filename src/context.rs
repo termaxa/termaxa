@@ -80,6 +80,21 @@ pub fn gather_with(command: &str, readable: &dyn Fn(&str) -> bool) -> Vec<Signal
         }
     }
 
+    // Options that turn a reading command into a writing or running one.
+    // The starter allows `sed -n *`, `find *`, `git diff*`, `git log*`,
+    // `git show*` and `git branch*` for the reading forms; the option beside
+    // them writes a file, overwrites a branch or runs a command (reported by
+    // Tim Schipper, Sep 27, 2026, and extended the same day). Read off each
+    // segment's own words, through wrappers, `-c` strings and git's global
+    // options, so the allow the rule gives the reading form is not the
+    // allow the writing form gets.
+    for label in option_effects(command) {
+        signals.push(Signal {
+            label,
+            escalate: true,
+        });
+    }
+
     // Command substitution: contents the gate cannot read are a reason to
     // put a human in the loop. Contents it can read and would allow are
     // not; a quoted heredoc is data and needs no reading at all.
@@ -96,6 +111,103 @@ pub fn gather_with(command: &str, readable: &dyn Fn(&str) -> bool) -> Vec<Signal
     }
 
     signals
+}
+
+/// What a command does through its options besides reading: the labels of
+/// every write or run found, one per kind, in a stable order.
+pub fn option_effects(command: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for seg in crate::shell::split_segments_deep(command) {
+        let raw = crate::pg::shell_tokens(seg.command());
+        let toks = crate::delete::without_any_wrappers(&raw).unwrap_or(raw);
+        let Some(first) = toks.first() else {
+            continue;
+        };
+        match crate::delete::command_head(first).as_str() {
+            "sed" | "gsed" => {
+                let inv = crate::sed::parse_args(&toks[1..]);
+                if inv.in_place {
+                    out.push("sed edits its input files in place: -i".into());
+                }
+                // `--sandbox` makes sed itself refuse `w`, `e` and `r`.
+                if !inv.sandbox {
+                    if inv.script_file {
+                        out.push("sed runs a script file the gate does not read: -f".into());
+                    }
+                    for script in &inv.scripts {
+                        let fx = crate::sed::effects(script);
+                        for w in &fx.writes {
+                            out.push(format!("sed writes a file: {w}"));
+                        }
+                        if fx.executes {
+                            out.push("sed runs a shell command: e".into());
+                        }
+                        if fx.not_understood {
+                            out.push("sed script not understood".into());
+                        }
+                    }
+                }
+            }
+            // Inline code is typed on the command line and read by no one:
+            // the dev loop's `node *` allows a file the project runs, not a
+            // program the agent writes into `-e`.
+            "node" | "nodejs" => {
+                let inline = toks[1..].iter().any(|t| {
+                    matches!(t.as_str(), "-e" | "-p" | "--eval" | "--print")
+                        || t.starts_with("--eval=")
+                        || t.starts_with("--print=")
+                        || (t.len() > 2
+                            && t.starts_with('-')
+                            && !t.starts_with("--")
+                            && t[1..].chars().all(|c| c == 'e' || c == 'p'))
+                });
+                if inline {
+                    out.push("node runs inline code the gate does not read: -e/-p".into());
+                }
+            }
+            "find" | "gfind" => {
+                for t in &toks[1..] {
+                    if matches!(t.as_str(), "-fprint" | "-fprint0" | "-fprintf" | "-fls") {
+                        out.push(format!("find writes a file: {t}"));
+                    }
+                }
+            }
+            "git" => {
+                let g = crate::delete::git_without_global_options(&toks)
+                    .unwrap_or_else(|| toks.clone());
+                let sub = g.get(1).map(String::as_str).unwrap_or("");
+                let args = if g.len() > 2 { &g[2..] } else { &[][..] };
+                let long_output = args.iter().any(|a| {
+                    a == "--output"
+                        || a.starts_with("--output=")
+                        || a == "--output-directory"
+                        || a.starts_with("--output-directory=")
+                });
+                let short_output = matches!(sub, "format-patch" | "archive")
+                    && args
+                        .iter()
+                        .any(|a| a.starts_with("-o") && !a.starts_with("--"));
+                if long_output || short_output {
+                    out.push(format!("git {sub} writes a file: --output"));
+                }
+                // `-M`/`-C` rename or copy over an existing branch; `-f`
+                // resets one. The long `--force` is already a flag signal.
+                if sub == "branch"
+                    && args.iter().any(|a| {
+                        a.starts_with('-')
+                            && !a.starts_with("--")
+                            && a[1..].chars().any(|c| matches!(c, 'M' | 'C' | 'f'))
+                    })
+                {
+                    out.push("git branch overwrites an existing branch: -M/-C/-f".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Escalation ladder: allow -> ask. `ask` and `deny` are never escalated further
@@ -218,6 +330,110 @@ mod tests {
     /// became an ask (Sep 10, 2026). The signals come off the command the
     /// policy judged: no flag for `ls`, and the agent's own `-rf` is still
     /// found inside the eval.
+    /// Tim Schipper's report (Sep 27, 2026), reproduced on 0.19.5 and
+    /// extended the same day: each of these was allowed by a starter rule
+    /// written for the reading form of the command. Now the option that
+    /// writes or runs is a signal, the allow becomes an ask, and the reason
+    /// names the option. The reading forms beside them still pass.
+    #[test]
+    fn an_option_that_writes_or_runs_turns_a_reading_allow_into_an_ask() {
+        let policy = crate::policy::Policy::builtin().expect("the starter parses");
+        let ctx = crate::resolve::EvalContext::at(std::path::Path::new("."));
+        let verdict = |c: &str| {
+            let d = policy.evaluate_command(c, &ctx);
+            let signals = gather_with(c, &|_| false);
+            apply(d, &signals).0.action
+        };
+        for (c, label) in [
+            ("git branch -M old existing", "git branch overwrites"),
+            ("git branch -C old existing", "git branch overwrites"),
+            (
+                "find . -type f -fprint /tmp/important.txt",
+                "find writes a file: -fprint",
+            ),
+            (
+                "find . -type f -fprintf /tmp/important.txt \"%p\\n\"",
+                "find writes a file: -fprintf",
+            ),
+            ("find . -fls /tmp/important.txt", "find writes a file: -fls"),
+            (
+                "git diff --output=/tmp/important.txt",
+                "git diff writes a file",
+            ),
+            (
+                "git log --output=/tmp/important.txt",
+                "git log writes a file",
+            ),
+            (
+                "git show --output=/tmp/important.txt HEAD",
+                "git show writes a file",
+            ),
+            (
+                "git -C . diff --output=/tmp/important.txt",
+                "git diff writes a file",
+            ),
+            (
+                "sed -n -i 's/foo/bar/' /tmp/important.txt",
+                "sed edits its input files in place",
+            ),
+            (
+                "sed -n 'w /tmp/important.txt' README.md",
+                "sed writes a file: /tmp/important.txt",
+            ),
+            (
+                "sed -n 's/x/y/w /tmp/important.txt' README.md",
+                "sed writes a file: /tmp/important.txt",
+            ),
+            (
+                "sed -n '1e touch /tmp/pwned' README.md",
+                "sed runs a shell command",
+            ),
+            (
+                "sh -c \"sed -n '1e touch /tmp/pwned' README.md\"",
+                "sed runs a shell command",
+            ),
+            (
+                "env LC_ALL=C sed -n '1e touch /tmp/pwned' README.md",
+                "sed runs a shell command",
+            ),
+        ] {
+            assert_eq!(verdict(c), Action::Ask, "{c}");
+            let effects = option_effects(c);
+            assert!(
+                effects.iter().any(|e| e.starts_with(label)),
+                "{c}: {effects:?}"
+            );
+        }
+        for c in [
+            "sed -n '1,5p' README.md",
+            "sed -n '/error/p' app.log",
+            "sed -n 's/foo/bar/gp' README.md",
+            "find . -name '*.rs' -print",
+            "git diff --stat",
+            "git log --oneline -5",
+            "git branch -a",
+            "git branch --show-current",
+        ] {
+            assert!(option_effects(c).is_empty(), "{c}: {:?}", option_effects(c));
+            assert_eq!(verdict(c), Action::Allow, "{c}");
+        }
+        // Inline node code asks: it is typed on the command line and read by
+        // no one. A file the project runs stays in the dev loop, as the
+        // starter's dev-loop test holds.
+        for c in [
+            "node -e 'require(\"fs\").writeFileSync(\"/tmp/important.txt\", \"x\")'",
+            "node -e \"require('fs').rmSync('/tmp/important.txt')\"",
+            "node -p 'process.exit()'",
+            "node --input-type=module -e 'x'",
+            "node --eval 'x'",
+        ] {
+            assert_eq!(verdict(c), Action::Ask, "{c}");
+        }
+        for c in ["node scripts/check.js", "node --version", "node --test"] {
+            assert_eq!(verdict(c), Action::Allow, "{c}");
+        }
+    }
+
     #[test]
     fn a_harness_preamble_is_not_a_destructive_flag_on_the_agents_command() {
         let form = |cmd: &str| {

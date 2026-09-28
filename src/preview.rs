@@ -177,7 +177,16 @@ fn generate_one(command: &str, cwd: &std::path::Path, live: bool) -> Option<Prev
     if cmd.starts_with("git push") {
         // Entirely subprocess-derived: `git rev-parse`, `git log`. Nothing
         // static to fall back on, so a non-live preview has no answer.
-        return if live { git_push_preview(&cmd) } else { None };
+        if !live {
+            return None;
+        }
+        // A push that deletes, prunes or mirrors is read off its own words
+        // (not the lowercased text: branch names are case-sensitive) before
+        // the current-branch comparison, which describes none of that.
+        if let Some(fx) = push_ref_effects(&crate::pg::shell_tokens(command)) {
+            return Some(push_ref_preview(&fx));
+        }
+        return git_push_preview(&cmd);
     }
     // Route by the program's file stem, not by the text. `pg::preview_for`
     // has accepted `/usr/local/pgsql/bin/psql` since v0.14.1 and has a test
@@ -203,6 +212,226 @@ fn generate_one(command: &str, cwd: &std::path::Path, live: bool) -> Option<Prev
         }
     }
     None
+}
+
+/// A push that removes refs on the remote, read off its own words.
+///
+/// The current-branch preview answered "nothing to push — remote is up to
+/// date" for `git push origin :main`, `git push --delete origin old`,
+/// `git push --prune` and `git push --mirror` (reported by Tim Schipper,
+/// Sep 27, 2026): it compares the branch with its upstream and never read
+/// the refspecs. An empty source (`:ref`) or `--delete`/`-d` deletes the
+/// named refs; `--prune` deletes remote refs with no local counterpart;
+/// `--mirror` makes every remote ref match, deleting and force-updating.
+///
+/// `--prune` removes only what the given refspecs cover. With a plain
+/// refspec (`git push --prune origin main`) or none, git deletes nothing,
+/// and the first version of this preview said otherwise and denied it
+/// (caught the same day against Tim's write-up and git's own `--dry-run`).
+/// Only a wildcard refspec prunes; `prune` holds its (source, destination)
+/// prefixes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PushRefEffects {
+    pub remote: String,
+    pub deletes: Vec<String>,
+    pub prune: Vec<(String, String)>,
+    pub mirror: bool,
+}
+
+pub fn push_ref_effects(tokens: &[String]) -> Option<PushRefEffects> {
+    let g = crate::delete::git_without_global_options(tokens).unwrap_or_else(|| tokens.to_vec());
+    if g.first().map(String::as_str) != Some("git") || g.get(1).map(String::as_str) != Some("push")
+    {
+        return None;
+    }
+    let (mut delete_mode, mut prune, mut mirror) = (false, false, false);
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 2;
+    while i < g.len() {
+        let a = g[i].as_str();
+        match a {
+            "--delete" | "-d" => delete_mode = true,
+            "--prune" => prune = true,
+            "--mirror" => mirror = true,
+            "-o" | "--push-option" | "--repo" | "--receive-pack" | "--exec" => i += 1,
+            _ if a.starts_with('-') => {}
+            _ => positional.push(a.to_string()),
+        }
+        i += 1;
+    }
+    let remote = positional
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "origin".into());
+    let mut deletes = Vec::new();
+    let mut patterns: Vec<(String, String)> = Vec::new();
+    for spec in positional.iter().skip(1) {
+        let spec = spec.trim_start_matches('+');
+        if let Some(dst) = spec.strip_prefix(':') {
+            // A bare `:` is the "matching" push, not a delete.
+            if !dst.is_empty() {
+                deletes.push(dst.to_string());
+            }
+        } else if delete_mode {
+            deletes.push(spec.to_string());
+        } else if prune {
+            let (src, dst) = spec.split_once(':').unwrap_or((spec, spec));
+            if let (Some(s), Some(d)) = (src.strip_suffix('*'), dst.strip_suffix('*')) {
+                patterns.push((s.to_string(), d.to_string()));
+            }
+        }
+    }
+    if deletes.is_empty() && patterns.is_empty() && !mirror {
+        return None;
+    }
+    Some(PushRefEffects {
+        remote,
+        deletes,
+        prune: patterns,
+        mirror,
+    })
+}
+
+fn push_ref_preview(fx: &PushRefEffects) -> Preview {
+    let mut lines: Vec<String> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    // Refs a prune or mirror would remove or rewrite.
+    let mut set_removed = 0usize;
+    // A set that could not be listed is unknown, which is not a set of none.
+    let mut unknown = false;
+    for d in &fx.deletes {
+        let name = d.trim_start_matches("refs/heads/");
+        let tracking = format!("{}/{}", fx.remote, name);
+        lines.push(format!("⚠ deletes branch {name} on {}", fx.remote));
+        match git(&["rev-parse", "--short", "--verify", "--quiet", &tracking]) {
+            Some(sha) => {
+                let only = git(&["rev-list", "--count", &tracking, "--not", "--branches"])
+                    .unwrap_or_else(|| "0".into());
+                lines.push(format!(
+                    "    last fetched tip {sha}; {only} commit(s) on it are on no local branch"
+                ));
+            }
+            None => lines
+                .push("    no remote-tracking ref for it here: fetch to see what it holds".into()),
+        }
+        parts.push(format!("deletes {name} on {}", fx.remote));
+    }
+    // A wildcard prune: destination refs under the pattern whose source ref
+    // does not exist here. Branches come from this clone's remote-tracking
+    // refs; any other namespace is asked of the remote itself.
+    for (src, dst) in &fx.prune {
+        let listed: Option<Vec<String>> = if src == "refs/heads/" && dst == "refs/heads/" {
+            Some(
+                git(&[
+                    "for-each-ref",
+                    "--format=%(refname:strip=3)",
+                    &format!("refs/remotes/{}/", fx.remote),
+                ])
+                .unwrap_or_default()
+                .lines()
+                .filter(|b| *b != "HEAD")
+                .map(|b| format!("{dst}{b}"))
+                .collect(),
+            )
+        } else {
+            std::process::Command::new("git")
+                .args(["ls-remote", "--refs", &fx.remote, &format!("{dst}*")])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter_map(|l| l.split_whitespace().nth(1).map(String::from))
+                        .collect()
+                })
+        };
+        let Some(remote_refs) = listed else {
+            unknown = true;
+            lines.push(format!(
+                "⚠ --prune {src}*:{dst}* could not list {dst}* on {}: refs there with no local counterpart are DELETED",
+                fx.remote
+            ));
+            parts.push("prune: unknown set".into());
+            continue;
+        };
+        let gone: Vec<String> = remote_refs
+            .iter()
+            .filter_map(|r| r.strip_prefix(dst.as_str()))
+            .filter(|rest| {
+                git(&["rev-parse", "--verify", "--quiet", &format!("{src}{rest}")]).is_none()
+            })
+            .map(String::from)
+            .collect();
+        set_removed += gone.len();
+        lines.push(format!(
+            "⚠ --prune {src}*:{dst}*: refs under {dst} on {} with no local counterpart are DELETED",
+            fx.remote
+        ));
+        lines.push(if gone.is_empty() {
+            "    none to delete".to_string()
+        } else {
+            format!("    deleted: {}", gone.join(", "))
+        });
+        parts.push(format!("prune: {} ref(s) deleted", gone.len()));
+    }
+    if fx.mirror {
+        let tracked = git(&[
+            "for-each-ref",
+            "--format=%(refname:strip=3)",
+            &format!("refs/remotes/{}/", fx.remote),
+        ])
+        .unwrap_or_default();
+        let locals = git(&["for-each-ref", "--format=%(refname:strip=2)", "refs/heads/"])
+            .unwrap_or_default();
+        let local: std::collections::HashSet<&str> = locals.lines().collect();
+        let gone: Vec<&str> = tracked
+            .lines()
+            .filter(|b| *b != "HEAD" && !local.contains(b))
+            .collect();
+        lines.push(format!(
+            "⚠ --mirror: every ref on {} is made to match this repository; refs it has and this one does not are DELETED, refs that differ are force-updated",
+            fx.remote
+        ));
+        let mut differ: Vec<&str> = local
+            .iter()
+            .copied()
+            .filter(|b| {
+                let t = format!("{}/{}", fx.remote, b);
+                match (
+                    git(&["rev-parse", "--verify", "--quiet", &t]),
+                    git(&["rev-parse", "--verify", "--quiet", b]),
+                ) {
+                    (Some(r), Some(l)) => r != l,
+                    _ => false,
+                }
+            })
+            .collect();
+        differ.sort();
+        set_removed += differ.len() + gone.len();
+        if !differ.is_empty() {
+            lines.push(format!(
+                "    force-updated, as of the last fetch: {}",
+                differ.join(", ")
+            ));
+        }
+        lines.push(if gone.is_empty() {
+            "    none to delete as of the last fetch".to_string()
+        } else {
+            format!("    deleted, as of the last fetch: {}", gone.join(", "))
+        });
+        parts.push(format!("mirror: {} branch(es) deleted", gone.len()));
+    }
+    Preview {
+        // One deleted branch is pinned before the push (`backup::plan`);
+        // several are not, and neither is a prune or mirror set that would
+        // remove or rewrite something, or one that could not be listed. A
+        // prune with nothing to prune destroys nothing.
+        uninsurable: fx.deletes.len() > 1 || set_removed > 0 || unknown,
+        title: format!("push preview (refs removed on {})", fx.remote),
+        lines,
+        summary: parts.join("; "),
+    }
 }
 
 /// What would `git push` actually send?
@@ -579,6 +808,110 @@ mod push_preview_tests {
         assert!(p.title.contains("new remote branch"), "{}", p.title);
     }
 
+    /// A branch that exists on the remote and nowhere locally, with a
+    /// commit only it holds: what a delete, a prune or a mirror removes.
+    fn remote_only_branch(work: &Path) {
+        git_run(work, &["switch", "-q", "-c", "old-branch"]);
+        commit_one(work, "old.txt", "only on old-branch");
+        git_run(work, &["push", "-q", "origin", "old-branch"]);
+        git_run(work, &["switch", "-q", "main"]);
+        git_run(work, &["branch", "-q", "-D", "old-branch"]);
+    }
+
+    /// Tim Schipper's report (Sep 27, 2026): each of these asked, and the
+    /// preview described an ordinary push, "nothing to push — remote is up
+    /// to date". The preview reads the refspecs now and says what goes.
+    #[test]
+    fn a_push_that_removes_refs_says_which_and_what_is_on_them() {
+        let mut env = TestEnv::new("preview-push-removes");
+        let work = repo_with_remote(&mut env);
+
+        // Nothing to prune yet: said so, and nothing is uninsurable.
+        let quiet = preview_of("git push --prune origin refs/heads/*:refs/heads/*");
+        assert!(!quiet.uninsurable, "{:?}", quiet.lines);
+        assert!(
+            quiet.lines.iter().any(|l| l.contains("none to delete")),
+            "{:?}",
+            quiet.lines
+        );
+        // Tim's exact form, a plain refspec: git's own `--dry-run` deletes
+        // nothing, so this is an ordinary push and says so. The first version
+        // of this preview listed every branch and denied it.
+        remote_only_branch(&work);
+        let plain = preview_of("git push --prune origin main");
+        assert_eq!(plain.summary, "nothing to push", "{:?}", plain.lines);
+        assert!(!plain.uninsurable);
+
+        for c in [
+            "git push --delete origin old-branch",
+            "git push origin :old-branch",
+            "git push -d origin old-branch",
+        ] {
+            let p = preview_of(c);
+            assert_eq!(p.summary, "deletes old-branch on origin", "{c}");
+            assert!(!p.uninsurable, "{c}: one deleted branch is pinned first");
+            assert!(
+                p.lines
+                    .iter()
+                    .any(|l| l.contains("1 commit(s) on it are on no local branch")),
+                "{c}: {:?}",
+                p.lines
+            );
+            assert!(
+                !p.lines.iter().any(|l| l.contains("nothing to push")),
+                "{c}"
+            );
+        }
+        let prune = preview_of("git push --prune origin refs/heads/*:refs/heads/*");
+        assert_eq!(prune.summary, "prune: 1 ref(s) deleted");
+        assert!(prune.uninsurable);
+        assert!(
+            prune.lines.iter().any(|l| l.contains("old-branch")),
+            "{:?}",
+            prune.lines
+        );
+        let mirror = preview_of("git push --mirror origin");
+        assert!(
+            mirror.summary.starts_with("mirror: 1 branch(es) deleted"),
+            "{}",
+            mirror.summary
+        );
+        assert!(mirror.uninsurable);
+        // Two deletions are not pinned, and the preview does not pretend.
+        let two = preview_of("git push --delete origin old-branch main");
+        assert!(two.uninsurable);
+        // An ordinary push is unchanged.
+        assert_eq!(
+            preview_of("git push origin main").summary,
+            "nothing to push"
+        );
+    }
+
+    #[test]
+    fn the_refspec_reader_knows_a_delete_from_a_matching_push() {
+        let t = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let fx = push_ref_effects(&t("git push origin :main")).expect("a delete");
+        assert_eq!(
+            (fx.remote.as_str(), fx.deletes.clone()),
+            ("origin", vec!["main".to_string()])
+        );
+        assert_eq!(
+            push_ref_effects(&t("git -C /x push --delete up a b"))
+                .expect("delete")
+                .deletes,
+            vec!["a", "b"]
+        );
+        assert!(
+            push_ref_effects(&t("git push --mirror origin"))
+                .expect("mirror")
+                .mirror
+        );
+        // A bare `:` is the matching push, and a `+` is a force, not a delete.
+        assert_eq!(push_ref_effects(&t("git push origin :")), None);
+        assert_eq!(push_ref_effects(&t("git push origin +main")), None);
+        assert_eq!(push_ref_effects(&t("git push origin main")), None);
+    }
+
     #[test]
     fn nothing_to_push_is_said_plainly() {
         let mut env = TestEnv::new("preview-current");
@@ -897,6 +1230,36 @@ mod live_gate_tests {
             "an insured overwrite must not read as uninsured: {body}"
         );
         assert!(!pv.uninsurable, "this write IS insured");
+    }
+
+    /// Tim Schipper's write-up (Sep 27, 2026): for each option that writes,
+    /// the output file was not extracted as a target, so the preview did not
+    /// show it and the backup did not copy it. It is a destination now, with
+    /// what it loses and the insurance that covers it.
+    #[test]
+    fn a_file_written_through_an_option_reports_what_it_loses() {
+        let t = crate::testutil::TempTree::new("ov-option");
+        let dir = t.path();
+        std::fs::write(dir.join("important.txt"), "keep this line\n").unwrap();
+        std::fs::write(dir.join("other.txt"), "x\n").unwrap();
+        for c in [
+            "find . -type f -fprint important.txt",
+            "find . -fls important.txt",
+            "git diff --output=important.txt",
+            "git log --output important.txt",
+            "sed -n -i 's/keep/lose/' important.txt",
+            "sed -n 'w important.txt' other.txt",
+            "sed -n 's/x/y/w important.txt' other.txt",
+            "psql -o important.txt -c 'select 1'",
+        ] {
+            let pv = generate(c, None, dir, false).unwrap_or_else(|| panic!("{c}: no preview"));
+            let body = pv.lines.join("\n");
+            assert!(body.contains("important.txt"), "{c}: {body}");
+            assert!(body.contains("loses"), "{c}: {body}");
+            assert!(body.contains("insurance   :"), "{c}: {body}");
+            assert!(!pv.uninsurable, "{c}: the copy is taken first");
+        }
+        assert!(generate("find . -name '*.txt' -print", None, dir, false).is_none());
     }
 
     /// Creating a file destroys nothing. A preview announcing it would be
