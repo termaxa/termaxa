@@ -61,6 +61,7 @@ There is deliberately no `curl | sh` installer — Termaxa itself flags that pat
 termaxa                       # what this is, and what to try next
 termaxa check "rm -rf /"      # works immediately — no setup, no project config
 termaxa replay                # every command your agents have run on this machine, judged; nothing executed
+termaxa replay --against-record   # did every one of those calls reach the gate? the transcript held against the record
 ```
 
 `replay` reads the transcripts Claude Code and Codex keep under your home directory and answers the question to ask before installing a gate: how often would it have asked about your ordinary work? Every ask it lists is a rule to add or a reason it should stay an ask.
@@ -411,6 +412,7 @@ backup_failure: proceed          # deny: refuse a command whose backup could not
 | `termaxa` | what this is, and what to try next |
 | `termaxa init [--claude-code\|--codex\|--cursor\|--copilot]` | scaffold `.termaxa/`, detect tools, install the hook (one harness needs no flag) |
 | `termaxa replay [paths…] [--all]` | judge every command in your agents' transcripts; nothing executed |
+| `termaxa replay --against-record` | hold the transcripts against this machine's record: every call in a session the gate was wired for is judged, fired-but-unrecorded (the hook's witness exists, no record line), or never-fired (no witness: the wiring was bypassed). Exit 1 if either bypass is found |
 | `termaxa demo` | the gate on a throwaway project: three checks and the record |
 | `termaxa wrap -- <agent>` | launch an agent with shelled commands routed through the gate (Unix) |
 | `termaxa supervise` | run the decision daemon as yourself; hooks decide through it (Unix) |

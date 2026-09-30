@@ -52,6 +52,10 @@ pub struct ParsedHook {
     pub command: String,
     pub cwd: String,
     pub session: Option<String>,
+    /// The harness's own id for this tool call (`tool_use_id` in Claude
+    /// Code's, Codex's and Cursor's payloads), so a record line can be
+    /// matched to the transcript's call exactly (replay --against-record).
+    pub call_id: Option<String>,
     /// True for post-execution events (afterShellExecution / postToolUse /
     /// PostToolUse): the command already ran, so this is a receipt, not a gate.
     pub is_post: bool,
@@ -167,6 +171,10 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
             command,
             cwd: resolve_cwd(),
             session: s("conversation_id").or_else(|| s("session_id")),
+            call_id: s("tool_use_id")
+                .or_else(|| s("call_id"))
+                .or_else(|| s("toolCallId"))
+                .or_else(|| s("tool_call_id")),
             is_post,
         });
     }
@@ -206,6 +214,9 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
                     .or_else(|| s("workingDirectory"))
                     .unwrap_or_default(),
                 session: s("sessionId").or_else(|| s("session_id")),
+                call_id: s("toolCallId")
+                    .or_else(|| s("tool_call_id"))
+                    .or_else(|| s("tool_use_id")),
                 is_post,
             });
         }
@@ -241,6 +252,10 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
             command,
             cwd: s("cwd").unwrap_or_default(),
             session: s("session_id").or_else(|| s("conversation_id")),
+            call_id: s("tool_use_id")
+                .or_else(|| s("call_id"))
+                .or_else(|| s("toolCallId"))
+                .or_else(|| s("tool_call_id")),
             is_post,
         });
     }
@@ -769,6 +784,7 @@ fn append_write_entry(
     };
     let (ts_ms, ts) = now();
     let _ = log.append(&AuditEntry {
+        call_id: None,
         ts_ms,
         ts,
         source: source.into(),
@@ -814,6 +830,7 @@ fn protected_write(w: &FileWrite, path: &str, protected: crate::protect::Protect
         if let Ok(log) = AuditLog::new(&paths.state_dir) {
             let (ts_ms, ts) = now();
             let _ = log.append(&AuditEntry {
+                call_id: None,
                 ts_ms,
                 ts,
                 source: "hook".into(),
@@ -985,6 +1002,8 @@ pub struct Outcome {
 pub fn run() -> Result<()> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
+    // The witness goes down before anything that can fail: see witness.rs.
+    crate::witness::leave(&buf);
     let outcome = decide(&buf)?;
     if let Some(r) = &outcome.rendered {
         println!("{r}");
@@ -1036,6 +1055,7 @@ fn refuse_unrecognised(raw: &str) -> Option<Outcome> {
     if let Ok(log) = AuditLog::new(&paths.state_dir) {
         let (ts_ms, ts) = now();
         let _ = log.append(&AuditEntry {
+            call_id: None,
             ts_ms,
             ts,
             source: "hook".into(),
@@ -1200,6 +1220,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
             if let Ok(log) = AuditLog::new(&paths.state_dir) {
                 let (ts_ms, ts) = now();
                 let _ = log.append(&AuditEntry {
+                    call_id: input.call_id.clone(),
                     ts_ms,
                     ts,
                     source: "post".into(),
@@ -1520,6 +1541,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         if let Ok(log) = AuditLog::new(&paths.state_dir) {
             let (ts_ms, ts) = now();
             let _ = log.append(&AuditEntry {
+                call_id: input.call_id.clone(),
                 ts_ms,
                 ts,
                 source: "hook".into(),

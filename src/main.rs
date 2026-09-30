@@ -25,6 +25,7 @@ mod supervise;
 #[cfg(test)]
 mod testutil;
 mod ui;
+mod witness;
 mod wrap;
 
 use anyhow::{bail, Result};
@@ -142,6 +143,11 @@ enum Cmd {
         /// List every distinct ask and deny, not the 25 most frequent
         #[arg(long)]
         all: bool,
+        /// Hold the transcripts against this machine's record: every call in a
+        /// session the gate was wired for is judged, fired-but-unrecorded, or
+        /// never-fired (the last two are measured bypasses)
+        #[arg(long = "against-record")]
+        against_record: bool,
     },
     /// Show or release the session circuit breaker's standing trips
     Breaker {
@@ -372,6 +378,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let log = audit::AuditLog::new(&state_dir)?;
             let (ts_ms, ts) = audit::now();
             log.append(&audit::AuditEntry {
+                call_id: None,
                 ts_ms,
                 ts,
                 source: "check".into(),
@@ -614,7 +621,11 @@ fn dispatch(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Cmd::Demo => demo::run(),
-        Cmd::Replay { paths, all } => replay::run(paths, all),
+        Cmd::Replay {
+            paths,
+            all,
+            against_record,
+        } => replay::run(paths, all, against_record),
         Cmd::Breaker { action } => {
             let paths = paths::resolve()?;
             let now_ms = audit::now().0;

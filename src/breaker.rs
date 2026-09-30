@@ -110,6 +110,7 @@ fn event(
 ) -> AuditEntry {
     let (ts_ms, ts) = crate::audit::now();
     AuditEntry {
+        call_id: None,
         ts_ms,
         ts,
         source: "breaker".into(),
