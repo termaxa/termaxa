@@ -169,6 +169,29 @@ That is the honest state of this row: proved by a rig, proved once by a real ses
 
 **Migration.** Entries written before v0.16 have no hash. They stay readable and are reported as pre-chain rather than as breaks: Termaxa can prove continuity from the boundary onward, and does not retroactively claim to have protected history it was not there for. A broken link names the entry and leaves the rest of the record readable, because one corrupt line making the whole log unreadable would destroy more evidence than the corruption did.
 
+## Published advisories, and how long each was exposed
+
+Every bypass found so far is fixed and published. Each row has both
+endpoints, so the number of days is a count anyone can redo, not a claim:
+the first release that carried the flaw, dated by its tag, and the day the
+advisory was published. All dates are UTC. `git log --format=%cs` prints a
+tag's date in the committer's own timezone (India), which is a day later
+for some of these; to get the UTC date of a tag, run
+`TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd <tag>`.
+The affected range and publication date are on each advisory's page.
+
+| Advisory | Severity | What | First affected | Fixed in | Published | Days exposed |
+|---|---|---|---|---|---|---|
+| [GHSA-gxg4-5fmj-534m](https://github.com/termaxa/termaxa/security/advisories/GHSA-gxg4-5fmj-534m) | Moderate | The Postgres preview could execute the SQL file it was analysing | v0.6.1, 2026-07-02 | v0.14.1, 2026-08-09 | 2026-08-09 | 38 |
+| [GHSA-p2fg-58v6-j4fx](https://github.com/termaxa/termaxa/security/advisories/GHSA-p2fg-58v6-j4fx) | Moderate | A single `&` was not split, so the command after it inherited the allow | v0.7.0, 2026-07-02 | v0.14.1, 2026-08-09 | 2026-08-09 | 38 |
+| [GHSA-m854-p747-v3gw](https://github.com/termaxa/termaxa/security/advisories/GHSA-m854-p747-v3gw) | Moderate | A denied `terraform destroy` still ran `terraform plan` | v0.9.0, 2026-07-04 | v0.14.2, 2026-08-10 | 2026-08-10 | 37 |
+| [GHSA-rv66-7qcx-c45j](https://github.com/termaxa/termaxa/security/advisories/GHSA-rv66-7qcx-c45j) | High | A compound command could inherit a benign prefix's verdict | v0.7.0, 2026-07-02 | v0.16.0, 2026-08-17 | 2026-08-17 | 46 |
+| [GHSA-36jf-95xr-37f2](https://github.com/termaxa/termaxa/security/advisories/GHSA-36jf-95xr-37f2) | Moderate | Options on commands allowed for reading could write, overwrite a branch or run a command | v0.6.1, 2026-07-02 | v0.19.6, 2026-09-28 | 2026-09-28 | 88 |
+
+"Days exposed" is the window a user of the first affected release was
+exposed without knowing it: from that release to the public advisory. It
+is not the time from report to fix.
+
 ## Reporting a vulnerability
 
 If you find a way to bypass a policy that *should* hold (e.g. a compound-command or quoting trick that sneaks a destructive command past a matching `deny` rule), please report it.
