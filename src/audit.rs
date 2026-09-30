@@ -43,6 +43,12 @@ pub struct AuditEntry {
     /// For "run": process exit code if the command executed.
     pub exit_code: Option<i32>,
     pub cwd: String,
+    /// The harness's own id for the tool call (`tool_use_id`), when the
+    /// payload carried one, so `termaxa replay --against-record` can match
+    /// this line to the transcript's call exactly rather than by session,
+    /// text and time. Serde-defaulted: older lines parse as None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 
     // ---- provenance (v0.16, roadmap 2.6) ----
     //
@@ -500,6 +506,7 @@ mod tests {
     fn entry(command: &str) -> AuditEntry {
         let (ts_ms, ts) = now();
         AuditEntry {
+            call_id: None,
             ts_ms,
             ts,
             source: "test".into(),

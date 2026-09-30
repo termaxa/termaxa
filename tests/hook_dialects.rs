@@ -874,3 +874,55 @@ fn a_trip_holds_across_sessions_until_a_recorded_resume() {
     let after = hook(&home, &proj, &mk("C", "git reset --hard HEAD~1"), &[]);
     assert_ne!(after.code, 2, "the hold is gone after a resume");
 }
+
+/// The hook leaves a witness before it judges anything, and the record line
+/// carries the payload's tool_use_id, so replay --against-record can tell a
+/// call the gate never saw from one it saw and failed to record.
+#[cfg(unix)]
+#[test]
+fn the_hook_leaves_a_witness_first_and_records_the_call_id() {
+    use serde_json::json;
+    let tmp = scratch("witness");
+    let home = tmp.join("home");
+    let proj = project(
+        &tmp,
+        "version: 1\ndefault: ask\nrules:\n  - match: \"git status*\"\n    action: allow\n",
+    );
+    let payload = json!({
+        "session_id": "W",
+        "transcript_path": "/tmp/t",
+        "cwd": proj.to_string_lossy(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "toolu_witness_1",
+        "tool_input": {"command": "git status"}
+    });
+    hook(&home, &proj, &payload, &[]);
+    let mut seen = String::new();
+    let mut audit = String::new();
+    for p in std::fs::read_dir(home.join("projects"))
+        .expect("projects dir")
+        .flatten()
+    {
+        seen.push_str(
+            &std::fs::read_to_string(p.path().join("logs").join("seen.jsonl")).unwrap_or_default(),
+        );
+        audit.push_str(
+            &std::fs::read_to_string(p.path().join("logs").join("audit.jsonl")).unwrap_or_default(),
+        );
+    }
+    let w: serde_json::Value =
+        serde_json::from_str(seen.lines().next().expect("a witness line")).unwrap();
+    assert_eq!(w["call_id"], "toolu_witness_1");
+    assert_eq!(w["session"], "W");
+    assert_eq!(w["command"], "git status");
+    let r = audit
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["session"] == "W")
+        .expect("the record line");
+    assert_eq!(
+        r["call_id"], "toolu_witness_1",
+        "the record carries the harness's id"
+    );
+}

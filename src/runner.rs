@@ -195,6 +195,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     let log = AuditLog::new(&paths.state_dir)?;
     let (ts_ms, ts) = now();
     log.append(&AuditEntry {
+        call_id: None,
         ts_ms,
         ts,
         source: "run".into(),
