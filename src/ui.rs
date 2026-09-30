@@ -112,6 +112,8 @@ pub fn decision(action: &str) -> String {
 pub fn mark(action: &str, source: &str) -> String {
     match (action, source) {
         (_, "post") => green("✓"),
+        ("resumed", _) => green("▶"),
+        ("tripped", _) => red("⚡"),
         ("allow", _) => green("✓"),
         ("ask", _) => amber("?"),
         ("deny", _) => red("✗"),

@@ -121,7 +121,7 @@ $ del /s /q .                     -> DENY  circuit breaker: 2 prior
                                      file-delete attempts this session
 ```
 
-Three shells, one intent, third variant auto-denied — no rule enumerated per spelling. `find -exec rm`, `xargs rm`, and `unlink` count too. Configure via `circuit_breaker:` in `policy.yaml` (on by default, threshold 2).
+Three shells, one intent, third variant auto-denied — no rule enumerated per spelling. `find -exec rm`, `xargs rm`, and `unlink` count too. Configure via `circuit_breaker:` in `policy.yaml` (on by default, threshold 2). A trip holds that intent for the whole project, across sessions, until you run `termaxa breaker resume --reason "…"` (recorded with who and why) or an optional `resume_after` expires it; `termaxa breaker status` shows what is holding.
 
 ### 4 - Destroy, then un-destroy
 

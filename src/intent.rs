@@ -388,6 +388,62 @@ pub fn breaker_config(policy_path: &Path) -> BreakerConfig {
     }
 }
 
+/// The recent commands in `session` carrying `intent`, oldest first, by the
+/// same counting rule as `recent_intent_count` (a file-overwrite counts
+/// only when a rule objected; an approved command does not). The evidence a
+/// trip carries.
+pub fn recent_intent_commands(
+    log_path: &Path,
+    session: &str,
+    intent: Intent,
+    max_bytes: u64,
+) -> Vec<String> {
+    let Ok(mut f) = File::open(log_path) else {
+        return vec![];
+    };
+    let len = match f.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return vec![],
+    };
+    let start = len.saturating_sub(max_bytes);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return vec![];
+    }
+    let mut buf = String::new();
+    if f.read_to_string(&mut buf).is_err() {
+        return vec![];
+    }
+    let lines = buf.lines().skip(if start > 0 { 1 } else { 0 });
+    let entries: Vec<serde_json::Value> = lines
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["session"].as_str() == Some(session))
+        .collect();
+    let approved: HashSet<&str> = entries
+        .iter()
+        .filter(|e| e["source"].as_str() == Some("post"))
+        .filter_map(|e| e["command"].as_str())
+        .collect();
+    entries
+        .iter()
+        .filter(|e| e["intent"].as_str() == Some(intent.label()))
+        .filter(|e| intent != Intent::FileOverwrite || e["matched_rule"].as_str().is_some())
+        .filter(|e| match e["decision"].as_str() {
+            Some("deny") => true,
+            Some("ask") => !approved.contains(e["command"].as_str().unwrap_or("")),
+            _ => false,
+        })
+        .filter_map(|e| e["command"].as_str().map(String::from))
+        .collect()
+}
+
+/// `circuit_breaker.resume_after` as milliseconds, if set and valid.
+pub fn breaker_resume_after(policy_path: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(policy_path).ok()?;
+    let v: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
+    let raw = v["circuit_breaker"]["resume_after"].as_str()?;
+    crate::breaker::parse_duration(raw)
+}
+
 // ---------------------------------------------------------------------------
 // The one call the hook makes
 // ---------------------------------------------------------------------------
