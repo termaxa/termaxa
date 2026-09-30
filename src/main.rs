@@ -1,5 +1,6 @@
 mod audit;
 mod backup;
+mod breaker;
 mod context;
 mod delete;
 mod demo;
@@ -40,6 +41,26 @@ use policy::Policy;
 struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum BreakerCmd {
+    /// Show the trips that are currently holding (the default)
+    Status,
+    /// Release a standing trip, recording who, when and why
+    Resume {
+        /// Why it is safe to resume — recorded on the release line
+        #[arg(long)]
+        reason: String,
+        /// Which intent to resume (e.g. file-delete); omit to resume all
+        #[arg(long)]
+        intent: Option<String>,
+    },
+    /// Alias for `resume` that needs no reason (records "manual reset")
+    Reset {
+        #[arg(long)]
+        intent: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -122,6 +143,11 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Show or release the session circuit breaker's standing trips
+    Breaker {
+        #[command(subcommand)]
+        action: BreakerCmd,
+    },
     /// List backups taken by the insurance engine
     Backups {
         /// Remove every backup the retention rule allows (see `retention:`
@@ -148,6 +174,40 @@ enum Cmd {
         #[arg(long)]
         md: bool,
     },
+}
+
+/// Release standing trips (all, or one intent), recording each.
+fn release(
+    paths: &paths::Paths,
+    mut state: breaker::State,
+    reason: &str,
+    intent: Option<&str>,
+    cwd: &str,
+    now_ms: u128,
+    _reset: bool,
+) -> anyhow::Result<()> {
+    let by = breaker::current_user();
+    let (gone, kept): (Vec<_>, Vec<_>) = state.trips.into_iter().partition(|t| {
+        intent.is_none_or(|i| t.intent == i) && t.expires_ts_ms.is_none_or(|e| now_ms < e)
+    });
+    if gone.is_empty() {
+        println!("{} no matching trip is holding", ui::dim("•"));
+        state.trips = kept;
+        return Ok(());
+    }
+    let log = audit::AuditLog::new(&paths.state_dir)?;
+    for t in &gone {
+        breaker::record_resume(&log, t, &by, reason, cwd)?;
+        println!(
+            "{} resumed {} ({})",
+            ui::green("▶"),
+            ui::bold(&t.intent),
+            reason
+        );
+    }
+    state.trips = kept;
+    breaker::save(&paths.state_dir, &state)?;
+    Ok(())
 }
 
 fn main() {
@@ -555,6 +615,74 @@ fn dispatch(cli: Cli) -> Result<i32> {
         }
         Cmd::Demo => demo::run(),
         Cmd::Replay { paths, all } => replay::run(paths, all),
+        Cmd::Breaker { action } => {
+            let paths = paths::resolve()?;
+            let now_ms = audit::now().0;
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let mut state = breaker::load(&paths.state_dir);
+            // Expiry is applied here too, so `status` never shows a trip the
+            // next command would have released.
+            if let Ok(l) = audit::AuditLog::new(&paths.state_dir) {
+                if let Ok(s) =
+                    breaker::release_expired(&paths.state_dir, &l, state.clone(), now_ms, &cwd)
+                {
+                    state = s;
+                }
+            }
+            match action {
+                BreakerCmd::Status => {
+                    let live: Vec<_> = state
+                        .trips
+                        .iter()
+                        .filter(|t| t.expires_ts_ms.is_none_or(|e| now_ms < e))
+                        .collect();
+                    if live.is_empty() {
+                        println!("{} no trips are holding", ui::green("✓"));
+                    } else {
+                        println!("{} trip(s) holding for this project:", ui::amber("⚡"));
+                        for t in live {
+                            println!(
+                                "  {} since {} — {} attempt(s): {}",
+                                ui::bold(&t.intent),
+                                t.tripped_ts,
+                                t.attempts.len(),
+                                t.attempts.join("; ")
+                            );
+                            if let Some(e) = t.expires_ts_ms {
+                                let mins = (e.saturating_sub(now_ms)) / 60_000;
+                                println!("    expires in about {mins} min unless resumed sooner");
+                            }
+                        }
+                        println!(
+                            "
+Resume with: termaxa breaker resume --reason \"…\""
+                        );
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+                BreakerCmd::Resume { reason, intent } => release(
+                    &paths,
+                    state,
+                    &reason,
+                    intent.as_deref(),
+                    &cwd,
+                    now_ms,
+                    false,
+                ),
+                BreakerCmd::Reset { intent } => release(
+                    &paths,
+                    state,
+                    "manual reset",
+                    intent.as_deref(),
+                    &cwd,
+                    now_ms,
+                    true,
+                ),
+            }?;
+            Ok(0)
+        }
         Cmd::Backups { prune } => {
             let p = paths::resolve()?;
             if prune {

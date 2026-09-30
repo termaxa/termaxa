@@ -708,6 +708,12 @@ rules:
 circuit_breaker:
   enabled: true
   threshold: 2   # trip on the 3rd attempt
+  # A trip holds that intent for the PROJECT, across sessions, until a
+  # person runs `termaxa breaker resume --reason "…"` (the release is
+  # recorded with who, when and why). Optionally, resume_after releases it
+  # on its own after a time, recording an expiry line; omit it to require a
+  # person. `termaxa breaker status` shows what is holding.
+  # resume_after: 24h
 # Insurance copies (#72). A backup is removed only when it is BOTH outside
 # the `keep` most recent AND older than `days`; everything else stays. Each
 # insured command removes at most one, so the hook stays fast;

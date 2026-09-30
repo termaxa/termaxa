@@ -1351,21 +1351,72 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         );
     if decision.action == Action::Ask && !ungated_overwrite {
         let log_path = paths.state_dir.join("logs").join("audit.jsonl");
-        if let Some((_intent, _prior, reason)) = crate::intent::maybe_trip(
-            &paths.policy_file(),
-            &log_path,
-            input.session.as_deref(),
-            &command,
-        ) {
-            decision = crate::policy::Decision {
-                action: Action::Deny,
-                // The breaker chose this deliberately, from history rather
-                // than from a rule - a Context decision in the sense that
-                // matters here: something formed an opinion.
-                source: crate::policy::DecisionSource::Context,
-                matched_rule: Some(crate::intent::BREAKER_RULE.to_string()),
-                reason,
-            };
+        let cwd_s = input.cwd.clone();
+        let now_ms = crate::audit::now().0;
+        let mut state = crate::breaker::load(&paths.state_dir);
+        // A trip whose expiry has passed is released, with its own line,
+        // before this command is judged (the policy's `resume_after`).
+        if let Ok(l) = crate::audit::AuditLog::new(&paths.state_dir) {
+            if let Ok(s) =
+                crate::breaker::release_expired(&paths.state_dir, &l, state.clone(), now_ms, &cwd_s)
+            {
+                state = s;
+            }
+        }
+        if let Some(intent) = crate::intent::classify_command(&command) {
+            if let Some(trip) = crate::breaker::active(&state, intent.label(), now_ms) {
+                // A trip already holds this intent for the project: deny
+                // without re-counting, and name the standing trip.
+                decision = crate::policy::Decision {
+                    action: Action::Deny,
+                    source: crate::policy::DecisionSource::Context,
+                    matched_rule: Some(crate::intent::BREAKER_RULE.to_string()),
+                    reason: format!(
+                        "circuit breaker is tripped for {} (since {}) — resume with `termaxa breaker resume --reason \"…\"`",
+                        trip.intent, trip.tripped_ts
+                    ),
+                };
+            } else if let Some((_intent, _prior, reason)) = crate::intent::maybe_trip(
+                &paths.policy_file(),
+                &log_path,
+                input.session.as_deref(),
+                &command,
+            ) {
+                // The count just reached the threshold: record the trip as
+                // an event carrying its attempts, and hold it.
+                let (ts_ms, ts) = crate::audit::now();
+                let attempts = crate::intent::recent_intent_commands(
+                    &log_path,
+                    input.session.as_deref().unwrap_or(""),
+                    intent,
+                    64 * 1024,
+                );
+                let expires = crate::intent::breaker_resume_after(&paths.policy_file())
+                    .map(|ms| ts_ms + ms as u128);
+                let trip = crate::breaker::Trip {
+                    intent: intent.label().to_string(),
+                    tripped_ts_ms: ts_ms,
+                    tripped_ts: ts,
+                    session: input.session.clone(),
+                    attempts: {
+                        let mut a = attempts;
+                        a.push(command.clone());
+                        a
+                    },
+                    expires_ts_ms: expires,
+                };
+                if let Ok(l) = crate::audit::AuditLog::new(&paths.state_dir) {
+                    let _ = crate::breaker::record_trip(&l, &trip, &cwd_s);
+                }
+                state.trips.push(trip);
+                let _ = crate::breaker::save(&paths.state_dir, &state);
+                decision = crate::policy::Decision {
+                    action: Action::Deny,
+                    source: crate::policy::DecisionSource::Context,
+                    matched_rule: Some(crate::intent::BREAKER_RULE.to_string()),
+                    reason,
+                };
+            }
         }
     }
 

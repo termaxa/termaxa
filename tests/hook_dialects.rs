@@ -791,3 +791,86 @@ fn a_probe_denial_notifies_nobody_while_a_real_one_does() {
     hook(&home, &proj, &probe, &[("TERMAXA_HOOK_PROBE", "1")]);
     assert_eq!(arrivals(&listener), 0, "a diagnostic must not page anyone");
 }
+
+/// The circuit breaker's trip and resume are events (decision #108-adjacent,
+/// Tim Schipper's third idea, Oct 2026). A trip holds the intent for the
+/// project across sessions, and only a recorded resume releases it. This is
+/// the path I verified by hand, pinned: git-destructive because the starter
+/// asks about it rather than denying, so the breaker's deny is unmistakably
+/// the breaker's and not a rule's.
+#[cfg(unix)]
+#[test]
+fn a_trip_holds_across_sessions_until_a_recorded_resume() {
+    use serde_json::json;
+    let tmp = scratch("breaker-hold");
+    let home = tmp.join("home");
+    // The starter policy: git reset --hard asks (no deny rule), classifies
+    // as git-destructive. threshold 2 → the 3rd trips.
+    let policy = "version: 1\ndefault: ask\nrules:\n  - match: \"git status*\"\n    action: allow\ncircuit_breaker:\n  enabled: true\n  threshold: 2\n  resume_after: 24h\n";
+    let proj = project(&tmp, policy);
+    let mk = |session: &str, cmd: &str| {
+        json!({
+            "session_id": session,
+            "transcript_path": "/tmp/t",
+            "cwd": proj.to_string_lossy(),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd}
+        })
+    };
+    // Two asks, then the third trips — all in session A.
+    hook(&home, &proj, &mk("A", "git reset --hard HEAD~1"), &[]);
+    hook(&home, &proj, &mk("A", "git reset --hard HEAD~2"), &[]);
+    let third = hook(&home, &proj, &mk("A", "git reset --hard HEAD~3"), &[]);
+    assert_eq!(third.code, 2, "the third variant is denied (exit 2)");
+    // A DIFFERENT session is denied by the standing trip, not by a rule.
+    let other = hook(&home, &proj, &mk("B", "git reset --hard HEAD~9"), &[]);
+    assert_eq!(other.code, 2, "a different session is held by the trip");
+    let log = project_logs(&home);
+    assert!(
+        log.contains("\"decision\":\"tripped\""),
+        "the trip is an event: {log}"
+    );
+    let b_deny = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["session"] == "B" && e["decision"] == "deny")
+        .expect("session B has a deny line");
+    assert_eq!(
+        b_deny["matched_rule"], "circuit-breaker",
+        "held by the breaker, not a rule"
+    );
+    assert!(b_deny["reason"]
+        .as_str()
+        .unwrap()
+        .contains("tripped for git-destructive"));
+
+    // Resume it, with a reason, and the release is recorded.
+    let out = Command::new(env!("CARGO_BIN_EXE_termaxa"))
+        .args(["breaker", "resume", "--reason", "reviewed, intended"])
+        .current_dir(&proj)
+        .env("TERMAXA_HOME", &home)
+        .env("USER", "tester")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("breaker resume runs");
+    assert!(out.status.success());
+    let log = project_logs(&home);
+    let resume = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["decision"] == "resumed")
+        .expect("a resume event is recorded");
+    assert_eq!(resume["actor"], "tester", "the resume records who");
+    assert!(
+        resume["reason"]
+            .as_str()
+            .unwrap()
+            .contains("reviewed, intended"),
+        "and why"
+    );
+
+    // After the resume, a fresh git-destructive command asks again, not denied.
+    let after = hook(&home, &proj, &mk("C", "git reset --hard HEAD~1"), &[]);
+    assert_ne!(after.code, 2, "the hold is gone after a resume");
+}
