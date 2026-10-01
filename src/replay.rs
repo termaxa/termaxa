@@ -88,18 +88,64 @@ pub fn commands_in(v: &serde_json::Value, out: &mut Vec<String>) {
                         }
                         _ => {}
                     }
+                } else if k == "arguments" {
+                    // Codex: the call's arguments are a JSON string. Only
+                    // here is a string parsed; a file an agent WROTE that
+                    // happens to contain `"command":` is not a call (the
+                    // first run of --against-record flagged a hooks file's
+                    // `termaxa hook` as a shell call, Oct 1, 2026).
+                    if let serde_json::Value::String(s) = val {
+                        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
+                            commands_in(&inner, out);
+                        }
+                    }
                 } else {
                     commands_in(val, out);
                 }
             }
         }
         serde_json::Value::Array(items) => items.iter().for_each(|i| commands_in(i, out)),
-        serde_json::Value::String(s) if s.trim_start().starts_with('{') => {
-            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
-                commands_in(&inner, out);
-            }
-        }
         _ => {}
+    }
+}
+
+/// The script inside a shell wrapper: `["bash","-lc",S]`, `["sh","-c",S]`,
+/// `["powershell.exe","-Command",S]`, `["cmd","/c",S]` → `S`. What the gate
+/// judges and records is the inner command (the Codex dialect unwraps it),
+/// so the transcript's call has to be read the same way to match.
+pub fn unwrap_shell(argv: &[String]) -> Option<String> {
+    let shell = argv
+        .first()?
+        .rsplit(['/', '\\'])
+        .next()?
+        .to_ascii_lowercase();
+    let known = matches!(
+        shell.as_str(),
+        "bash"
+            | "sh"
+            | "zsh"
+            | "dash"
+            | "powershell"
+            | "powershell.exe"
+            | "pwsh"
+            | "pwsh.exe"
+            | "cmd"
+            | "cmd.exe"
+    );
+    if !known || argv.len() < 3 {
+        return None;
+    }
+    let flag = argv[argv.len() - 2].to_ascii_lowercase();
+    let is_flag = matches!(
+        flag.as_str(),
+        "-c" | "-lc" | "-command" | "-c," | "/c" | "-file"
+    ) && !argv[..argv.len() - 2][1..]
+        .iter()
+        .any(|a| !a.starts_with('-') && !a.starts_with('/'));
+    if is_flag {
+        Some(argv[argv.len() - 1].clone())
+    } else {
+        None
     }
 }
 
@@ -306,6 +352,10 @@ pub struct Call {
     pub id: Option<String>,
     pub ts_ms: Option<u128>,
     pub command: String,
+    /// False when the transcript's own result for this call says it was
+    /// interrupted or rejected before it ran: no hook was due, so its
+    /// absence from the record is not a bypass.
+    pub executed: bool,
 }
 
 fn rfc3339_ms(s: &str) -> Option<u128> {
@@ -314,25 +364,51 @@ fn rfc3339_ms(s: &str) -> Option<u128> {
         .map(|d| d.timestamp_millis().max(0) as u128)
 }
 
-/// Every call in one transcript, with its session, id and time where the
-/// harness wrote them. Claude Code: `sessionId`, `timestamp` and
-/// `message.content[].tool_use{id,name:"Bash",input.command}` per line.
-/// Codex: `function_call{call_id,arguments}` items, a `session_meta`
-/// payload id, or the rollout file's own name for the session.
+/// The words of a `tool_result` that mean the call never ran.
+fn result_says_not_run(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    [
+        "interrupted",
+        "rejected",
+        "doesn't want to proceed",
+        "does not want to proceed",
+        "cancelled",
+        "canceled",
+        "aborted",
+    ]
+    .iter()
+    .any(|m| t.contains(m))
+}
+
+fn text_of(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items.iter().map(text_of).collect::<Vec<_>>().join(" "),
+        serde_json::Value::Object(map) => map.values().map(text_of).collect::<Vec<_>>().join(" "),
+        _ => String::new(),
+    }
+}
+
+/// Every shell call in one transcript, with its session, id and time where
+/// the harness wrote them. Claude Code: a `tool_use` block named `Bash`
+/// with `input.command`, `sessionId` and `timestamp` on the line, and the
+/// later `tool_result` for its id. Codex: a `function_call` of its shell
+/// tool with `call_id` and `arguments`, the session from `session_meta` or
+/// the rollout file's name, and a shell wrapper unwrapped to its script.
+/// Nothing else counts: a file an agent wrote that mentions a command is
+/// not a call.
 pub fn calls_in_file(path: &Path) -> Vec<Call> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
+    let mut out: Vec<Call> = Vec::new();
+    let mut not_run: std::collections::HashSet<String> = Default::default();
     let mut file_session: Option<String> = None;
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .map(str::to_string);
     for line in text.lines() {
-        if !line.contains("command") && !line.contains("session_meta") {
-            continue;
-        }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
@@ -355,43 +431,88 @@ pub fn calls_in_file(path: &Path) -> Vec<Call> {
             .map(str::to_string)
             .or_else(|| file_session.clone())
             .or_else(|| stem.clone());
-        // Claude Code: tool_use blocks carry their own id.
         if let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) {
             for b in blocks {
-                if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-                    continue;
-                }
-                let mut cmds = Vec::new();
-                if let Some(input) = b.get("input") {
-                    commands_in(input, &mut cmds);
-                }
-                for command in cmds {
-                    out.push(Call {
-                        session: session.clone(),
-                        id: b.get("id").and_then(|x| x.as_str()).map(str::to_string),
-                        ts_ms,
-                        command,
-                    });
+                match b.get("type").and_then(|t| t.as_str()) {
+                    Some("tool_use") if b.get("name").and_then(|n| n.as_str()) == Some("Bash") => {
+                        if let Some(cmd) = b.pointer("/input/command").and_then(|c| c.as_str()) {
+                            if !cmd.trim().is_empty() {
+                                out.push(Call {
+                                    session: session.clone(),
+                                    id: b.get("id").and_then(|x| x.as_str()).map(str::to_string),
+                                    ts_ms,
+                                    command: cmd.to_string(),
+                                    executed: true,
+                                });
+                            }
+                        }
+                    }
+                    Some("tool_result") => {
+                        if let Some(id) = b.get("tool_use_id").and_then(|x| x.as_str()) {
+                            if result_says_not_run(&text_of(b)) {
+                                not_run.insert(id.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             continue;
         }
-        // Codex and anything else: the command wherever it sits, with the
-        // nearest call id the line carries.
-        let id = v
-            .pointer("/payload/call_id")
-            .or_else(|| v.get("call_id"))
+        // Codex: a function call of the shell tool, at the top level or
+        // under `payload`.
+        let item = v.get("payload").unwrap_or(&v);
+        let is_call = item.get("type").and_then(|t| t.as_str()) == Some("function_call");
+        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if !is_call
+            || !matches!(
+                name,
+                "shell" | "exec_command" | "local_shell" | "shell_command" | "container.exec"
+            )
+        {
+            continue;
+        }
+        let id = item
+            .get("call_id")
             .and_then(|x| x.as_str())
             .map(str::to_string);
-        let mut cmds = Vec::new();
-        commands_in(&v, &mut cmds);
-        for command in cmds {
-            out.push(Call {
-                session: session.clone(),
-                id: id.clone(),
-                ts_ms,
-                command,
-            });
+        let Some(args) = item.get("arguments") else {
+            continue;
+        };
+        let parsed: serde_json::Value = match args {
+            serde_json::Value::String(s) => {
+                serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+            }
+            other => other.clone(),
+        };
+        let command = match parsed.get("command") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(items)) => {
+                let argv: Vec<String> = items
+                    .iter()
+                    .map(|i| match i {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                unwrap_shell(&argv).unwrap_or_else(|| crate::runner::shell_join(&argv))
+            }
+            _ => continue,
+        };
+        if command.trim().is_empty() {
+            continue;
+        }
+        out.push(Call {
+            session: session.clone(),
+            id,
+            ts_ms,
+            command,
+            executed: true,
+        });
+    }
+    for c in &mut out {
+        if c.id.as_deref().is_some_and(|id| not_run.contains(id)) {
+            c.executed = false;
         }
     }
     out
@@ -512,6 +633,9 @@ pub struct Against {
     pub unwired_sessions: usize,
     pub unwired_calls: usize,
     pub judged: usize,
+    /// Interrupted or rejected before running, per the transcript's own
+    /// result: no hook was due.
+    pub not_run: usize,
     pub fired_unrecorded: Vec<Call>,
     pub never_fired: Vec<Call>,
 }
@@ -550,6 +674,7 @@ pub fn against_record_in(home: &Path, roots: &[PathBuf]) -> Against {
             match fate(&c, &records, &witnesses) {
                 Fate::Judged(_) => a.judged += 1,
                 Fate::FiredUnrecorded => a.fired_unrecorded.push(c),
+                Fate::NeverFired if !c.executed => a.not_run += 1,
                 Fate::NeverFired => a.never_fired.push(c),
             }
         }
@@ -753,7 +878,60 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id.as_deref(), Some("call_7"));
         assert_eq!(calls[0].session.as_deref(), Some("X"));
-        assert!(calls[0].command.contains("ls -la"));
+        assert_eq!(
+            calls[0].command, "ls -la",
+            "the wrapper is unwrapped to its script"
+        );
+    }
+
+    /// What the first run on a real machine got wrong (Oct 1, 2026): a
+    /// hooks file an agent WROTE is not a call; a call the transcript's own
+    /// result says was interrupted never ran, so no hook was due; and
+    /// Codex's `powershell.exe -Command` wrapper matches the inner command
+    /// the gate recorded.
+    #[test]
+    fn a_written_file_is_not_a_call_and_an_interrupted_call_is_not_a_bypass() {
+        let tmp = TempTree::new("phantoms");
+        let c = tmp.file(
+            "c.jsonl",
+            concat!(
+                r#"{"type":"assistant","sessionId":"S","timestamp":"2026-10-01T10:00:00Z","message":{"content":[{"type":"tool_use","id":"toolu_w","name":"Write","input":{"file_path":".claude/settings.json","content":"{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"termaxa hook\"}]}]}}"}}]}}"#, "
+",
+                r#"{"type":"assistant","sessionId":"S","timestamp":"2026-10-01T10:00:01Z","message":{"content":[{"type":"tool_use","id":"toolu_a","name":"Bash","input":{"command":"termaxa log"}},{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"termaxa backups"}}]}}"#, "
+",
+                r#"{"type":"user","sessionId":"S","timestamp":"2026-10-01T10:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_b","is_error":true,"content":"[Request interrupted by user for tool use]"}]}}"#, "
+",
+            ),
+        );
+        let calls = calls_in_file(&c);
+        let names: Vec<(&str, bool)> = calls
+            .iter()
+            .map(|x| (x.command.as_str(), x.executed))
+            .collect();
+        assert_eq!(
+            names,
+            vec![("termaxa log", true), ("termaxa backups", false)],
+            "{calls:?}"
+        );
+        let x = tmp.file(
+            "rollout-2.jsonl",
+            concat!(
+                r#"{"timestamp":"2026-09-05T18:49:39Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call_1","arguments":"{\"command\":[\"powershell.exe\",\"-Command\",\"echo hi\"]}"}}"#, "
+",
+            ),
+        );
+        assert_eq!(calls_in_file(&x)[0].command, "echo hi");
+        assert_eq!(
+            unwrap_shell(&["bash".into(), "-lc".into(), "ls".into()]).as_deref(),
+            Some("ls")
+        );
+        assert_eq!(
+            unwrap_shell(&["C:\\x\\cmd.exe".into(), "/c".into(), "dir".into()]).as_deref(),
+            Some("dir")
+        );
+        assert_eq!(unwrap_shell(&["rm".into(), "-rf".into(), "x".into()]), None);
+        // A plain replay tally no longer counts the written file's command.
+        assert_eq!(commands_in_file(&c), vec!["termaxa log", "termaxa backups"]);
     }
 
     /// Both harnesses' shapes, as captured: Claude Code's `input.command`,
