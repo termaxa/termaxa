@@ -715,6 +715,12 @@ pub fn render_against(a: &Against, roots: &[PathBuf]) -> String {
     ));
     s.push_str(&format!(
         "  {:<22}{}   {}\n",
+        "not run",
+        a.not_run,
+        dim("interrupted or rejected before running, per the transcript: no hook was due")
+    ));
+    s.push_str(&format!(
+        "  {:<22}{}   {}\n",
         "fired, unrecorded",
         a.fired_unrecorded.len(),
         dim("the hook left a witness and no record line: the gate failed after it fired")
@@ -844,6 +850,10 @@ mod tests {
             vec!["curl -X DELETE https://x/keys"]
         );
         let out = render_against(&a, &[PathBuf::from("/t")]);
+        assert!(
+            out.contains("not run"),
+            "every bucket renders, so the counts add up: {out}"
+        );
         assert!(
             out.contains("never fired") && out.contains("curl -X DELETE"),
             "{out}"
