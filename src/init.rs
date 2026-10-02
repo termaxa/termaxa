@@ -21,6 +21,13 @@ pub const STARTER_POLICY: &str = r#"# Termaxa policy — first matching rule win
 # severe verdict governs.
 version: 1
 default: ask
+# How the gate acts on its verdicts (decision #108). `enforce`: asks ask and
+# denies deny. `observe`: nothing outside the floor is interrupted; every
+# verdict is still recorded, insurance is still taken, and `termaxa report`
+# shows what enforcement would have done. Rules marked `floor: true` are
+# enforced in both modes; observe mode cannot lower the floor. `TERMAXA_MODE`
+# overrides this line on one machine.
+mode: enforce
 
 rules:
   # ---- self-defence: the gate's own configuration ----
@@ -50,15 +57,19 @@ rules:
   - match: "*.claude*settings*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
   - match: "*.cursor*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
   - match: "*.codex*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
   - match: "*.github*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
 
   # ---- destruction by overwrite (v0.15) ----
   #
@@ -104,12 +115,15 @@ rules:
   - match: "*> /etc/*"
     action: deny
     reason: "Overwriting a system config file."
+    floor: true
   - match: "*> ~/.ssh/*"
     action: deny
     reason: "Overwriting an SSH key or config."
+    floor: true
   - match: "*> *id_rsa*"
     action: deny
     reason: "Overwriting an SSH private key."
+    floor: true
 
   # The policy is an in-repo artifact, reviewable in PRs, and the deny below
   # would otherwise make that workflow impossible: `git add .termaxa/…`,
@@ -158,24 +172,30 @@ rules:
   - match: "*.termaxa*policy*"
     action: deny
     reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
   - match: "*.termaxa*projects*"
     action: deny
     reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
   - match: "*.termaxa*backups*"
     action: deny
     reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
   - match: "*.termaxa*logs*"
     action: deny
     reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
   - match: "*.termaxa*shims/*"
     action: deny
     reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
   # Pointing git's hook directory anywhere runs whatever is there on the
   # next commit. It used to be caught only when the target was inside
   # `.termaxa`; the hazard is the redirection itself.
   - match: "*git config*hooksPath*"
     action: deny
     reason: "Redirecting git hooks runs arbitrary code on the next commit. Do it yourself."
+    floor: true
 
   # ---- destructive: hard stops ----
   - match: "git push*--force*"
@@ -202,15 +222,18 @@ rules:
   - match: "rm -rf /"
     action: deny
     reason: "Recursive delete from the filesystem root is blocked."
+    floor: true
   - match: "rm -rf / *"
     action: deny
     reason: "Recursive delete from the filesystem root is blocked."
+    floor: true
   # GNU rm refuses `rm -rf /` on its own; --no-preserve-root is the one
   # spelling it obeys. The rule above is named for the command everybody
   # quotes, this one is named for the command that actually works.
   - match: "*--no-preserve-root*"
     action: deny
     reason: "--no-preserve-root is the only spelling `rm` obeys at `/`. Blocked."
+    floor: true
   # Broad recursive-force deletes (any target), Unix + PowerShell + cmd
   # forms. DENY by default: with auto-approving agent UIs, `ask` silently
   # degrades to `allow`. Relax deliberately, per project, if you need to.
@@ -243,9 +266,11 @@ rules:
   - match: "*delete shadows*"
     action: deny
     reason: "Deleting shadow copies destroys the recovery point itself."
+    floor: true
   - match: "*shadowcopy delete*"
     action: deny
     reason: "Deleting shadow copies destroys the recovery point itself."
+    floor: true
   # A local database is somebody's months of work as often as it is a
   # throwaway. Field report, Sep 2026: an agent asked to fix a UI ran
   # `npx supabase db reset` and wiped a database holding months of notes,
@@ -254,18 +279,23 @@ rules:
   - match: "*db reset*"
     action: deny
     reason: "Resetting a database drops every row in it. Dump it first, or run this yourself."
+    floor: true
   - match: "*migrate reset*"
     action: deny
     reason: "Resetting migrations drops and recreates the schema. Dump it first, or run this yourself."
+    floor: true
   - match: "*db push*--force-reset*"
     action: deny
     reason: "A forced reset drops every row in the database. Dump it first, or run this yourself."
+    floor: true
   - match: "*drizzle-kit drop*"
     action: deny
     reason: "Dropping the schema destroys the data under it. Dump it first, or run this yourself."
+    floor: true
   - match: "*Win32_ShadowCopy*Delete*"
     action: deny
     reason: "Deleting shadow copies destroys the recovery point itself."
+    floor: true
   # The PowerShell way to delete a WMI/CIM instance - shadow copies are the
   # common target. `Get-WmiObject Win32_ShadowCopy | ForEach-Object
   # { $_.Delete() }` is split at the pipe and neither half names both; it
@@ -273,24 +303,30 @@ rules:
   - match: "*Remove-WmiObject*"
     action: deny
     reason: "Removing a WMI instance (a shadow copy, typically) is not recoverable."
+    floor: true
   - match: "*Remove-CimInstance*"
     action: deny
     reason: "Removing a CIM instance (a shadow copy, typically) is not recoverable."
+    floor: true
   - match: "kubectl delete*"
     action: deny
     reason: "kubectl delete is blocked. Use a manifest change + apply."
+    floor: true
   - match: "*drop table*"
     action: deny
     reason: "DROP TABLE is blocked. Archive or rename instead."
   - match: "*drop database*"
     action: deny
     reason: "DROP DATABASE is blocked."
+    floor: true
   - match: "terraform destroy*"
     action: deny
     reason: "terraform destroy is blocked by policy."
+    floor: true
   - match: "tofu destroy*"
     action: deny
     reason: "tofu destroy is blocked by policy."
+    floor: true
 
   # ---- consequential: human in the loop ----
   #
@@ -343,14 +379,17 @@ rules:
   - match: "docker system prune*"
     action: deny
     reason: "docker system prune has no recovery path. Remove specific objects instead."
+    floor: true
   # Raw device writes destroy partition tables and filesystems with nothing
   # to restore from. Not insurable at any layer.
   - match: "dd*of=/dev/*"
     action: deny
     reason: "Writing to a raw device is not recoverable."
+    floor: true
   - match: "mkfs*"
     action: deny
     reason: "Formatting a device is not recoverable."
+    floor: true
   - match: "npm publish*"
     action: ask
   - match: "cargo publish*"
@@ -369,6 +408,7 @@ rules:
   - match: "*find* -delete*"
     action: deny
     reason: "find -delete removes everything it matches and nothing is copied first. Delete named paths with rm instead."
+    floor: true
 
   # ---- read-only operations: let the agent work ----
   - match: "git status*"

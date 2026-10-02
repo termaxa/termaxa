@@ -49,6 +49,18 @@ pub struct AuditEntry {
     /// text and time. Serde-defaulted: older lines parse as None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
+    /// Observe mode (decision #108): the mode in force, whether the verdict
+    /// was enforced, whether the floor held it, and what covered the command
+    /// (`insured`, `known-uninsured`, `unknown`, `floor`). All None on lines
+    /// written in enforce mode before v0.20, and on allows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforced: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<String>,
 
     // ---- provenance (v0.16, roadmap 2.6) ----
     //
@@ -507,6 +519,10 @@ mod tests {
         let (ts_ms, ts) = now();
         AuditEntry {
             call_id: None,
+            mode: None,
+            enforced: None,
+            floor: None,
+            coverage: None,
             ts_ms,
             ts,
             source: "test".into(),

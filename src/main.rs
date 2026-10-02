@@ -379,6 +379,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let (ts_ms, ts) = audit::now();
             log.append(&audit::AuditEntry {
                 call_id: None,
+                mode: None,
+                enforced: None,
+                floor: None,
+                coverage: None,
                 ts_ms,
                 ts,
                 source: "check".into(),
