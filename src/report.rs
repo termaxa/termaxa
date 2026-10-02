@@ -86,6 +86,7 @@ struct Report {
     backups: Vec<(String, String)>,
     rollbacks: usize,
     breaker_trips: usize,
+    observed: ObservedTally,
     /// (intent-label, count) for every destructive intent CLASSIFIED in scope,
     /// most frequent first. This counts commands the classifier recognised —
     /// not breaker trips. A legitimate `rm -rf ./build` is counted here.
@@ -129,6 +130,51 @@ fn habit_fires(r: &Report) -> bool {
 /// executed/post record is a success (✓), not a denial (✗).
 fn mark_for(decision: &str, source: &str) -> String {
     crate::ui::mark(decision, source)
+}
+
+#[derive(Default)]
+struct ObservedTally {
+    would_ask: usize,
+    would_deny: usize,
+    insured: usize,
+    known_uninsured: usize,
+    unknown: usize,
+    floor_held: usize,
+    ran_without_copy: usize,
+}
+
+impl ObservedTally {
+    fn from(entries: &[&AuditEntry]) -> Self {
+        let mut t = ObservedTally::default();
+        for e in entries {
+            if e.enforced == Some(false) && e.coverage.is_some() {
+                match e.decision.as_str() {
+                    "ask" => t.would_ask += 1,
+                    "deny" => t.would_deny += 1,
+                    _ => {}
+                }
+                match e.coverage.as_deref() {
+                    Some("insured") => t.insured += 1,
+                    Some("known-uninsured") => {
+                        t.known_uninsured += 1;
+                        t.ran_without_copy += 1;
+                    }
+                    Some("unknown") => {
+                        t.unknown += 1;
+                        t.ran_without_copy += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if e.floor == Some(true) {
+                t.floor_held += 1;
+            }
+        }
+        t
+    }
+    fn any(&self) -> bool {
+        self.would_ask + self.would_deny + self.floor_held > 0
+    }
 }
 
 fn compute(entries: &[&AuditEntry], paths: &Paths) -> Result<Report> {
@@ -269,6 +315,7 @@ fn compute(entries: &[&AuditEntry], paths: &Paths) -> Result<Report> {
         backups,
         rollbacks,
         breaker_trips,
+        observed: ObservedTally::from(entries),
         intents,
         trips_by_intent,
         recent,
@@ -385,6 +432,25 @@ fn insight_for(label: &str) -> Option<Vec<&'static str>> {
     }
 }
 
+fn observed_md(r: &Report) {
+    if !r.observed.any() {
+        return;
+    }
+    let o = &r.observed;
+    println!("\n## Observed, not enforced\n");
+    println!(
+        "Enforcement would have asked {} and denied {}.\n",
+        o.would_ask, o.would_deny
+    );
+    println!("| Covered by | Count |");
+    println!("|---|---|");
+    println!("| insured (a copy was taken first) | {} |", o.insured);
+    println!("| known, uninsured | {} |", o.known_uninsured);
+    println!("| consequence unknown | {} |", o.unknown);
+    println!("| held by the floor | {} |", o.floor_held);
+    println!("\n**Ran with no copy: {}**\n", o.ran_without_copy);
+}
+
 fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
     let line = "──────────────────────────────────────────";
 
@@ -429,6 +495,44 @@ fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
             println!("{:<20}{}", label, count);
         }
         println!("{:<20}{}", "breaker trips", r.breaker_trips);
+    }
+
+    if r.observed.any() {
+        let o = &r.observed;
+        println!("\n{}", bold("Observed, not enforced"));
+        println!("{}", dim(line));
+        println!(
+            "enforcement would have asked {} and denied {}",
+            o.would_ask, o.would_deny
+        );
+        println!(
+            "{:<22}{}   {}",
+            "  insured",
+            o.insured,
+            dim("a copy was taken first")
+        );
+        println!(
+            "{:<22}{}   {}",
+            "  known, uninsured",
+            o.known_uninsured,
+            dim("understood, nothing could be copied")
+        );
+        println!(
+            "{:<22}{}   {}",
+            "  consequence unknown",
+            o.unknown,
+            dim("the gate could not read what they change")
+        );
+        println!(
+            "{:<22}{}   {}",
+            "  held by the floor",
+            o.floor_held,
+            dim("denied even in observe mode")
+        );
+        println!(
+            "{}",
+            amber(&format!("ran with no copy: {}", o.ran_without_copy))
+        );
     }
 
     // Insight: fires when the asks are a habit rather than a decision.
@@ -597,6 +701,7 @@ fn print_markdown(r: &Report, roll: &Rollup, session: Option<&str>) {
         }
         println!("- **breaker trips** — {}", r.breaker_trips);
     }
+    observed_md(r);
     if let Some((label, count)) = r.trips_by_intent.first() {
         if *count >= INSIGHT_THRESHOLD {
             if let Some(causes) = insight_for(label) {
@@ -654,6 +759,10 @@ mod tests {
     fn entry(decision: &str, command: &str) -> AuditEntry {
         AuditEntry {
             call_id: None,
+            mode: None,
+            enforced: None,
+            floor: None,
+            coverage: None,
             ts_ms: 0,
             ts: "2026-01-01T00:00:00Z".into(),
             source: "hook".into(),

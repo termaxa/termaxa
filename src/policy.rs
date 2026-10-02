@@ -51,6 +51,13 @@ pub struct Rule {
     /// out of spelling) applied to the rule text itself.
     #[serde(default, skip_serializing_if = "is_false")]
     pub case_sensitive: bool,
+    /// Part of the floor: observe mode (`mode: observe`, decision #108)
+    /// records what enforcement would have done without interrupting
+    /// execution, except for rules marked `floor: true`, which it enforces
+    /// exactly as `enforce` mode does. Lowering the floor means editing
+    /// this file, a change the fingerprint records.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub floor: bool,
     /// Match this rule against the command's RESOLVED targets rather than
     /// against the command string.
     ///
@@ -196,6 +203,10 @@ impl BackupFailure {
 pub struct Policy {
     #[serde(default = "default_version")]
     pub version: u32,
+    /// `enforce` (the default) or `observe` (decision #108). `TERMAXA_MODE`
+    /// overrides it on one machine; see `effective_mode`.
+    #[serde(default, skip_serializing_if = "Mode::is_default")]
+    pub mode: Mode,
     /// Action when no rule matches.
     #[serde(default = "default_action")]
     pub default: Action,
@@ -276,6 +287,40 @@ fn severity(a: Action) -> u8 {
         Action::Ask => 1,
         Action::Deny => 2,
     }
+}
+
+/// How the gate acts on its verdicts (decision #108, Sep 30, 2026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Asks ask and denies deny.
+    #[default]
+    Enforce,
+    /// Records what enforcement would have done without interrupting
+    /// execution, except for the floor. Insurance is still taken. The hook
+    /// stays silent outside the floor, so the harness's own prompts are
+    /// exactly what they were without Termaxa.
+    Observe,
+}
+
+impl Mode {
+    pub fn is_default(&self) -> bool {
+        *self == Mode::Enforce
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Mode::Enforce => "enforce",
+            Mode::Observe => "observe",
+        }
+    }
+}
+
+/// Where the effective mode came from, for `doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeSource {
+    Default,
+    PolicyFile,
+    Environment,
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +541,43 @@ impl Policy {
     /// MOST DANGEROUS segment govern the combined verdict (deny > ask > allow).
     /// Closes the v0.6.1 field-report bypass where `git status && <anything>`
     /// rode the `git status*` wildcard.
+    /// The mode in force: `TERMAXA_MODE` (`observe` or `enforce`) over the
+    /// policy file's `mode`, over the default. Observe mode needs a floor to
+    /// stand on: a policy with no `floor: true` rule (one written before
+    /// v0.20, say) is enforced regardless, and `doctor` says why.
+    pub fn effective_mode(&self) -> (Mode, ModeSource) {
+        let (mode, src) = match std::env::var("TERMAXA_MODE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("observe") => (Mode::Observe, ModeSource::Environment),
+            Some("enforce") => (Mode::Enforce, ModeSource::Environment),
+            _ if self.mode == Mode::Observe => (Mode::Observe, ModeSource::PolicyFile),
+            _ => (Mode::Enforce, ModeSource::Default),
+        };
+        if mode == Mode::Observe && self.floor_rules() == 0 {
+            return (Mode::Enforce, src);
+        }
+        (mode, src)
+    }
+
+    /// How many rules are marked `floor: true`.
+    pub fn floor_rules(&self) -> usize {
+        self.rules.iter().filter(|r| r.floor).count()
+    }
+
+    /// Whether the rule a decision names is on the floor. `matched` is the
+    /// rule's `match` (or `match_path`) text, as `Decision::matched_rule`
+    /// carries it.
+    pub fn is_floor_rule(&self, matched: &str) -> bool {
+        self.rules.iter().any(|r| {
+            r.floor
+                && (r.r#match.as_deref() == Some(matched)
+                    || r.match_path.as_deref() == Some(matched))
+        })
+    }
+
     pub fn evaluate_command(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
         let segments = crate::shell::split_segments_deep(command);
         if segments.len() <= 1 {
@@ -942,6 +1024,7 @@ mod schema_and_severity_tests {
             r#match: Some("ls*".into()),
             action: Action::Allow,
             reason: None,
+            floor: false,
             case_sensitive: false,
             match_path: None,
         };
@@ -955,6 +1038,7 @@ mod schema_and_severity_tests {
             r#match: Some("git branch -D*".into()),
             action: Action::Deny,
             reason: None,
+            floor: false,
             case_sensitive: true,
             match_path: None,
         };
@@ -1123,6 +1207,7 @@ mod tests {
             r#match: Some("git branch*-D*".into()),
             action: Action::Deny,
             reason: None,
+            floor: false,
             case_sensitive: true,
             match_path: None,
         };
@@ -2443,6 +2528,7 @@ mod combined_gate_tests {
             r#match: None,
             action: Action::Deny,
             reason: None,
+            floor: false,
             case_sensitive: false,
             match_path: Some("*/.env".into()),
         };
@@ -2475,6 +2561,7 @@ mod combined_gate_tests {
             r#match: None,
             action: Action::Deny,
             reason: None,
+            floor: false,
             case_sensitive: false,
             match_path: Some("*/.ssh/id_*".into()),
         };

@@ -926,3 +926,84 @@ fn the_hook_leaves_a_witness_first_and_records_the_call_id() {
         "the record carries the harness's id"
     );
 }
+
+/// Observe mode (decision #108): outside the floor an ask or deny runs,
+/// insured, and is recorded as not-enforced with its coverage; a floor rule
+/// and an uninsurable command are enforced even in observe mode; allows are
+/// unchanged. This is the record the first run produced, pinned.
+#[cfg(unix)]
+#[test]
+fn observe_mode_records_what_enforcement_would_have_done() {
+    use serde_json::json;
+    let tmp = scratch("observe");
+    let home = tmp.join("home");
+    // A policy in observe mode with one floor rule and one ordinary deny.
+    let policy = concat!(
+        "version: 1\nmode: observe\ndefault: ask\nrules:\n",
+        "  - match: \"rm -rf /\"\n    action: deny\n    floor: true\n",
+        "  - match: \"*rm -rf*\"\n    action: deny\n",
+        "  - match: \"ls*\"\n    action: allow\n",
+    );
+    let proj = project(&tmp, policy);
+    std::fs::create_dir_all(proj.join("sc")).unwrap();
+    for i in 0..12 {
+        std::fs::write(proj.join("sc").join(format!("f{i}")), "x").unwrap();
+    }
+    let mk = |cmd: &str| {
+        json!({"session_id":"O","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+               "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+    };
+    // Ordinary deny: runs in observe mode (exit 0), not the enforced 2.
+    assert_eq!(
+        hook(&home, &proj, &mk("rm -rf ./sc"), &[]).code,
+        0,
+        "observed deny runs"
+    );
+    // The floor: enforced even here.
+    assert_eq!(
+        hook(&home, &proj, &mk("rm -rf /"), &[]).code,
+        2,
+        "the floor holds in observe mode"
+    );
+    // An unreadable script: an ask, observed, runs.
+    assert_eq!(
+        hook(&home, &proj, &mk("python rebuild.py"), &[]).code,
+        0,
+        "observed ask runs"
+    );
+    // An allow is unchanged.
+    assert_eq!(hook(&home, &proj, &mk("ls -la"), &[]).code, 0);
+
+    let log = project_logs(&home);
+    let line = |cmd: &str| -> serde_json::Value {
+        log.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["command"] == cmd)
+            .unwrap_or_else(|| panic!("no record line for {cmd}: {log}"))
+    };
+    let del = line("rm -rf ./sc");
+    assert_eq!(del["decision"], "deny");
+    assert_eq!(del["enforced"], false, "observed, not enforced");
+    assert_eq!(del["floor"], false);
+    assert_eq!(del["coverage"], "insured", "the copy was taken first");
+    let root = line("rm -rf /");
+    assert_eq!(root["enforced"], true, "the floor is enforced");
+    assert_eq!(root["floor"], true);
+    assert_eq!(root["coverage"], "floor");
+    let script = line("python rebuild.py");
+    assert_eq!(script["enforced"], false);
+    assert_eq!(
+        script["coverage"], "unknown",
+        "the gate cannot read a script"
+    );
+    // A floor with nothing marked falls back to enforce (doctor says why).
+    let enforce_proj = project(
+        &tmp,
+        "version: 1\nmode: observe\ndefault: ask\nrules:\n  - match: \"*rm -rf*\"\n    action: deny\n",
+    );
+    assert_eq!(
+        hook(&home, &enforce_proj, &json!({"session_id":"E","transcript_path":"/tmp/t","cwd":enforce_proj.to_string_lossy(),"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf ./x"}}), &[]).code,
+        2,
+        "observe with no floor rule is enforced"
+    );
+}

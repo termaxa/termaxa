@@ -785,6 +785,10 @@ fn append_write_entry(
     let (ts_ms, ts) = now();
     let _ = log.append(&AuditEntry {
         call_id: None,
+        mode: None,
+        enforced: None,
+        floor: None,
+        coverage: None,
         ts_ms,
         ts,
         source: source.into(),
@@ -831,6 +835,10 @@ fn protected_write(w: &FileWrite, path: &str, protected: crate::protect::Protect
             let (ts_ms, ts) = now();
             let _ = log.append(&AuditEntry {
                 call_id: None,
+                mode: None,
+                enforced: None,
+                floor: None,
+                coverage: None,
                 ts_ms,
                 ts,
                 source: "hook".into(),
@@ -1056,6 +1064,10 @@ fn refuse_unrecognised(raw: &str) -> Option<Outcome> {
         let (ts_ms, ts) = now();
         let _ = log.append(&AuditEntry {
             call_id: None,
+            mode: None,
+            enforced: None,
+            floor: None,
+            coverage: None,
             ts_ms,
             ts,
             source: "hook".into(),
@@ -1221,6 +1233,10 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
                 let (ts_ms, ts) = now();
                 let _ = log.append(&AuditEntry {
                     call_id: input.call_id.clone(),
+                    mode: None,
+                    enforced: None,
+                    floor: None,
+                    coverage: None,
                     ts_ms,
                     ts,
                     source: "post".into(),
@@ -1484,6 +1500,33 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         crate::context::apply_insurance(decision, uninsurable)
     };
 
+    // OBSERVE MODE (decision #108). Records what enforcement would have
+    // done without interrupting execution, except for the configured
+    // safety floor. The floor is every rule marked `floor: true`, plus any
+    // command whose insurance cannot be taken at the moment it runs (the
+    // uninsurable escalation above): known destruction with no way back.
+    // Outside the floor the verdict is kept for the record, insurance is
+    // still taken, and the hook stays silent so the harness's own prompts
+    // are what they were without Termaxa. A probe is never observed: it
+    // must see the policy's verdict. The would-be verdict is `observed`.
+    let (mode, _mode_src) = policy.effective_mode();
+    let floor_rule = decision
+        .matched_rule
+        .as_deref()
+        .is_some_and(|m| policy.is_floor_rule(m));
+    let floor_holds =
+        matches!(decision.action, Action::Deny) && (floor_rule || uninsured_escalation);
+    let observed: Option<Action> = if mode == crate::policy::Mode::Observe
+        && !is_probe
+        && matches!(decision.action, Action::Ask | Action::Deny)
+        && !floor_holds
+    {
+        Some(decision.action)
+    } else {
+        None
+    };
+    let will_run = observed.is_some() || decision.action != Action::Deny;
+
     // Insure before allowing: PreToolUse runs before execution, so a backup
     // taken here is guaranteed to predate the command. Never for deny.
     //
@@ -1505,7 +1548,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // sentinel. An agent command cannot set its harness's env; a leaked env
     // var without the sentinel changes nothing.
     let mut backup_id: Option<String> = None;
-    if !is_probe && decision.action != Action::Deny {
+    if !is_probe && will_run {
         match crate::backup::take(&paths.state_dir, &command, std::path::Path::new(&input.cwd)) {
             Ok(Some(rec)) => {
                 backup_id = Some(rec.id);
@@ -1542,6 +1585,28 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
             let (ts_ms, ts) = now();
             let _ = log.append(&AuditEntry {
                 call_id: input.call_id.clone(),
+                mode: Some(mode.as_str().to_string()),
+                enforced: Some(observed.is_none()),
+                floor: Some(floor_holds),
+                coverage: if matches!(decision.action, Action::Ask | Action::Deny) {
+                    Some(
+                        if floor_holds {
+                            "floor"
+                        } else if backup_id.is_some() {
+                            "insured"
+                        } else if decision.matched_rule.is_some()
+                            || preview_summary.is_some()
+                            || intent_label.is_some()
+                        {
+                            "known-uninsured"
+                        } else {
+                            "unknown"
+                        }
+                        .to_string(),
+                    )
+                } else {
+                    None
+                },
                 ts_ms,
                 ts,
                 source: "hook".into(),
@@ -1580,7 +1645,8 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // the harness decide for itself.
     //
     // Suggested by Tim Schipper.
-    let silent = is_silent(input.dialect, &decision);
+    let silent = is_silent(input.dialect, &decision)
+        || (observed.is_some() && matches!(input.dialect, Dialect::ClaudeCode | Dialect::Codex));
 
     // Codex honours exactly one PreToolUse verdict: `deny`. An `ask` is
     // "unsupported permissionDecision:ask", which fails the hook and falls
@@ -1589,13 +1655,24 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // how to proceed; the audit log records the ask the policy made.
     let codex_ask = input.dialect == Dialect::Codex && decision.action == Action::Ask;
     let permission = match decision.action {
+        _ if observed.is_some() => "allow",
         Action::Allow => "allow",
         Action::Ask if codex_ask => "deny",
         Action::Ask => "ask",
         Action::Deny => "deny",
     };
 
-    let mut reason = if codex_ask {
+    let mut reason = if let Some(would) = observed {
+        format!(
+            "[termaxa] observed, not enforced — enforcement would have {}: {}",
+            if would == Action::Deny {
+                "denied"
+            } else {
+                "asked"
+            },
+            decision.reason
+        )
+    } else if codex_ask {
         format!(
             "[termaxa] asks: {} — Codex cannot prompt from a hook, so this is refused; \
              add an allow rule to .termaxa/policy.yaml for this command, or run it yourself",
@@ -1624,7 +1701,8 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // A probe must not page anyone: with `notify.on: [deny]` configured,
     // every `termaxa doctor` run would otherwise post a "denied rm -rf /"
     // webhook per detected agent.
-    if !is_probe {
+    // An observed verdict stopped nothing, so it pages nobody.
+    if !is_probe && observed.is_none() {
         crate::notify::maybe_send(
             &policy,
             &decision.action.to_string(),
@@ -1656,6 +1734,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         // JSON on stdout is the documented channel and the exit code stays 0
         // so the JSON is read.
         exit_code: if decision.action == Action::Deny
+            && observed.is_none()
             && !matches!(
                 input.dialect,
                 Dialect::Codex | Dialect::Copilot | Dialect::CopilotRepoSettings

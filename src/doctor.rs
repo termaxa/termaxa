@@ -52,6 +52,35 @@ pub fn run(dir: &Path) -> Result<i32> {
                         pol.rules.len(),
                         crate::ui::decision(&pol.default.to_string())
                     );
+                    // Observe mode (decision #108): say the mode and where it
+                    // came from, and in observe mode say plainly that nothing
+                    // outside the floor is blocked.
+                    let (mode, src) = pol.effective_mode();
+                    let from = match src {
+                        crate::policy::ModeSource::Default => "default",
+                        crate::policy::ModeSource::PolicyFile => "policy.yaml",
+                        crate::policy::ModeSource::Environment => "TERMAXA_MODE",
+                    };
+                    if mode == crate::policy::Mode::Observe {
+                        println!(
+                            "  {} observe mode ({}) — nothing outside the {} floor rule(s) is blocked; verdicts are recorded",
+                            crate::ui::amber("◉"),
+                            from,
+                            pol.floor_rules()
+                        );
+                    } else {
+                        let asked =
+                            pol.mode == crate::policy::Mode::Observe && pol.floor_rules() == 0;
+                        println!(
+                            "  enforce mode ({}){}",
+                            from,
+                            if asked {
+                                crate::ui::dim(" — policy asked for observe but has no floor rule, so it is enforced")
+                            } else {
+                                String::new()
+                            }
+                        );
+                    }
                 }
                 Err(e) => {
                     println!("{} policy will not parse: {}", red("✗"), e);

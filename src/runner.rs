@@ -91,10 +91,52 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     };
 
     let root = paths.project_dir.parent();
-    let preview_summary =
-        crate::preview::generate(&command, root, &run_cwd, true).map(|p| p.summary);
+    let preview = crate::preview::generate(&command, root, &run_cwd, true);
+    let preview_summary = preview.as_ref().map(|p| p.summary.clone());
+
+    // OBSERVE MODE (decision #108), the same rule as the hook: outside the
+    // floor an ask or deny runs after its insurance and is recorded as what
+    // enforcement would have done. The floor is a `floor: true` rule, or a
+    // command the preview marks uninsurable.
+    let (mode, _) = policy.effective_mode();
+    let floor_rule = decision
+        .matched_rule
+        .as_deref()
+        .is_some_and(|m| policy.is_floor_rule(m));
+    let uninsurable = preview.as_ref().is_some_and(|p| p.uninsurable);
+    let floor_holds = decision.action == Action::Deny && (floor_rule || uninsurable);
+    let observed = mode == crate::policy::Mode::Observe
+        && matches!(decision.action, Action::Ask | Action::Deny)
+        && !floor_holds;
+    if observed {
+        println!(
+            "{}",
+            crate::ui::dim(&format!(
+                "observe mode: enforcement would have {}; running after insurance (not enforced)",
+                if decision.action == Action::Deny {
+                    "denied"
+                } else {
+                    "asked"
+                }
+            ))
+        );
+    }
 
     let (approved, exit_code) = match decision.action {
+        _ if observed => {
+            if insure(&mut backup_id) {
+                if let Some(why) = changed_since(&command, &run_cwd, judged.as_ref()) {
+                    eprintln!("termaxa: {why}");
+                    recheck_refusal = Some(why);
+                    (Some(false), None)
+                } else {
+                    let code = execute(argv)?;
+                    (None, Some(code))
+                }
+            } else {
+                (Some(false), None)
+            }
+        }
         Action::Deny => {
             eprintln!("termaxa: blocked by policy.");
             (Some(false), None)
@@ -196,6 +238,28 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     let (ts_ms, ts) = now();
     log.append(&AuditEntry {
         call_id: None,
+        mode: Some(mode.as_str().to_string()),
+        enforced: Some(!observed),
+        floor: Some(floor_holds),
+        coverage: if matches!(decision.action, Action::Ask | Action::Deny) {
+            Some(
+                if floor_holds {
+                    "floor"
+                } else if backup_id.is_some() {
+                    "insured"
+                } else if decision.matched_rule.is_some()
+                    || preview_summary.is_some()
+                    || intent_label.is_some()
+                {
+                    "known-uninsured"
+                } else {
+                    "unknown"
+                }
+                .to_string(),
+            )
+        } else {
+            None
+        },
         ts_ms,
         ts,
         source: "run".into(),
