@@ -2,6 +2,36 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.20.0 — observe mode, and what it would have caught
+
+**In plain words:** `mode: observe` lets a team install Termaxa and change nothing: every command still runs, every verdict is recorded with its insurance still taken, and `termaxa report` shows what enforcement would have asked, denied, and copied first. Only a floor of 33 rules (the gate's own files, the machine and its recovery points, commands with no way back) is enforced regardless. The circuit breaker's trips and resumes are now recorded events, and `termaxa replay --against-record` says whether every command in an agent's transcripts actually reached the gate.
+
+### Observe mode (#130)
+
+- `mode: observe` in `.termaxa/policy.yaml`, or `TERMAXA_MODE=observe` on one machine. The default stays `enforce`. In both the hook and `termaxa run`.
+- Outside the floor, an ask or deny runs after its insurance and is recorded as the verdict enforcement would have given, with `enforced: false` and a `coverage` of `insured`, `known-uninsured` or `unknown`. The agent sees an allow; its own prompts are what they were without Termaxa. Observed verdicts page nobody.
+- The floor: every rule marked `floor: true`, plus any command whose insurance cannot be taken at the moment it runs. The starter marks 33 of its 47 denies: the gate's own configuration and state (10), the machine and its recovery points (11), and commands with no recovery path (12). Observe mode never relaxes a floor rule. A policy that asks for observe with no floor rule is enforced instead; `doctor` says why.
+- `termaxa report` gains "Observed, not enforced": what enforcement would have asked and denied, the coverage buckets, what the floor held, and "ran with no copy". `doctor` names the mode, its source and the floor-rule count.
+- Existing policies: `init` never rewrites a policy, so a policy written before this release has no floor markers. To use observe mode, add `floor: true` to the rules you would never want relaxed (the 33 in `examples/policy.yaml` are the reference), or regenerate the starter in a fresh project and merge.
+
+### The circuit breaker resumes only by a recorded act (#126)
+
+- A trip is an event in the record, carrying the attempts that caused it, and it holds that intent for the project across sessions until `termaxa breaker resume --reason "…"` releases it, recording who, when and why before the next command is judged. `termaxa breaker status` shows what is holding; `reset` is the no-reason alias.
+- Optional `circuit_breaker.resume_after` (e.g. `24h`) releases a trip on its own, and that release writes its own line too.
+- Before: a trip was recomputed on every ask from the record's last 64 KB, so it ended silently when the session changed or enough other activity scrolled past.
+
+### replay --against-record (#127, #128, #129)
+
+- The hook leaves a witness (`logs/seen.jsonl`) as the first thing it does, before the policy loads. Record lines carry the harness's `tool_use_id` as `call_id`.
+- `termaxa replay --against-record` sorts every shell call in a wired session into judged, fired-but-unrecorded (a witness and no record line: the gate failed after it fired) or never-fired (neither: the wiring was bypassed), plus not-run (interrupted before running, per the transcript's own result). Sessions the gate never saw are counted as not wired, not accused. Exit 1 if either bypass class is non-empty.
+- The transcript reader now counts shell calls only: not files an agent wrote that mention a command; a `powershell -Command` or `bash -lc` wrapper is read as its script. The plain `replay` tally benefits too.
+
+### Also
+
+- SECURITY.md lists every published advisory with both endpoints of its exposure (first affected release and publication date, both UTC) and the days between, with the command to recompute any row.
+- Record schema: optional `call_id`, `mode`, `enforced`, `floor` and `coverage`; older lines parse unchanged. Policy schema: `mode`, `floor`, `circuit_breaker.resume_after`.
+- 540 tests.
+
 ## v0.19.6 — the option beside the one a rule was written for
 
 **In plain words:** a command allowed for reading (`sed -n`, `find`, `git diff`/`log`/`show`/`branch`, inline `node`) no longer runs without a prompt when an option makes it write a file, overwrite a branch or run a command; the file it would write is previewed and backed up first; and a push that deletes remote branches says which, instead of "nothing to push".

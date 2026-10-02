@@ -309,6 +309,34 @@ OPA decides allow/deny well. It has no execution previews, no automatic backups,
 herdr plugin install termaxa/termaxa
 ```
 
+## Observe mode (v0.20)
+
+Enforcing on day one interrupts work before anyone knows what the gate would catch. Observe mode is the other order: install it, change nothing, read what it would have caught.
+
+```yaml
+# .termaxa/policy.yaml
+mode: observe      # or TERMAXA_MODE=observe on one machine; the default is enforce
+```
+
+Every command still runs. Every verdict is recorded as what enforcement would have done, and the insurance is still taken, so a delete that would have been denied has its copy before it runs. The agent sees an allow; its own prompts are exactly what they were without Termaxa.
+
+Except for the floor. The starter marks 33 rules `floor: true`: the gate's own configuration and state, the machine and its recovery points, and commands with no recovery path (`mkfs`, `drop database`, `terraform destroy`, `find -delete`…). Those are enforced in both modes, and so is any command whose insurance cannot be taken at the moment it runs. Observe mode cannot lower the floor; editing the policy can, and the fingerprint records it.
+
+What you read, after a week:
+
+```
+Observed, not enforced
+──────────────────────────────────────────
+enforcement would have asked 14 and denied 3
+  insured             9   a copy was taken first
+  known, uninsured    5   understood, nothing could be copied
+  consequence unknown 3   the gate could not read what they change
+  held by the floor   1   denied even in observe mode
+ran with no copy: 8
+```
+
+"Ran with no copy" is the team's exposure, in a number. When it's one you can't live with, switch the mode. (Policies written before v0.20 have no floor markers; add `floor: true` to the rules you would never want relaxed, or take the 33 from `examples/policy.yaml`. A policy with no floor rule is enforced even in observe mode, and `doctor` says so.)
+
 ## Supervised mode (Unix, v0.17)
 
 Everything above runs as **you**. The hook reads the policy, decides, writes the audit log and takes backups with the same filesystem authority the agent has — which is enough for the threat model Termaxa is built for, and not enough for one specific claim: in basic mode, **the audit log is the agent's own account of itself**.
@@ -424,7 +452,9 @@ backup_failure: proceed          # deny: refuse a command whose backup could not
 | `termaxa log [-n N] [-f] [--decision D] [--source S] [--json]` | the audit trail; `-f` follows it |
 | `termaxa stats` | totals, sessions, top blocked |
 | `termaxa backups [--prune]` · `termaxa rollback <id>` | list / prune / restore backups |
-| `termaxa report [--session ID] [--all] [--days N] [--md]` | session summary + rollup |
+| `termaxa report [--session ID] [--all] [--days N] [--md]` | session summary + rollup; in observe mode, what enforcement would have done |
+| `termaxa breaker status` | the circuit breaker's standing trips for this project |
+| `termaxa breaker resume --reason "…"` | release a trip, recorded with who, when and why (`reset` needs no reason) |
 | `termaxa notify --test` | verify your webhook |
 | `termaxa paths` | where policy and state live |
 
@@ -460,7 +490,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ## Contributing
 
-Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is dependency-light Rust: ~14,600 lines of production code in `src/`, plus ~15,800 lines of tests (unit tests live beside the code they test; `tests/` holds the integration ones). More test than product, on purpose — `src/policy.rs` and `src/preview.rs` are the best places to start reading, and the test module at the bottom of each file explains what the code is defending against.
+Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is dependency-light Rust: ~15,900 lines of production code in `src/`, plus ~16,400 lines of tests (unit tests live beside the code they test; `tests/` holds the integration ones). More test than product, on purpose — `src/policy.rs` and `src/preview.rs` are the best places to start reading, and the test module at the bottom of each file explains what the code is defending against.
 
 If you can make an agent get past the gate in a way that isn't already documented above, that's the most useful contribution you can make: [open an issue](https://github.com/termaxa/termaxa/issues) or email security@termaxa.com.
 
