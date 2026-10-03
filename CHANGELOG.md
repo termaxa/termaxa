@@ -2,6 +2,20 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.20.1 — observe mode says nothing
+
+**In plain words:** v0.20.0's observe mode answered Cursor and Copilot `allow` for commands outside the floor. Copilot treats a hook's `allow` as an approval, so in Copilot, turning observe mode on skipped Copilot's own prompts. Observe mode now says nothing in every harness, which each harness treats as no opinion. Enforce mode is unchanged.
+
+### Fixed
+
+- An observed verdict is silence in every harness: no output, exit 0 (#132). Measured Oct 4, 2026 on Windows with a probe hook that answered one way per trial: Copilot CLI 1.0.83 skipped its own prompt and ran on a hook's `allow`; with no answer, Copilot prompted, and Cursor 3.21.16 decided as it would alone in each of its three auto-run modes. The floor still answers, in each harness's own shape.
+
+### Measured and documented
+
+- `docs/dialects.md` gains the table: silence, `allow`, `ask` and `deny` per harness; Cursor's per-attempt `sandbox` field and empty `cwd`; Copilot's object `toolArgs` on Windows.
+- Cursor 3.21.16's Auto-review overrides a hook's `ask` and runs the command, while Allowlist and Run Everything show the prompt; `deny` is enforced in every mode, and nothing in Cursor's payload names the mode. Copilot CLI 1.0.91 prompts on a hook's `ask` even under Allow All. SECURITY.md states the Cursor case.
+- 541 tests.
+
 ## v0.20.0 — observe mode, and what it would have caught
 
 **In plain words:** `mode: observe` lets a team install Termaxa and change nothing: every command still runs, every verdict is recorded with its insurance still taken, and `termaxa report` shows what enforcement would have asked, denied, and copied first. Only a floor of 33 rules (the gate's own files, the machine and its recovery points, commands with no way back) is enforced regardless. The circuit breaker's trips and resumes are now recorded events, and `termaxa replay --against-record` says whether every command in an agent's transcripts actually reached the gate.

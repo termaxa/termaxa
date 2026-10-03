@@ -111,6 +111,8 @@ Some of these are **architectural boundaries** — they follow from Termaxa bein
   agent and Termaxa goes quiet (`termaxa log` shows no new hook entries), suspect
   dialect drift and file an issue with a debug capture.
 
+- **In Cursor's Auto-review mode, a hook's `ask` is decided by Cursor's reviewer.** Measured Oct 4, 2026 on Cursor 3.21.16 (Windows): with the hook answering `ask`, Auto-review ran the command without a prompt, while Allowlist and Run Everything showed one ("Hook requested approval"). `deny` is enforced in every mode, and insurance is taken before an ask is answered, so under Auto-review the denies and the copies still hold; what the reviewer passes is everything Termaxa only asks about, including unread scripts. Cursor's hook payload does not say which mode is on, so the gate cannot tell. Copilot CLI (1.0.91) prompts on a hook's `ask` even under Allow All; Claude Code forces the prompt under its auto mode (above).
+
 ## Design choices that support safety
 
 - **Fail closed on policy** (unmatched → `ask`), fail open on plumbing (broken hook input → step aside).
