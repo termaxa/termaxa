@@ -149,6 +149,14 @@ pub fn run(dir: &Path) -> Result<i32> {
                 "    {}",
                 dim("restart Cursor after wiring — it caches hook config at startup")
             );
+            // Measured Oct 4, 2026 on Cursor 3.21.16: Auto-review runs a
+            // command the hook answered `ask`; Allowlist and Run Everything
+            // show the prompt. The payload does not name the mode, so the
+            // gate cannot tell; say it where the user wires Cursor up.
+            println!(
+                "    {}",
+                dim("in Cursor's Auto-review mode, Cursor's reviewer decides Termaxa's asks (denies and insurance still hold); Allowlist or Run Everything keep them")
+            );
         }
     }
 

@@ -101,8 +101,12 @@ jobs:
 
   # Opens the winget update PR on microsoft/winget-pkgs from the published
   # release, so no one runs `wingetcreate` by hand. Needs a classic PAT
-  # with `public_repo` in the WINGET_TOKEN secret (it pushes to the
-  # devdoc83/winget-pkgs fork and opens the PR); the first package
+  # with `public_repo` and `workflow` in the WINGET_TOKEN secret (it pushes
+  # to the devdoc83/winget-pkgs fork and opens the PR). `workflow` because
+  # syncing the fork carries upstream's own workflow changes, and without it
+  # the sync fails with "does not have the correct permissions to execute
+  # `UpdateRef`" (v0.20.1, Oct 3, 2026, after upstream changed its workflows
+  # the day before; rerun green once the scope was added). The first package
   # submission (#424831) took 55 days of human validation, updates are
   # auto-validated and usually merge within a day. Skipped, not failed, when
   # the token is absent, so a release never depends on it.
