@@ -1007,3 +1007,76 @@ fn observe_mode_records_what_enforcement_would_have_done() {
         "observe with no floor rule is enforced"
     );
 }
+
+/// Observe mode answers nothing, in every dialect (v0.20.1). Measured Oct 4,
+/// 2026: Copilot CLI treats a hook's `allow` as an approval and skips its
+/// own prompt, so v0.20.0's `allow` for an observed verdict widened what
+/// Copilot ran; silence leaves Cursor's and Copilot's own decision in place.
+/// The floor still answers, in each harness's own shape.
+#[cfg(unix)]
+#[test]
+fn observe_mode_is_silent_to_cursor_and_copilot_and_the_floor_still_answers() {
+    use serde_json::json;
+    let tmp = scratch("observe-silent");
+    let home = tmp.join("home");
+    let policy = concat!(
+        "version: 1\nmode: observe\ndefault: ask\nrules:\n",
+        "  - match: \"rm -rf /\"\n    action: deny\n    floor: true\n",
+        "  - match: \"*rm -rf*\"\n    action: deny\n",
+    );
+    let proj = project(&tmp, policy);
+    std::fs::create_dir_all(proj.join("sc")).unwrap();
+    std::fs::write(proj.join("sc").join("f"), "x").unwrap();
+    let p = proj.to_string_lossy().to_string();
+    let cursor = |cmd: &str| {
+        json!({"hook_event_name":"beforeShellExecution","command":cmd,"cwd":p,
+               "workspace_roots":[p],"conversation_id":"OC","sandbox":false})
+    };
+    let copilot = |cmd: &str| json!({"toolName":"powershell","toolArgs":{"command":cmd},"cwd":p,"sessionId":"OP"});
+
+    // An observed deny: nothing on stdout, exit 0, in both.
+    let c = hook(&home, &proj, &cursor("rm -rf ./sc"), &[]);
+    assert_eq!(
+        (c.stdout.trim(), c.code),
+        ("", 0),
+        "Cursor gets silence for an observed verdict"
+    );
+    let g = hook(&home, &proj, &copilot("rm -rf ./sc"), &[]);
+    assert_eq!(
+        (g.stdout.trim(), g.code),
+        ("", 0),
+        "Copilot gets silence: an allow would skip its prompt"
+    );
+
+    // The floor answers in each harness's shape.
+    let cf = hook(&home, &proj, &cursor("rm -rf /"), &[]);
+    assert!(
+        cf.stdout.contains("\"permission\":\"deny\""),
+        "{}",
+        cf.stdout
+    );
+    assert_eq!(cf.code, 2, "Cursor's deny exits 2");
+    let gf = hook(&home, &proj, &copilot("rm -rf /"), &[]);
+    assert!(
+        gf.stdout.contains("\"permissionDecision\":\"deny\""),
+        "{}",
+        gf.stdout
+    );
+    assert_eq!(
+        gf.code, 0,
+        "Copilot reads a non-zero exit as a hook error, so a deny exits 0"
+    );
+
+    // The record still says what enforcement would have done.
+    let log = project_logs(&home);
+    let observed: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["command"] == "rm -rf ./sc")
+        .collect();
+    assert_eq!(observed.len(), 2, "{log}");
+    for e in &observed {
+        assert_eq!(e["decision"], "deny");
+        assert_eq!(e["enforced"], false);
+    }
+}
