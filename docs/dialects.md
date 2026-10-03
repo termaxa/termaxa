@@ -60,7 +60,31 @@ Copilot CLI:
 
 Silence - no output, exit 0 - is the answer for an allow no rule named, and
 only where the harness documents that no output means no opinion (Claude
-Code; Codex for every allow). Cursor and Copilot always get an answer.
+Code; Codex for every allow). Cursor and Copilot always get an answer in
+enforce mode. An observed verdict (observe mode) is silence in every
+harness, measured below.
+
+## Silence, `allow` and `ask`, as measured (Oct 4, 2026, Windows)
+
+A probe hook answered each harness exactly one way per trial, keyed by a
+token in the command, and logged every call; the harness's own prompt was
+declined whenever it appeared, so a written file means it ran with no human
+yes.
+
+| | Cursor 3.21.16 | Copilot CLI 1.0.83 |
+| --- | --- | --- |
+| No output | the harness decides as it would alone: Allowlist asks, Auto-review's reviewer decides | Copilot asks |
+| `allow` | Allowlist still asks; Auto-review and Run Everything run | **Copilot skips its own prompt and runs** |
+| `ask` | asks in Allowlist and in Run Everything ("Hook requested approval"); **Auto-review's reviewer overrides it and runs** | asks in manual approval (1.0.91); under `--allow-all-tools` not yet measured |
+| `deny` | blocked | blocked |
+
+Cursor runs the hook before its own approval prompt, once per attempt, and
+says whether the attempt is sandboxed (`"sandbox": true|false`). On Windows
+its sandbox cannot enforce filesystem isolation, so every command reaches
+the unsandboxed attempt. The payload's `cwd` is empty; the project is in
+`workspace_roots`. Nothing in the payload names the auto-run mode.
+Copilot's `toolArgs` arrives as an inline object on Windows (tool
+`powershell`), which the reader has accepted since the Sep 9 capture.
 
 ## Native writes
 
@@ -98,7 +122,6 @@ it is a delete, judged by its target.
 
 ## What is not captured yet
 
-- Any harness's silence semantics beyond Claude Code and Codex.
 - Copilot CLI's file tools, if it has hookable ones.
 
 Each of those is one capture away. Send it.

@@ -1645,8 +1645,14 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // the harness decide for itself.
     //
     // Suggested by Tim Schipper.
-    let silent = is_silent(input.dialect, &decision)
-        || (observed.is_some() && matches!(input.dialect, Dialect::ClaudeCode | Dialect::Codex));
+    // An observed verdict is silence in every dialect (decision #108: observe
+    // mode never grants what the harness would not have granted by itself).
+    // Measured Oct 4, 2026 on Windows: silence leaves each harness's own
+    // decision in place (Cursor 3.21.16 in all three auto-run modes; Copilot
+    // CLI 1.0.83 still prompts), while an explicit `allow` makes Copilot
+    // skip its own prompt and run. v0.20.0 answered Cursor and Copilot
+    // `allow` here, so turning observe mode on widened what Copilot ran.
+    let silent = is_silent(input.dialect, &decision) || observed.is_some();
 
     // Codex honours exactly one PreToolUse verdict: `deny`. An `ask` is
     // "unsupported permissionDecision:ask", which fails the hook and falls
@@ -1655,24 +1661,13 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // how to proceed; the audit log records the ask the policy made.
     let codex_ask = input.dialect == Dialect::Codex && decision.action == Action::Ask;
     let permission = match decision.action {
-        _ if observed.is_some() => "allow",
         Action::Allow => "allow",
         Action::Ask if codex_ask => "deny",
         Action::Ask => "ask",
         Action::Deny => "deny",
     };
 
-    let mut reason = if let Some(would) = observed {
-        format!(
-            "[termaxa] observed, not enforced — enforcement would have {}: {}",
-            if would == Action::Deny {
-                "denied"
-            } else {
-                "asked"
-            },
-            decision.reason
-        )
-    } else if codex_ask {
+    let mut reason = if codex_ask {
         format!(
             "[termaxa] asks: {} — Codex cannot prompt from a hook, so this is refused; \
              add an allow rule to .termaxa/policy.yaml for this command, or run it yourself",

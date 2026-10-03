@@ -318,7 +318,7 @@ Enforcing on day one interrupts work before anyone knows what the gate would cat
 mode: observe      # or TERMAXA_MODE=observe on one machine; the default is enforce
 ```
 
-Every command still runs. Every verdict is recorded as what enforcement would have done, and the insurance is still taken, so a delete that would have been denied has its copy before it runs. The agent sees an allow; its own prompts are exactly what they were without Termaxa.
+Every command still runs. Every verdict is recorded as what enforcement would have done, and the insurance is still taken, so a delete that would have been denied has its copy before it runs. The hook says nothing, so the agent's own prompts are exactly what they were without Termaxa: observe mode never approves anything on the harness's behalf.
 
 Except for the floor. The starter marks 33 rules `floor: true`: the gate's own configuration and state, the machine and its recovery points, and commands with no recovery path (`mkfs`, `drop database`, `terraform destroy`, `find -delete`…). Those are enforced in both modes, and so is any command whose insurance cannot be taken at the moment it runs. Observe mode cannot lower the floor; editing the policy can, and the fingerprint records it.
 

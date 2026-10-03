@@ -20,10 +20,13 @@ Outside the floor, every command runs:
   - `unknown`: the gate could not read what the command changes (a script
     file, inline code, an unresolvable substitution).
 
-The agent sees an allow. Claude Code and Codex get silence (their own
-prompts are what they were without Termaxa); Cursor and Copilot, which need
-an answer on every call, get `allow`. Observed verdicts send no
-notifications.
+The hook says nothing: no output, exit 0, in every harness. Measured on
+Claude Code, Codex, Cursor 3.21.16 and Copilot CLI 1.0.83, silence leaves
+the harness's own decision in place, so its prompts are exactly what they
+were without Termaxa and observe mode grants nothing the harness would not
+have granted by itself. (v0.20.0 answered Cursor and Copilot `allow`
+instead, and Copilot treats a hook's `allow` as an approval: it skipped its
+own prompt. Fixed in v0.20.1.) Observed verdicts send no notifications.
 
 ## The floor
 
