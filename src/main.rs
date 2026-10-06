@@ -84,6 +84,10 @@ enum Cmd {
         /// what each one buys. Prints and verifies; never executes.
         #[arg(long = "supervised")]
         supervised: bool,
+        /// Start in observe mode: every command runs, the floor still holds,
+        /// and `termaxa report` shows what enforcement would have done
+        #[arg(long = "observe")]
+        observe: bool,
     },
     /// Check whether Termaxa is actually wired up and able to see commands
     Doctor,
@@ -252,6 +256,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             codex,
             copilot,
             supervised,
+            observe,
         } => {
             let dir = std::env::current_dir()?;
             // `--supervised` prints the setup and nothing else. It used to run
@@ -269,11 +274,11 @@ fn dispatch(cli: Cli) -> Result<i32> {
             // exist.
             if supervised {
                 if !dir.join(".termaxa").join("policy.yaml").exists() {
-                    init::run(&dir, claude_code, cursor, codex, copilot)?;
+                    init::run(&dir, claude_code, cursor, codex, copilot, observe)?;
                 }
                 init::print_supervised_setup(&dir)?;
             } else {
-                init::run(&dir, claude_code, cursor, codex, copilot)?;
+                init::run(&dir, claude_code, cursor, codex, copilot, observe)?;
             }
             Ok(0)
         }

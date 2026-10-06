@@ -331,7 +331,7 @@ herdr plugin install termaxa/termaxa
 Enforcing on day one interrupts work before anyone knows what the gate would catch. Observe mode is the other order: install it, change nothing, read what it would have caught.
 
 ```yaml
-# .termaxa/policy.yaml
+# .termaxa/policy.yaml, or `termaxa init --observe` on a new project
 mode: observe      # or TERMAXA_MODE=observe on one machine; the default is enforce
 ```
 
@@ -455,7 +455,7 @@ backup_failure: proceed          # deny: refuse a command whose backup could not
 | Command | Purpose |
 |---|---|
 | `termaxa` | what this is, and what to try next |
-| `termaxa init [--claude-code\|--codex\|--cursor\|--copilot]` | scaffold `.termaxa/`, detect tools, install the hook (one harness needs no flag) |
+| `termaxa init [--claude-code\|--codex\|--cursor\|--copilot] [--observe]` | scaffold `.termaxa/`, detect tools, install the hook (one harness needs no flag); `--observe` starts in observe mode |
 | `termaxa replay [paths…] [--all]` | judge every command in your agents' transcripts; nothing executed |
 | `termaxa replay --against-record` | hold the transcripts against this machine's record: every call in a session the gate was wired for is judged, fired-but-unrecorded (the hook's witness exists, no record line), or never-fired (no witness: the wiring was bypassed). Exit 1 if either bypass is found |
 | `termaxa demo` | the gate on a throwaway project: three checks and the record |
