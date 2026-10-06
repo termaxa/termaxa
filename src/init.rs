@@ -765,12 +765,25 @@ circuit_breaker:
 #   days: 30
 "#;
 
+/// The starter policy as `init` writes it: enforcing by default, observing
+/// when asked. Observe mode is the adoption path (install it, change nothing,
+/// read what it would have caught), and until v0.21 the only way to start
+/// there was to edit the file `init` had just written.
+pub fn starter_policy(observe: bool) -> String {
+    if observe {
+        STARTER_POLICY.replacen("\nmode: enforce\n", "\nmode: observe\n", 1)
+    } else {
+        STARTER_POLICY.to_string()
+    }
+}
+
 pub fn run(
     dir: &Path,
     write_claude_hook: bool,
     write_cursor_hook: bool,
     write_codex_hook: bool,
     write_copilot_hook: bool,
+    observe: bool,
 ) -> Result<()> {
     let termaxa_dir = dir.join(".termaxa");
     fs::create_dir_all(&termaxa_dir)?;
@@ -778,9 +791,22 @@ pub fn run(
     let policy_path = termaxa_dir.join("policy.yaml");
     if policy_path.exists() {
         println!("• .termaxa/policy.yaml already exists — leaving it untouched");
+        if observe {
+            println!(
+                "  to observe, set `mode: observe` in it (or TERMAXA_MODE=observe on this machine)"
+            );
+        }
     } else {
-        fs::write(&policy_path, STARTER_POLICY)?;
-        println!("✓ wrote .termaxa/policy.yaml (starter policy)");
+        fs::write(&policy_path, starter_policy(observe))?;
+        if observe {
+            println!("✓ wrote .termaxa/policy.yaml (starter policy, observe mode)");
+            println!(
+                "  every command runs and the floor still holds; `termaxa report` shows what \
+                 enforcement would have done. Set `mode: enforce` once you have read it."
+            );
+        } else {
+            println!("✓ wrote .termaxa/policy.yaml (starter policy)");
+        }
     }
 
     // --- record the policy fingerprint ---
@@ -1416,6 +1442,28 @@ mod tests {
         crate::resolve::EvalContext::at(std::path::Path::new("."))
     }
     use crate::testutil::{TempTree, TestEnv};
+
+    /// `init --observe` writes the same starter policy with one line changed,
+    /// and the result must be a policy the gate loads in observe mode: a
+    /// flag that wrote a weaker or an unparseable policy would be worse than
+    /// telling people to edit the file.
+    #[test]
+    fn init_observe_changes_the_mode_line_and_nothing_else() {
+        assert_eq!(starter_policy(false), STARTER_POLICY);
+        let observed = starter_policy(true);
+        let differing: Vec<(&str, &str)> = STARTER_POLICY
+            .lines()
+            .zip(observed.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(differing, vec![("mode: enforce", "mode: observe")]);
+        assert_eq!(STARTER_POLICY.lines().count(), observed.lines().count());
+        let t = TempTree::new("init-observe");
+        let path = t.path().join("policy.yaml");
+        std::fs::write(&path, &observed).expect("writable");
+        let policy = crate::policy::Policy::load(&path).expect("the observed starter must load");
+        assert!(matches!(policy.mode, crate::policy::Mode::Observe));
+    }
 
     /// `examples/policy.yaml` is the file people copy. It had drifted to 28
     /// rules against the starter's 44 — missing every broad delete deny and
