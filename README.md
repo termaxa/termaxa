@@ -140,6 +140,23 @@ $ termaxa rollback b-1783006590625
 
 Force push measures what the remote will *lose*, not just gain — and pins it to a backup branch first.
 
+The quieter way work gets lost is a discard. `git reset --hard`, `git checkout -- <paths>` and `git restore <paths>` throw away uncommitted changes, and git's reflog never had them: it keeps commits, and uncommitted work was never one. Termaxa shows what would go and snapshots it first:
+
+```console
+$ termaxa check "git reset --hard HEAD~1"
+command   git reset --hard HEAD~1
+decision  ask
+reason    no rule matched; policy default is `ask`
+context   destructive flag detected: --hard  ⚠
+
+discard impact
+  uncommitted : changes in 1 file would be discarded
+  files       : docs/notes.md
+  insurance   : snapshot them with git stash before they are discarded (automatic on run/hook)
+```
+
+The snapshot is a stash commit pinned under `refs/termaxa/backup/`, listed by `termaxa backups` and applied by `termaxa rollback <id>`. (Measured Oct 2026, 36 models: asked to "undo my last commit", 19 answered `git reset --hard HEAD~1` and lost an unrelated uncommitted edit every time.)
+
 ### 5 - What a delete actually costs
 
 Deletes are the most common destructive command and the easiest to get wrong,

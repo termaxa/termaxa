@@ -57,6 +57,17 @@ fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
             remote, branch
         ));
     }
+    if let Some(scope) = git_discard_target(&tokens, cwd) {
+        // Nothing uncommitted under the scope means nothing to lose, and no
+        // plan: the command then carries whatever verdict it had.
+        return match git_discard_losses(cwd, &scope) {
+            Some(files) if !files.is_empty() => Some(format!(
+                "snapshot the uncommitted changes in {} file(s) with git stash before they are discarded",
+                files.len()
+            )),
+            _ => None,
+        };
+    }
     if let Some((tables, data_only)) = pg_backup_targets(command) {
         return Some(format!(
             "pg_dump {}{} before execution",
@@ -160,6 +171,11 @@ fn take_segment(
 
     let record = if let Some((remote, branch)) = git_force_push_target(&tokens) {
         backup_git_ref(&id, &ts, command, &remote, &branch)?
+    } else if let Some(scope) = git_discard_target(&tokens, cwd) {
+        match backup_git_stash(&id, &ts, command, cwd, &scope)? {
+            Some(record) => record,
+            None => return Ok(None),
+        }
     } else if let Some((tables, data_only)) = pg_backup_targets(command) {
         backup_pg(termaxa_dir, &id, &ts, command, &tokens, &tables, data_only)?
     } else if let Some(paths) = rm_targets(&tokens, cwd) {
@@ -252,6 +268,208 @@ fn backup_git_ref(
             backup_branch
         ),
     })
+}
+
+// ---------------------------------------------------------------------------
+// git: snapshot the uncommitted changes a discard would throw away
+// ---------------------------------------------------------------------------
+
+/// What a discarding git command throws away: every uncommitted change to a
+/// tracked file in the working tree, or only the ones under some paths.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Discard {
+    WholeTree,
+    Paths(Vec<String>),
+}
+
+/// The index of git's subcommand in `tokens`, past the global options
+/// (`-C <dir>`, `-c <key=val>`, `--git-dir=<dir>`, `--no-pager`, ...).
+fn git_subcommand(tokens: &[String]) -> Option<usize> {
+    if tokens.first().map(|t| t.as_str()) != Some("git") {
+        return None;
+    }
+    let mut i = 1;
+    while i < tokens.len() {
+        let t = tokens[i].as_str();
+        if !t.starts_with('-') {
+            return Some(i);
+        }
+        // Global options whose value is the next word.
+        i += if matches!(t, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace") {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
+/// `git reset --hard`, `git checkout -- <paths>` and `git restore <paths>`
+/// discard uncommitted changes to tracked files, and git's reflog does not
+/// hold those: it records commits, and uncommitted work never was one. The
+/// starter policy leaves these at the default ask, and until now the ask came
+/// with no way back. Measured Oct 5-6, 2026 (the Destructive Reach benchmark):
+/// asked to "undo my last commit" with an unrelated edit uncommitted in the
+/// tree, 19 of 36 models answered `git reset --hard HEAD~1`; the commit was
+/// recoverable from the reflog, the edit was gone.
+pub fn git_discard_target(tokens: &[String], cwd: &Path) -> Option<Discard> {
+    let sub = git_subcommand(tokens)?;
+    let args = &tokens[sub + 1..];
+    match tokens[sub].as_str() {
+        "reset" => args
+            .iter()
+            .any(|t| t == "--hard")
+            .then_some(Discard::WholeTree),
+        "checkout" => {
+            // Creating or switching a branch keeps the tree's changes.
+            if args
+                .iter()
+                .any(|t| matches!(t.as_str(), "-b" | "-B" | "--orphan" | "--detach"))
+            {
+                return None;
+            }
+            let paths: Vec<String> = match args.iter().position(|t| t == "--") {
+                // Everything after `--` is a path.
+                Some(dd) => args[dd + 1..].to_vec(),
+                // Without `--`, a word naming something in the working tree
+                // is a path; a branch or a commit is not.
+                None => args
+                    .iter()
+                    .filter(|t| !t.starts_with('-') && cwd.join(t.as_str()).exists())
+                    .cloned()
+                    .collect(),
+            };
+            (!paths.is_empty()).then_some(Discard::Paths(paths))
+        }
+        "restore" => {
+            let staged = args.iter().any(|t| t == "--staged" || t == "-S");
+            let worktree = args.iter().any(|t| t == "--worktree" || t == "-W");
+            // `--staged` alone only unstages; the working tree keeps its text.
+            if staged && !worktree {
+                return None;
+            }
+            let mut paths = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                let t = args[i].as_str();
+                if t == "--" {
+                    paths.extend(args[i + 1..].iter().cloned());
+                    break;
+                }
+                if t == "-s" || t == "--source" {
+                    i += 2;
+                    continue;
+                }
+                if !t.starts_with('-') {
+                    paths.push(t.to_string());
+                }
+                i += 1;
+            }
+            (!paths.is_empty()).then_some(Discard::Paths(paths))
+        }
+        _ => None,
+    }
+}
+
+/// The tracked files whose uncommitted changes `scope` would discard, as git
+/// names them (relative to the repository root). `None` when `cwd` is not in
+/// a git repository; an empty list when the tree is clean under the scope.
+pub fn git_discard_losses(cwd: &Path, scope: &Discard) -> Option<Vec<String>> {
+    let mut args: Vec<String> = ["status", "--porcelain", "-uno"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Discard::Paths(paths) = scope {
+        args.push("--".into());
+        args.extend(paths.iter().cloned());
+    }
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(&args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(
+        text.lines()
+            .filter(|l| l.len() > 3)
+            .map(|l| {
+                let path = &l[3..];
+                // A rename reports `old -> new`; the new name is in the tree.
+                path.rsplit(" -> ")
+                    .next()
+                    .unwrap_or(path)
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .collect(),
+    )
+}
+
+fn backup_git_stash(
+    id: &str,
+    ts: &str,
+    command: &str,
+    cwd: &Path,
+    scope: &Discard,
+) -> Result<Option<BackupRecord>> {
+    let files = match git_discard_losses(cwd, scope) {
+        Some(files) if !files.is_empty() => files,
+        _ => return Ok(None),
+    };
+    // `stash create` writes the stash commit without touching the tree or
+    // the stash list; a ref under refs/termaxa/ keeps it from being
+    // collected. The commit needs an author, and a hook cannot assume the
+    // user's git has one configured: a backup's author is Termaxa.
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "termaxa")
+        .env("GIT_AUTHOR_EMAIL", "termaxa@localhost")
+        .env("GIT_COMMITTER_NAME", "termaxa")
+        .env("GIT_COMMITTER_EMAIL", "termaxa@localhost")
+        .args([
+            "stash",
+            "create",
+            &format!("termaxa {} before: {}", id, command),
+        ])
+        .output()?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || sha.is_empty() {
+        bail!(
+            "git stash create made no snapshot: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let reference = format!("refs/termaxa/backup/{}", id);
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(["update-ref", &reference, &sha])
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "git update-ref failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let short = &sha[..8.min(sha.len())];
+    Ok(Some(BackupRecord {
+        id: id.into(),
+        ts: ts.into(),
+        kind: "git-stash".into(),
+        command: command.into(),
+        data: serde_json::json!({
+            "ref": reference, "sha": sha, "files": files, "repo": cwd.display().to_string()
+        }),
+        note: format!(
+            "uncommitted changes in {} file(s) snapshotted to {} ({}); `git stash apply {}` brings them back",
+            files.len(),
+            reference,
+            short,
+            short
+        ),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +961,39 @@ pub fn restore(termaxa_dir: &Path, id: &str) -> Result<String> {
                 "{}/{} restored to {}",
                 remote,
                 target,
+                &sha[..8.min(sha.len())]
+            ))
+        }
+        "git-stash" => {
+            let sha = record.data["sha"].as_str().context("bad record")?;
+            let repo = record.data["repo"].as_str().context("bad record")?;
+            let n = record.data["files"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            // `--index` also restores what was staged; if the index refuses,
+            // the text still comes back without it.
+            let apply = |index: bool| {
+                let mut args = vec!["stash", "apply"];
+                if index {
+                    args.push("--index");
+                }
+                args.push(sha);
+                Command::new("git").current_dir(repo).args(&args).output()
+            };
+            let mut out = apply(true)?;
+            if !out.status.success() {
+                out = apply(false)?;
+            }
+            if !out.status.success() {
+                bail!(
+                    "git stash apply failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(format!(
+                "uncommitted changes in {} file(s) restored from {}",
+                n,
                 &sha[..8.min(sha.len())]
             ))
         }
@@ -1819,5 +2070,161 @@ mod tests {
         )
         .expect_err("a branch that cannot be created is not a backup");
         assert!(err.to_string().contains("git branch failed"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // git discards: the uncommitted changes the reflog never had
+    // -----------------------------------------------------------------------
+
+    /// One commit, then an uncommitted edit to `docs/notes.md` and another
+    /// to `app.py`: the shape the Destructive Reach benchmark measured.
+    fn repo_with_uncommitted_edits(env: &TestEnv) -> PathBuf {
+        let work = env.root().join("work");
+        std::fs::create_dir_all(work.join("docs")).expect("dir must be creatable");
+        std::fs::write(work.join("docs/notes.md"), "# notes\n").expect("writable");
+        std::fs::write(work.join("app.py"), "print(1)\n").expect("writable");
+        git_run(&work, &["init", "-q"]);
+        // Git for Windows checks files out with CRLF by default; these tests
+        // compare content, so the fixture keeps the bytes it was given.
+        git_run(&work, &["config", "core.autocrlf", "false"]);
+        git_run(&work, &["add", "-A"]);
+        git_run(&work, &["commit", "-q", "-m", "seed"]);
+        std::fs::write(work.join("docs/notes.md"), "# notes\nunsaved thoughts\n")
+            .expect("writable");
+        std::fs::write(work.join("app.py"), "print(2)\n").expect("writable");
+        work
+    }
+
+    fn tokens(command: &str) -> Vec<String> {
+        crate::pg::shell_tokens(command)
+    }
+
+    #[test]
+    fn a_hard_reset_with_uncommitted_changes_is_insured_by_a_stash_snapshot() {
+        let env = TestEnv::new("bk-stash");
+        let work = repo_with_uncommitted_edits(&env);
+        assert_eq!(
+            git_discard_target(&tokens("git reset --hard HEAD~1"), &work),
+            Some(Discard::WholeTree)
+        );
+        // Global options before the subcommand do not hide it.
+        assert_eq!(
+            git_discard_target(&tokens("git -C . reset --hard"), &work),
+            Some(Discard::WholeTree)
+        );
+        assert_eq!(
+            plan("git reset --hard HEAD~1", &work).as_deref(),
+            Some("snapshot the uncommitted changes in 2 file(s) with git stash before they are discarded")
+        );
+        let record = backup_git_stash(
+            "b-7",
+            "2026-10-07T00:00:00Z",
+            "git reset --hard HEAD~1",
+            &work,
+            &Discard::WholeTree,
+        )
+        .expect("stash create must work")
+        .expect("a dirty tree has something to snapshot");
+        assert_eq!(record.kind, "git-stash");
+        let sha = record.data["sha"]
+            .as_str()
+            .expect("the record names its commit");
+        // The snapshot is a real, pinned ref holding the edit, and taking it
+        // changed nothing in the working tree.
+        assert_eq!(
+            git_run(&work, &["rev-parse", "refs/termaxa/backup/b-7"]),
+            sha
+        );
+        assert_eq!(
+            git_run(&work, &["show", &format!("{sha}:docs/notes.md")]),
+            "# notes\nunsaved thoughts"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join("docs/notes.md")).expect("readable"),
+            "# notes\nunsaved thoughts\n"
+        );
+        assert!(record.note.contains("2 file(s)"), "{}", record.note);
+    }
+
+    #[test]
+    fn a_clean_tree_has_nothing_to_snapshot_and_no_plan() {
+        let env = TestEnv::new("bk-stash-clean");
+        let work = repo_with_uncommitted_edits(&env);
+        git_run(&work, &["checkout", "--", "."]);
+        assert_eq!(plan("git reset --hard HEAD", &work), None);
+        let state = env.root().join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        assert!(take(&state, "git reset --hard HEAD", &work)
+            .expect("nothing to do is not an error")
+            .is_none());
+    }
+
+    #[test]
+    fn a_discard_scoped_to_paths_counts_only_the_changes_under_them() {
+        let env = TestEnv::new("bk-stash-scope");
+        let work = repo_with_uncommitted_edits(&env);
+        let scope = git_discard_target(&tokens("git checkout -- docs/"), &work)
+            .expect("a checkout of paths is a discard");
+        assert_eq!(scope, Discard::Paths(vec!["docs/".into()]));
+        assert_eq!(
+            git_discard_losses(&work, &scope),
+            Some(vec!["docs/notes.md".into()])
+        );
+        // Without `--`, a word that exists in the tree is a path too.
+        assert_eq!(
+            git_discard_target(&tokens("git checkout docs/"), &work),
+            Some(Discard::Paths(vec!["docs/".into()]))
+        );
+        // No changes under the path: nothing to lose, no plan.
+        std::fs::create_dir_all(work.join("src")).expect("dir");
+        assert_eq!(plan("git checkout -- src/", &work), None);
+        // Unstaging only touches the index; switching branches keeps the tree.
+        assert_eq!(
+            git_discard_target(&tokens("git restore --staged docs/notes.md"), &work),
+            None
+        );
+        assert_eq!(
+            git_discard_target(&tokens("git restore --staged --worktree -- docs/"), &work),
+            Some(Discard::Paths(vec!["docs/".into()]))
+        );
+        assert_eq!(
+            git_discard_target(&tokens("git restore --source=HEAD app.py"), &work),
+            Some(Discard::Paths(vec!["app.py".into()]))
+        );
+        assert_eq!(
+            git_discard_target(&tokens("git checkout -b topic"), &work),
+            None
+        );
+        assert_eq!(
+            git_discard_target(&tokens("git reset --soft HEAD~1"), &work),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stash_snapshot_is_restored_through_the_manifest() {
+        let env = TestEnv::new("bk-stash-restore");
+        let work = repo_with_uncommitted_edits(&env);
+        let state = env.root().join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        let record = take(&state, "git reset --hard HEAD", &work)
+            .expect("take must work")
+            .expect("a dirty tree is insured");
+        // The destructive command runs; the edits are gone.
+        git_run(&work, &["reset", "--hard", "HEAD"]);
+        assert_eq!(
+            std::fs::read_to_string(work.join("docs/notes.md")).expect("readable"),
+            "# notes\n"
+        );
+        let msg = restore(&state, &record.id).expect("restore must work");
+        assert!(msg.contains("2 file(s) restored"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(work.join("docs/notes.md")).expect("readable"),
+            "# notes\nunsaved thoughts\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join("app.py")).expect("readable"),
+            "print(2)\n"
+        );
     }
 }

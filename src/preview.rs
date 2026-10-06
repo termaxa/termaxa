@@ -188,6 +188,16 @@ fn generate_one(command: &str, cwd: &std::path::Path, live: bool) -> Option<Prev
         }
         return git_push_preview(&cmd);
     }
+    // A discarding git command: what it throws away that git itself cannot
+    // bring back. `git status` is the only source, so a non-live preview has
+    // no answer.
+    if let Some(scope) = crate::backup::git_discard_target(&crate::pg::shell_tokens(command), cwd) {
+        return if live {
+            git_discard_preview(cwd, &scope)
+        } else {
+            None
+        };
+    }
     // Route by the program's file stem, not by the text. `pg::preview_for`
     // has accepted `/usr/local/pgsql/bin/psql` since v0.14.1 and has a test
     // saying so; this line never sent it one, because the normalized text
@@ -212,6 +222,39 @@ fn generate_one(command: &str, cwd: &std::path::Path, live: bool) -> Option<Prev
         }
     }
     None
+}
+
+/// The uncommitted changes a `git reset --hard`, `git checkout -- <paths>`
+/// or `git restore <paths>` would throw away. The reflog keeps commits, not
+/// these, so without the snapshot `backup` takes they are simply gone
+/// (Destructive Reach benchmark, Oct 2026: 19 of 36 models discarded an
+/// unrelated uncommitted edit this way when asked to undo a commit). A clean
+/// tree under the scope loses nothing and gets no preview.
+fn git_discard_preview(cwd: &std::path::Path, scope: &crate::backup::Discard) -> Option<Preview> {
+    let files = crate::backup::git_discard_losses(cwd, scope)?;
+    if files.is_empty() {
+        return None;
+    }
+    let n = files.len();
+    let shown: Vec<&str> = files.iter().take(6).map(|s| s.as_str()).collect();
+    let mut listed = shown.join(", ");
+    if n > shown.len() {
+        listed.push_str(&format!(" (+{} more)", n - shown.len()));
+    }
+    let plural = if n == 1 { "file" } else { "files" };
+    Some(Preview {
+        title: "discard impact".into(),
+        lines: vec![
+            format!("  uncommitted : changes in {n} {plural} would be discarded"),
+            format!("  files       : {listed}"),
+            "  insurance   : snapshot them with git stash before they are discarded (automatic on run/hook)"
+                .into(),
+        ],
+        summary: format!(
+            "discards uncommitted changes in {n} {plural} ({listed}); a snapshot is taken first"
+        ),
+        uninsurable: false,
+    })
 }
 
 /// A push that removes refs on the remote, read off its own words.
@@ -1076,6 +1119,36 @@ mod push_preview_tests {
         );
         let listed = p.lines.iter().filter(|l| l.contains("file")).count();
         assert!(listed >= 8, "all eight are shown: {:?}", p.lines);
+    }
+
+    #[test]
+    fn a_hard_reset_previews_the_uncommitted_changes_it_would_discard() {
+        let env = TestEnv::new("pv-discard");
+        let work = env.root().join("work");
+        std::fs::create_dir_all(work.join("docs")).expect("dir must be creatable");
+        std::fs::write(work.join("docs/notes.md"), "# notes\n").expect("writable");
+        git_run(&work, &["init", "-q"]);
+        git_run(&work, &["config", "core.autocrlf", "false"]);
+        git_run(&work, &["add", "-A"]);
+        git_run(&work, &["commit", "-q", "-m", "seed"]);
+        // Clean: nothing would be lost, so there is nothing to preview.
+        assert!(generate("git reset --hard HEAD", None, &work, true).is_none());
+        std::fs::write(work.join("docs/notes.md"), "# notes\nunsaved thoughts\n")
+            .expect("writable");
+        let p = generate("git reset --hard HEAD~1", None, &work, true)
+            .expect("an uncommitted edit is a discard to preview");
+        assert_eq!(p.title, "discard impact");
+        assert!(!p.uninsurable, "a stash snapshot is the insurance");
+        assert!(
+            p.lines[0].contains("1 file would be discarded"),
+            "{:?}",
+            p.lines
+        );
+        assert!(p.lines[1].contains("docs/notes.md"), "{:?}", p.lines);
+        assert!(p.lines[2].contains("git stash"), "{:?}", p.lines);
+        assert!(p.summary.contains("docs/notes.md"), "{}", p.summary);
+        // Only `git status` can answer, so a static preview has nothing to say.
+        assert!(generate("git reset --hard HEAD~1", None, &work, false).is_none());
     }
 }
 
