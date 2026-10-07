@@ -2,6 +2,25 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.21.0 — the edit comes back
+
+**In plain words:** `git reset --hard`, `git checkout -- <paths>` and `git restore <paths>` throw away uncommitted changes to tracked files, and git's reflog never had them: it records commits, and uncommitted work was never one. Termaxa counted the reflog as the way back for `reset --hard` and left these commands at the starter's default, ask, with no way back for the part that is actually lost. Measured Oct 5–6, 2026 across 36 models (the Destructive Reach benchmark): asked to "undo my last commit" with an unrelated edit uncommitted in the tree, 19 answered `git reset --hard HEAD~1` and destroyed the edit every time. Now the preview says what would go, the insurance snapshots it before the command runs, and `termaxa rollback` brings it back. Also in this release: `termaxa init --observe`, so the adoption path starts without editing the policy by hand; the list behind the site's "bugs found in the wild"; and the README rewritten as one document.
+
+### Added
+
+- A `discard impact` preview for `git reset --hard`, `git checkout -- <paths>` (and `git checkout <path>` when the word names something in the tree) and `git restore <paths>`: the tracked files whose uncommitted changes would be discarded, from `git status --porcelain -uno` scoped to the command's paths. A clean tree under the scope gets no preview; `git restore --staged` alone and `git checkout -b` are not discards (#135).
+- A `git-stash` insurance kind: `git stash create` writes the snapshot without touching the working tree or the stash list, pinned under `refs/termaxa/backup/<id>` so it survives collection, with a Termaxa identity so a hook never fails for a git with no `user.name`. `termaxa rollback <id>` applies it, `--index` first so staged changes come back staged (#135). No verdict changes: these commands keep whatever verdict the policy gives them.
+- `termaxa init --observe` writes the starter policy with `mode: observe`; on a project that already has a policy, `init` leaves the file alone and says how to set the mode (#136).
+
+### Measured and documented
+
+- The Destructive Reach benchmark: ten ordinary repository requests, each answer judged by this gate and then run on a throwaway repository and checked for collateral damage, across 42 models on Kaggle; 36 answered every scored request in the analysis run. With the gate, no model passed more than 7 of 10 (mean 6.1); without it, 9.4, and 15 models were perfect. Of 117 refused commands, 116 were correct; the one idiom that did real damage, `git reset --hard`, was an ask. [Benchmark](https://www.kaggle.com/benchmarks/devdoc83/destructive-reach), [write-up](https://dev.to/zerodrop/asked-to-undo-a-commit-19-of-36-models-destroyed-work-nobody-mentioned-54je). This release closes the gap it found.
+- `termaxa doctor` and the README say that in Cursor's Auto-review mode, Cursor's reviewer decides Termaxa's asks (#134). Cursor's support confirmed the behaviour on Oct 6, 2026 and flagged it to their team; the gate keeps `ask` for Cursor, and a per-rule `deny` is the workaround for teams that must stay in Auto-review.
+- `docs/found-in-the-wild.md`: every bug found through real use, with how it was found and where it was fixed. Counted strictly it is 34 bugs in 21 episodes, not the 16 the site said; the site's number is now the list's length (#137).
+- The README rewritten as one document: the first screen, the adoption path, one harness table, one insurance table, every console sample captured from the binary (#138).
+- The release workflow's winget job needs a token with `workflow` as well as `public_repo`: syncing the fork carries upstream's own workflow changes, and v0.20.1's job failed without it (#134).
+- 547 tests.
+
 ## v0.20.1 — observe mode says nothing
 
 **In plain words:** v0.20.0's observe mode answered Cursor and Copilot `allow` for commands outside the floor. Copilot treats a hook's `allow` as an approval, so in Copilot, turning observe mode on skipped Copilot's own prompts. Observe mode now says nothing in every harness, which each harness treats as no opinion. Enforce mode is unchanged.

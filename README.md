@@ -220,7 +220,7 @@ $ termaxa doctor
 
 Termaxa doctor
 ──────────────────────────────────────────
-✓ termaxa 0.20.1
+✓ termaxa 0.21.0
   /usr/local/bin/termaxa
 
 Policy
