@@ -2,15 +2,13 @@
 
 # 🛡 Termaxa
 
-**The agent's own prompt shows you the command it wants to run. Termaxa shows you the consequence.**
+**A gate between an AI coding agent and your shell.** Before a command runs, Termaxa shows what it would destroy, takes a backup it can restore, and asks or refuses by a policy you can read. For people running Claude Code, Codex, Cursor or Copilot CLI, alone or unattended.
 
-The files, the rows, the commit a force push would lose: previewed before anything runs, backed up first, the dangerous few blocked, and every decision in a record the agent cannot rewrite.
+**Try it in ten seconds:** [play.termaxa.com](https://play.termaxa.com) runs the real gate on a throwaway project. **Install:** `brew install termaxa/tap/termaxa` or `cargo install termaxa`.
 
-**Try it in ten seconds, nothing installed:** [play.termaxa.com](https://play.termaxa.com) runs the real gate on a throwaway project. Try to get a destructive command past it.
+<img src="https://termaxa.com/termaxa-claude-code-v2.gif" alt="A real Claude Code session with its own approvals switched off: the agent inspects scratch/, tries rm -rf ./scratch, and Termaxa's hook stops it with the reason and the 12 files it would have taken; the agent declines to route around it" width="800">
 
-<img src="https://termaxa.com/termaxa-deny.gif" alt="An agent asks to run rm -rf ./scratch; Termaxa shows the target, 12 files, the backup it took, and denies it, while the red bar of the allow/ask/deny meter lights up" width="800">
-
-Termaxa is a Rust command-line gate for the shell commands a coding agent runs: it previews the blast radius, backs up first, blocks the dangerous ones, and keeps a record the agent cannot rewrite. No model, no service, no account — a hook for Claude Code, Codex, Cursor and Copilot, or a wrapper for anything else. It's a cooperative windshield, not a sandbox.
+*A real Claude Code session, approvals off: the inspection runs, the `rm -rf` is stopped with its reason and its blast radius, and the agent declines to route around it. Recorded on Claude Code 2.1.283.*
 
 [![CI](https://github.com/termaxa/termaxa/actions/workflows/ci.yml/badge.svg)](https://github.com/termaxa/termaxa/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/termaxa/termaxa?display_name=tag)](https://github.com/termaxa/termaxa/releases)
@@ -20,29 +18,49 @@ Termaxa is a Rust command-line gate for the shell commands a coding agent runs: 
 
 ---
 
-Your AI agent wants to run `git push --force`, `DROP TABLE users`, `terraform apply`, `rm -rf`. Most of the time it's right. Sometimes it isn't. Today your only options are *supervise every command* (which defeats the point of an agent) or *trust it blindly* (which defeats your Friday).
+## The problem
 
-<div align="center">
+A coding agent runs shell commands on its own, and the damage rarely comes from a clever attack. It comes from an ordinary chore done with the most forceful spelling available: `rm -rf` for a cleanup, `--force` for a push, `reset --hard` for an undo. Your choices have been to supervise every command, which defeats the point of an agent, or to trust it blindly, which works until it doesn't.
 
-<img src="https://termaxa.com/termaxa-claude-code.gif" alt="A real Claude Code session with its own approvals switched off: it inspects scratch/ freely, tries rm -rf ./scratch, and Termaxa's hook stops it with the reason and the 12 files; the agent declines to route around it" width="800">
+It isn't a rare failure. Measured in October 2026 across 36 models: asked to *"undo my last commit"*, 19 of them ran `git reset --hard` and destroyed uncommitted work in a file nobody had mentioned ([the benchmark](https://www.kaggle.com/benchmarks/devdoc83/destructive-reach), [the write-up](https://dev.to/zerodrop/asked-to-undo-a-commit-19-of-36-models-destroyed-work-nobody-mentioned-54je)).
 
-*Inside the agent, not beside it: a real Claude Code session with its own approvals switched off. The inspection runs without a prompt; the `rm -rf` is stopped with the reason and the 12 files it would have taken, and the agent declines to route around it. Recorded on termaxa 0.19.5.*
+## What Termaxa does
 
-</div>
+Termaxa is a single Rust binary that sits in the agent's hook path, with no model, no service and no account. For every command:
 
-Termaxa is a third option: a gate the agent's commands pass through. It reads a policy you wrote, shows you what's actually about to happen, backs up what's about to change, and records everything. Hooks for **Claude Code**, **Codex**, **Cursor** and **Copilot CLI**, all live-tested; `termaxa wrap` for a harness without hooks; a standalone CLI anywhere. Running agents in [Herdr](https://herdr.dev)? `herdr plugin install termaxa/termaxa` puts the gate, the record and the reason a pane went red in the multiplexer ([the plugin](herdr-plugin/)).
+1. **Decides** by a policy in your repository: allow, ask or deny. First matching rule wins; unmatched commands ask.
+2. **Previews the consequence,** not the text: the files a delete takes, the commit a force push loses, the rows a `DROP` removes, the uncommitted edits a `reset --hard` discards.
+3. **Insures** before anything runs: copies the files, pins the ref, dumps the table, snapshots the edits, so `termaxa rollback` can undo it.
+4. **Escalates** an agent that keeps trying: a circuit breaker counts destructive *intent* across spellings and shells, and trips.
+5. **Records** every decision in an append-only, hash-chained log the agent cannot rewrite.
 
+```console
+$ termaxa check "rm -rf ./scratch"
+command   rm -rf ./scratch
+decision  deny
+rule      *rm -rf*
+reason    Recursive force delete blocked by default policy.
+context   destructive flag detected: -rf  ⚠
+
+delete impact
+  target      : /home/dev/proj/scratch
+  contains    : 12 files across 1 directory
+  insurance   : copy 1 path(s) to .termaxa/backups before deletion (automatic on run/hook)
 ```
-  Claude Code --> TERMAXA --> git . postgres . docker . terraform . your shell
-                    |
-                    +- decide    allow / ask / deny  (your policy)
-                    +- preview   commits lost, rows affected, resources destroyed
-                    +- insure    automatic backup before destructive ops
-                    +- escalate  repeated destructive intent -> auto-deny
-                    +- record    every attempt, with an execution report
-```
 
-## Quick start (5 minutes)
+*Every console sample on this page was captured from the binary on a fixture. Paths are shortened, and the doctor and report outputs are abridged.*
+
+## Why not the prompt you already have?
+
+**The agent's own prompt** shows you the command. Termaxa shows you what the command would do, and stops the dangerous few even when nobody is watching the prompt. The recording above is a session with the agent's approvals switched off.
+
+**A sandbox** contains what a command can reach. Termaxa judges what a command would destroy inside the reach you gave it: a sandbox that includes your repository lets `rm -rf ./src` through. They're complementary; use both when you need hard guarantees.
+
+**A policy engine** (OPA and friends) evaluates a string against rules. Termaxa adds the three things a string doesn't carry: the consequence, the backup, and the record. The policy is still a file in your repo, reviewable in a pull request.
+
+## Quick start
+
+The order that works: judge your past, observe your present, then enforce.
 
 **1. Install.**
 
@@ -53,48 +71,56 @@ winget install Termaxa.Termaxa       # Windows (the winget manifest can lag a re
 scoop bucket add termaxa https://github.com/termaxa/scoop-bucket && scoop install termaxa   # Windows, always current
 ```
 
-Or download the asset for your platform from [Releases](https://github.com/termaxa/termaxa/releases); every one is attested and checksummed, and the Linux one is a static musl build that runs on any distro.
+Or download the asset for your platform from [Releases](https://github.com/termaxa/termaxa/releases): every one is attested and checksummed, and the Linux one is a static musl build that runs on any distro. There is deliberately no `curl | sh` installer, because Termaxa flags that pattern as a hazard and the gate's rules apply to the gate.
 
-There is deliberately no `curl | sh` installer — Termaxa itself flags that pattern as a hazard, and the gate's rules apply to the gate. Every binary is a checksummed Release asset built by the tag-gated CI.
+**2. Judge what your agents have already run.** Nothing is installed in a project, nothing is executed:
 
 ```bash
-termaxa                       # what this is, and what to try next
-termaxa check "rm -rf /"      # works immediately — no setup, no project config
-termaxa replay                # every command your agents have run on this machine, judged; nothing executed
-termaxa replay --against-record   # did every one of those calls reach the gate? the transcript held against the record
+termaxa check "rm -rf /"      # works immediately, no setup
+termaxa replay                # every command your agents have run on this machine, judged
 ```
 
-`replay` reads the transcripts Claude Code and Codex keep under your home directory and answers the question to ask before installing a gate: how often would it have asked about your ordinary work? Every ask it lists is a rule to add or a reason it should stay an ask.
+`replay` reads the transcripts Claude Code and Codex keep under your home directory and answers the question to ask before adopting a gate: how often would it have asked about your ordinary work? Every ask it lists is a rule to add, or a reason it should stay an ask.
 
-**2. Wire up a project.**
+**3. Wire a project, in observe mode.**
 
 ```bash
 cd your-project
-termaxa init --claude-code      # writes .termaxa/policy.yaml, installs the Claude Code hook
-termaxa doctor                  # confirm it's actually wired up
+termaxa init --claude-code --observe    # or --codex, --cursor, --copilot
+termaxa doctor                          # proves the hook fires; "configured" alone is not enough
 ```
 
-**3. See it work.**
+In observe mode every command still runs, the backups are still taken, and the record fills with what enforcement *would* have done. The hook says nothing, so your agent's prompts are exactly what they were.
+
+**4. Read the report, then enforce.**
 
 ```bash
-termaxa check "git push --force origin main"
+termaxa report       # "Observed, not enforced": what would have been asked, denied, and what ran with no copy
 ```
 
-From now on, every Bash command Claude Code runs in this project passes through Termaxa first. Runtime state (logs, backups) lives in `~/.termaxa/`, safely **outside** your repo.
+When *ran with no copy* is a number you can't live with, set `mode: enforce` in `.termaxa/policy.yaml`. From then on, every shell command the agent runs in this project passes through the gate first. Runtime state (logs, backups) lives under `~/.termaxa/`, outside your repository.
 
 ## What it looks like
 
-### 1 - A destructive command can't hide behind a safe prefix
+### A compound command is judged by its worst part
 
 ```console
-$ termaxa check "git status && rm -rf /"
+$ termaxa check "git status && rm -rf ./build"
+command   git status && rm -rf ./build
 decision  deny
-reason    segment 2/2 `rm -rf /` — Recursive delete from the filesystem root is blocked.
+rule      *rm -rf*
+reason    segment 2/2 `rm -rf ./build` — Recursive force delete blocked by default policy.
+context   destructive flag detected: -rf  ⚠
+
+delete impact
+  target      : /home/dev/proj/build
+  contains    : 1 files across 1 directory
+  insurance   : copy 1 path(s) to .termaxa/backups before deletion (automatic on run/hook)
 ```
 
-Termaxa splits compound commands and judges each part. `git status &&` buys nothing.
+`&&`, `||`, `;`, `|` and a lone `&` are split and judged per segment; the most dangerous segment governs. The first live Claude Code session found `git status && <anything>` riding a `git status*` allow rule; that bypass has been a named regression test since v0.7 ([GHSA-rv66-7qcx-c45j](https://github.com/termaxa/termaxa/security/advisories/GHSA-rv66-7qcx-c45j)).
 
-### 2 - Blast radius, before you commit to it
+### Blast radius, before you commit to it
 
 ```console
 $ termaxa check "psql -d shop -c 'DROP TABLE users'"
@@ -109,11 +135,9 @@ postgres impact
   insurance : pg_dump users before execution (automatic on run/hook)
 ```
 
-Row estimates come from the planner (`pg_class.reltuples`, stale between `ANALYZE`s) — Termaxa never scans your tables.
+Row estimates come from the planner (`pg_class.reltuples`, stale between `ANALYZE`s); Termaxa never scans your tables, and the preview never executes anything of yours. It did once: the Postgres preview could run the SQL file it was analysing ([GHSA-gxg4-5fmj-534m](https://github.com/termaxa/termaxa/security/advisories/GHSA-gxg4-5fmj-534m), fixed in v0.14.1), which is why "the preview runs nothing on a denied command" is now a rule with tests.
 
-### 3 - An agent that retries can't syntax its way through
-
-An agent blocked on `rm -rf .` will often just try again with different words. Termaxa classifies the *intent*, not the spelling, and trips a per-session circuit breaker on repeat attempts:
+### An agent that retries can't syntax its way through
 
 ```console
 $ rm -rf .                        -> ask   (file-delete #1)
@@ -122,45 +146,51 @@ $ del /s /q .                     -> DENY  circuit breaker: 2 prior
                                      file-delete attempts this session
 ```
 
-Three shells, one intent, third variant auto-denied — no rule enumerated per spelling. `find -exec rm`, `xargs rm`, and `unlink` count too. Configure via `circuit_breaker:` in `policy.yaml` (on by default, threshold 2). A trip holds that intent for the whole project, across sessions, until you run `termaxa breaker resume --reason "…"` (recorded with who and why) or an optional `resume_after` expires it; `termaxa breaker status` shows what is holding.
+Three shells, one intent, third variant denied, with no rule enumerated per spelling. `find -exec rm`, `xargs rm` and `unlink` count too. The breaker is on by default (threshold 2, `circuit_breaker:` in the policy). A trip holds that intent for the whole project, across sessions, until `termaxa breaker resume --reason "…"` releases it, recorded with who and why, or an optional `resume_after` expires it. `termaxa breaker status` shows what is holding.
 
-### 4 - Destroy, then un-destroy
+### Destroy, then un-destroy
 
 ```console
-$ termaxa run -- git push --force origin main
-┌ push preview (main -> origin)
-│  ⚠ remote will LOSE 1 commit(s):
-│    ✗ 44510f1 important work
+$ termaxa run -- git reset --hard HEAD
+┌ termaxa
+│ command : git reset --hard HEAD
+│ decision: ask
+│ reason  : no rule matched; policy default is `ask`
+│ context : destructive flag detected: --hard  ⚠
+└
+┌ discard impact
+│  uncommitted : changes in 1 file would be discarded
+│  files       : docs/notes.md
+│  insurance   : snapshot them with git stash before they are discarded (automatic on run/hook)
 └
 Proceed? [y/N] y
-🛟 backup b-1783006590625 — origin/main @ 44510f1 pinned to termaxa/backup/b-1783006590625
-$ termaxa rollback b-1783006590625
-✓ origin/main restored to 44510f1
+🛟 backup b-1791356096439 — uncommitted changes in 1 file(s) snapshotted to refs/termaxa/backup/b-1791356096439 (a4136247); `git stash apply a4136247` brings them back
+HEAD is now at 35105b7 c1
+
+$ termaxa rollback b-1791356096439
+restore  : b-1791356096439 [git-stash]
+saved    : uncommitted changes in 1 file(s) snapshotted to refs/termaxa/backup/b-1791356096439 (a4136247); `git stash apply a4136247` brings them back
+insured  : git reset --hard HEAD
+Restoring writes data. Proceed? [y/N] y
+✓ uncommitted changes in 1 file(s) restored from a4136247
 ```
 
-Force push measures what the remote will *lose*, not just gain — and pins it to a backup branch first.
-
-The quieter way work gets lost is a discard. `git reset --hard`, `git checkout -- <paths>` and `git restore <paths>` throw away uncommitted changes, and git's reflog never had them: it keeps commits, and uncommitted work was never one. Termaxa shows what would go and snapshots it first:
+`git reset --hard`, `git checkout -- <paths>` and `git restore <paths>` throw away uncommitted changes, and git's reflog never had them: it keeps commits, and uncommitted work was never one. This is the idiom from the benchmark above, and the snapshot is the answer to it. A force push is the same shape at the remote, and the starter policy simply denies it:
 
 ```console
-$ termaxa check "git reset --hard HEAD~1"
-command   git reset --hard HEAD~1
-decision  ask
-reason    no rule matched; policy default is `ask`
-context   destructive flag detected: --hard  ⚠
-
-discard impact
-  uncommitted : changes in 1 file would be discarded
-  files       : docs/notes.md
-  insurance   : snapshot them with git stash before they are discarded (automatic on run/hook)
+$ termaxa check "git push --force origin main"
+decision  deny
+rule      git push*--force*
+reason    Force pushes are blocked by policy. Open a PR instead.
+context   current branch: main  ⚠
+context   destructive flag detected: --force  ⚠
 ```
 
-The snapshot is a stash commit pinned under `refs/termaxa/backup/`, listed by `termaxa backups` and applied by `termaxa rollback <id>`. (Measured Oct 2026, 36 models: asked to "undo my last commit", 19 answered `git reset --hard HEAD~1` and lost an unrelated uncommitted edit every time.)
+A project that relaxes that rule to an ask gets the push preview (the commits the remote would *lose*) and the insurance: the remote ref is pinned to a local backup branch before the push, and `rollback` pushes it back.
 
-### 5 - What a delete actually costs
+### What a delete actually costs
 
-Deletes are the most common destructive command and the easiest to get wrong,
-because a path can look correctly scoped right up until it isn't:
+Deletes are the most common destructive command and the easiest to get wrong, because a path can look correctly scoped right up until it isn't:
 
 ```console
 $ termaxa check "rm -rf /c/Users/harih"
@@ -177,44 +207,28 @@ delete impact
   ✗ insurance : too large to copy (5,000+ files) — NOT recoverable
 ```
 
-`/c/Users/harih` is Git Bash syntax for `C:\Users\harih` — a real user
-profile, not a stray directory. Termaxa resolves the path, counts what's
-actually inside it (budgeted: 5,000 files or 300ms, and it says when it
-stopped counting), flags credentials in the blast radius, and tells you
-whether a backup is even possible.
+`/c/Users/harih` is Git Bash syntax for `C:\Users\harih`, a real user profile. Termaxa resolves the path, counts what is inside it (budgeted: 5,000 files or 300 ms, and it says when it stopped counting), flags credentials in the blast radius, and says whether a backup is even possible. An ordinary in-project delete says none of that, which is the point: a warning that fires on `rm -rf ./target` is a warning nobody reads.
 
-An ordinary in-project delete says none of that, which is the point — a
-warning that fires on `rm -rf ./target` is a warning nobody reads:
+What it can't do is know what you meant. If the path has a typo in it, Termaxa faithfully reports the blast radius of the path you typed. Making that gap visible before execution is the whole contribution.
 
-```console
-$ termaxa check "rm -rf ./target"
-delete impact
-  target      : /home/you/project/target
-  contains    : 1,204 files across 38 directories
-  insurance   : copy 1 path(s) to .termaxa/backups before deletion
-```
+### After a session
 
-**What it can't do:** know what you meant. If the path has a typo in it,
-Termaxa will faithfully report the blast radius of the path you actually
-typed. Making that gap visible before execution is the whole contribution.
-
-### Is it actually wired up?
-
-The failure mode nobody warns you about: the hook is installed, the agent doesn't call it, and everything looks fine. `termaxa doctor` answers the question directly.
+The failure nobody warns you about: the hook is installed, the agent doesn't call it, and everything looks fine. `termaxa doctor` invokes the registered hook with a must-deny payload and reports whether it fired. It used to grep for the hook's name, and said "configured" in green through two sessions that ran ungated (Windows, August 13, 2026); that is why it probes now.
 
 ```console
 $ termaxa doctor
 
 Termaxa doctor
 ──────────────────────────────────────────
-✓ termaxa 0.17.0
-  /home/you/.cargo/bin/termaxa
+✓ termaxa 0.20.1
+  /usr/local/bin/termaxa
 
 Policy
-✓ /home/you/project/.termaxa/policy.yaml
-  67 rule(s), default ask
-  fingerprint 1aa53b6e0d64
-  ✓ unchanged since 2026-08-13T18:10:22Z
+✓ /home/dev/proj/.termaxa/policy.yaml
+  203 rule(s), default ask
+  enforce mode (default)
+  fingerprint 69edb158b1af
+  ✓ unchanged since 2026-10-07T06:54:22Z
 
 Agents
 ✓ Claude Code  hook configured and live
@@ -224,154 +238,60 @@ Preview support
 · psql       Postgres blast radius unavailable
 · pg_dump    Postgres backups unavailable
 · terraform  plan previews unavailable
-
-Mode
-✓ basic        everything runs as you; protection is cooperative
-
-State
-✓ /home/you/.termaxa/projects/project-4005e00d
-  3 audit entries (3 from hooks)
-  ✓ chain valid: entries 1–3
-
-──────────────────────────────────────────
-✓ Everything checks out.
-  proof is in the log: run your agent, then `termaxa report`
 ```
 
-**Configured and live** is earned, not assumed: doctor invokes the registered hook command exactly as the agent would — synthetic must-deny payload on stdin, two-second timeout — and requires a decision back. Three states: **configured and live** (it answered), **registered but NOT firing** (a registration exists, the command doesn't run — worse than absent, because it's the state that *looks* safe), and **not configured**. Until v0.15 doctor only checked that a registration existed; a hook whose path was mangled at exec failed non-blocking, two full sessions ran ungated, and doctor said "configured" in green throughout.
-
-Two honest boundaries. The probe only runs binaries named `termaxa` — a settings file arrives with a cloned repo and is untrusted input. And **live means "answered when doctor invoked it"**: if the agent's own invocation is broken on the agent's side, the probe can't see that — which is why doctor pairs it with the log. Live here plus no recent hook entries there means the agent has never reached the gate; doctor says so and points you at `TERMAXA_HOOK_DEBUG`, because agents rename their hook APIs, and when they do, the gate fails open and silent (see [Honest limitations](#honest-limitations)). Doctor is read-only, probe included: no backup, no audit entry, no notification — proven by test against the real binary.
-
-### After a session: the report
+The fingerprint is how a policy edit gets noticed: `init` records a hash, and `doctor` says when the file no longer matches it. `termaxa report` reads the record and says what happened:
 
 ```console
 $ termaxa report
 
-Session   session a3f8c21
+Session   session s1
 ──────────────────────────────────────────
-Duration            18 min
-Commands            41   ✓ 34 · ? 6 · ✗ 1
-Escalated           2
-Auto-flow           34
-Previews            4
-Backups             3
-Rollbacks           0
+Commands            10   ✓ 3 · ? 4 · ✗ 3
+Asks                4   approved 0 · declined 0 · unanswered 4
+Previews            2
+Backups             1
 
 Destructive intents
 ──────────────────────────────────────────
-file-delete         5
-db-destroy          1
-breaker trips       1
+file-delete         2
+git-destructive     2
+breaker trips       0
 
-Insight
+Observed, not enforced
 ──────────────────────────────────────────
-The breaker blocked file-delete 1 time in this scope.
-
-This often indicates:
-• generated files being cleaned
-• build/output directories
-• an agent retry loop
-
-If this work is intentional, add an explicit allow rule
-scoped to the paths involved — relaxation is deliberate.
-
-Recent events
-──────────────────────────────────────────
-? git push --force origin main
-✗ psql -d shop -c "DROP TABLE users"
-✓ cargo test
-
-Backups   : 3 — rollback available (`termaxa backups`)
-Risk      : High    (deny×3 + escalation×2 + ask×1 = 13)
-
-Last 30 days
-──────────────────────────────────────────
-Sessions        12
-Commands        341
-Decisions       ✓ 302 · ? 31 · ✗ 8
-Backups         19
-Breaker trips   3
-
-Top directories
-  api
-  crates/core
-  web
+enforcement would have asked 4 and denied 2
+  insured             1   a copy was taken first
+  known, uninsured    3   understood, nothing could be copied
+  consequence unknown 2   the gate could not read what they change
+  held by the floor   1   denied even in observe mode
+ran with no copy: 5
 ```
 
-One command, no flags: what the agent tried, what got blocked, what's recoverable — plus a 30-day view. Note that *destructive intents* and *breaker trips* are separate numbers: a legitimate `rm -rf ./build` is a classified intent, not a trip.
+Every line is a fact with a source in the audit log. The report reads the local append-only log, makes no network calls and sends no telemetry. `termaxa replay --against-record` goes one step further and holds your agents' transcripts against that log, sorting every shell call into judged, fired-but-unrecorded or never-fired. Its first run flagged nine calls as never fired; all nine were defects of its own transcript reader, each now a test. A tool that can disprove its own findings is the point of the check.
 
-Every line is a fact with a source in the audit log. Nothing invented, nothing collected: the report reads the local append-only log, makes no network calls, and sends no telemetry.
+## Harnesses
 
-## Why Termaxa?
+| Harness | Wire it | How a verdict reaches the agent | Measured on | The caveat that matters |
+|---|---|---|---|---|
+| **Claude Code** | `termaxa init --claude-code` → `.claude/settings.json` (`PreToolUse` on `Bash` and the write tools) | an ask prompts inside the agent; a deny carries the reason and the preview | 2.1.283 (the recording above) | every Bash call arrives wrapped in a preamble, which the gate reads as scaffolding |
+| **Codex CLI** | `termaxa init --codex` → `.codex/hooks.json` (`Bash` and `apply_patch`) | **deny only**: Codex rejects an explicit allow and has no ask, so an ask is a refusal with its reason; `apply_patch` is judged as the files it writes | 0.155.1 (Sep 19, 2026) | the agent reads the refusal and decides; nothing prompts you |
+| **Cursor** | `termaxa init --cursor` → `.cursor/hooks.json` (shell and file tools; `Delete` is a delete) | an ask shows "Hook requested approval" in Allowlist and Run Everything; a deny is blocked everywhere | 3.21.16 (Oct 4, 2026) | **in Auto-review mode, Cursor's reviewer overrides a hook's ask and runs the command.** Confirmed by Cursor's support, Oct 6, 2026, and flagged to their team. Use Allowlist or Run Everything with Termaxa; `doctor` says so |
+| **Copilot CLI** | `termaxa init --copilot` → `.github/hooks/hooks.json` | an ask prompts even under Allow All; a deny is blocked | 1.0.83 and 1.0.91 (Oct 4, 2026) | Copilot treats a hook's *allow* as an approval and skips its own prompt. In enforce mode that is the gate approving; in observe mode the gate stays silent, so Copilot's prompts are unchanged (v0.20.1 fixed the version that didn't) |
+| **Herdr** | `herdr plugin install termaxa/termaxa` | a pane starts the agent under the gate; the sidebar shows a refusal; the record opens beside it | see [`herdr-plugin/`](herdr-plugin/) | the plugin wires the harness it starts |
+| **Anything else** | `termaxa run -- <cmd>`, or `termaxa wrap -- <agent>` (Unix) | `run` gates one command; `wrap` shims the shells an agent resolves by name | Claude Code under `wrap`, Linux, with and without zsh | a harness that names `/bin/sh` by absolute path stays outside `wrap`; hooks are the way in |
 
-**"Claude Code already asks permission — why do I need this?"**
-
-The built-in prompt tells you the *command*. Termaxa tells you the *consequence*: 50,000 rows, 3 dependent tables, 1 commit lost. It takes the backup **before** you approve, and when it blocks something it tells the model *why*, so the agent proposes an alternative instead of retrying.
-
-**Why not a sandbox / Docker / Claude Code's `/sandbox`?**
-
-A sandbox contains damage *to the sandbox*. But your repo, your database, and your Terraform state are exactly the real things an agent must touch to be useful — and a sandbox's default write scope *is* your working directory. Containment, consequence, and recovery are three different questions: sandboxes answer the first, Termaxa answers the second and third. They're complementary — run both. ([Longer version.](https://termaxa.com/blog/claude-code-sandbox))
-
-**Why not OPA / policy engines?**
-
-OPA decides allow/deny well. It has no execution previews, no automatic backups, no rollback, and no agent-native hook. Termaxa is policy *plus* the things you actually want when an agent is holding the keyboard.
-
-## In Herdr
-
-[Herdr](https://herdr.dev) is a terminal multiplexer for running several agents at once. The plugin in [`herdr-plugin/`](herdr-plugin/) gives it three things: an action that starts Claude Code (or Codex, through its hook) in a new pane under the gate; a pane that follows the project's record live; and a watcher that puts the gate's verdict on the sidebar (`termaxa deny`, with the command and reason) and opens the record beside the agent the moment it is refused. Measured in a live Herdr 0.9.1 session; the two Herdr facts it depends on (plugin commands do not get your login PATH; a plugin pane starts in the plugin root) are in its README.
+Each harness speaks its own dialect, and dialects change: Cursor 3.11 renamed its hook events and four releases went ungated before v0.11.4. The dialects are captured, by version, in [docs/dialects.md](docs/dialects.md), and the hook **fails open** on a payload it can't read, by design, because a gate that fails closed on every harness update becomes the outage. `unrecognised: deny` in the policy flips that for unattended runs.
 
 <img src="https://termaxa.com/termaxa-herdr.gif" alt="In a multiplexer, one action starts Claude Code under the gate; the refused rm -rf shows on the sidebar as termaxa deny, and the record opens beside the agent" width="800">
 
-```bash
-herdr plugin install termaxa/termaxa
-```
+## Modes
 
-## Observe mode (v0.20)
+**Enforce** is the default: asks ask, denies deny, insurance before execution.
 
-Enforcing on day one interrupts work before anyone knows what the gate would catch. Observe mode is the other order: install it, change nothing, read what it would have caught.
+**Observe** (`mode: observe`, `termaxa init --observe`, or `TERMAXA_MODE=observe` on one machine) runs everything and records what enforcement would have done, insurance included. The hook stays silent, so the agent's own prompts are unchanged. The exception is the floor: 33 starter rules marked `floor: true` are enforced in both modes, and so is any command whose insurance cannot be taken. They cover the gate's own configuration and state, the machine and its recovery points, and commands with no recovery path: `rm -rf /`, `mkfs`, `dd` to a device, shadow-copy deletion, `drop database`, database resets, `kubectl delete`, `terraform destroy`, `docker system prune`, `find -delete`. Policies written before v0.20 have no floor markers; add `floor: true` to the rules you would never relax, or take the 33 from [`examples/policy.yaml`](examples/policy.yaml). Design and measurements: [docs/observe-mode.md](docs/observe-mode.md).
 
-```yaml
-# .termaxa/policy.yaml, or `termaxa init --observe` on a new project
-mode: observe      # or TERMAXA_MODE=observe on one machine; the default is enforce
-```
-
-Every command still runs. Every verdict is recorded as what enforcement would have done, and the insurance is still taken, so a delete that would have been denied has its copy before it runs. The hook says nothing, so the agent's own prompts are exactly what they were without Termaxa: observe mode never approves anything on the harness's behalf.
-
-Except for the floor. The starter marks 33 rules `floor: true`: the gate's own configuration and state, the machine and its recovery points, and commands with no recovery path (`mkfs`, `drop database`, `terraform destroy`, `find -delete`…). Those are enforced in both modes, and so is any command whose insurance cannot be taken at the moment it runs. Observe mode cannot lower the floor; editing the policy can, and the fingerprint records it.
-
-What you read, after a week:
-
-```
-Observed, not enforced
-──────────────────────────────────────────
-enforcement would have asked 14 and denied 3
-  insured             9   a copy was taken first
-  known, uninsured    5   understood, nothing could be copied
-  consequence unknown 3   the gate could not read what they change
-  held by the floor   1   denied even in observe mode
-ran with no copy: 8
-```
-
-"Ran with no copy" is the team's exposure, in a number. When it's one you can't live with, switch the mode. (Policies written before v0.20 have no floor markers; add `floor: true` to the rules you would never want relaxed, or take the 33 from `examples/policy.yaml`. A policy with no floor rule is enforced even in observe mode, and `doctor` says so.)
-
-## Supervised mode (Unix, v0.17)
-
-Everything above runs as **you**. The hook reads the policy, decides, writes the audit log and takes backups with the same filesystem authority the agent has — which is enough for the threat model Termaxa is built for, and not enough for one specific claim: in basic mode, **the audit log is the agent's own account of itself**.
-
-Supervised mode moves the authority. A small daemon runs as you; the agent runs as a different user; the two talk over a socket:
-
-```
-  agent user                          you
-  ----------                          ---
-  claude --> termaxa hook --socket--> termaxa supervise
-                                        |
-                                        +- reads the policy
-                                        +- decides
-                                        +- takes the backup
-                                        +- writes the audit log
-```
-
-The agent's user cannot read the audit log, edit the backups, change the policy, or stop the supervisor — **not because the code refuses, but because the OS does.**
+**Supervised** (Unix) moves the authority. A daemon running as you makes every decision; the agent runs as a second account that cannot read the audit log, edit the backups, change the policy or stop the supervisor, because the operating system refuses, not the code.
 
 ```bash
 termaxa init --supervised     # prints the setup; runs none of it
@@ -379,11 +299,51 @@ termaxa supervise &           # as you
 sudo -u termaxa-agent termaxa wrap -- claude
 ```
 
-`init --supervised` prints and never executes: creating a user and chowning a directory tree need root, and a tool that asks for root to "set things up for you" is asking to be trusted with exactly the authority this mode exists to bound. `termaxa doctor` then reports what those commands actually produced.
+`init --supervised` prints and never executes: creating a user and chowning a tree need root, and a tool that asks for root to set things up is asking for exactly the authority this mode exists to bound. A boundary rig proves it with 23 assertions, each with a control leg. The first real agent session under it found that no command reached the supervisor at all; the [field report](docs/field-reports/2026-08-17-supervised-routing.md) is published with what broke, and the fix is in v0.17. Full setup, the credential trade-off and what remains untested: [docs/supervisor.md](docs/supervisor.md).
 
-**What it does not change.** This is still an enforcement layer, not an isolation layer. An agent's native file tools reach the gate only through the path rules that name them (v0.19), under a supervised gate exactly as under a basic one, and `wrap` catches a shell resolved by name — not `/bin/sh` by absolute path. What changes is who decides and who holds the record.
+**`wrap`** (Unix) is for agents without hooks: `termaxa wrap -- <agent>` shims the shells the agent resolves by name, and sets `CLAUDE_CODE_SHELL` for Claude Code, which honours it.
 
-**How well it is proved.** A boundary rig creates a second real account and has it try: 23 assertions, each with a control leg proving the operator *can* do the thing, so a refusal means "blocked" rather than "impossible for everyone". It has also run with a real agent twice — and the [field report](docs/field-reports/2026-08-17-supervised-routing.md) is published including what broke, because the first session found agent commands never reached the supervisor at all. Full setup, the credential tradeoff, and what remains untested: [docs/supervisor.md](docs/supervisor.md).
+## What it insures, and what it can't
+
+Destructive doesn't mean recoverable. Each row is what the code does; the last two are what it doesn't.
+
+| Command | Preview | Insurance, taken before execution | `rollback` |
+|---|---|---|---|
+| a delete (`rm`, `rmdir`, `Remove-Item`, `del`, `rd`; `sudo rm`, `/bin/rm`, `git -C … rm`) | target, file count, what's inside, outside-the-project and credential warnings | the paths copied under `~/.termaxa/`, within the budget (5,000 files or 300 ms); over budget, the copy is refused with the preview's words rather than silently skipped | copies them back |
+| an overwrite (a truncating redirect, `cp` onto an existing file, an option that writes a file) | what the existing file loses | the file copied | copies it back |
+| a force push, or a push that removes refs | the commits the remote would lose; which refs go | the remote ref pinned to a local backup branch | force-pushes the pinned ref back |
+| `git reset --hard`, `git checkout -- <paths>`, `git restore <paths>` | the uncommitted changes that would be discarded, by file | a stash snapshot pinned under `refs/termaxa/backup/` | applies it, staged state included |
+| `DROP`, `TRUNCATE`, `DELETE` through `psql` | rows, dependents, whether the statement even succeeds | `pg_dump` of the tables (schema and data for `DROP`, data only otherwise) | replays the dump |
+| `terraform apply` | the plan's add/change/destroy counts | the local state file copied; remote state is the backend's job | the state file, **not** the destroyed resources |
+| `terraform destroy`, `find -delete`, `docker system prune`, database resets | the floor denies them; nothing is copied first, and nothing could be | none | none |
+| a script the agent wrote (`python cleanup.py`), a deletion inside a language runtime, `git branch -D` | the gate cannot read what they change; `git branch -D` asks | none | none |
+
+## Policy
+
+`.termaxa/policy.yaml`: first match wins, `*` is a wildcard, matching is case- and whitespace-insensitive and sees through the spellings the resolver knows (`-C`, `env`, `sudo`, a variable assigned on the same line):
+
+```yaml
+version: 1
+default: ask                     # unmatched commands require approval
+mode: enforce                    # or observe
+
+rules:
+  - match: "git status*"
+    action: allow
+  - match: "git push*--force*"
+    action: deny
+    reason: "Force pushes are blocked by policy. Open a PR instead."
+  - match: "*find* -delete*"
+    action: deny
+    reason: "find -delete removes everything it matches and nothing is copied first. Delete named paths with rm instead."
+    floor: true                  # enforced even in observe mode
+
+circuit_breaker:
+  enabled: true
+  threshold: 2
+```
+
+The starter `init` writes has 203 rules: 141 allow, 14 ask, 48 deny, 33 of them floor. Native file tools (Claude Code's `Write`, Cursor's `Delete`, Codex's `apply_patch`) are judged by their target through the same path rules, and the gate's own files are protected by rules you can read but the agent cannot rewrite unnoticed: `doctor` reports the fingerprint. `unrecognised: deny` and `backup_failure: deny` are the two switches for unattended runs.
 
 ## Architecture
 
@@ -411,57 +371,20 @@ sudo -u termaxa-agent termaxa wrap -- claude
         +---------------------------------------------------+
 ```
 
-Six engines, one binary. Policy is in-repo (`.termaxa/policy.yaml`, reviewable in PRs); logs and backups live in `~/.termaxa/` where no `git` operation can touch them.
-
-## Policy
-
-`.termaxa/policy.yaml` — first match wins, `*` is a wildcard, matching is case- and whitespace-insensitive:
-
-```yaml
-version: 1
-default: ask                     # unmatched commands require approval
-
-rules:
-  - match: "git status*"
-    action: allow
-  - match: "git push*--force*"
-    action: ask
-    reason: "Force push — remote history will be overwritten."
-  - match: "*drop table*"
-    action: deny
-    reason: "DROP TABLE is blocked. Archive or rename instead."
-
-  # match_path matches the RESOLVED target, not the spelling. `> .env` and
-  # `> ./.env` are one file, and a rule needs only one of the two matchers.
-  - match_path: "*/.env"
-    action: deny
-    reason: "Overwriting .env destroys credentials that are not in the repo."
-
-circuit_breaker:                 # optional (on by default)
-  enabled: true
-  threshold: 2                   # trip on the 3rd repeated destructive attempt
-
-notify:                          # optional
-  webhook: https://hooks.slack.com/services/...
-  on: [deny, ask]
-
-# Both default to the cooperative choice; set them for unattended runs.
-unrecognised: allow              # deny: refuse a shell event the hook cannot read
-backup_failure: proceed          # deny: refuse a command whose backup could not be taken
-```
+Six engines, one binary. Policy is in-repo and reviewable in pull requests; logs and backups live under `~/.termaxa/`, where no `git` operation can touch them.
 
 ## Command reference
 
 | Command | Purpose |
 |---|---|
 | `termaxa` | what this is, and what to try next |
-| `termaxa init [--claude-code\|--codex\|--cursor\|--copilot] [--observe]` | scaffold `.termaxa/`, detect tools, install the hook (one harness needs no flag); `--observe` starts in observe mode |
+| `termaxa init [--claude-code\|--codex\|--cursor\|--copilot] [--observe]` | scaffold `.termaxa/`, detect tools, install the hook; `--observe` starts in observe mode |
 | `termaxa replay [paths…] [--all]` | judge every command in your agents' transcripts; nothing executed |
-| `termaxa replay --against-record` | hold the transcripts against this machine's record: every call in a session the gate was wired for is judged, fired-but-unrecorded (the hook's witness exists, no record line), or never-fired (no witness: the wiring was bypassed). Exit 1 if either bypass is found |
+| `termaxa replay --against-record` | hold the transcripts against this machine's record: judged, fired-but-unrecorded, or never-fired. Exit 1 if either bypass is found |
 | `termaxa demo` | the gate on a throwaway project: three checks and the record |
 | `termaxa wrap -- <agent>` | launch an agent with shelled commands routed through the gate (Unix) |
 | `termaxa supervise` | run the decision daemon as yourself; hooks decide through it (Unix) |
-| `termaxa init --supervised` | print the supervised-mode setup — prints, never executes |
+| `termaxa init --supervised` | print the supervised-mode setup; prints, never executes |
 | `termaxa doctor` | is the gate wired up? binary, policy, agents, tools, state |
 | `termaxa check "<cmd>"` | dry-run: verdict + preview (exit 0/3/4) |
 | `termaxa run -- <cmd>` | gated execution: preview → approve → backup → run |
@@ -475,45 +398,32 @@ backup_failure: proceed          # deny: refuse a command whose backup could not
 | `termaxa notify --test` | verify your webhook |
 | `termaxa paths` | where policy and state live |
 
-Colour is on when output is a terminal and off when it isn't. `NO_COLOR`, `TERMAXA_NO_COLOR`, and `CLICOLOR_FORCE` are all respected.
+Colour is on when output is a terminal and off when it isn't. `NO_COLOR`, `TERMAXA_NO_COLOR` and `CLICOLOR_FORCE` are respected.
 
 ## Honest limitations
 
-Termaxa is pre-1.0. It's real and tested, and it is not magic. Specifically:
+Termaxa is pre-1.0. It's real and tested, and it is not magic.
 
-- **Hooks advise; they don't enforce.** Termaxa gates commands an agent submits through the Claude Code or Cursor hook. Those agents are *cooperative* — they respect a `deny` and propose an alternative, which is what makes the gate work. An agent running in full-auto mode could, in principle, retry a blocked action through a different command or shell; the circuit breaker raises the cost of that, but a hook is an *integration* point for visibility and policy, not an *enforcement* boundary. `termaxa wrap -- <agent>` (Unix, v0.16) widens this: commands the agent runs *through a shell resolved by name* pass through the gate even without a hook, though a caller naming `/bin/sh` by absolute path still does not. Claude Code is that caller — measured Sep 10, 2026, it runs `/bin/bash` by absolute path when it finds no zsh — so `wrap` sets `CLAUDE_CODE_SHELL` to its shim, which Claude Code honours; a harness that hardcodes its shell and offers no such setting stays outside — Codex is one (measured Sep 19, 2026: its login shell by absolute path, `$SHELL` ignored), and its hooks are the way in. [**Supervised mode**](#supervised-mode-unix-v017) (Unix, v0.17) goes further and moves the *authority* — but it moves who decides, not where the boundary is: an agent's native tools bypass it exactly as they bypass a basic gate. For hard guarantees today, pair Termaxa with OS-level sandboxing.
-- **In Cursor's Auto-review mode, Cursor's reviewer decides Termaxa's asks.** Measured on Cursor 3.21.16: with the hook answering `ask`, Auto-review ran the command, while Allowlist and Run Everything showed the prompt ("Hook requested approval"). Denies are enforced in every mode and insurance is taken before an ask is answered, so what Auto-review passes is what Termaxa only asks about. Cursor's hook payload doesn't say which mode is on, so the gate can't tell; with Termaxa, prefer Allowlist or Run Everything. `termaxa doctor` says so too.
-- **The gate fails open on a payload it doesn't recognise — by design, and you can turn that off.** A hook that fails closed on every harness update becomes the outage the day a harness renames an event. So a payload Termaxa can't read passes through untouched, and `termaxa doctor` and the liveness probe are how you find out it happened. (It has happened: Cursor 3.11 renamed its hook events and four releases went ungated before v0.11.4.) For unattended runs, where a stopped agent is cheaper than an ungated one, `unrecognised: deny` in the policy refuses any event that looks like a shell tool call and can't be read, and `backup_failure: deny` refuses a command whose insurance couldn't be taken instead of running it with a warning nobody is reading.
-- **Native agent tools are judged by their target, and only by their target.** Since v0.19 the write matcher's events go through the same `match_path` rules as a shell command: a rule that names the file decides, with the cost shown, insurance taken and a receipt afterwards; a file no rule names gets no decision at all. String rules and the policy default do not apply to them. Every harness's write payloads are captured and read: Claude Code's `Write`/`Edit`/`MultiEdit`/`NotebookEdit`, Codex's `apply_patch` (its file headers, v0.19.1), Cursor's `Write` and `Delete` (v0.19.2; `Delete` passed through by default until then). `docs/dialects.md` has every shape. The Cursor agent that switched to its file-delete tool in live testing and removed files Termaxa never saw is the case this was built for; OS-level isolation is still what stops an agent that is trying. A script the agent writes and then runs (`python remover.py`) is the biggest thing the gate cannot see: an ask, with no preview and no insurance.
-- **Cooperative, not a sandbox.** Termaxa governs commands that flow through the agent hook, `termaxa run`, or a `wrap`ped shell. An agent with raw, unhooked shell access is *not* contained — that needs OS-level sandboxing, a complementary layer. Supervised mode does not change this: it makes the *record* trustworthy and the *decision* privileged, and leaves the interception boundary where it was. The threat model is *agents making expensive mistakes*, not a malicious agent actively evading you.
-- **Shell parsing is good, not perfect.** It splits on `&&`, `||`, `;`, `|`
-  and a lone `&`, reads `-c` strings, `eval '…'` and git's global options as
-  what they run, and flags `$(...)` unless the policy would explicitly allow
-  what is inside it (a quoted heredoc is data). Subshells `( )` and deeply
-  nested quoting are judged conservatively, not deeply understood. A path
-  built from a variable the same command line assigns in the clear
-  (`X=/tmp/a; rm -rf $X`) resolves since v0.19; one from the caller's
-  environment (`rm -rf ~/x/$SID`) does **not** — Termaxa cannot see that
-  environment, and expanding it here would be guessing. Since v0.16 that
-  target is carried as *unresolved* rather than resolved-wrongly, which lets
-  the policy layer treat it as its own kind of risk instead of pretending to
-  know where it points.
-- **Previews are best-effort.** No database connection → static analysis only. Terraform previews shell out to `terraform plan`. Remote Terraform state is versioned by its backend, not by Termaxa.
-- **Backups have edges.** Since v0.16 delete insurance resolves the command head, so `sudo rm`, `/bin/rm`, `env rm` and (since v0.19.4) `git -C <dir> rm` are covered — but a delete expressed some other way (a script, a language runtime) is not, and a target over the preview's budget is refused by the copy with the preview's own words rather than silently uninsured. A link is copied as a link, never followed (v0.19.4). Postgres backups use `pg_dump`/`psql` and must be on your PATH. Retention since v0.19: a `retention:` key (defaults keep 50 / 30 days, both required) prunes at most one backup per insured command and all of them under `termaxa backups --prune`; every prune is a manifest record.
-- **The format may still change.** Pre-1.0 means the policy schema and CLI can shift between minor versions. Pin a release.
-- **Claude Code, Cursor, Codex and Copilot CLI are live-tested.** Claude Code and Cursor are exercised end-to-end, including the circuit breaker tripping under a real Cursor session and, since v0.19, native writes denied through the hook and Claude Code under `wrap` on Linux with and without zsh. Codex was measured live on Sep 5–6, 2026 (codex-cli 0.153.4, Windows 11) and again on Sep 19 (0.155.1, Linux, `apply_patch` and `PostToolUse` captured): a hard stop lands in Codex's own UI as "Blocked by hook" with Termaxa's reason and the blast-radius preview. Two things to know about Codex: its hooks honour exactly one PreToolUse verdict, `deny`, so under Codex an **ask is a refusal** — the reason says the gate asked and how to add an allow rule — and its "Bash" tool on Windows is PowerShell, which is why the starter allows the read-only cmdlets. Copilot CLI was measured live on Sep 9–10, 2026 (Copilot Free, Windows 11): an **ask arrives as a real prompt** with Termaxa's reason in it, a deny shows the reason, and an agent that was refused in PowerShell and tried `cmd /c rmdir /s /q` instead was refused again. Three things to know about Copilot: its shell tool on Windows is named `powershell`; it runs the hooks in `.github/hooks/*.json` first and then any in `.claude/settings.json` ("repo settings"), and a deny from the first stops the chain; and it reads a non-zero exit as a hook error, so Termaxa answers it with exit 0 and the verdict in the JSON. Write those hook files without a byte-order mark — Windows PowerShell 5.1's `Set-Content -Encoding utf8` adds one, and Copilot then ignores the file.
-- **Windows PowerShell 5.1 mangles redirected Unicode.** `termaxa report > out.txt` writes UTF-16 and garbles the box-drawing glyphs. That's the shell, not Termaxa — use PowerShell 7, or `termaxa report --md | Out-File -Encoding utf8 report.md`.
+- **Hooks advise; they don't enforce.** The agents are cooperative: they respect a deny and propose an alternative, which is what makes the gate work. An agent in full-auto mode could retry a blocked action through another command or shell; the breaker raises the cost of that, but a hook is an integration point, not an enforcement boundary. Supervised mode moves who decides, not where the boundary is. For hard guarantees, pair Termaxa with OS-level sandboxing.
+- **Cooperative, not a sandbox.** Termaxa governs commands that flow through a hook, `termaxa run` or a wrapped shell. Raw, unhooked shell access is not contained.
+- **Native tools are judged by their target only.** A `Write` to `.env` is denied; a `Write` whose content is a script that deletes things is a write. What the agent then runs is judged when it runs it.
+- **The gate fails open on a payload it doesn't recognise, by design.** `doctor` and the liveness probe are how you find out; `unrecognised: deny` is the switch for runs where a stopped agent is cheaper than an ungated one.
+- **Shell parsing is good, not perfect.** Compound commands, `-c` strings, `eval`, git's global options and same-line variables are read as what they run; `$(…)` is flagged unless the policy would allow what's inside. Subshells and deep quoting are judged conservatively. A path built from the caller's environment (`rm -rf ~/x/$SID`) is carried as *unresolved*, not guessed.
+- **Previews are best-effort.** No database connection means static analysis only; Terraform previews shell out to `terraform plan`.
+- **Backups have edges.** A delete expressed through a script or a language runtime is not insured; a target over the budget is refused rather than silently uninsured; a link is copied as a link, never followed into the tree behind it, which is the mechanism of the Sep 20, 2026 incident that deleted 48,218 live files through directory junctions.
+- **The format may still change.** Pin a release.
+- **Windows PowerShell 5.1 mangles redirected Unicode.** `termaxa report > out.txt` writes UTF-16 and garbles the box-drawing glyphs. Use PowerShell 7, or `termaxa report --md | Out-File -Encoding utf8 report.md`.
 
-See [SECURITY.md](SECURITY.md) for the full threat model.
+Every bug found in real use, with how it was found and where it was fixed, is in [docs/found-in-the-wild.md](docs/found-in-the-wild.md): 34 so far. The threat model and the published advisories are in [SECURITY.md](SECURITY.md).
 
 ## Contributing
 
-Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is dependency-light Rust: ~15,900 lines of production code in `src/`, plus ~16,400 lines of tests (unit tests live beside the code they test; `tests/` holds the integration ones). More test than product, on purpose — `src/policy.rs` and `src/preview.rs` are the best places to start reading, and the test module at the bottom of each file explains what the code is defending against.
+Rust 2021, ~15,700 lines of production code and ~17,200 of tests, 547 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
 
-If you can make an agent get past the gate in a way that isn't already documented above, that's the most useful contribution you can make: [open an issue](https://github.com/termaxa/termaxa/issues) or email security@termaxa.com.
+## Security
+
+Found a bypass? [SECURITY.md](SECURITY.md) says how to report it and what happens next; five advisories are published there, one from an outside researcher, each with its exposure window in UTC.
 
 ## License
 
-Dual-licensed under either [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
-Contributions are accepted under the same terms — dual MIT/Apache-2.0, at the
-user's option. No CLA.
+MIT or Apache-2.0, at your option.
