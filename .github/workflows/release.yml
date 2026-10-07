@@ -117,25 +117,49 @@ jobs:
     if: ${{ !contains(github.ref_name, '-') }}
     # A courtesy job, not part of the release: the assets are published by
     # the job before it, and a winget hiccup must not paint the release red.
-    continue-on-error: true
+    # `continue-on-error` lives on the steps, not the job: a job-level one
+    # keeps the workflow green but still marks the commit with a red check
+    # (v0.21.0, Oct 7, 2026); on the steps, a failure is a warning on a
+    # green job.
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
     steps:
       - name: Version without the v
         id: ver
         shell: bash
         run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      # komac itself, pinned and checksummed like everything else this
+      # project runs. Until v0.21.0 this job used the wrapper action
+      # vedantmgoyal9/winget-releaser@main, which is these same commands in
+      # a PowerShell script; on Oct 7, 2026 its action.yml became invalid
+      # ("Required property is missing: shell") on both `main` and `v2`, and
+      # the job failed at setup before any step ran. A dependency on someone
+      # else's moving branch is the wrong shape for a release job.
+      - name: Install komac
+        if: ${{ env.WINGET_TOKEN != '' }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $url = "https://github.com/russellbanks/Komac/releases/download/v2.16.0/komac-2.16.0-x86_64-pc-windows-msvc.exe"
+          Invoke-WebRequest -Uri $url -OutFile komac.exe
+          $hash = (Get-FileHash komac.exe -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "bdc45baf028f750da7519cc8a5f2eab5dfef46dfe88650eeb0d0a9bf51446e4f") { throw "komac checksum mismatch: $hash" }
       - name: Open the winget PR
         if: ${{ env.WINGET_TOKEN != '' }}
-        uses: vedantmgoyal9/winget-releaser@main
-        with:
-          identifier: Termaxa.Termaxa
-          version: ${{ steps.ver.outputs.v }}
-          release-tag: ${{ github.ref_name }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
           # The winget-pkgs fork is under the maintainer's account, not the
           # org: the default (`github.repository_owner` = termaxa) made the
           # first run fail with "Could not resolve to a Repository with the
           # name 'termaxa/winget-pkgs'" (v0.19.5, Sep 27, 2026).
-          fork-user: devdoc83
-          installers-regex: 'termaxa-windows-x86_64\.exe$'
-          token: ${{ secrets.WINGET_TOKEN }}
-        env:
-          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          KOMAC_FORK_OWNER: devdoc83
+          KOMAC_CREATED_WITH: Termaxa release workflow
+          KOMAC_CREATED_WITH_URL: https://github.com/termaxa/termaxa/blob/main/.github/workflows/release.yml
+          FORCE_HYPERLINK: "0"
+        run: |
+          $installer = "https://github.com/termaxa/termaxa/releases/download/${{ github.ref_name }}/termaxa-windows-x86_64.exe"
+          .\komac.exe sync-fork
+          .\komac.exe update Termaxa.Termaxa --version ${{ steps.ver.outputs.v }} --urls $installer --submit
+          .\komac.exe cleanup --only-merged
