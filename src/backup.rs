@@ -107,16 +107,26 @@ fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
 
 /// Local terraform state worth insuring? (Remote backends — S3 etc. — are
 /// versioned by their own backend and out of scope; we say so in the note.)
+///
+/// The command is read the way the policy and the classifier read it
+/// (`delete::tool_call`): past a wrapper, by the program's name whatever its
+/// path, and past `-chdir=`, whose directory is where the state is. Until
+/// Oct 9, 2026 only `terraform apply` written plainly was insured, so
+/// `terraform -chdir=infra apply` ran with nothing copied while its plain
+/// spelling had its state copied first.
 fn tf_state_target(tokens: &[String]) -> Option<PathBuf> {
-    let bin = tokens.first()?;
-    if bin != "terraform" && bin != "tofu" {
+    let call = crate::delete::tool_call(tokens)?;
+    if call.tool != "terraform" && call.tool != "tofu" {
         return None;
     }
-    let sub = tokens.get(1)?;
+    let sub = tokens.get(call.sub)?;
     if sub != "apply" && sub != "destroy" {
         return None;
     }
-    let state = PathBuf::from("terraform.tfstate");
+    let state = match call.chdir() {
+        Some(dir) => PathBuf::from(dir).join("terraform.tfstate"),
+        None => PathBuf::from("terraform.tfstate"),
+    };
     if state.exists() {
         Some(state)
     } else {
@@ -1451,6 +1461,46 @@ mod tests {
         std::fs::create_dir_all(&empty).expect("dir must be creatable");
         env.chdir(&empty);
         assert_eq!(tf_state_target(&tokens_of("terraform destroy")), None);
+    }
+
+    /// Oct 9, 2026: `terraform -chdir=infra apply` was read as a command
+    /// whose subcommand is `-chdir=infra`, so nothing was copied before it,
+    /// while its plain spelling had its state copied first. The state is in
+    /// the directory `-chdir=` names, and the program is read the way the
+    /// policy reads it: past a wrapper, by its name whatever its path.
+    #[test]
+    fn a_chdir_spelling_insures_the_state_in_that_directory() {
+        let mut env = TestEnv::new("bk-tfstate-chdir");
+        let work = env.root().join("work");
+        let infra = work.join("infra");
+        std::fs::create_dir_all(&infra).expect("infra dir must be creatable");
+        std::fs::write(infra.join("terraform.tfstate"), "{}").expect("state must be writable");
+        env.chdir(&work);
+
+        let expected = Some(PathBuf::from("infra").join("terraform.tfstate"));
+        for c in [
+            "terraform -chdir=infra destroy -auto-approve",
+            "terraform -chdir=infra apply",
+            "tofu -chdir=infra apply -auto-approve",
+            "/usr/local/bin/terraform -chdir=infra apply",
+            "sudo terraform -chdir=infra destroy",
+        ] {
+            assert_eq!(tf_state_target(&tokens_of(c)), expected, "{c}");
+        }
+        assert_eq!(
+            tf_state_target(&tokens_of("terraform -chdir=infra plan")),
+            None,
+            "a plan changes nothing, in any directory"
+        );
+        assert_eq!(
+            tf_state_target(&tokens_of("terraform apply")),
+            None,
+            "control: the working directory itself has no state to copy"
+        );
+        assert!(
+            plan("terraform -chdir=infra apply", &work).is_some(),
+            "the preview's insurance line agrees with what `take` copies"
+        );
     }
 
     #[test]
