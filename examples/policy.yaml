@@ -45,22 +45,36 @@ rules:
   # `termaxa doctor` fingerprints the policy for that case: what was not
   # blocked can at least be noticed.
   #
-  # Reads are denied too, except for the handful listed below, because
-  # separating reads from writes in general would mean enumerating every read
-  # command. To add one, put it in that group — NOT at the top of the file.
-  - match: "*.claude*settings*"
+  # These first five rules speak about PATHS, not spellings: they fire on a
+  # command that writes to, overwrites or removes one of the gate's own
+  # files, whatever the command is called and however the path is spelled,
+  # and they fire ahead of every string rule, so no read exception below can
+  # launder a redirect into them. Until v0.21.3 the string rules carried this
+  # alone, and `cat .termaxa/policy.yaml > .termaxa/policy.yaml` matched the
+  # gate's own `cat .termaxa*` exception: allowed, and the policy truncated.
+  # A path rule reads what the command TOUCHES, so that spelling and every
+  # other one land here. A trailing `*` component matches nothing as well as
+  # anything, so `*/.termaxa/*` is the directory too, which makes `rm -rf
+  # .termaxa` a floor rule rather than an ordinary `*rm -rf*` deny (Max
+  # Petrusenko's field report, Oct 9, 2026: `git clean -fdx` removed
+  # `.termaxa/policy.yaml`; the rule holds every delete the gate can read).
+  - match_path: "*/.termaxa/*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
+  - match_path: "*/.claude/settings*.json"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
-  - match: "*.cursor*hooks*"
+  - match_path: "*/.cursor/hooks.json"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
-  - match: "*.codex*hooks*"
+  - match_path: "*/.codex/hooks.json"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
-  - match: "*.github*hooks*"
+  - match_path: "*/.github/hooks/*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
@@ -119,12 +133,16 @@ rules:
     reason: "Overwriting an SSH private key."
     floor: true
 
-  # The policy is an in-repo artifact, reviewable in PRs, and the deny below
-  # would otherwise make that workflow impossible: `git add .termaxa/…`,
+  # The policy is an in-repo artifact, reviewable in PRs, and the denies
+  # below would otherwise make that workflow impossible: `git add .termaxa/…`,
   # `git diff .termaxa/…` and `cp .termaxa/policy.yaml backup.yaml` are all
-  # blocked by it. These exceptions give the workflow back.
+  # blocked by them. These exceptions give the workflow back, for the gate's
+  # own files and, since v0.21.3, for the hook configs: `cat
+  # .claude/settings.json` and `git diff .claude/settings.json` were denied
+  # by the rule written to stop an agent EDITING the file, which the
+  # `.termaxa` rules had an exception for and the hook-config rules did not.
   #
-  # The test for inclusion is that the `.termaxa` path can only be READ, never
+  # The test for inclusion is that the path can only be READ, never
   # written. diff/status/log/show/cat read it; add/commit stage what is
   # already on disk. `checkout`, `restore` and `config` are absent on purpose
   # — overwriting the working tree from a ref is exactly what the deny is for,
@@ -134,11 +152,13 @@ rules:
   # safe way: `cp .termaxa/policy.yaml backup.yaml` matches,
   # `cp backup.yaml .termaxa/policy.yaml` does not.
   #
-  # Position matters twice over. Above the deny, or these never fire. Below
-  # the four denies above, because a trailing `*` swallows a redirect —
-  #     cat .termaxa/policy.yaml > .claude/settings.json
+  # Position matters twice over. Above the denies, or these never fire. Below
+  # the overwrite denies above, because a trailing `*` swallows a redirect —
+  #     cat .termaxa/policy.yaml > /etc/hosts
   # matches `cat .termaxa*` too, and at the top of the file it would allow
-  # that and shadow the rule that exists to stop it.
+  # that and shadow the rule that exists to stop it. A redirect into one of
+  # the gate's own files is caught by the path rules at the top whatever
+  # the order here; `/etc`, `~/.ssh` and the keys have string rules only.
   - match: "git diff *.termaxa*"
     action: allow
   - match: "git status *.termaxa*"
@@ -155,14 +175,49 @@ rules:
     action: allow
   - match: "cp .termaxa*"
     action: allow
-  # A belt over the path rule in protect.rs for commands whose grammar the
-  # gate does not model (`sed -i`, an editor, `python -c`). Named by what
-  # they hold, because a plain `*.termaxa*` also matched the PATH line
-  # `wrap` itself injects into every shell it starts -
-  # `export PATH=~/.termaxa/shims:...` - and refused Claude Code's own
-  # startup snapshot (Sep 10, 2026). The matcher knows only `*`, so the
-  # separator is spanned by it; `shims/` with the slash is a file inside
-  # the shim directory, while `shims:` in a PATH is not.
+  - match: "cat .claude/settings*"
+    action: allow
+  - match: "git diff *.claude/settings*"
+    action: allow
+  - match: "git show *.claude/settings*"
+    action: allow
+  - match: "git add *.claude/settings*"
+    action: allow
+  - match: "cat .cursor/hooks*"
+    action: allow
+  - match: "git diff *.cursor/hooks*"
+    action: allow
+  - match: "git show *.cursor/hooks*"
+    action: allow
+  - match: "git add *.cursor/hooks*"
+    action: allow
+  - match: "cat .codex/hooks*"
+    action: allow
+  - match: "git diff *.codex/hooks*"
+    action: allow
+  - match: "git show *.codex/hooks*"
+    action: allow
+  - match: "git add *.codex/hooks*"
+    action: allow
+  - match: "cat .github/hooks*"
+    action: allow
+  - match: "git diff *.github/hooks*"
+    action: allow
+  - match: "git show *.github/hooks*"
+    action: allow
+  - match: "git add *.github/hooks*"
+    action: allow
+  # A belt over the path rules for commands whose grammar the gate does not
+  # model (`sed -i`, an editor, `python -c`): the gate's own files, then the
+  # hook configs. Reads are denied by these too, except for the reads listed
+  # above, because separating reads from writes in general would mean
+  # enumerating every read command. To add one, put it in that group — NOT
+  # at the top of the file. Named by what they hold, because a plain
+  # `*.termaxa*` also matched the PATH line `wrap` itself injects into every
+  # shell it starts - `export PATH=~/.termaxa/shims:...` - and refused Claude
+  # Code's own startup snapshot (Sep 10, 2026). The matcher knows only `*`,
+  # so the separator is spanned by it; `shims/` with the slash is a file
+  # inside the shim directory, while `shims:` in a PATH is not.
   - match: "*.termaxa*policy*"
     action: deny
     reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
@@ -182,6 +237,22 @@ rules:
   - match: "*.termaxa*shims/*"
     action: deny
     reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
+  - match: "*.claude*settings*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match: "*.cursor*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match: "*.codex*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match: "*.github*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
   # Pointing git's hook directory anywhere runs whatever is there on the
   # next commit. It used to be caught only when the target was inside

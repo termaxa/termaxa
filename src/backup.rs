@@ -80,10 +80,21 @@ fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
         ));
     }
     if let Some(paths) = rm_targets(&tokens, cwd) {
-        return Some(format!(
-            "copy {} path(s) to .termaxa/backups before deletion",
-            paths.len()
-        ));
+        // The count `take` will copy: a reproducible directory past the
+        // budget is left out there, so it is left out here.
+        let root = project_root_of(cwd);
+        let copied = paths
+            .iter()
+            .filter(|p| !skipped_as_reproducible(p, root.as_deref()))
+            .count();
+        return Some(if copied == 0 {
+            "nothing to copy — every target is rebuilt by a build".into()
+        } else {
+            format!(
+                "copy {} path(s) to .termaxa/backups before deletion",
+                copied
+            )
+        });
     }
     // Overwrites. `take` has insured these since v0.15 (#14) and `plan` never
     // mentioned them, so every preview of a truncating redirect said "no
@@ -103,6 +114,23 @@ fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
         );
     }
     None
+}
+
+/// The project root the command runs under, for the reproducible-directory
+/// reading: the directory holding `.termaxa/`, found from `cwd` the way the
+/// hook finds its policy. `None` outside any project, and then no directory
+/// is reproducible, so the budget refuses as it always has.
+fn project_root_of(cwd: &Path) -> Option<PathBuf> {
+    crate::paths::resolve_readonly(cwd)
+        .ok()
+        .and_then(|p| p.project_dir.parent().map(Path::to_path_buf))
+}
+
+/// A delete operand the copy leaves out: a directory a build rebuilds, past
+/// the budget. Under the budget it is copied like anything else, so nothing
+/// that was insured before v0.21.3 stops being insured.
+fn skipped_as_reproducible(p: &Path, root: Option<&Path>) -> bool {
+    crate::delete::reproducible_within(p, root).is_some() && crate::delete::scan_budgeted(p).capped
 }
 
 /// Local terraform state worth insuring? (Remote backends — S3 etc. — are
@@ -189,7 +217,28 @@ fn take_segment(
     } else if let Some((tables, data_only)) = pg_backup_targets(command) {
         backup_pg(termaxa_dir, &id, &ts, command, &tokens, &tables, data_only)?
     } else if let Some(paths) = rm_targets(&tokens, cwd) {
-        backup_files(termaxa_dir, &id, &ts, command, &paths)?
+        // A directory a build rebuilds, past the budget, is not copied and
+        // not a failure: the preview said "not copied" for it, and the
+        // other operands still get their copy. Before v0.21.3 the budget
+        // refused the whole take, so `rm -rf node_modules src` left `src`
+        // uninsured because of a directory nobody needed back.
+        let root = project_root_of(cwd);
+        let (skipped, copied): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .partition(|p| skipped_as_reproducible(p, root.as_deref()));
+        if copied.is_empty() {
+            return Ok(None);
+        }
+        let mut record = backup_files(termaxa_dir, &id, &ts, command, &copied)?;
+        if !skipped.is_empty() {
+            let names: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
+            record.note = format!(
+                "{}; not copied (rebuilt by a build): {}",
+                record.note,
+                names.join(", ")
+            );
+        }
+        record
     } else if let Some(state) = tf_state_target(&tokens) {
         backup_files(termaxa_dir, &id, &ts, command, &[state])?
     } else if let Some(paths) = all_overwrite_paths(redirects, &tokens, cwd) {
@@ -1793,6 +1842,78 @@ mod tests {
                     .len(),
             "the longest path written is recorded: {longest}"
         );
+    }
+
+    /// v0.21.3: a directory a build rebuilds, past the budget, is left out
+    /// of the copy rather than refusing it, and the other operands are
+    /// still copied. Before, `rm -rf node_modules src` was refused whole
+    /// for a directory nobody needed back, and `src` ran uninsured. The
+    /// reading needs a project root (the directory holding `.termaxa/`,
+    /// found from the cwd), and applies only below it.
+    #[test]
+    fn a_build_directory_past_the_budget_is_left_out_and_the_rest_is_copied() {
+        let tmp = TempTree::new("bk-rebuilt");
+        let state = tmp.dir("state");
+        let proj = tmp.dir("proj");
+        std::fs::create_dir_all(proj.join(".termaxa")).unwrap();
+        std::fs::write(
+            proj.join(".termaxa").join("policy.yaml"),
+            "version: 1\ndefault: ask\nrules: []\n",
+        )
+        .unwrap();
+        let nm = proj.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        for i in 0..5_001 {
+            std::fs::write(nm.join(format!("f{i}")), "x").unwrap();
+        }
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::write(proj.join("src").join("a.ts"), "x").unwrap();
+
+        // Alone: nothing to copy, and that is not a failure.
+        assert_eq!(
+            plan("rm -rf node_modules", &proj).as_deref(),
+            Some("nothing to copy — every target is rebuilt by a build")
+        );
+        let none = take(&state, "rm -rf node_modules", &proj).expect("not a failure");
+        assert!(none.is_none(), "nothing copied, nothing recorded: {none:?}");
+        assert!(!state.join("backups").join("manifest.jsonl").exists());
+
+        // With another operand: that one is copied, the count says one, and
+        // the record says what was left out.
+        assert_eq!(
+            plan("rm -rf node_modules src", &proj).as_deref(),
+            Some("copy 1 path(s) to .termaxa/backups before deletion")
+        );
+        let record = take(&state, "rm -rf node_modules src", &proj)
+            .expect("the copy of src succeeds")
+            .expect("src is insured");
+        let items = record.data["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(
+            items[0]["original"].as_str().unwrap().ends_with("src"),
+            "{items:?}"
+        );
+        assert!(record.note.contains("not copied"), "{}", record.note);
+        assert!(record.note.contains("node_modules"), "{}", record.note);
+
+        // Under the budget the same directory is copied like anything else.
+        let small = proj.join("dist");
+        std::fs::create_dir_all(&small).unwrap();
+        std::fs::write(small.join("a.js"), "x").unwrap();
+        let record = take(&state, "rm -rf dist", &proj)
+            .unwrap()
+            .expect("under the budget: insured");
+        assert_eq!(record.data["items"].as_array().unwrap().len(), 1);
+
+        // Outside any project the name is not read: refused as before.
+        let loose = tmp.dir("loose").join("node_modules");
+        std::fs::create_dir_all(&loose).unwrap();
+        for i in 0..5_001 {
+            std::fs::write(loose.join(format!("f{i}")), "x").unwrap();
+        }
+        let err = take(&state, "rm -rf node_modules", &tmp.dir("loose"))
+            .expect_err("no root, no reading");
+        assert!(err.to_string().contains("too large to copy"), "{err}");
     }
 
     /// The junction incident's mechanism, inside the insurance (Sep 21,

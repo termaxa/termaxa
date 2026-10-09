@@ -32,23 +32,33 @@ own prompt. Fixed in v0.20.1.) Observed verdicts send no notifications.
 
 Two things are enforced in both modes:
 
-1. Every rule marked `floor: true`. The starter marks 33 of its denies, in
+1. Every rule marked `floor: true`. The starter marks 38 of its denies, in
    three groups: the gate's own configuration and state (hook configs,
-   `.termaxa/` policy, record, backups, shims, `core.hooksPath`); the
-   machine and its recovery points (`rm -rf /`, `--no-preserve-root`,
-   `/etc`, SSH keys, shadow copies, WMI/CIM deletion); and commands whose
-   own reason says there is no recovery path (`mkfs`, `dd` to a device,
-   `drop database`, `kubectl delete`, `docker system prune`, `terraform`
-   and `tofu destroy`, `find -delete`, migration and schema resets).
+   `.termaxa/` policy, record, backups, shims, `core.hooksPath`; since
+   v0.21.3 these are path rules as well as string rules, so a write into
+   one of those files is held however the command is spelled, and reading
+   them, `cat .claude/settings.json` or `git diff .termaxa/policy.yaml`,
+   is ordinary work); the machine and its recovery points (`rm -rf /`,
+   `--no-preserve-root`, `/etc`, SSH keys, shadow copies, WMI/CIM
+   deletion); and commands whose own reason says there is no recovery path
+   (`mkfs`, `dd` to a device, `drop database`, `kubectl delete`, `docker
+   system prune`, `terraform` and `tofu destroy`, `find -delete`,
+   migration and schema resets).
 2. Any command whose insurance cannot be taken at the moment it runs: a
    delete past the copy budget, a push that deletes a ref it cannot pin, a
-   `--prune` or `--mirror` that would remove refs, a drop with no dump.
+   `--prune` or `--mirror` that would remove refs, a drop with no dump. A
+   directory a build or an install rebuilds is the exception (v0.21.3):
+   `rm -rf node_modules`, `.next`, `dist`, `build`, `out`, `target`,
+   `.venv`, `__pycache__` and their kind, inside the project root, are
+   past the budget and not a loss, so they run, recorded as
+   `known-uninsured`, with nothing copied. The same directory under any
+   other name, or outside the project, is held as before.
 
 Observe mode cannot relax either. Lowering the floor means editing the
 policy, which the fingerprint records. A policy that asks for observe but
 has no `floor: true` rule at all is enforced instead; `termaxa doctor`
 says why. Policies written before v0.20 have no markers: add `floor: true`
-to the rules you would never want relaxed, or take the 33 from
+to the rules you would never want relaxed, or take the 38 from
 `examples/policy.yaml`.
 
 ## What you read

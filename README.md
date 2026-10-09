@@ -225,7 +225,7 @@ Termaxa doctor
 
 Policy
 ✓ /home/dev/proj/.termaxa/policy.yaml
-  203 rule(s), default ask
+  224 rule(s), default ask
   enforce mode (default)
   fingerprint 69edb158b1af
   ✓ unchanged since 2026-10-07T06:54:22Z
@@ -289,7 +289,7 @@ Each harness speaks its own dialect, and dialects change: Cursor 3.11 renamed it
 
 **Enforce** is the default: asks ask, denies deny, insurance before execution.
 
-**Observe** (`mode: observe`, `termaxa init --observe`, or `TERMAXA_MODE=observe` on one machine) runs everything and records what enforcement would have done, insurance included. The hook stays silent, so the agent's own prompts are unchanged. The exception is the floor: 33 starter rules marked `floor: true` are enforced in both modes, and so is any command whose insurance cannot be taken. They cover the gate's own configuration and state, the machine and its recovery points, and commands with no recovery path: `rm -rf /`, `mkfs`, `dd` to a device, shadow-copy deletion, `drop database`, database resets, `kubectl delete`, `terraform destroy`, `docker system prune`, `find -delete`. Policies written before v0.20 have no floor markers; add `floor: true` to the rules you would never relax, or take the 33 from [`examples/policy.yaml`](examples/policy.yaml). Design and measurements: [docs/observe-mode.md](docs/observe-mode.md).
+**Observe** (`mode: observe`, `termaxa init --observe`, or `TERMAXA_MODE=observe` on one machine) runs everything and records what enforcement would have done, insurance included. The hook stays silent, so the agent's own prompts are unchanged. The exception is the floor: 38 starter rules marked `floor: true` are enforced in both modes, and so is any command whose insurance cannot be taken. They cover the gate's own configuration and state (by path since v0.21.3, so a write into `.termaxa/` or a hook config is held however it is spelled, and reading those files is ordinary work), the machine and its recovery points, and commands with no recovery path: `rm -rf /`, `mkfs`, `dd` to a device, shadow-copy deletion, `drop database`, database resets, `kubectl delete`, `terraform destroy`, `docker system prune`, `find -delete`. A delete past the copy budget is uninsurable, and so held, unless the directory is one a build rebuilds (`node_modules`, `.next`, `dist`, `target`, `.venv` and their kind, inside the project): those run in observe mode with nothing copied, because nothing in them is the only copy of anything. Policies written before v0.20 have no floor markers; add `floor: true` to the rules you would never relax, or take the 38 from [`examples/policy.yaml`](examples/policy.yaml). Design and measurements: [docs/observe-mode.md](docs/observe-mode.md).
 
 **Supervised** (Unix) moves the authority. A daemon running as you makes every decision; the agent runs as a second account that cannot read the audit log, edit the backups, change the policy or stop the supervisor, because the operating system refuses, not the code.
 
@@ -343,7 +343,7 @@ circuit_breaker:
   threshold: 2
 ```
 
-The starter `init` writes has 203 rules: 141 allow, 14 ask, 48 deny, 33 of them floor. Native file tools (Claude Code's `Write`, Cursor's `Delete`, Codex's `apply_patch`) are judged by their target through the same path rules, and the gate's own files are protected by rules you can read but the agent cannot rewrite unnoticed: `doctor` reports the fingerprint. `unrecognised: deny` and `backup_failure: deny` are the two switches for unattended runs.
+The starter `init` writes has 224 rules: 157 allow, 14 ask, 53 deny, 38 of them floor. Native file tools (Claude Code's `Write`, Cursor's `Delete`, Codex's `apply_patch`) are judged by their target through the same path rules, and the gate's own files are protected by rules you can read but the agent cannot rewrite unnoticed: `doctor` reports the fingerprint. `unrecognised: deny` and `backup_failure: deny` are the two switches for unattended runs.
 
 ## Architecture
 
@@ -410,7 +410,7 @@ Termaxa is pre-1.0. It's real and tested, and it is not magic.
 - **The gate fails open on a payload it doesn't recognise, by design.** `doctor` and the liveness probe are how you find out; `unrecognised: deny` is the switch for runs where a stopped agent is cheaper than an ungated one.
 - **Shell parsing is good, not perfect.** Compound commands, `-c` strings, `eval`, same-line variables and the global options of git, kubectl, terraform, tofu and docker are read as what they run, and a program named by its path is read by its name for deny rules; `$(…)` is flagged unless the policy would allow what's inside. Subshells and deep quoting are judged conservatively. A path built from the caller's environment (`rm -rf ~/x/$SID`) is carried as *unresolved*, not guessed.
 - **Previews are best-effort.** No database connection means static analysis only; Terraform previews shell out to `terraform plan`.
-- **Backups have edges.** A delete expressed through a script or a language runtime is not insured; a glob target (`rm -rf build/*`) is previewed as what it expands to and is not insured, because the shell expands it after the gate has looked; a target over the budget is refused rather than silently uninsured; a link is copied as a link, never followed into the tree behind it, which is the mechanism of the Sep 20, 2026 incident that deleted 48,218 live files through directory junctions.
+- **Backups have edges.** A delete expressed through a script or a language runtime is not insured; a glob target (`rm -rf build/*`) is previewed as what it expands to and is not insured, because the shell expands it after the gate has looked; a target over the budget is refused rather than silently uninsured, unless it is a directory a build rebuilds (`node_modules`, `.next`, `dist`, `target`, `.venv`, inside the project), which is left out of the copy and said so; a link is copied as a link, never followed into the tree behind it, which is the mechanism of the Sep 20, 2026 incident that deleted 48,218 live files through directory junctions.
 - **The format may still change.** Pin a release.
 - **Windows PowerShell 5.1 mangles redirected Unicode.** `termaxa report > out.txt` writes UTF-16 and garbles the box-drawing glyphs. Use PowerShell 7, or `termaxa report --md | Out-File -Encoding utf8 report.md`.
 

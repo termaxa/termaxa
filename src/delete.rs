@@ -56,6 +56,64 @@ const SENSITIVE: &[(&str, &str)] = &[
     (".netrc", "stored logins"),
 ];
 
+// Directories a build or an install rebuilds, by name, with what rebuilds
+// them. A delete of one of these past the copy budget is not a loss: nothing
+// in it is the only copy of anything, so the preview says it is not copied
+// rather than "NOT recoverable", and the command is not uninsurable. Until
+// v0.21.3 `rm -rf node_modules` read as unrecoverable (9,330 files on the
+// machine it was first measured on, #48), which made it a hard stop in
+// observe mode once the hook held uninsurable denies (v0.21.2): the one
+// delete a web project runs every week was the one a week of watching
+// would interrupt (found Oct 9, 2026, preparing Max Petrusenko's observe
+// week). The list is short on purpose and names only directories nobody
+// writes by hand; it is read only INSIDE the project root, because the name
+// alone proves nothing about a directory elsewhere (`~/target` is somebody's).
+const REPRODUCIBLE: &[(&str, &str)] = &[
+    ("node_modules", "npm, pnpm, yarn or bun install"),
+    (".next", "next build"),
+    (".nuxt", "nuxt build"),
+    (".svelte-kit", "the SvelteKit build"),
+    (".turbo", "turbo"),
+    (".parcel-cache", "parcel"),
+    (".cache", "the tool that filled it"),
+    ("dist", "the build"),
+    ("build", "the build"),
+    ("out", "the build"),
+    ("target", "cargo build"),
+    (".venv", "venv or uv sync"),
+    ("venv", "venv"),
+    ("__pycache__", "the interpreter"),
+    (".pytest_cache", "pytest"),
+    (".mypy_cache", "mypy"),
+    (".ruff_cache", "ruff"),
+    ("coverage", "the test run"),
+];
+
+/// The reproducible directory a target is, or sits inside, and what rebuilds
+/// it: `(name, rebuilt_by)`. Only inside the project root, and only for the
+/// components below it, so a project that lives under `~/build/` is not
+/// read as a build artifact. `None` elsewhere, and with no root at all.
+pub fn reproducible_within(
+    target: &Path,
+    project_root: Option<&Path>,
+) -> Option<(&'static str, &'static str)> {
+    use std::path::Component;
+    let root = project_root?;
+    let t = for_compare(target);
+    let r = for_compare(root);
+    let below = t.strip_prefix(&r).ok()?;
+    below.components().find_map(|c| match c {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy();
+            REPRODUCIBLE
+                .iter()
+                .find(|(n, _)| name.eq_ignore_ascii_case(n))
+                .copied()
+        }
+        _ => None,
+    })
+}
+
 pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Option<Preview> {
     let targets = extract_targets_detailed(command);
     if targets.is_empty() {
@@ -137,6 +195,7 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
                         shown.join(", "),
                         more
                     ));
+                    let mut rebuilt: Option<(&str, &str)> = None;
                     if let Some(parent) = resolved.parent() {
                         if is_filesystem_root(parent) {
                             lines.push("  ⚠ resolves to a FILESYSTEM ROOT".into());
@@ -144,21 +203,43 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
                         } else if is_user_profile(parent) {
                             lines.push("  ⚠ resolves to a USER PROFILE directory".into());
                             worst_first.push("resolves to a user profile".into());
+                        } else {
+                            // `rm -rf node_modules/*`: everything the glob
+                            // matches sits inside a directory an install
+                            // rebuilds, so nothing here is the only copy.
+                            rebuilt = reproducible_within(parent, project_root);
                         }
                     }
-                    lines.push(
-                        "  ✗ insurance : a glob is expanded by the shell, not by the gate — \
-                         NOT recoverable"
-                            .into(),
-                    );
                     worst_first.push("GLOB target".into());
-                    worst_first.push("NOT recoverable".into());
-                    uninsurable = true;
-                    summary_parts.push(format!(
-                        "{} — {} entries",
-                        short(raw),
-                        fmt_num(found.len())
-                    ));
+                    match rebuilt {
+                        Some((name, by)) => {
+                            lines.push(format!(
+                                "  insurance   : not copied — a glob is expanded by the shell, \
+                                 and everything it matches is inside {}, which {} rebuilds",
+                                name, by
+                            ));
+                            summary_parts.push(format!(
+                                "{} — {} entries, rebuilt by {}",
+                                short(raw),
+                                fmt_num(found.len()),
+                                by
+                            ));
+                        }
+                        None => {
+                            lines.push(
+                                "  ✗ insurance : a glob is expanded by the shell, not by the gate — \
+                                 NOT recoverable"
+                                    .into(),
+                            );
+                            worst_first.push("NOT recoverable".into());
+                            uninsurable = true;
+                            summary_parts.push(format!(
+                                "{} — {} entries",
+                                short(raw),
+                                fmt_num(found.len())
+                            ));
+                        }
+                    }
                 }
                 None => {
                     lines.push(
@@ -249,15 +330,30 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
         // is ambiguous on its own: it could mean the backup engine does not
         // cover this command, or that the target is simply too big to copy.
         // A preview whose lines are meant to be facts has to say which.
+        //
+        // Past the budget, a directory a build or an install rebuilds is the
+        // third fact: not copied, and not a loss. `rm -rf node_modules` is
+        // the delete a web project runs every week; read as "NOT
+        // recoverable" it was a hard stop in observe mode (v0.21.2).
+        let mut rebuilt: Option<(&str, &str)> = None;
         match crate::backup::plan(command, cwd) {
             Some(plan) if !scan.capped => {
                 lines.push(format!("  insurance   : {} (automatic on run/hook)", plan));
             }
-            Some(_) => {
-                lines.push(format!("  ✗ insurance : {}", too_large_to_copy()));
-                worst_first.push("NOT recoverable".into());
-                uninsurable = true;
-            }
+            Some(_) => match reproducible_within(&resolved, project_root) {
+                Some((name, by)) => {
+                    lines.push(format!(
+                        "  insurance   : not copied — {} is rebuilt by {}",
+                        name, by
+                    ));
+                    rebuilt = Some((name, by));
+                }
+                None => {
+                    lines.push(format!("  ✗ insurance : {}", too_large_to_copy()));
+                    worst_first.push("NOT recoverable".into());
+                    uninsurable = true;
+                }
+            },
             None => {
                 lines
                     .push("  ✗ insurance : no backup covers this command — NOT recoverable".into());
@@ -266,7 +362,15 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
             }
         }
 
-        summary_parts.push(format!("{} — {}", short(&display), count_str));
+        match rebuilt {
+            Some((_, by)) => summary_parts.push(format!(
+                "{} — {}, rebuilt by {}",
+                short(&display),
+                count_str,
+                by
+            )),
+            None => summary_parts.push(format!("{} — {}", short(&display), count_str)),
+        }
     }
 
     // The summary is what lands in an agent's confirmation prompt, where it
@@ -2422,6 +2526,94 @@ mod tests {
         assert!(
             has_line(&lines, "+ files (stopped counting)"),
             "the count says it stopped: {lines:?}"
+        );
+    }
+
+    /// A directory a build rebuilds, past the budget, is the third fact
+    /// (v0.21.3): not copied, and not a loss. `rm -rf node_modules` read as
+    /// "NOT recoverable", which made it the floor in observe mode. The name
+    /// is read only below the project root: the same tree with no root, or
+    /// outside it, or under any other name, is as unrecoverable as before.
+    #[test]
+    fn a_build_directory_past_the_budget_is_not_copied_and_not_a_loss() {
+        let tmp = TempTree::new("del-rebuilt");
+        let root = tmp.path().to_path_buf();
+        for name in ["node_modules", "huge"] {
+            let dir = tmp.dir(name);
+            for i in 0..(MAX_FILES + 100) {
+                std::fs::write(dir.join(format!("f{i}")), "").expect("file must be writable");
+            }
+        }
+        let nm = root.join("node_modules");
+        let cwd = root.clone();
+
+        let pv = preview_for("rm -rf node_modules", Some(&root), &cwd).expect("a preview");
+        assert!(
+            !pv.uninsurable,
+            "rebuilt by an install, not a loss: {:?}",
+            pv.lines
+        );
+        assert!(
+            has_line(&pv.lines, "not copied — node_modules is rebuilt by"),
+            "{:?}",
+            pv.lines
+        );
+        assert!(!has_line(&pv.lines, "NOT recoverable"), "{:?}", pv.lines);
+        assert!(
+            pv.summary.contains("rebuilt by"),
+            "the prompt's summary says why: {}",
+            pv.summary
+        );
+
+        // Inside it, by any spelling, including a glob the shell expands.
+        let pv = preview_for("rm -rf node_modules/*", Some(&root), &cwd).expect("a preview");
+        assert!(!pv.uninsurable, "{:?}", pv.lines);
+        assert!(has_line(&pv.lines, "inside node_modules"), "{:?}", pv.lines);
+        let pv =
+            preview_for(&format!("rm -rf {}", nm.display()), Some(&root), &cwd).expect("a preview");
+        assert!(!pv.uninsurable, "absolute spelling: {:?}", pv.lines);
+
+        // Controls: the same size under another name, no root, a root it is
+        // outside of, and a glob at the root itself.
+        let pv = preview_for("rm -rf huge", Some(&root), &cwd).expect("a preview");
+        assert!(pv.uninsurable, "a name says nothing: {:?}", pv.lines);
+        assert!(has_line(&pv.lines, "too large to copy"), "{:?}", pv.lines);
+        let pv = preview_for("rm -rf node_modules", None, &cwd).expect("a preview");
+        assert!(pv.uninsurable, "no root, no reading: {:?}", pv.lines);
+        let elsewhere = tmp.dir("elsewhere");
+        let pv = preview_for("rm -rf node_modules", Some(&elsewhere), &cwd).expect("a preview");
+        assert!(
+            pv.uninsurable,
+            "outside the root, no reading: {:?}",
+            pv.lines
+        );
+        let pv = preview_for("rm -rf ./*", Some(&root), &cwd).expect("a preview");
+        assert!(pv.uninsurable, "the root's own glob: {:?}", pv.lines);
+    }
+
+    #[test]
+    fn a_reproducible_name_is_read_only_below_the_project_root() {
+        let tmp = TempTree::new("del-rebuilt-names");
+        let root = tmp.dir("build"); // a project that LIVES under `build/`
+        let proj = root.join("proj");
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        // The component in the root is not read; the ones below it are.
+        assert_eq!(reproducible_within(&proj.join("src"), Some(&proj)), None);
+        assert_eq!(reproducible_within(&proj, Some(&proj)), None);
+        assert_eq!(
+            reproducible_within(&proj.join("node_modules").join("x"), Some(&proj)).map(|r| r.0),
+            Some("node_modules")
+        );
+        assert_eq!(
+            reproducible_within(&proj.join("apps").join("web").join(".next"), Some(&proj))
+                .map(|r| r.0),
+            Some(".next")
+        );
+        assert_eq!(reproducible_within(&proj.join("target"), None), None);
+        assert_eq!(
+            reproducible_within(&tmp.path().join("target"), Some(&proj)),
+            None,
+            "outside the root"
         );
     }
 
