@@ -220,7 +220,7 @@ $ termaxa doctor
 
 Termaxa doctor
 ──────────────────────────────────────────
-✓ termaxa 0.21.2
+✓ termaxa 0.21.3
   /usr/local/bin/termaxa
 
 Policy
@@ -418,7 +418,7 @@ Every bug found in real use, with how it was found and where it was fixed, is in
 
 ## Contributing
 
-Rust 2021, ~16,900 lines of production code and ~17,400 of tests, 558 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
+Rust 2021, ~17,200 lines of production code and ~17,700 of tests, 564 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
 
 ## Security
 
