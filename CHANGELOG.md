@@ -2,6 +2,28 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.21.1 — every spelling of kubectl, terraform and docker
+
+**In plain words:** the starter denies `kubectl delete`, `terraform destroy`, `tofu destroy` and `docker system prune` outright, and observe mode holds them as floor rules. Each rule is written for the subcommand, and a global option in front of it hid the subcommand from the rule: `kubectl -n prod delete deploy api`, `kubectl --context prod delete …` and `terraform -chdir=infra destroy` got the policy default, an ask under enforce mode, and ran under observe mode. So did a program named by its path, such as `/usr/local/bin/terraform destroy`. Found Oct 9, 2026 while answering a question on the Product Hunt launch about whether that deny can be overridden, and measured on v0.21.0 through the Claude Code hook. Every one of those spellings is now the hard stop its plain form is, in both modes.
+
+### Fixed
+
+- kubectl's, terraform's, tofu's and docker's global options before the subcommand no longer hide it from a rule (#141). The options are moved after the subcommand rather than removed, so an exception a team scopes by namespace or directory (`kubectl delete * -n staging`, placed above the deny) holds in both spellings. An option the readings do not know ends the reading, and the command keeps its default.
+- A program named by its path (`/usr/bin/kubectl`, `C:\tools\terraform.exe`) is read by its name for deny rules, as a privilege wrapper already was. An allow never admits it (#141).
+- The classifier reads the same way, so the circuit breaker counts `kubectl -n prod delete …` as infra-destroy (#141).
+- `terraform -chdir=infra apply` copies `infra/terraform.tfstate` first, and the terraform preview plans in the `-chdir` directory, so an ask written for that spelling is refused when its plan destroys something, as the plain spelling's is. Until now neither happened for any spelling but the plain one (#141).
+
+### Behaviour changes
+
+- Read-only work spelled with global options gets its plain spelling's verdict instead of the default: `kubectl -n prod get pods`, `terraform -chdir=infra plan` and `docker --context prod ps` match their allow rules. `terraform -chdir=infra apply` is the `terraform apply*` ask with its state copied, where it was the default ask with nothing copied.
+- No starter rule changed, so a project initialised on an earlier release gets all of this by upgrading the binary.
+
+### Measured and documented
+
+- SECURITY.md says which spellings a rule sees and what ends a reading (#141).
+- The README's line counts are recounted with RELEASING.md's command. v0.21.0's figures matched the test-module marker anywhere on a line, the reading RELEASING.md rules out, and put about 550 lines of production code among the tests.
+- 552 tests.
+
 ## v0.21.0 — the edit comes back
 
 **In plain words:** `git reset --hard`, `git checkout -- <paths>` and `git restore <paths>` throw away uncommitted changes to tracked files, and git's reflog never had them: it records commits, and uncommitted work was never one. Termaxa counted the reflog as the way back for `reset --hard` and left these commands at the starter's default, ask, with no way back for the part that is actually lost. Measured Oct 5–6, 2026 across 36 models (the Destructive Reach benchmark): asked to "undo my last commit" with an unrelated edit uncommitted in the tree, 19 answered `git reset --hard HEAD~1` and destroyed the edit every time. Now the preview says what would go, the insurance snapshots it before the command runs, and `termaxa rollback` brings it back. Also in this release: `termaxa init --observe`, so the adoption path starts without editing the policy by hand; the list behind the site's "bugs found in the wild"; and the README rewritten as one document.
