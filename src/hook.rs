@@ -1514,8 +1514,14 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         .matched_rule
         .as_deref()
         .is_some_and(|m| policy.is_floor_rule(m));
-    let floor_holds =
-        matches!(decision.action, Action::Deny) && (floor_rule || uninsured_escalation);
+    // The same floor `run` has had since v0.20.0: a deny the preview marks
+    // uninsurable is held too, whatever its rule. Until Oct 9, 2026 the hook
+    // held only a floor rule or an ask it had itself escalated, so an
+    // observed `rm -rf /*` (the non-floor `*rm -rf*`, over the copy budget)
+    // ran, while `run` held it and the doc said it would be held (found
+    // while fixing the `rm -r -f /` ask, Max Petrusenko's field report).
+    let floor_holds = matches!(decision.action, Action::Deny)
+        && (floor_rule || uninsured_escalation || uninsurable);
     let observed: Option<Action> = if mode == crate::policy::Mode::Observe
         && !is_probe
         && matches!(decision.action, Action::Ask | Action::Deny)

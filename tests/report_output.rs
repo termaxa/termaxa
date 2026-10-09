@@ -259,6 +259,79 @@ fn the_risk_label_is_coloured_by_its_own_severity() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Max Petrusenko's field report (Oct 9, 2026): `log` and `report` exited 0
+/// on a tampered chain; only `doctor` said "chain broken at entry N". Every
+/// reader of the record now says so, with the same sentence, and exits 1.
+/// The report carries the warning in its own text, because the markdown is
+/// what gets handed to someone; `log --json` keeps its stdout as JSON and
+/// says it on stderr.
+#[test]
+fn log_and_report_say_when_the_chain_does_not_verify() {
+    let tmp = scratch("chain");
+    let home = tmp.join("home");
+    let proj = project(&tmp);
+    for c in ["ls -la", "git status", "ls"] {
+        hook(&home, &proj, "C", c);
+    }
+    let run = |args: &[&str]| -> (i32, String, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_termaxa"))
+            .args(args)
+            .current_dir(&proj)
+            .env("TERMAXA_HOME", &home)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("the binary must be runnable");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    // Intact: exit 0, no warning anywhere.
+    let (code, out, err) = run(&["log"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!err.contains("chain broken"), "{err}");
+    let (code, out, _) = run(&["report", "--all"]);
+    assert_eq!(code, 0);
+    assert!(!out.contains("chain broken"), "{out}");
+
+    // Edit the second entry's command, hash left alone.
+    let logs = std::fs::read_dir(home.join("projects"))
+        .expect("the project state dir exists")
+        .flatten()
+        .map(|e| e.path().join("logs").join("audit.jsonl"))
+        .find(|p| p.exists())
+        .expect("an audit log");
+    let raw = std::fs::read_to_string(&logs).unwrap();
+    let mut lines: Vec<String> = raw.lines().map(String::from).collect();
+    assert!(lines[1].contains("git status"), "{}", lines[1]);
+    lines[1] = lines[1].replace("git status", "git stash");
+    std::fs::write(&logs, lines.join("\n") + "\n").unwrap();
+
+    let (code, out, err) = run(&["log"]);
+    assert_eq!(code, 1, "a broken chain is exit 1: {out}{err}");
+    assert!(err.contains("audit chain broken at entry 2"), "{err}");
+    assert!(
+        out.contains("git stash"),
+        "the record is still printed: {out}"
+    );
+    let (code, out, err) = run(&["log", "--json"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("audit chain broken at entry 2"), "{err}");
+    for l in out.lines() {
+        serde_json::from_str::<serde_json::Value>(l).expect("stdout stays JSON");
+    }
+    let (code, out, _) = run(&["report", "--all"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("audit chain broken at entry 2"), "{out}");
+    let (code, out, _) = run(&["report", "--all", "--md"]);
+    assert_eq!(code, 1);
+    assert!(
+        out.starts_with("> ⚠ audit chain broken at entry 2"),
+        "the markdown carries the warning first: {out}"
+    );
+}
+
 #[test]
 fn a_home_with_no_log_reports_no_activity() {
     let tmp = scratch("empty");

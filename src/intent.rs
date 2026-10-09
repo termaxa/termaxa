@@ -162,9 +162,13 @@ fn classify_segment_named(segment: &str) -> Option<Intent> {
         && !lc.iter().any(|t| t == "--cached");
     let lc: Vec<String> = if git_rm { lc[1..].to_vec() } else { lc };
     if delete_cmds.contains(&first) || git_rm {
+        // `--recursive` is GNU rm's long spelling of `-r`; until Oct 9,
+        // 2026 only the short cluster counted, so `rm --recursive --force x`
+        // classified as nothing and the breaker never saw it.
         let recursive = lc.iter().skip(1).any(|t| {
             t == "-recurse"
                 || t == "/s"
+                || t == "--recursive"
                 || (t.starts_with('-') && !t.starts_with("--") && t.contains('r'))
         });
         let force = lc.iter().skip(1).any(|t| {
