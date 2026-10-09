@@ -1067,6 +1067,102 @@ fn observe_mode_holds_a_deny_the_preview_marks_uninsurable() {
 }
 
 /// Observe mode answers nothing, in every dialect (v0.20.1). Measured Oct 4,
+/// A directory a build rebuilds is not the floor (v0.21.3). `rm -rf
+/// node_modules` past the copy budget read as unrecoverable, which made it
+/// a hard stop in observe mode once the hook held uninsurable denies
+/// (v0.21.2): the one delete a web project runs every week was the one a
+/// week of watching would interrupt (found Oct 9, 2026, preparing Max
+/// Petrusenko's observe week). Inside the project root it runs, recorded,
+/// with nothing copied; the same tree under any other name is still held;
+/// and a `match_path` rule marked `floor: true` holds a write to the gate's
+/// own files, which it could not before this release: `is_floor_rule`
+/// compared the bare pattern against the `path:` label the decision
+/// carries, so no path rule was ever on the floor.
+#[cfg(unix)]
+#[test]
+fn observe_mode_lets_a_build_directory_go_and_a_floor_path_rule_holds() {
+    use serde_json::json;
+    let tmp = scratch("observe-rebuilt");
+    let home = tmp.join("home");
+    let policy = concat!(
+        "version: 1\nmode: observe\ndefault: ask\nrules:\n",
+        "  - match_path: \"*/.termaxa/*\"\n    action: deny\n    floor: true\n",
+        "  - match: \"rm -rf /\"\n    action: deny\n    floor: true\n",
+        "  - match: \"*rm -rf*\"\n    action: deny\n",
+        "  - match: \"cat *\"\n    action: allow\n",
+    );
+    let proj = project(&tmp, policy);
+    // Two trees past the 5,000-file budget: one a build rebuilds, one not.
+    for dir in ["node_modules", "big"] {
+        let d = proj.join(dir);
+        for i in 0..5_100 {
+            let sub = d.join(format!("p{}", i % 50));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join(format!("f{i}")), "x").unwrap();
+        }
+    }
+    let mk = |cmd: &str| {
+        json!({"session_id":"R","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+               "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+    };
+
+    // The build directory: observed, silent, runs, nothing copied.
+    let out = hook(&home, &proj, &mk("rm -rf node_modules"), &[]);
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 0),
+        "a directory an install rebuilds is not the floor"
+    );
+    assert_eq!(backup_count(&home), 0, "and nothing was copied aside");
+
+    // The same size under another name: past the budget, unrecoverable,
+    // held.
+    let out = hook(&home, &proj, &mk("rm -rf big"), &[]);
+    assert_eq!(
+        out.code, 2,
+        "an unrecoverable delete is the floor: {}",
+        out.stdout
+    );
+    assert!(is_claude_shape(&out.stdout), "{}", out.stdout);
+
+    // A write into the gate's own files, by path rule: held, and the read
+    // the same spelling starts with is not.
+    let out = hook(
+        &home,
+        &proj,
+        &mk("cat .termaxa/policy.yaml > .termaxa/policy.yaml"),
+        &[],
+    );
+    assert_eq!(
+        out.code, 2,
+        "a floor path rule holds in observe mode: {}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("*/.termaxa/*"), "{}", out.stdout);
+    let out = hook(&home, &proj, &mk("cat .termaxa/policy.yaml"), &[]);
+    assert_eq!(out.code, 0, "reading it is ordinary work: {}", out.stdout);
+
+    let log = project_logs(&home);
+    let line = |cmd: &str| -> serde_json::Value {
+        log.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["command"] == cmd)
+            .unwrap_or_else(|| panic!("no record line for {cmd}: {log}"))
+    };
+    let ran = line("rm -rf node_modules");
+    assert_eq!(ran["decision"], "deny", "what enforcement would have done");
+    assert_eq!(ran["enforced"], false);
+    assert_eq!(ran["floor"], false);
+    assert_eq!(ran["coverage"], "known-uninsured");
+    let held = line("rm -rf big");
+    assert_eq!(held["enforced"], true);
+    assert_eq!(held["coverage"], "floor");
+    let written = line("cat .termaxa/policy.yaml > .termaxa/policy.yaml");
+    assert_eq!(written["enforced"], true);
+    assert_eq!(written["floor"], true);
+}
+
+/// Observe mode answers nothing, in every dialect (v0.20.1). Measured Oct 4,
 /// 2026: Copilot CLI treats a hook's `allow` as an approval and skips its
 /// own prompt, so v0.20.0's `allow` for an observed verdict widened what
 /// Copilot ran; silence leaves Cursor's and Copilot's own decision in place.

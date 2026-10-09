@@ -568,14 +568,15 @@ impl Policy {
     }
 
     /// Whether the rule a decision names is on the floor. `matched` is the
-    /// rule's `match` (or `match_path`) text, as `Decision::matched_rule`
-    /// carries it.
+    /// rule's label, as `Decision::matched_rule` carries it: its `match`
+    /// text, or `path:<pattern>` for a rule with only a `match_path`. Until
+    /// v0.21.3 this compared the bare `match_path` text against the
+    /// labelled one, so a path rule could never be on the floor: the starter
+    /// had no floor path rule before the gate's own files became path rules,
+    /// and the first one (`*/.termaxa/*`) was held by nothing in observe
+    /// mode until this compared labels.
     pub fn is_floor_rule(&self, matched: &str) -> bool {
-        self.rules.iter().any(|r| {
-            r.floor
-                && (r.r#match.as_deref() == Some(matched)
-                    || r.match_path.as_deref() == Some(matched))
-        })
+        self.rules.iter().any(|r| r.floor && r.label() == matched)
     }
 
     pub fn evaluate_command(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
@@ -2475,7 +2476,13 @@ rules:
         // policy the agent had written.
         let d = p.evaluate_command("echo 'default: allow' > .termaxa/policy.yaml", &here());
         assert_eq!(d.action, Action::Deny);
-        assert_eq!(d.matched_rule.as_deref(), Some("*.termaxa*policy*"));
+        // Since v0.21.3 the path rule answers first: it reads what the
+        // command touches, so no string rule ordering can get in front of
+        // it. The string rule is still there, for grammars the target
+        // extractor does not model.
+        assert_eq!(d.matched_rule.as_deref(), Some("path:*/.termaxa/*"));
+        assert!(p.is_floor_rule("path:*/.termaxa/*"));
+        assert!(p.is_floor_rule("*.termaxa*policy*"));
 
         for cmd in [
             "cat /tmp/mine.yaml > .termaxa/policy.yaml",
@@ -2591,13 +2598,21 @@ rules:
                 .position(|r| r.label() == pat)
                 .unwrap_or_else(|| panic!("rule `{pat}` must exist"))
         };
+        // Since v0.21.3 the hook configs are PATH rules at the top, so a
+        // redirect into one is caught whatever string allow matched first,
+        // and the hook-config string denies sit below the review exceptions
+        // like the `.termaxa` ones, with read exceptions of their own.
         assert!(
-            idx("*.claude*settings*") < idx("cat .termaxa*"),
-            "the hook-config denies must outrank the review exceptions"
+            idx("path:*/.claude/settings*.json") < idx("cat .termaxa*"),
+            "the hook-config path rules must outrank the review exceptions"
         );
         assert!(
             idx("cat .termaxa*") < idx("*.termaxa*policy*"),
             "the review exceptions must outrank the deny they except"
+        );
+        assert!(
+            idx("cat .claude/settings*") < idx("*.claude*settings*"),
+            "the hook-config read exceptions must outrank the deny they except"
         );
     }
 
