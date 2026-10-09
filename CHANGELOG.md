@@ -2,6 +2,26 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.21.2 — rm -r -f / is rm -rf /
+
+**In plain words:** `rm -r -f /` and `rm --recursive --force /` were asks in the starter, where `rm -rf /` is a hard stop; through the hook the preview said "resolves to a FILESYSTEM ROOT, NOT recoverable" and the answer was still ask, so an auto-approving harness ran it. And `rm -rf /*` ran in observe mode: the preview read `/*` as a path that does not exist, and the hook's floor was narrower than `run`'s. Both found on Oct 9, 2026 while checking Max Petrusenko's field report, the first from outside (Replay over 57,000 real Claude Code and Codex commands, a 38-command suite, a second reviewer), against the v0.21.1 release binary. Every spelling of a recursive, forced rm now reaches the `-rf` rule; a glob is previewed as what it expands to and held in observe mode; and four of his smaller findings are fixed. The report's lead item, `cd X &&` and `git -C X` ignored by the preview and the insurance, is the next release.
+
+### Fixed
+
+- Every spelling of a recursive, forced rm reaches the rule its `-rf` spelling reaches: `rm -r -f`, `rm -f -r`, `rm --recursive --force`, `rm -R -f`, `rm -rfv` and `rm x -r -f` read as `rm -rf`, past `sudo`, `env`, a path and a `-c` string, so `rm -r -f /` is the floor rule `rm -rf /` and `rm -r -f scratch` is `*rm -rf*`. `rm -r x` and `rm -f x` are what they were. The classifier learns `--recursive`, so the breaker counts every spelling (#143).
+- A glob target is previewed as what the shell expands it to, never as "nothing to delete": `rm -rf /*` lists the entries it matches, says it resolves to a filesystem root, and is uninsurable, because the copy aside plans from the path as written and the shell expands the glob after the gate has looked. A glob that matches nothing says so; a single-quoted `'*'` is a literal name; a glob in an earlier component is not expanded and says so (#143).
+- The hook's floor in observe mode is `run`'s: a deny the preview marks uninsurable is held, whatever its rule. `rm -rf /*` and `rm -r -f /*` are denied in both modes; an insured `rm -rf scratch` still runs in observe mode after its copy (#143).
+- An unresolved variable in a path the command only reads is not a refusal: `cp "$HOME/x" /tmp/x` was denied, and the reason called the source the "target". Only a path the command writes or removes fails closed (#143).
+- Rollback puts the original file modes back. The copy aside is made private on purpose, and the restore copied the private bits back, so a 755 script came back without its executable bit. The modes are recorded beside the copy and re-applied on restore (#143).
+- `termaxa log` and `termaxa report` say when the audit chain does not verify, with `doctor`'s sentence, and exit 1. The report carries it in its own text; `log --json` says it on stderr and keeps stdout JSON; `log --follow` warns and keeps running (#143).
+- `termaxa replay` prints reasons in full; a reason cut at 120 characters could not be audited from the output. Commands are cut at 200, were 110 (#143).
+
+### Measured and documented
+
+- The README's "backups have edges" line says a glob target is previewed and not insured.
+- Found in the wild: the first field report, Max Petrusenko, Oct 9, 2026.
+- 558 tests.
+
 ## v0.21.1 — every spelling of kubectl, terraform and docker
 
 **In plain words:** the starter denies `kubectl delete`, `terraform destroy`, `tofu destroy` and `docker system prune` outright, and observe mode holds them as floor rules. Each rule is written for the subcommand, and a global option in front of it hid the subcommand from the rule: `kubectl -n prod delete deploy api`, `kubectl --context prod delete …` and `terraform -chdir=infra destroy` got the policy default, an ask under enforce mode, and ran under observe mode. So did a program named by its path, such as `/usr/local/bin/terraform destroy`. Found Oct 9, 2026 while answering a question on the Product Hunt launch about whether that deny can be overridden, and measured on v0.21.0 through the Claude Code hook. Every one of those spellings is now the hard stop its plain form is, in both modes.
