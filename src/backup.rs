@@ -712,10 +712,17 @@ fn backup_files(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "item".into());
         let dest = dir.join(&name);
-        copy_recursive(p, &dest, &mut longest)?;
+        copy_recursive(p, &dest, &mut longest, true)?;
+        // The original modes, recorded beside the copy: the copy itself is
+        // made private, so a restore has nothing else to read them from.
+        // Max Petrusenko's field report (Oct 9, 2026): a 755 script came
+        // back from rollback without its executable bit.
+        let mut modes = serde_json::Map::new();
+        record_modes(p, Path::new(""), &mut modes);
         saved.push(serde_json::json!({
             "original": p.canonicalize().unwrap_or_else(|_| p.clone()).display().to_string(),
             "saved_as": dest.display().to_string(),
+            "modes": modes,
         }));
     }
     Ok(BackupRecord {
@@ -732,7 +739,73 @@ fn backup_files(
     })
 }
 
-fn copy_recursive(src: &Path, dst: &Path, longest: &mut usize) -> Result<()> {
+/// The permission bits of `src` and everything under it, keyed by the path
+/// relative to `src` (`""` for `src` itself), as octal strings. Links are
+/// skipped: their bits are the target's. Unix only; on Windows the map
+/// stays empty and a restore keeps what the copy produced.
+fn record_modes(src: &Path, rel: &Path, out: &mut serde_json::Map<String, serde_json::Value>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = fs::symlink_metadata(src) else {
+            return;
+        };
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        out.insert(
+            rel.to_string_lossy().to_string(),
+            serde_json::Value::String(format!("{:o}", meta.permissions().mode() & 0o7777)),
+        );
+        if meta.is_dir() {
+            if let Ok(entries) = fs::read_dir(src) {
+                for entry in entries.flatten() {
+                    record_modes(&entry.path(), &rel.join(entry.file_name()), out);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (src, rel, out);
+    }
+}
+
+/// Put the recorded permission bits back on a restored tree. A path the
+/// record does not name keeps what the copy gave it; a backup written
+/// before the modes were recorded restores as it did before.
+fn restore_modes(root: &Path, modes: &serde_json::Map<String, serde_json::Value>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for (rel, mode) in modes {
+            let Some(bits) = mode.as_str().and_then(|m| u32::from_str_radix(m, 8).ok()) else {
+                continue;
+            };
+            let path = if rel.is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(rel)
+            };
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(bits));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, modes);
+    }
+}
+
+/// `private` is true for the copy aside, which belongs to the record, and
+/// false for a restore, which belongs to the project again and gets its
+/// recorded modes back afterwards (`restore_modes`).
+fn copy_recursive(src: &Path, dst: &Path, longest: &mut usize, private: bool) -> Result<()> {
     *longest = (*longest).max(dst.as_os_str().len());
     // A link is copied as a link, never followed. The preview counts a
     // link as one entry and does not walk into it; the copy used to branch
@@ -757,10 +830,17 @@ fn copy_recursive(src: &Path, dst: &Path, longest: &mut usize) -> Result<()> {
     }
     if meta.is_dir() {
         fs::create_dir_all(dst)?;
-        make_private(dst, true)?;
+        if private {
+            make_private(dst, true)?;
+        }
         for entry in fs::read_dir(src)? {
             let entry = entry?;
-            copy_recursive(&entry.path(), &dst.join(entry.file_name()), longest)?;
+            copy_recursive(
+                &entry.path(),
+                &dst.join(entry.file_name()),
+                longest,
+                private,
+            )?;
         }
     } else {
         // Only a regular file is copied. `fs::copy` on a FIFO opens it for
@@ -781,7 +861,9 @@ fn copy_recursive(src: &Path, dst: &Path, longest: &mut usize) -> Result<()> {
         }
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
-            make_private(parent, true)?;
+            if private {
+                make_private(parent, true)?;
+            }
         }
         fs::copy(src, dst)?;
         // `fs::copy` PRESERVES the source's permission bits, so a
@@ -789,8 +871,11 @@ fn copy_recursive(src: &Path, dst: &Path, longest: &mut usize) -> Result<()> {
         // the wrong default for a backup: the copy lives in the state
         // directory and is the record's private property, whatever the
         // original was. Set after the copy because `fs::copy` writes the mode
-        // itself.
-        make_private(dst, false)?;
+        // itself. A restore copies the other way and is not made private:
+        // the file is the project's again.
+        if private {
+            make_private(dst, false)?;
+        }
     }
     Ok(())
 }
@@ -1039,7 +1124,10 @@ pub fn restore(termaxa_dir: &Path, id: &str) -> Result<String> {
                 let original = PathBuf::from(item["original"].as_str().context("bad record")?);
                 let saved = PathBuf::from(item["saved_as"].as_str().context("bad record")?);
                 let mut longest = 0usize;
-                copy_recursive(&saved, &original, &mut longest)?;
+                copy_recursive(&saved, &original, &mut longest, false)?;
+                if let Some(modes) = item["modes"].as_object() {
+                    restore_modes(&original, modes);
+                }
                 n += 1;
             }
             Ok(format!("{} path(s) restored to original locations", n))
@@ -1463,6 +1551,50 @@ mod tests {
         assert_eq!(tf_state_target(&tokens_of("terraform destroy")), None);
     }
 
+    /// Max Petrusenko's field report (Oct 9, 2026): rollback restored every
+    /// insured file, and a 755 script came back 700 and a 644 file 600. The
+    /// copy aside is made private on purpose; the restore then copied the
+    /// private copy's bits back. The original modes are recorded beside the
+    /// copy and put back on restore.
+    #[cfg(unix)]
+    #[test]
+    fn a_restored_file_gets_its_original_mode_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = TestEnv::new("bk-modes");
+        let work = env.root().join("work");
+        let tree = work.join("tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        let script = tree.join("run.sh");
+        let plain = tree.join("sub").join("notes.txt");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::write(&plain, "notes\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = env.root().join("state");
+
+        let rec = take(&state, "rm -rf tree", &work)
+            .expect("take must not fail")
+            .expect("a delete of an existing tree is insured");
+        // The copy is the record's: private.
+        let saved = PathBuf::from(rec.data["items"][0]["saved_as"].as_str().unwrap());
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&saved.join("run.sh")),
+            0o600,
+            "the copy aside is private"
+        );
+        assert_eq!(mode(&saved), 0o700);
+
+        std::fs::remove_dir_all(&tree).unwrap();
+        let msg = restore(&state, &rec.id).expect("restore must succeed");
+        assert!(msg.contains("restored"), "{msg}");
+        assert_eq!(mode(&script), 0o755, "the script is executable again");
+        assert_eq!(mode(&plain), 0o644);
+        assert_eq!(mode(&tree), 0o755);
+        assert_eq!(std::fs::read_to_string(&plain).unwrap(), "notes\n");
+    }
+
     /// Oct 9, 2026: `terraform -chdir=infra apply` was read as a command
     /// whose subcommand is `-chdir=infra`, so nothing was copied before it,
     /// while its plain spelling had its state copied first. The state is in
@@ -1600,7 +1732,8 @@ mod tests {
         let src = tree.clone();
         std::thread::spawn(move || {
             let mut longest = 0usize;
-            let _ = send.send(copy_recursive(&src, &dst, &mut longest).map_err(|e| e.to_string()));
+            let _ = send
+                .send(copy_recursive(&src, &dst, &mut longest, true).map_err(|e| e.to_string()));
         });
         let result = recv
             .recv_timeout(std::time::Duration::from_secs(5))

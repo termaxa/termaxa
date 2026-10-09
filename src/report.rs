@@ -63,12 +63,25 @@ pub fn run(paths: &Paths, scope: Scope, markdown: bool) -> Result<i32> {
     let r = compute(&entries, paths)?;
     let rollup = compute_rollup(&all_entries, scope.days);
 
+    // A report built on a record that does not verify says so first, in
+    // the report itself: the markdown is what gets handed to someone, and
+    // a warning on stderr would not travel with it. Exit 1, as `doctor`
+    // does, so a script that archives reports notices too. Until Oct 9,
+    // 2026 only `doctor` checked (Max Petrusenko's field report).
+    let chain_warning = log.verify_chain().ok().and_then(|c| c.warning());
+    if let Some(w) = &chain_warning {
+        if markdown {
+            println!("> ⚠ {w}\n");
+        } else {
+            println!("{} {}\n", crate::ui::red("✗"), w);
+        }
+    }
     if markdown {
         print_markdown(&r, &rollup, session.as_deref());
     } else {
         print_terminal(&r, &rollup, session.as_deref());
     }
-    Ok(0)
+    Ok(if chain_warning.is_some() { 1 } else { 0 })
 }
 
 struct Report {

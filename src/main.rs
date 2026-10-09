@@ -453,6 +453,16 @@ fn dispatch(cli: Cli) -> Result<i32> {
         } => {
             let p = paths::resolve()?;
             let log = audit::AuditLog::new(&p.state_dir)?;
+            // A reader of the record says when the record does not verify,
+            // as `doctor` does; until Oct 9, 2026 only `doctor` did, and
+            // `log` printed a tampered chain as if it were the record (Max
+            // Petrusenko's field report). Said on stderr, so `--json` stays
+            // JSON, and the exit code says it too, except under `--follow`,
+            // which keeps running for the pane that tails it.
+            let chain_warning = log.verify_chain().ok().and_then(|c| c.warning());
+            if let Some(w) = &chain_warning {
+                eprintln!("{} {}", ui::red("✗"), w);
+            }
             let print_entry = |e: &audit::AuditEntry| {
                 if json {
                     println!("{}", serde_json::to_string(e).unwrap_or_default());
@@ -523,15 +533,16 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 .collect();
             let skip = entries.len().saturating_sub(n);
             let entries: Vec<_> = entries.into_iter().skip(skip).collect();
+            let exit = if chain_warning.is_some() { 1 } else { 0 };
             if json {
                 for e in &entries {
                     println!("{}", serde_json::to_string(e)?);
                 }
-                return Ok(0);
+                return Ok(exit);
             }
             if entries.is_empty() {
                 println!("{}", ui::dim("(audit log is empty)"));
-                return Ok(0);
+                return Ok(exit);
             }
             for e in entries {
                 // Shared with the report: a post-execution receipt is a
@@ -565,7 +576,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     outcome
                 );
             }
-            Ok(0)
+            Ok(exit)
         }
         Cmd::Notify { test } => {
             let p = paths::resolve()?;

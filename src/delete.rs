@@ -99,6 +99,87 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
             continue;
         }
 
+        // A glob is expanded by the shell before rm sees it, so the path as
+        // written names nothing and the preview used to say so: `rm -rf /*`
+        // read "path does not exist, nothing to delete" (found Oct 9, 2026,
+        // while measuring Max Petrusenko's field report). `/*` is the
+        // canonical root wipe. What it expands to is listed here, and it is
+        // uninsurable: the copy aside is planned from the path as written,
+        // which exists only after the shell has expanded it.
+        if tok.has_glob() {
+            let resolved = resolve_path_in(raw, cwd);
+            let matches = expand_glob(&resolved);
+            lines.push(format!("  target      : {}", raw));
+            match matches {
+                Some(found) if found.is_empty() => {
+                    lines.push("  ⚠ GLOB: expanded by the shell; matches nothing here".into());
+                    summary_parts.push(format!("{} matches nothing", short(raw)));
+                }
+                Some(found) => {
+                    let shown: Vec<String> = found
+                        .iter()
+                        .take(6)
+                        .map(|p| {
+                            p.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| p.display().to_string())
+                        })
+                        .collect();
+                    let more = if found.len() > shown.len() {
+                        format!(" (+{} more)", found.len() - shown.len())
+                    } else {
+                        String::new()
+                    };
+                    lines.push(format!(
+                        "  ⚠ GLOB: expanded by the shell; matches {} entr{} here: {}{}",
+                        fmt_num(found.len()),
+                        if found.len() == 1 { "y" } else { "ies" },
+                        shown.join(", "),
+                        more
+                    ));
+                    if let Some(parent) = resolved.parent() {
+                        if is_filesystem_root(parent) {
+                            lines.push("  ⚠ resolves to a FILESYSTEM ROOT".into());
+                            worst_first.push("resolves to a filesystem root".into());
+                        } else if is_user_profile(parent) {
+                            lines.push("  ⚠ resolves to a USER PROFILE directory".into());
+                            worst_first.push("resolves to a user profile".into());
+                        }
+                    }
+                    lines.push(
+                        "  ✗ insurance : a glob is expanded by the shell, not by the gate — \
+                         NOT recoverable"
+                            .into(),
+                    );
+                    worst_first.push("GLOB target".into());
+                    worst_first.push("NOT recoverable".into());
+                    uninsurable = true;
+                    summary_parts.push(format!(
+                        "{} — {} entries",
+                        short(raw),
+                        fmt_num(found.len())
+                    ));
+                }
+                None => {
+                    lines.push(
+                        "  ⚠ GLOB: expanded by the shell; the pattern is not one the gate \
+                         expands, so what it matches is unknown"
+                            .into(),
+                    );
+                    lines.push(
+                        "  ✗ insurance : a glob is expanded by the shell, not by the gate — \
+                         NOT recoverable"
+                            .into(),
+                    );
+                    worst_first.push("GLOB target".into());
+                    worst_first.push("NOT recoverable".into());
+                    uninsurable = true;
+                    summary_parts.push(format!("{} — glob, not expanded", short(raw)));
+                }
+            }
+            continue;
+        }
+
         let resolved = resolve_path_in(raw, cwd);
         let display = resolved.display().to_string();
 
@@ -787,6 +868,79 @@ pub fn tool_options_moved(tokens: &[String]) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// `rm` with its recursive and force flags written any way rm accepts them,
+/// read as the one spelling every rm rule is written for: `rm -r -f x`,
+/// `rm -f -r x`, `rm --recursive --force x`, `rm -R -f x`, `rm -rfv x` and
+/// `rm x -r -f` all read as `rm -rf x`. The flags are folded into `-rf`
+/// first, any other flag follows, then the operands in their order.
+///
+/// Oct 9, 2026, from Max Petrusenko's field report (57,000 real commands):
+/// `rm -r -f` and `rm --recursive --force` were the policy default, an ask,
+/// while `rm -rf` was denied. Measured on v0.21.1: `rm -r -f /`,
+/// `rm -r -f /*` and `rm --recursive --force /` were asks through the hook,
+/// with the preview saying "resolves to a FILESYSTEM ROOT, NOT recoverable",
+/// so an auto-approving harness ran them. SECURITY.md names `rm -r -f /` as
+/// the case a careless agent hits as readily as a hostile one. `None` when
+/// the command is not `rm`, when it is not both recursive and forced, or
+/// when it is already spelled `-rf`.
+pub fn rm_flags_folded(tokens: &[String]) -> Option<Vec<String>> {
+    let (head, at) = resolve_head(tokens)?;
+    if head != "rm" {
+        return None;
+    }
+    let mut recursive = false;
+    let mut force = false;
+    let mut others: Vec<String> = Vec::new();
+    let mut operands: Vec<String> = Vec::new();
+    let mut flags_over = false;
+    let mut already = false;
+    for (i, t) in tokens.iter().enumerate().skip(at + 1) {
+        if flags_over || !t.starts_with('-') || t == "-" {
+            operands.push(t.clone());
+            continue;
+        }
+        if t == "--" {
+            flags_over = true;
+            others.push(t.clone());
+            continue;
+        }
+        if let Some(long) = t.strip_prefix("--") {
+            match long {
+                "recursive" => recursive = true,
+                "force" => force = true,
+                _ => others.push(t.clone()),
+            }
+            continue;
+        }
+        // A short cluster: `-rf`, `-fr`, `-rfv`, `-R`.
+        let mut rest = String::from("-");
+        for c in t[1..].chars() {
+            match c {
+                'r' | 'R' => recursive = true,
+                'f' => force = true,
+                other => rest.push(other),
+            }
+        }
+        if rest.len() > 1 {
+            others.push(rest);
+        }
+        if i == at + 1 && t == "-rf" {
+            already = true;
+        }
+    }
+    if !(recursive && force) {
+        return None;
+    }
+    if already && others.is_empty() && operands.len() + 2 == tokens.len() - at {
+        return None;
+    }
+    let mut out: Vec<String> = tokens[..=at].to_vec();
+    out.push("-rf".to_string());
+    out.extend(others);
+    out.extend(operands);
+    Some(out)
+}
+
 /// A program named by its path, read by its name: `/usr/bin/kubectl …` as
 /// `kubectl …`, `C:\tools\terraform.exe …` as `terraform …`. The head
 /// resolver has always read it this way (`command_head`); the string rules
@@ -908,6 +1062,14 @@ pub struct Tok {
 }
 
 impl Tok {
+    /// Does this token carry a glob the shell will expand (`*` or `?`
+    /// outside single quotes)? A double-quoted `"*"` is not expanded by the
+    /// shell either and reads as a glob here, which over-reports on a file
+    /// literally named `*`: the conservative side (#84).
+    pub fn has_glob(&self) -> bool {
+        !self.single_quoted && self.text.chars().any(|c| c == '*' || c == '?')
+    }
+
     /// Does this token carry a shell variable the gate cannot expand —
     /// `$NAME` or `${NAME}` outside single quotes and not escaped?
     ///
@@ -1063,6 +1225,44 @@ pub(crate) fn tokenize_detailed(s: &str) -> Vec<Tok> {
 /// against the wrong base silently found nothing and took no backup (the
 /// documented Cursor no-backup case). The payload carries the real cwd; every
 /// caller threads it here.
+/// What a glob in the LAST component of `pattern` matches on disk, in name
+/// order, the way the shell would expand it (dotfiles are not matched by a
+/// bare `*`, as in bash). `None` when a glob sits in an earlier component
+/// (`/srv/*/logs`), which this does not expand; `Some(empty)` when nothing
+/// matches. Only the delete preview reads it so far: the insurance plans
+/// from the path as written and takes no copy for a glob, and the preview
+/// says so, so the two agree (#61).
+pub fn expand_glob(pattern: &Path) -> Option<Vec<PathBuf>> {
+    let is_glob = |s: &str| s.contains('*') || s.contains('?');
+    let name = pattern.file_name()?.to_string_lossy().to_string();
+    let parent = pattern.parent()?;
+    if !is_glob(&name) || is_glob(&parent.to_string_lossy()) {
+        return None;
+    }
+    let dir = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Some(Vec::new());
+    };
+    let pattern_norm = name.replace('?', "*");
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            // A dotfile is matched only by a pattern that starts with a
+            // dot, as in bash.
+            let hidden = n.starts_with('.') && !name.starts_with('.');
+            !hidden && crate::policy::wildcard_match(&pattern_norm, &n)
+        })
+        .map(|e| e.path())
+        .collect();
+    found.sort();
+    Some(found)
+}
+
 pub fn resolve_path_in(raw: &str, cwd: &Path) -> PathBuf {
     let s = raw.trim().trim_matches('"').trim_matches('\'');
 
@@ -2120,6 +2320,81 @@ mod tests {
         assert!(
             !has_line(&lines, "too large to copy"),
             "nothing here is too large: {lines:?}"
+        );
+    }
+
+    /// `rm -rf /*` is the canonical root wipe, and the preview read `/*` as
+    /// a path that does not exist: "nothing to delete" (found Oct 9, 2026
+    /// while measuring Max Petrusenko's field report). A glob is expanded by
+    /// the shell, so the preview lists what it expands to here, says the
+    /// copy aside cannot plan for it, and marks it uninsurable, which is
+    /// what holds it under observe mode. A glob that matches nothing says
+    /// so and is not a concern; a single-quoted `'*'` is a literal name.
+    #[test]
+    fn a_glob_target_is_expanded_and_never_read_as_nothing_to_delete() {
+        let tmp = TempTree::new("del-glob");
+        let dir = tmp.dir("build");
+        for n in ["a.o", "b.o", "c.txt", ".hidden"] {
+            std::fs::write(dir.join(n), "x").expect("file must be writable");
+        }
+        let lines = preview_lines(&format!("rm -rf {}/*", dir.display()), None);
+        assert!(!has_line(&lines, "does not exist"), "{lines:?}");
+        assert!(has_line(&lines, "GLOB"), "{lines:?}");
+        assert!(
+            has_line(&lines, "matches 3 entries"),
+            "a bare * skips dotfiles: {lines:?}"
+        );
+        assert!(has_line(&lines, "a.o, b.o, c.txt"), "{lines:?}");
+        assert!(has_line(&lines, "NOT recoverable"), "{lines:?}");
+        let pv = preview_for(&format!("rm -rf {}/*.o", dir.display()), None, tmp.path())
+            .expect("a preview");
+        assert!(pv.uninsurable, "a glob is beyond the copy aside");
+        assert!(pv.summary.contains("GLOB target"), "{}", pv.summary);
+        assert!(
+            pv.lines.iter().any(|l| l.contains("matches 2 entries")),
+            "{:?}",
+            pv.lines
+        );
+
+        let lines = preview_lines(&format!("rm -rf {}/nothing-*", dir.display()), None);
+        assert!(has_line(&lines, "matches nothing"), "{lines:?}");
+        let pv = preview_for(
+            &format!("rm -rf {}/nothing-*", dir.display()),
+            None,
+            tmp.path(),
+        )
+        .expect("a preview");
+        assert!(
+            !pv.uninsurable,
+            "a glob that matches nothing destroys nothing"
+        );
+
+        // The root case, by its parent: `/*` resolves to a filesystem root.
+        let pv = preview_for("rm -rf /*", None, tmp.path()).expect("a preview");
+        assert!(pv.uninsurable);
+        assert!(
+            pv.lines.iter().any(|l| l.contains("FILESYSTEM ROOT")),
+            "{:?}",
+            pv.lines
+        );
+        // Single-quoted, the shell passes `*` literally: a file by that name.
+        let lines = preview_lines("rm -rf '*'", None);
+        assert!(!has_line(&lines, "GLOB"), "{lines:?}");
+        // A glob in an earlier component is not expanded, and says so rather
+        // than guessing.
+        let pv = preview_for("rm -rf /srv/*/logs", None, tmp.path()).expect("a preview");
+        assert!(pv.uninsurable);
+        assert!(
+            pv.lines
+                .iter()
+                .any(|l| l.contains("not one the gate expands")),
+            "{:?}",
+            pv.lines
+        );
+        assert_eq!(
+            expand_glob(Path::new("/srv/*/logs")),
+            None,
+            "only the last component is expanded"
         );
     }
 

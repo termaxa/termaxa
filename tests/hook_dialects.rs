@@ -1008,6 +1008,64 @@ fn observe_mode_records_what_enforcement_would_have_done() {
     );
 }
 
+/// The floor the hook holds in observe mode is `run`'s floor: a `floor:
+/// true` rule, or a deny the preview marks uninsurable. Until Oct 9, 2026
+/// the hook held only the rule and an ask it had itself escalated, so an
+/// observed `rm -rf /*` (the non-floor `*rm -rf*`, a glob the copy aside
+/// cannot plan for) ran silently; measured on v0.21.1 while reading Max
+/// Petrusenko's field report. An insured deny still runs, after its copy.
+#[test]
+fn observe_mode_holds_a_deny_the_preview_marks_uninsurable() {
+    use serde_json::json;
+    let tmp = scratch("observe-uninsurable");
+    let home = tmp.join("home");
+    let policy = concat!(
+        "version: 1\nmode: observe\ndefault: ask\nrules:\n",
+        "  - match: \"rm -rf /\"\n    action: deny\n    floor: true\n",
+        "  - match: \"*rm -rf*\"\n    action: deny\n",
+    );
+    let proj = project(&tmp, policy);
+    std::fs::create_dir_all(proj.join("sc")).unwrap();
+    std::fs::write(proj.join("sc").join("f"), "x").unwrap();
+    let mk = |cmd: &str| {
+        json!({"session_id":"U","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+               "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+    };
+    // A glob: expanded by the shell, nothing for the copy aside to plan
+    // from, so uninsurable, so held: answered as a deny, exit 2.
+    let out = hook(&home, &proj, &mk("rm -rf ./sc/*"), &[]);
+    assert_eq!(
+        out.code, 2,
+        "an uninsurable deny is the floor: {}",
+        out.stdout
+    );
+    assert!(is_claude_shape(&out.stdout), "{}", out.stdout);
+    // Control: the same directory named plainly is insured, so the deny is
+    // observed and runs, with the copy taken first.
+    assert_eq!(backup_count(&home), 0, "the held command took no copy");
+    let out = hook(&home, &proj, &mk("rm -rf ./sc"), &[]);
+    assert_eq!(
+        out.code, 0,
+        "an insured deny runs in observe mode: {}",
+        out.stdout
+    );
+    assert!(backup_count(&home) > 0, "after its copy");
+    let log = project_logs(&home);
+    let line = |cmd: &str| -> serde_json::Value {
+        log.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["command"] == cmd)
+            .unwrap_or_else(|| panic!("no record line for {cmd}: {log}"))
+    };
+    let held = line("rm -rf ./sc/*");
+    assert_eq!(held["enforced"], true);
+    assert_eq!(held["floor"], true);
+    assert_eq!(held["coverage"], "floor");
+    let ran = line("rm -rf ./sc");
+    assert_eq!(ran["enforced"], false);
+    assert_eq!(ran["coverage"], "insured");
+}
+
 /// Observe mode answers nothing, in every dialect (v0.20.1). Measured Oct 4,
 /// 2026: Copilot CLI treats a hook's `allow` as an approval and skips its
 /// own prompt, so v0.20.0's `allow` for an observed verdict widened what

@@ -741,9 +741,17 @@ impl Policy {
         // everything else, so an explicit allow above it still wins, which is
         // the escape hatch every other rule already has. One decision path,
         // not two.
-        let shape_deny = targets
-            .iter()
-            .find(|t| t.is_unresolved() && !t.shapes.is_empty());
+        // Only a target the command WRITES or REMOVES. A source is read and
+        // nothing happens to it, so `cp "$HOME/x" /tmp/x` (a backup copy) is
+        // not refused for the variable in the path it reads from; the same
+        // path as a destination, or under `mv` or `rm`, still is. Max
+        // Petrusenko's field report (Oct 9, 2026): 24% of his denies were
+        // this refusal, and its reason called the source the "target".
+        let shape_deny = targets.iter().find(|t| {
+            t.role != crate::resolve::TargetRole::Source
+                && t.is_unresolved()
+                && !t.shapes.is_empty()
+        });
 
         match (path_hit, shape_deny) {
             (Some((_, rule, target, role)), _) if rule.action == Action::Deny => {
@@ -890,6 +898,12 @@ pub fn readings(command: &str) -> Vec<String> {
                 out.push(l);
             }
         }
+        if let Some(r) = crate::delete::rm_flags_folded(&stripped) {
+            let l = r.join(" ").to_lowercase();
+            if !out.contains(&l) {
+                out.push(l);
+            }
+        }
     }
     // kubectl's, terraform's, tofu's and docker's global options moved after
     // the subcommand (`kubectl -n prod delete …` reads as `kubectl delete …
@@ -898,6 +912,15 @@ pub fn readings(command: &str) -> Vec<String> {
     // Same promise as every reading: it can only add matches.
     if let Some(moved) = crate::delete::tool_options_moved(&toks) {
         let l = moved.join(" ").to_lowercase();
+        if !out.contains(&l) {
+            out.push(l);
+        }
+    }
+    // rm's recursive and force flags folded into `-rf`, whatever way they
+    // were written (`-r -f`, `--recursive --force`, `-R -f`, after the
+    // operand), so `rm -r -f /` reaches the same hard stop as `rm -rf /`.
+    if let Some(folded) = crate::delete::rm_flags_folded(&toks) {
+        let l = folded.join(" ").to_lowercase();
         if !out.contains(&l) {
             out.push(l);
         }
@@ -933,6 +956,7 @@ fn deny_only_readings(command: &str) -> Vec<String> {
             Some(b.clone()),
             crate::delete::git_without_global_options(b),
             crate::delete::tool_options_moved(b),
+            crate::delete::rm_flags_folded(b),
         ];
         for v in variants.into_iter().flatten() {
             let l = v.join(" ").to_lowercase();
@@ -2031,6 +2055,108 @@ rules:
             Action::Allow,
             "control: the name is allowed"
         );
+    }
+
+    /// Max Petrusenko's field report (Oct 9, 2026, 57,000 real commands):
+    /// `rm -r -f` and `rm --recursive --force` were asks while `rm -rf` was
+    /// denied. Measured on v0.21.1 through the hook: `rm -r -f /`,
+    /// `rm -r -f /*` and `rm --recursive --force /` were asks, the preview
+    /// saying "resolves to a FILESYSTEM ROOT, NOT recoverable", so an
+    /// auto-approving harness ran them. SECURITY.md names `rm -r -f /` as
+    /// the case a careless agent hits as readily as a hostile one. Every
+    /// spelling of recursive-and-forced now reaches the rule its `-rf`
+    /// spelling reaches, by the same name, so the floor holds it too.
+    #[test]
+    fn every_spelling_of_a_recursive_forced_rm_reaches_the_rf_rule() {
+        let starter = Policy::builtin().unwrap();
+        let ctx = here();
+        for (c, rule) in [
+            ("rm -r -f /", "rm -rf /"),
+            ("rm -f -r /", "rm -rf /"),
+            ("rm --recursive --force /", "rm -rf /"),
+            ("rm --force --recursive /", "rm -rf /"),
+            ("rm -R -f /", "rm -rf /"),
+            ("rm -r -f / *", "rm -rf / *"),
+            ("rm -r -f /*", "*rm -rf*"),
+            ("rm -r -f scratch", "*rm -rf*"),
+            ("rm scratch -r -f", "*rm -rf*"),
+            ("rm -rfv scratch", "*rm -rf*"),
+            ("rm -r -f -v scratch", "*rm -rf*"),
+            ("rm -r -f -- scratch", "*rm -rf*"),
+            ("/bin/rm -r -f scratch", "*rm -rf*"),
+            ("sudo rm -r -f /", "rm -rf /"),
+            ("env rm -r -f scratch", "*rm -rf*"),
+            ("cd /tmp && rm -r -f scratch", "*rm -rf*"),
+            ("sh -c 'rm --recursive --force scratch'", "*rm -rf*"),
+        ] {
+            let d = starter.evaluate_command(c, &ctx);
+            assert_eq!(d.action, Action::Deny, "{c}: {}", d.reason);
+            assert_eq!(d.matched_rule.as_deref(), Some(rule), "{c}: {}", d.reason);
+        }
+        assert!(starter.is_floor_rule("rm -rf /"));
+        assert!(starter.is_floor_rule("rm -rf / *"));
+        // Recursive without force, or force without recursive, is what it
+        // was: the fold needs both, so `rm -r x` and `rm -f x` keep the
+        // default, and `-i` with `-r` is not `-rf`.
+        for c in [
+            "rm -r scratch",
+            "rm -f notes.txt",
+            "rm -i -r scratch",
+            "rm scratch",
+        ] {
+            let d = starter.evaluate_command(c, &ctx);
+            assert_eq!(d.action, Action::Ask, "{c}: {}", d.reason);
+            assert_eq!(d.source, DecisionSource::Default, "{c}");
+        }
+        // The classifier agrees, so the breaker counts every spelling.
+        for c in [
+            "rm -r -f x",
+            "rm --recursive --force x",
+            "rm --force --recursive x",
+        ] {
+            assert_eq!(
+                crate::intent::classify_command(c),
+                Some(crate::intent::Intent::FileDelete),
+                "{c}"
+            );
+        }
+        // The reading is a reading: the folded form is among them and the
+        // original stays.
+        let r = readings("rm -r -f scratch");
+        assert!(r.contains(&"rm -r -f scratch".to_string()), "{r:?}");
+        assert!(r.contains(&"rm -rf scratch".to_string()), "{r:?}");
+        assert!(
+            crate::delete::rm_flags_folded(&crate::intent::tokens("rm -rf scratch")).is_none(),
+            "already `-rf`: nothing to fold"
+        );
+    }
+
+    /// Same report: 24% of his denies were an unresolved variable in a path
+    /// the command only READS. `cp "$HOME/x" /tmp/x` is a backup copy, and
+    /// its reason called the source the "target". A source is read and
+    /// still there afterwards; only a path the command writes or removes
+    /// fails closed for a variable in it.
+    #[test]
+    fn an_unresolved_variable_in_a_source_is_not_a_refusal() {
+        let starter = Policy::builtin().unwrap();
+        let ctx = here();
+        let v = |c: &str| starter.evaluate_command(c, &ctx);
+        let d = v(r#"cp "$HOME/x" /tmp/x"#);
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
+        assert_eq!(d.source, DecisionSource::Default, "{}", d.reason);
+        assert_eq!(v("cat $HOME/notes.txt").action, Action::Allow);
+        // The same path written to, moved away or removed still refuses.
+        // (`cat /tmp/x > "$HOME/x"` is an explicit `cat *` allow, which
+        // outranks the unresolved reading by decision #62; not this test.)
+        for c in [
+            r#"cp /tmp/x "$HOME/x""#,
+            r#"mv "$HOME/x" /tmp/x"#,
+            r#"rm "$HOME/x""#,
+        ] {
+            let d = v(c);
+            assert_eq!(d.action, Action::Deny, "{c}: {}", d.reason);
+            assert!(d.reason.contains("cannot be resolved"), "{c}: {}", d.reason);
+        }
     }
 
     /// The Cursor forum's Windows incident (Sep 17, 2026, ticket T-F90960):

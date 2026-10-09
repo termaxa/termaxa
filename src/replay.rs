@@ -268,22 +268,26 @@ pub fn render(t: &Tally, roots: &[PathBuf], all: bool) -> String {
             }
         ));
         for (cmd, (n, reason)) in ranked(&t.asks).into_iter().take(limit) {
+            // The command is cut, the reason never is: a reason cut short
+            // cannot be audited (Max Petrusenko's field report, Oct 9, 2026).
             o.push_str(&format!(
                 "  {:>4}  {}\n        {}\n",
                 n,
-                short(cmd, 110),
-                short(reason, 120)
+                short(cmd, 200),
+                reason
             ));
         }
     }
     if !t.denies.is_empty() {
         o.push_str(&format!("\ndenied ({} distinct):\n", t.denies.len()));
         for (cmd, (n, reason)) in ranked(&t.denies).into_iter().take(limit) {
+            // The command is cut, the reason never is: a reason cut short
+            // cannot be audited (Max Petrusenko's field report, Oct 9, 2026).
             o.push_str(&format!(
                 "  {:>4}  {}\n        {}\n",
                 n,
-                short(cmd, 110),
-                short(reason, 120)
+                short(cmd, 200),
+                reason
             ));
         }
     }
@@ -1000,6 +1004,28 @@ mod tests {
         assert!(text.contains("allow     3  (50%)"), "{text}");
         assert!(text.contains("chmod -R 777 ."), "{text}");
         assert!(text.contains("nothing was executed"), "{text}");
+        // A reason is printed whole, however long: a reason cut at 120
+        // characters could not be audited from the output (Max Petrusenko's
+        // field report, Oct 9, 2026). The command is still cut, at 200.
+        let mut long = Tally::default();
+        let reason = "x".repeat(300);
+        long.commands = 1;
+        long.denied = 1;
+        long.denies
+            .insert("rm -rf ./scratch".into(), (1, reason.clone()));
+        let text = render(&long, &[], false);
+        assert!(
+            text.contains(&reason),
+            "the reason is printed in full: {text}"
+        );
+        let mut wide = Tally::default();
+        let cmd = "y".repeat(300);
+        wide.commands = 1;
+        wide.asked = 1;
+        wide.asks.insert(cmd.clone(), (1, "r".into()));
+        let text = render(&wide, &[], false);
+        assert!(!text.contains(&cmd), "a 300-char command is cut: {text}");
+        assert!(text.contains(&"y".repeat(200)), "{text}");
         // A missing root is zero transcripts, not an error.
         let empty = replay(&starter, &ctx, &[tmp.path().join("nowhere")]);
         assert_eq!(empty.commands, 0);

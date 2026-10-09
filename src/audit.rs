@@ -150,6 +150,26 @@ impl ChainReport {
     pub fn is_intact(&self) -> bool {
         self.breaks.is_empty()
     }
+
+    /// The sentence every reader prints for a chain that does not verify,
+    /// so `doctor`, `log` and `report` disagree about nothing. `None` when
+    /// the chain holds.
+    pub fn warning(&self) -> Option<String> {
+        if self.is_intact() {
+            return None;
+        }
+        let which = self
+            .breaks
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let plural = if self.breaks.len() == 1 { "y" } else { "ies" };
+        Some(format!(
+            "audit chain broken at entr{plural} {which} — an entry was edited or removed; \
+             what follows is the record as it stands, not as it was written"
+        ))
+    }
 }
 
 pub struct AuditLog {
@@ -490,6 +510,16 @@ mod tests {
         );
         // The record is still readable - reporting, not refusing.
         assert_eq!(log.read_last(10).unwrap().len(), 4);
+        // One sentence for every reader: `doctor`, `log` and `report` all
+        // print this one (Oct 9, 2026: until then only `doctor` checked).
+        let w = r.warning().expect("a broken chain has a warning");
+        assert!(w.starts_with("audit chain broken at entry 2"), "{w}");
+        let intact = ChainReport {
+            pre_chain: 0,
+            verified: 3,
+            breaks: vec![],
+        };
+        assert!(intact.warning().is_none());
     }
 
     /// Deleting an entry breaks the link that named it.
