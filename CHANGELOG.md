@@ -2,6 +2,55 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.21.3 — node_modules is not the floor
+
+**In plain words:** preparing the first observe-mode week on a live Next.js project (Max Petrusenko, Oct 9, 2026), 46 commands such a project runs went through the v0.21.2 hook in observe mode. Three were held that should not have been: `rm -rf node_modules` and `rm -rf .next`, past the copy budget and so read as unrecoverable, when an install rebuilds them; and `cat .claude/settings.json`, denied by the rule written to stop an agent *editing* the hook config. Measuring the second found a hole in the gate's own defence: `cat .termaxa/policy.yaml > .termaxa/policy.yaml` was an allow, in both modes, because the gate's own read exception matched the redirect and nothing read where it landed. The policy would have truncated to nothing. A directory a build rebuilds is now not a loss, the gate's own files and the hook configs are path rules on the floor, and reading a hook config is ordinary work.
+
+### Security
+
+- `cat .termaxa/policy.yaml > .termaxa/policy.yaml` and `cat .termaxa/policy.yaml > .termaxa/backups/x` were allowed: the `cat .termaxa*` review exception matched the redirect, the `*.termaxa*policy*` deny sits below it, and no rule read the target. The gate's own files and the four hook configs are now `match_path` rules first in the starter, marked `floor: true`: `*/.termaxa/*`, `*/.claude/settings*.json`, `*/.cursor/hooks.json`, `*/.codex/hooks.json`, `*/.github/hooks/*`. A path rule fires on what the command touches, ahead of every string rule, so a redirect, `tee`, `sed -i` or `cp` into one of them is denied however it is spelled, and `rm -rf .termaxa` is a floor rule rather than an ordinary `*rm -rf*` deny (the field report asked for one after `git clean -fdx` removed the policy). The string rules stay as the belt for grammars the target extractor does not model (#145).
+- A `match_path` rule could not be on the floor: `is_floor_rule` compared the bare pattern against the `path:<pattern>` label a decision carries. No starter rule was affected, because none was marked; it compares labels now (#145).
+
+### Fixed
+
+- A directory a build or an install rebuilds, past the copy budget, is not read as unrecoverable: `node_modules`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.cache`, `dist`, `build`, `out`, `target`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `coverage`. The preview says `not copied — node_modules is rebuilt by npm, pnpm, yarn or bun install`, the command is not uninsurable, observe mode lets it run recorded as `known-uninsured`, and the copy aside leaves the directory out and copies the other operands (`rm -rf node_modules src` copies `src`; before, the whole take was refused). A glob inside one (`rm -rf node_modules/*`) reads the same way. The name is read only below the project root: no root, outside it, or the same tree under any other name is as unrecoverable as before, and a project that lives under `~/build/` is not a build artifact. Under the budget the directory is copied like anything else. Enforce mode keeps the `*rm -rf*` deny (#145).
+- Reading a hook config is ordinary work: `cat`, `git diff`, `git show` and `git add` of `.claude/settings*`, `.cursor/hooks*`, `.codex/hooks*` and `.github/hooks*` are allowed, the exceptions `.termaxa/` has had since #16. The four hook-config string denies move down beside the `.termaxa` ones, below the overwrite denies; `cat .claude/settings.json > /etc/hosts` is still the `/etc` deny (#145).
+
+### Measured and documented
+
+- Starter: 224 rules (157 allow, 14 ask, 53 deny), 38 on the floor, six path rules; `examples/policy.yaml` regenerated. README, SECURITY.md (the self-defence paragraphs) and `docs/observe-mode.md` say what the floor holds and what a build directory is.
+- 46 commands through the hook in observe mode, v0.21.2 against v0.21.3: every verdict identical except the build-directory deletes (now run, recorded), the hook-config reads (now allow), and the writes into the gate's own files (now held by path, including the self-truncation that was an allow).
+- 564 tests.
+
+### Upgrade note — existing projects keep the old policy
+
+`termaxa init` writes `.termaxa/policy.yaml` once and never rewrites it, so upgrading the binary changes nothing in a project that already has one: its `cat .termaxa*` exception still launders a redirect into `.termaxa/`, and `cat .claude/settings.json` is still denied. The build-directory reading is in the binary and needs no policy change. To pick up the rest, put the five path rules at the top of your `rules:`, above everything else:
+
+```yaml
+  - match_path: "*/.termaxa/*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
+  - match_path: "*/.claude/settings*.json"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.cursor/hooks.json"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.codex/hooks.json"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.github/hooks/*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+```
+
+and, if you want the reads back, take the hook-config exceptions from `examples/policy.yaml` and place them where its `.termaxa` exceptions sit. Or delete `.termaxa/policy.yaml` and re-run `termaxa init` if you have not customised it. `termaxa doctor` reports the fingerprint change either way; `termaxa check "cat .termaxa/policy.yaml > .termaxa/policy.yaml"` should say `deny`.
+
 ## v0.21.2 — rm -r -f / is rm -rf /
 
 **In plain words:** `rm -r -f /` and `rm --recursive --force /` were asks in the starter, where `rm -rf /` is a hard stop; through the hook the preview said "resolves to a FILESYSTEM ROOT, NOT recoverable" and the answer was still ask, so an auto-approving harness ran it. And `rm -rf /*` ran in observe mode: the preview read `/*` as a path that does not exist, and the hook's floor was narrower than `run`'s. Both found on Oct 9, 2026 while checking Max Petrusenko's field report, the first from outside (Replay over 57,000 real Claude Code and Codex commands, a 38-command suite, a second reviewer), against the v0.21.1 release binary. Every spelling of a recursive, forced rm now reaches the `-rf` rule; a glob is previewed as what it expands to and held in observe mode; and four of his smaller findings are fixed. The report's lead item, `cd X &&` and `git -C X` ignored by the preview and the insurance, is the next release.
