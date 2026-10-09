@@ -579,6 +579,242 @@ pub fn git_without_global_options(tokens: &[String]) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// How many words one of `tool`'s global options spans when it is written
+/// before the subcommand: 1 for a flag on its own or with its value attached
+/// (`--insecure-skip-tls-verify`, `--context=prod`, `-nprod`,
+/// `-chdir=infra`), 2 when the value is the next word (`-n prod`,
+/// `--kubeconfig ~/.kube/prod`). `None` for anything else, which ends the
+/// options.
+///
+/// HAND-WALKED LIST (decision #56). kubectl's are the inherited flags of the
+/// generated `kubectl options` reference, with the klog flags (`-v`,
+/// `--vmodule`, `--log-*`) builds still accept; terraform and tofu have one,
+/// `-chdir=`, which they take only with the equals sign; docker's are the
+/// root command's flags. Every entry is placed by what the tool does with the
+/// NEXT word. A value flag read as a bare one would make its value the
+/// subcommand, so `kubectl -n get delete pod x` would read as a `get`; a flag
+/// the list does not know therefore ends the reading instead of being
+/// guessed at, and the command keeps the verdict its other readings give.
+fn tool_global_option_span(tool: &str, tok: &str) -> Option<usize> {
+    let (value, short_value, bare): (&[&str], &[&str], &[&str]) = match tool {
+        "kubectl" => (
+            &[
+                "--as",
+                "--as-group",
+                "--as-uid",
+                "--as-user-extra",
+                "--cache-dir",
+                "--certificate-authority",
+                "--client-certificate",
+                "--client-key",
+                "--cluster",
+                "--context",
+                "--kubeconfig",
+                "--kuberc",
+                "--namespace",
+                "--password",
+                "--profile",
+                "--profile-output",
+                "--proxy-url",
+                "--request-timeout",
+                "--server",
+                "--storage-driver-buffer-duration",
+                "--storage-driver-db",
+                "--storage-driver-host",
+                "--storage-driver-password",
+                "--storage-driver-table",
+                "--storage-driver-user",
+                "--tls-server-name",
+                "--token",
+                "--user",
+                "--username",
+                "--v",
+                "--vmodule",
+                "--log-backtrace-at",
+                "--log-dir",
+                "--log-file",
+                "--log-file-max-size",
+                "--log-flush-frequency",
+                "--stderrthreshold",
+            ],
+            &["-n", "-s", "-v"],
+            &[
+                "--disable-compression",
+                "--insecure-skip-tls-verify",
+                "--match-server-version",
+                "--storage-driver-secure",
+                "--warnings-as-errors",
+                // `--version` takes an optional value only after `=`.
+                "--version",
+                "--help",
+                "-h",
+                "--add-dir-header",
+                "--alsologtostderr",
+                "--logtostderr",
+                "--one-output",
+                "--skip-headers",
+                "--skip-log-headers",
+            ],
+        ),
+        // terraform reads `-chdir=` and nothing else before the subcommand.
+        // `--chdir=` is not a spelling terraform accepts; reading it costs
+        // nothing, because the command it is part of does not run.
+        "terraform" | "tofu" => {
+            return (tok.starts_with("-chdir=") || tok.starts_with("--chdir=")).then_some(1);
+        }
+        "docker" => (
+            &[
+                "--config",
+                "--context",
+                "--host",
+                "--log-level",
+                "--tlscacert",
+                "--tlscert",
+                "--tlskey",
+            ],
+            &["-c", "-H", "-l"],
+            &["--debug", "--tls", "--tlsverify", "--version", "-D", "-v"],
+        ),
+        _ => return None,
+    };
+    if value.contains(&tok) || short_value.contains(&tok) {
+        return Some(2);
+    }
+    if bare.contains(&tok) {
+        return Some(1);
+    }
+    // `--context=prod`, `-n=prod`, and a boolean given a value
+    // (`--tlsverify=false`).
+    if let Some((name, _)) = tok.split_once('=') {
+        if value.contains(&name) || short_value.contains(&name) || bare.contains(&name) {
+            return Some(1);
+        }
+    }
+    // A short value flag with its value attached: `-nprod`, `-Htcp://x`.
+    if !tok.starts_with("--") && tok.len() > 2 && short_value.iter().any(|s| tok.starts_with(s)) {
+        return Some(1);
+    }
+    None
+}
+
+/// A tool that takes global options before its subcommand, read once for
+/// every consumer: the policy's readings, the classifier, the insurance and
+/// the terraform preview (decision #37).
+///
+/// kubectl, terraform, tofu and docker put their global options where git
+/// puts its own, between the program and the subcommand, and a rule written
+/// for the subcommand never saw past them. Measured Oct 9, 2026 on v0.21.0
+/// through the Claude Code hook: `kubectl -n prod delete deploy api` and
+/// `terraform -chdir=. destroy -auto-approve` were the policy default (an
+/// ask) under enforce mode and passed silently under observe mode, where
+/// `kubectl delete*` and `terraform destroy*` are floor rules. So were
+/// `kubectl --context prod delete …`, `kubectl --kubeconfig … delete …`,
+/// `tofu -chdir=… destroy` and `docker --context prod system prune`. The
+/// same miss as git's `-C` (v0.19.4), in the tools nobody had measured.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ToolCall {
+    /// The tool's normalized name: `kubectl`, `terraform`, `tofu` or `docker`.
+    pub tool: String,
+    /// Index of the tool's own word, past any wrapper.
+    pub at: usize,
+    /// The global options as written, in order, their values included.
+    pub options: Vec<String>,
+    /// Index of the subcommand: the first word after the options.
+    pub sub: usize,
+}
+
+impl ToolCall {
+    /// The directory terraform or tofu is told to run in by `-chdir=`.
+    pub fn chdir(&self) -> Option<&str> {
+        self.options.iter().find_map(|o| {
+            o.strip_prefix("-chdir=")
+                .or_else(|| o.strip_prefix("--chdir="))
+        })
+    }
+}
+
+/// `None` when the command is not one of these tools, when an option the
+/// list does not know comes before the subcommand, or when nothing follows
+/// the options.
+pub fn tool_call(tokens: &[String]) -> Option<ToolCall> {
+    let (tool, at) = resolve_head(tokens)?;
+    if !matches!(tool.as_str(), "kubectl" | "terraform" | "tofu" | "docker") {
+        return None;
+    }
+    let mut i = at + 1;
+    while let Some(t) = tokens.get(i) {
+        if !t.starts_with('-') {
+            break;
+        }
+        let span = tool_global_option_span(&tool, t)?;
+        if i + span > tokens.len() {
+            return None;
+        }
+        i += span;
+    }
+    if i >= tokens.len() {
+        return None;
+    }
+    Some(ToolCall {
+        options: tokens[at + 1..i].to_vec(),
+        tool,
+        at,
+        sub: i,
+    })
+}
+
+/// The tokens with a tool's global options moved after everything else:
+/// `kubectl -n prod delete deploy api` reads as `kubectl delete deploy api
+/// -n prod`, `terraform -chdir=infra destroy` as `terraform destroy
+/// -chdir=infra`.
+///
+/// MOVED, not removed as git's are. The namespace, the context or the
+/// directory is what a team scopes an exception by (`kubectl delete * -n
+/// staging`, placed above the deny it excepts), and a reading without it
+/// would match the deny and never the exception, so the exception would
+/// hold only for the one spelling that puts the flag last. kubectl itself
+/// accepts its global flags after the subcommand, so for kubectl the moved
+/// form is a spelling the tool runs; for terraform and docker it is only a
+/// reading. `None` when there were no options to move.
+pub fn tool_options_moved(tokens: &[String]) -> Option<Vec<String>> {
+    let call = tool_call(tokens)?;
+    if call.options.is_empty() {
+        return None;
+    }
+    let mut out: Vec<String> = tokens[..=call.at].to_vec();
+    out.extend_from_slice(&tokens[call.sub..]);
+    out.extend(call.options);
+    Some(out)
+}
+
+/// A program named by its path, read by its name: `/usr/bin/kubectl …` as
+/// `kubectl …`, `C:\tools\terraform.exe …` as `terraform …`. The head
+/// resolver has always read it this way (`command_head`); the string rules
+/// did not, so `/usr/local/bin/terraform destroy` and `/sbin/mkfs.ext4
+/// /dev/sdb1` fell to the default past their hard stops (measured Oct 9,
+/// 2026, v0.21.0). For DENY rules only, like a privilege wrapper (see
+/// `Policy::evaluate`): `./ls` is whatever file sits there, and an allow
+/// written for `ls *` must not admit it. `None` when the program is already
+/// named by its name.
+pub fn program_by_name(tokens: &[String]) -> Option<Vec<String>> {
+    let first = tokens.first()?;
+    if is_env_assignment(first) {
+        return None;
+    }
+    let named_by_path =
+        first.contains('/') || first.contains('\\') || first.to_ascii_lowercase().ends_with(".exe");
+    if !named_by_path {
+        return None;
+    }
+    let name = command_head(first);
+    if name.is_empty() {
+        return None;
+    }
+    let mut out = tokens.to_vec();
+    out[0] = name;
+    Some(out)
+}
+
 /// `FOO=bar` before a command name is an environment assignment, not the
 /// command. Guarded against paths that merely contain `=`: the name half must
 /// be a plain identifier.

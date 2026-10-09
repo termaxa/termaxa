@@ -143,7 +143,10 @@ fn classify_segment_named(segment: &str) -> Option<Intent> {
     // `C:\Windows\System32\del.exe /s /q x` all classify as nothing.
     // `git -C /x push --force` is a force push; the global options before
     // the subcommand are stepped over before anything below reads `sub`.
+    // kubectl's, terraform's and docker's are moved after it, so
+    // `kubectl -n prod delete …` is the teardown it is.
     let toks = crate::delete::git_without_global_options(&toks).unwrap_or(toks);
+    let toks = crate::delete::tool_options_moved(&toks).unwrap_or(toks);
     let (head, at) = crate::delete::resolve_head(&toks)?;
     let first = head.as_str();
     // Arguments begin after the command, which is `at`, not 0.

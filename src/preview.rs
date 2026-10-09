@@ -207,15 +207,28 @@ fn generate_one(command: &str, cwd: &std::path::Path, live: bool) -> Option<Prev
     if crate::pg::psql_program(&crate::pg::shell_tokens(command)).is_some() {
         return crate::pg::preview_for(command, cwd, live);
     }
-    for bin in ["terraform", "tofu"] {
-        if cmd.starts_with(&format!("{} apply", bin))
-            || cmd.starts_with(&format!("{} destroy", bin))
+    // terraform and tofu: read past `-chdir=` (`delete::tool_call`, the
+    // reading the policy, the classifier and the insurance share), and plan
+    // in that directory. Until Oct 9, 2026 `terraform -chdir=infra destroy`
+    // had no preview at all, so an ask written for it was never refused the
+    // way the plain spelling's is when the plan destroys something. Only for
+    // the program named plainly as the first word: `env TF_VAR_x=… terraform
+    // apply` planned without its variables, or a binary by path planned with
+    // whichever one is on PATH, would describe a different run, and a
+    // preview must not reassure about a run it did not model (#84).
+    let toks = crate::pg::shell_tokens(command);
+    if let Some(call) = crate::delete::tool_call(&toks) {
+        let plainly = call.at == 0 && toks[0].eq_ignore_ascii_case(&call.tool);
+        let sub = toks[call.sub].to_ascii_lowercase();
+        if plainly
+            && (call.tool == "terraform" || call.tool == "tofu")
+            && (sub == "apply" || sub == "destroy")
         {
             // `terraform plan` is the confirmed case: it initializes
             // providers and evaluates `external` data sources, which execute
             // arbitrary programs.
             return if live {
-                terraform_preview(bin, cmd.starts_with(&format!("{} destroy", bin)))
+                terraform_preview(&call.tool, sub == "destroy", call.chdir())
             } else {
                 None
             };
@@ -610,11 +623,19 @@ fn git(args: &[&str]) -> Option<String> {
 
 /// Run `plan` and surface add/change/destroy counts before an apply.
 /// -input=false and -lock=false are load-bearing: a preview must never hang
-/// the hook waiting for interactive input or a state lock.
-fn terraform_preview(bin: &str, destroy: bool) -> Option<Preview> {
-    let mut args = vec!["plan", "-no-color", "-input=false", "-lock=false"];
+/// the hook waiting for interactive input or a state lock. `chdir` is the
+/// directory the command names with `-chdir=`, passed the one way terraform
+/// accepts it: before the subcommand, with the equals sign.
+fn terraform_preview(bin: &str, destroy: bool, chdir: Option<&str>) -> Option<Preview> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(dir) = chdir {
+        args.push(format!("-chdir={dir}"));
+    }
+    for a in ["plan", "-no-color", "-input=false", "-lock=false"] {
+        args.push(a.to_string());
+    }
     if destroy {
-        args.push("-destroy");
+        args.push("-destroy".to_string());
     }
     let out = match std::process::Command::new(bin).args(&args).output() {
         Ok(out) => out,
@@ -1201,7 +1222,7 @@ mod terraform_stub_tests {
         let tmp = TempTree::new("tf-destroys");
         let bin = stub(tmp.path(), "faketf", DESTROYS_ONE, 0);
 
-        let p = terraform_preview(bin.to_str().expect("utf-8 path"), true)
+        let p = terraform_preview(bin.to_str().expect("utf-8 path"), true, None)
             .expect("a successful plan is a preview");
         assert_eq!(p.summary, "plan: +2 ~0 -1");
         assert!(
@@ -1218,7 +1239,7 @@ mod terraform_stub_tests {
         let tmp = TempTree::new("tf-safe");
         let bin = stub(tmp.path(), "faketf", DESTROYS_NOTHING, 0);
 
-        let p = terraform_preview(bin.to_str().expect("utf-8 path"), false)
+        let p = terraform_preview(bin.to_str().expect("utf-8 path"), false, None)
             .expect("a successful plan is a preview");
         assert_eq!(p.summary, "plan: +1 ~0 -0");
         assert!(
@@ -1235,7 +1256,7 @@ mod terraform_stub_tests {
         let tmp = TempTree::new("tf-failed");
         let bin = stub(tmp.path(), "faketf", DESTROYS_ONE, 1);
 
-        assert!(terraform_preview(bin.to_str().expect("utf-8 path"), false).is_none());
+        assert!(terraform_preview(bin.to_str().expect("utf-8 path"), false, None).is_none());
     }
 
     #[test]
@@ -1272,6 +1293,74 @@ mod terraform_stub_tests {
         assert!(apply.is_some(), "`terraform apply` must be previewed");
         assert!(destroy.is_some(), "`terraform destroy` must be previewed");
         // `env` is still alive here, holding the lock across the restore.
+        drop(env);
+    }
+
+    /// Oct 9, 2026: `terraform -chdir=infra destroy` had no preview, so an
+    /// ask written for it could never be refused for destroying something
+    /// the state copy cannot bring back, while the plain spelling's was.
+    /// The stub answers only a plan run with `-chdir=stack` first, so a
+    /// preview that dropped the directory is no preview at all.
+    #[test]
+    fn a_chdir_spelling_is_planned_in_its_directory() {
+        let env = TestEnv::new("tf-chdir");
+        let bin_dir = env.root().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("stub dir must be creatable");
+        let path = bin_dir.join("terraform");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = \"-chdir=stack\" ] || exit 3\n\
+                 [ \"$2\" = \"plan\" ] || exit 4\nprintf '%s\\n' \"{DESTROYS_ONE}\"\nexit 0\n"
+            ),
+        )
+        .expect("stub must be writable");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("stub must be executable");
+        crate::testutil::wait_until_executable(&path);
+
+        let previous = std::env::var_os("PATH");
+        let combined = match &previous {
+            Some(p) => format!("{}:{}", bin_dir.display(), p.to_string_lossy()),
+            None => bin_dir.display().to_string(),
+        };
+        std::env::set_var("PATH", combined);
+
+        let here = std::path::Path::new(".");
+        let chdir = generate(
+            "terraform -chdir=stack destroy -auto-approve",
+            None,
+            here,
+            true,
+        );
+        let plain = generate("terraform destroy -auto-approve", None, here, true);
+        // A wrapper is not previewed: the plan would run without what the
+        // wrapper sets, a different run from the one being judged.
+        let wrapped = generate(
+            "env TF_VAR_region=x terraform -chdir=stack destroy",
+            None,
+            here,
+            true,
+        );
+        let denied = generate("terraform -chdir=stack destroy", None, here, false);
+
+        match previous {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let p = chdir.expect("the -chdir spelling is planned, in its directory");
+        assert_eq!(p.summary, "plan: +2 ~0 -1");
+        assert!(
+            p.uninsurable,
+            "a plan that destroys a resource is past the state copy"
+        );
+        assert!(
+            plain.is_none(),
+            "control: the stub refuses a plan run without -chdir=stack"
+        );
+        assert!(wrapped.is_none(), "a wrapped spelling is not planned");
+        assert!(denied.is_none(), "a denied command spawns nothing");
         drop(env);
     }
 }

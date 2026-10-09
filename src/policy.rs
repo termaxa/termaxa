@@ -691,12 +691,13 @@ impl Policy {
         // delete …` must hit a `gh repo delete*` deny, while an allow written
         // for `apt-get install*` must not admit `sudo apt-get install`. The
         // reading through sudo/doas is therefore matched against deny rules
-        // and nothing else.
-        let privileged = crate::delete::without_any_wrappers(&crate::intent::tokens(command))
-            .map(|t| t.join(" ").to_lowercase());
-        if let Some(pv) = privileged
-            .as_deref()
-            .filter(|pv| !views.iter().any(|v| v == pv))
+        // and nothing else. A program named by its path is the same case
+        // (Oct 9, 2026): `/usr/bin/kubectl delete …` must hit `kubectl
+        // delete*`, while an allow written for `ls *` must not admit `./ls`,
+        // which is whatever file sits there. See `deny_only_readings`.
+        for pv in deny_only_readings(command)
+            .iter()
+            .filter(|pv| !views.iter().any(|v| v == *pv))
         {
             if let Some((idx, rule)) = self
                 .rules
@@ -704,7 +705,9 @@ impl Policy {
                 .enumerate()
                 .find(|(_, r)| r.action == Action::Deny && r.matches(pv))
             {
-                best = Some((idx, rule));
+                if best.is_none_or(|(bi, _)| idx < bi) {
+                    best = Some((idx, rule));
+                }
             }
         }
         for v in &views {
@@ -877,6 +880,62 @@ pub fn readings(command: &str) -> Vec<String> {
         }
         if let Some(g) = crate::delete::git_without_global_options(&stripped) {
             let l = g.join(" ").to_lowercase();
+            if !out.contains(&l) {
+                out.push(l);
+            }
+        }
+        if let Some(m) = crate::delete::tool_options_moved(&stripped) {
+            let l = m.join(" ").to_lowercase();
+            if !out.contains(&l) {
+                out.push(l);
+            }
+        }
+    }
+    // kubectl's, terraform's, tofu's and docker's global options moved after
+    // the subcommand (`kubectl -n prod delete …` reads as `kubectl delete …
+    // -n prod`), so a rule written for the subcommand sees the command, and
+    // an exception scoped by namespace or directory still sees its scope.
+    // Same promise as every reading: it can only add matches.
+    if let Some(moved) = crate::delete::tool_options_moved(&toks) {
+        let l = moved.join(" ").to_lowercase();
+        if !out.contains(&l) {
+            out.push(l);
+        }
+    }
+    out
+}
+
+/// The readings `Policy::evaluate` matches against DENY rules and nothing
+/// else: the command past a privilege wrapper (`sudo`, `doas`), and a program
+/// named by its path read by its name, each also with git's global options
+/// stepped over and a tool's global options moved after its subcommand.
+/// Readings that are already among `readings` are matched there, against
+/// every rule, and are left out by the caller.
+fn deny_only_readings(command: &str) -> Vec<String> {
+    let toks = crate::intent::tokens(command);
+    let privileged = crate::delete::without_any_wrappers(&toks);
+    let unprivileged = crate::delete::without_unprivileged_wrappers(&toks);
+    let mut bases: Vec<Vec<String>> = Vec::new();
+    for b in [Some(&toks), unprivileged.as_ref(), privileged.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(named) = crate::delete::program_by_name(b) {
+            bases.push(named);
+        }
+    }
+    if let Some(p) = privileged {
+        bases.insert(0, p);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for b in &bases {
+        let variants = [
+            Some(b.clone()),
+            crate::delete::git_without_global_options(b),
+            crate::delete::tool_options_moved(b),
+        ];
+        for v in variants.into_iter().flatten() {
+            let l = v.join(" ").to_lowercase();
             if !out.contains(&l) {
                 out.push(l);
             }
@@ -1718,6 +1777,259 @@ rules:
                 "scratch".into()
             ]),
             Some(("git rm".to_string(), 3))
+        );
+    }
+
+    /// Oct 9, 2026, measured on v0.21.0 through the Claude Code hook while
+    /// answering a question on the Product Hunt launch: `kubectl -n prod
+    /// delete deploy api` and `terraform -chdir=. destroy -auto-approve` were
+    /// the default ask under enforce mode and passed silently under observe
+    /// mode, where `kubectl delete*` and `terraform destroy*` are floor rules.
+    /// A tool's global options before its subcommand hid the subcommand from
+    /// every rule written for it, as git's `-C` did until v0.19.4, and a
+    /// program named by its path hid itself from every anchored rule. Each
+    /// spelling here is the hard stop its plain form is, named by the same
+    /// rule, so observe mode's floor holds it too.
+    #[test]
+    fn a_tools_global_options_and_a_program_path_do_not_hide_a_hard_stop() {
+        let starter = Policy::builtin().unwrap();
+        let ctx = here();
+        for (c, rule) in [
+            ("kubectl -n prod delete deploy api", "kubectl delete*"),
+            (
+                "kubectl --namespace prod delete deploy api",
+                "kubectl delete*",
+            ),
+            (
+                "kubectl --namespace=prod delete deploy api",
+                "kubectl delete*",
+            ),
+            ("kubectl -n=prod delete deploy api", "kubectl delete*"),
+            ("kubectl -nprod delete deploy api", "kubectl delete*"),
+            (
+                "kubectl --context prod delete ns payments",
+                "kubectl delete*",
+            ),
+            (
+                "kubectl --context=prod -n payments delete pod web",
+                "kubectl delete*",
+            ),
+            (
+                "kubectl --kubeconfig ~/.kube/prod delete ns payments",
+                "kubectl delete*",
+            ),
+            (
+                "kubectl --insecure-skip-tls-verify -s https://10.0.0.1:6443 delete ns x",
+                "kubectl delete*",
+            ),
+            ("kubectl -v 6 delete ns x", "kubectl delete*"),
+            (
+                "terraform -chdir=infra destroy -auto-approve",
+                "terraform destroy*",
+            ),
+            ("terraform -chdir=. destroy", "terraform destroy*"),
+            ("tofu -chdir=infra destroy", "tofu destroy*"),
+            (
+                "docker --context prod system prune -af",
+                "docker system prune*",
+            ),
+            (
+                "docker -H tcp://10.0.0.5:2375 system prune -af --volumes",
+                "docker system prune*",
+            ),
+            ("docker -D system prune -a", "docker system prune*"),
+            // A program named by its path.
+            ("/usr/bin/kubectl delete ns x", "kubectl delete*"),
+            (
+                "/usr/local/bin/terraform destroy -auto-approve",
+                "terraform destroy*",
+            ),
+            (r"C:\tools\terraform.exe destroy", "terraform destroy*"),
+            ("/usr/bin/docker system prune -af", "docker system prune*"),
+            ("/sbin/mkfs.ext4 /dev/sdb1", "mkfs*"),
+            ("/usr/bin/git push --force origin main", "git push*--force*"),
+            // Both at once, and through the wrappers the readings already knew.
+            ("/usr/bin/kubectl -n prod delete ns x", "kubectl delete*"),
+            ("sudo kubectl -n prod delete ns x", "kubectl delete*"),
+            (
+                "sudo /usr/bin/kubectl -n prod delete ns x",
+                "kubectl delete*",
+            ),
+            (
+                "sudo git -C /x push --force origin main",
+                "git push*--force*",
+            ),
+            (
+                "env KUBECONFIG=/x kubectl -n prod delete ns x",
+                "kubectl delete*",
+            ),
+            (
+                "KUBECONFIG=/x kubectl --context prod delete ns x",
+                "kubectl delete*",
+            ),
+            (
+                "bash -c 'kubectl -n prod delete deploy api'",
+                "kubectl delete*",
+            ),
+            (
+                "sh -c \"terraform -chdir=infra destroy -auto-approve\"",
+                "terraform destroy*",
+            ),
+        ] {
+            let d = starter.evaluate_command(c, &ctx);
+            assert_eq!(d.action, Action::Deny, "{c}: {}", d.reason);
+            assert_eq!(d.matched_rule.as_deref(), Some(rule), "{c}: {}", d.reason);
+            assert!(
+                starter.is_floor_rule(rule) || rule == "git push*--force*",
+                "{c}: `{rule}` is on the floor, so observe mode holds it too"
+            );
+            assert_eq!(d.source, DecisionSource::ExplicitRule, "{c}");
+        }
+        assert!(
+            !starter.is_floor_rule("git push*--force*"),
+            "control: the one non-floor rule above is not on the floor"
+        );
+
+        // The classifier reads the same command, so the breaker counts it.
+        for c in [
+            "kubectl -n prod delete deployment api",
+            "kubectl --context=prod delete ns payments",
+            "/usr/bin/kubectl --kubeconfig ~/.kube/prod delete pod x",
+        ] {
+            assert_eq!(
+                crate::intent::classify_command(c),
+                Some(crate::intent::Intent::InfraDestroy),
+                "{c}"
+            );
+        }
+        assert_eq!(
+            crate::intent::classify_command("kubectl -n prod get pods"),
+            None
+        );
+    }
+
+    /// The other half of the same change, and why the options are MOVED
+    /// rather than removed: a team excepts staging with a narrower rule
+    /// above the deny, scoped by the namespace or the directory, and the
+    /// exception has to see that scope in every spelling the deny sees.
+    /// Removed, `-n staging` would be gone from the reading that matches
+    /// `kubectl delete*`, and the deny would win for the staging command the
+    /// exception was written for.
+    #[test]
+    fn an_exception_scoped_by_namespace_or_directory_holds_in_both_spellings() {
+        let policy: Policy = serde_yaml::from_str(
+            r#"
+default: ask
+rules:
+  - match: "kubectl delete * -n staging"
+    action: ask
+    reason: "Staging teardown: approve it if it is meant."
+  - match: "kubectl delete*"
+    action: deny
+  - match: "terraform destroy*-chdir=envs/staging"
+    action: allow
+  - match: "terraform destroy*"
+    action: deny
+"#,
+        )
+        .unwrap();
+        let ctx = here();
+        let v = |c: &str| policy.evaluate_command(c, &ctx);
+        assert_eq!(v("kubectl delete pod web -n staging").action, Action::Ask);
+        assert_eq!(v("kubectl -n staging delete pod web").action, Action::Ask);
+        assert_eq!(v("kubectl -n prod delete pod web").action, Action::Deny);
+        assert_eq!(v("kubectl delete pod web -n prod").action, Action::Deny);
+        // The exception reads the spelling it names. `--namespace staging`
+        // is not `-n staging`, so it falls to the deny: closed, not open.
+        assert_eq!(
+            v("kubectl --namespace staging delete pod web").action,
+            Action::Deny
+        );
+        // A privilege wrapper and a path are read for deny rules only, so an
+        // exception does not admit them.
+        assert_eq!(
+            v("sudo kubectl -n staging delete pod web").action,
+            Action::Deny
+        );
+        assert_eq!(
+            v("/usr/bin/kubectl -n staging delete pod web").action,
+            Action::Deny
+        );
+        assert_eq!(
+            v("terraform -chdir=envs/staging destroy -auto-approve").action,
+            Action::Allow
+        );
+        assert_eq!(
+            v("terraform -chdir=envs/prod destroy -auto-approve").action,
+            Action::Deny
+        );
+        assert_eq!(
+            v("terraform -chdir=envs/staging-old destroy").action,
+            Action::Deny,
+            "the exception ends where its directory does"
+        );
+    }
+
+    /// The readings must not put a value where the subcommand goes, and a
+    /// flag they do not know ends them. Ordinary work keeps its verdict or
+    /// gains the one its plain spelling has (#48), and a path never earns an
+    /// allow.
+    #[test]
+    fn a_tools_options_are_read_by_what_takes_a_value_and_ordinary_work_is_unharmed() {
+        let starter = Policy::builtin().unwrap();
+        let ctx = here();
+        let v = |c: &str| starter.evaluate_command(c, &ctx);
+        // `-n` takes the next word: a namespace called `get` is not the
+        // subcommand.
+        assert_eq!(v("kubectl -n get delete pod x").action, Action::Deny);
+        // And a context called `delete` is not one either.
+        assert_eq!(
+            v("kubectl --context delete get pods").action,
+            v("kubectl get pods --context delete").action
+        );
+        assert_eq!(v("kubectl --context delete get pods").action, Action::Allow);
+        // KNOWN LIMIT, pinned: a flag the list does not know ends the reading
+        // and the command keeps its default. An ask, never an allow.
+        assert_eq!(v("kubectl --frobnicate delete ns x").action, Action::Ask);
+        assert_eq!(
+            v("kubectl --frobnicate delete ns x").source,
+            DecisionSource::Default
+        );
+
+        for (c, rule) in [
+            ("kubectl -n prod get pods", "kubectl get*"),
+            (
+                "kubectl --context staging describe pod web",
+                "kubectl describe*",
+            ),
+            ("terraform -chdir=infra plan", "terraform plan*"),
+            ("terraform -chdir=infra init -upgrade", "terraform init*"),
+            ("docker --context prod ps -a", "docker ps*"),
+        ] {
+            let d = v(c);
+            assert_eq!(d.action, Action::Allow, "{c}: {}", d.reason);
+            assert_eq!(d.matched_rule.as_deref(), Some(rule), "{c}");
+        }
+        // An apply gets its rule's ask, and with it the insurance the rule
+        // was written for, where it had only the default before.
+        let apply = v("terraform -chdir=infra apply -auto-approve");
+        assert_eq!(apply.action, Action::Ask);
+        assert_eq!(apply.matched_rule.as_deref(), Some("terraform apply*"));
+        // A program named by its path is read for deny rules only.
+        for c in [
+            "/usr/bin/kubectl get pods",
+            "./ls -la",
+            "./ls",
+            "/usr/bin/git status",
+        ] {
+            let d = v(c);
+            assert_eq!(d.action, Action::Ask, "{c}: {}", d.reason);
+            assert_eq!(d.source, DecisionSource::Default, "{c}");
+        }
+        assert_eq!(
+            v("ls -la").action,
+            Action::Allow,
+            "control: the name is allowed"
         );
     }
 
