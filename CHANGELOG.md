@@ -2,6 +2,66 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.21.4 — a path after a cd is where the cd went
+
+**In plain words:** a write or delete spelled after a `cd` was judged as if the `cd` had not run. `cd .claude && echo {} > settings.json` matched no path rule, and the starter allowed it from v0.18.6 on, while `echo {} > .claude/settings.json` is a floor deny; the gate's own policy, `.cursor/hooks.json`, `.codex/hooks.json` and any rule of yours that names a directory were sidestepped the same way. The preview and the copy aside had the same blind spot, which is how the lead item of Max Petrusenko's field report found it: from a main checkout, `cd ../wt && rm -r data` was previewed as "does not exist" and, in observe mode, ran with nothing copied. Every part of a command line is now judged in the directory it runs in.
+
+Security release for [GHSA-3hg6-x893-mfr4](https://github.com/termaxa/termaxa/security/advisories/GHSA-3hg6-x893-mfr4) (High), found on Oct 12, 2026 while fixing that item. One code PR (#148). The advisory lists, release by release, when each form started.
+
+### Security
+
+- A path after a `cd` is judged where the `cd` went. `cd`, `chdir`, `pushd`, `Set-Location`, `sl` and `Push-Location`, also behind `builtin`, `command`, `time`, an assignment, a backslash or a brace, carry over `&&`, `;` and newlines, and not over `|` or `&`; a `( ... )` subshell restores the directory when it closes; a `cd` inside `eval` carries on after it, and one inside `sh -c` does not. The path rules on `.termaxa/` and the hook configs fire on the file the shell will touch: `cd .termaxa && echo x > policy.yaml`, `cd .claude && echo {} > settings.json`, `cd .cursor && echo {} > hooks.json` and `cd .codex && echo {} > hooks.json` were allowed and are denied, in both modes, and `cd .termaxa && rm policy.yaml` was an ask and is denied (#148).
+- A `cd` the gate cannot read (`cd "$X"`, `cd -`, `popd`, one under `if` or after `||`) leaves the directory unknown. A relative path after it is unresolved: refused like a variable in a path, and previewed as an unresolved directory rather than guessed (#148).
+
+### Fixed
+
+- The preview, the copy aside and the pre-execution re-check read the directory a segment runs in, and git's `-C`. `cd ../wt && rm -r data` and `git -C ../wt rm -r data` count and copy `../wt/data`; `cd ../wt && git reset --hard` snapshots the uncommitted changes in `../wt`; a force-push pin and a terraform plan run in the segment's directory; rolling back a pin pushes from the repository it was taken in (#148, from Max Petrusenko's field report, Oct 9).
+- A subshell's parentheses are not part of a file name: `(cd .claude && echo {} > settings.json)` writes `settings.json`, not `settings.json)` (#148).
+
+### Measured and documented
+
+- Every release from v0.14.2, through the hook against its own starter policy: the advisory has the release in which each `cd` spelling became an ask or an allow.
+- 46 ordinary commands (`cd src && cargo test`, `git -C sub status`, Claude Code's `bash -c -l "... eval '...'"` wrapper and more) keep their v0.21.3 verdicts.
+- SECURITY.md says what a `cd` the gate cannot follow does, and that an explicit allow still outranks an unresolved target: `cd .termaxa; ls && cd ..; echo x > policy.yaml` is allowed by `echo *`, as `echo x > "$X/policy.yaml"` is. README's observe-mode paragraph no longer says the floor holds these files however a write is spelled.
+- Four test-only helpers in `delete.rs` and `backup.rs` moved below the production code, so RELEASING.md's line count reads them as tests.
+- Dated corrections under v0.21.3 and v0.21.2.
+- 583 tests.
+
+### Upgrade note — a policy from before v0.21.3
+
+The denies above come from the path rules v0.21.3 added. `termaxa init` never rewrites a policy, so a project initialised before v0.21.3 guards these files with string rules (`*.claude*settings*` and its neighbours), and a string rule cannot see across a `cd`: with that policy, v0.21.4 fixes the previews and the copy aside, and `cd .claude && echo {} > settings.json` is still allowed. Put these five rules at the top of `rules:` in `.termaxa/policy.yaml`:
+
+```yaml
+  - match_path: "*/.termaxa/*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
+  - match_path: "*/.claude/settings*.json"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.cursor/hooks.json"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.codex/hooks.json"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.github/hooks/*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+```
+
+Then check:
+
+```
+termaxa check "cd .claude && echo {} > settings.json"
+```
+
+It should say `deny`.
+
 ## v0.21.3 — node_modules is not the floor
 
 **In plain words:** preparing the first observe-mode week on a live Next.js project (Max Petrusenko, Oct 9, 2026), 46 commands such a project runs went through the v0.21.2 hook in observe mode. Three were held that should not have been: `rm -rf node_modules` and `rm -rf .next`, past the copy budget and so read as unrecoverable, when an install rebuilds them; and `cat .claude/settings.json`, denied by the rule written to stop an agent *editing* the hook config. Measuring the second found a hole in the gate's own defence: `cat .termaxa/policy.yaml > .termaxa/policy.yaml` was an allow, in both modes, because the gate's own read exception matched the redirect and nothing read where it landed. The policy would have truncated to nothing. A directory a build rebuilds is now not a loss, the gate's own files and the hook configs are path rules on the floor, and reading a hook config is ordinary work.
@@ -51,6 +111,10 @@ All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https:
 
 and, if you want the reads back, take the hook-config exceptions from `examples/policy.yaml` and place them where its `.termaxa` exceptions sit. Or delete `.termaxa/policy.yaml` and re-run `termaxa init` if you have not customised it. `termaxa doctor` reports the fingerprint change either way; `termaxa check "cat .termaxa/policy.yaml > .termaxa/policy.yaml"` should say `deny`.
 
+### Correction, Oct 13, 2026
+
+The Security bullet above says a write into the gate's own files or a hook config "is denied however it is spelled". Not after a `cd`: the path was resolved in the directory the command started in, so `cd .termaxa && echo x > policy.yaml` and `cd .claude && echo {} > settings.json` were allowed. Fixed in v0.21.4 ([GHSA-3hg6-x893-mfr4](https://github.com/termaxa/termaxa/security/advisories/GHSA-3hg6-x893-mfr4)).
+
 ## v0.21.2 — rm -r -f / is rm -rf /
 
 **In plain words:** `rm -r -f /` and `rm --recursive --force /` were asks in the starter, where `rm -rf /` is a hard stop; through the hook the preview said "resolves to a FILESYSTEM ROOT, NOT recoverable" and the answer was still ask, so an auto-approving harness ran it. And `rm -rf /*` ran in observe mode: the preview read `/*` as a path that does not exist, and the hook's floor was narrower than `run`'s. Both found on Oct 9, 2026 while checking Max Petrusenko's field report, the first from outside (Replay over 57,000 real Claude Code and Codex commands, a 38-command suite, a second reviewer), against the v0.21.1 release binary. Every spelling of a recursive, forced rm now reaches the `-rf` rule; a glob is previewed as what it expands to and held in observe mode; and four of his smaller findings are fixed. The report's lead item, `cd X &&` and `git -C X` ignored by the preview and the insurance, is the next release.
@@ -70,6 +134,10 @@ and, if you want the reads back, take the hook-config exceptions from `examples/
 - The README's "backups have edges" line says a glob target is previewed and not insured.
 - Found in the wild: the first field report, Max Petrusenko, Oct 9, 2026.
 - 558 tests.
+
+### Correction, Oct 13, 2026
+
+The field report's lead item shipped in v0.21.4, not v0.21.3, and it was more than the preview and the insurance: after a `cd`, a write into the gate's own files or a hook config was allowed ([GHSA-3hg6-x893-mfr4](https://github.com/termaxa/termaxa/security/advisories/GHSA-3hg6-x893-mfr4)).
 
 ## v0.21.1 — every spelling of kubectl, terraform and docker
 

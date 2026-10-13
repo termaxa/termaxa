@@ -220,7 +220,7 @@ $ termaxa doctor
 
 Termaxa doctor
 ──────────────────────────────────────────
-✓ termaxa 0.21.3
+✓ termaxa 0.21.4
   /usr/local/bin/termaxa
 
 Policy
@@ -289,7 +289,7 @@ Each harness speaks its own dialect, and dialects change: Cursor 3.11 renamed it
 
 **Enforce** is the default: asks ask, denies deny, insurance before execution.
 
-**Observe** (`mode: observe`, `termaxa init --observe`, or `TERMAXA_MODE=observe` on one machine) runs everything and records what enforcement would have done, insurance included. The hook stays silent, so the agent's own prompts are unchanged. The exception is the floor: 38 starter rules marked `floor: true` are enforced in both modes, and so is any command whose insurance cannot be taken. They cover the gate's own configuration and state (by path since v0.21.3, so a write into `.termaxa/` or a hook config is held however it is spelled, and reading those files is ordinary work), the machine and its recovery points, and commands with no recovery path: `rm -rf /`, `mkfs`, `dd` to a device, shadow-copy deletion, `drop database`, database resets, `kubectl delete`, `terraform destroy`, `docker system prune`, `find -delete`. A delete past the copy budget is uninsurable, and so held, unless the directory is one a build rebuilds (`node_modules`, `.next`, `dist`, `target`, `.venv` and their kind, inside the project): those run in observe mode with nothing copied, because nothing in them is the only copy of anything. Policies written before v0.20 have no floor markers; add `floor: true` to the rules you would never relax, or take the 38 from [`examples/policy.yaml`](examples/policy.yaml). Design and measurements: [docs/observe-mode.md](docs/observe-mode.md).
+**Observe** (`mode: observe`, `termaxa init --observe`, or `TERMAXA_MODE=observe` on one machine) runs everything and records what enforcement would have done, insurance included. The hook stays silent, so the agent's own prompts are unchanged. The exception is the floor: 38 starter rules marked `floor: true` are enforced in both modes, and so is any command whose insurance cannot be taken. They cover the gate's own configuration and state (held by the path a write lands on since v0.21.3, and after a `cd` too since v0.21.4; reading those files is ordinary work), the machine and its recovery points, and commands with no recovery path: `rm -rf /`, `mkfs`, `dd` to a device, shadow-copy deletion, `drop database`, database resets, `kubectl delete`, `terraform destroy`, `docker system prune`, `find -delete`. A delete past the copy budget is uninsurable, and so held, unless the directory is one a build rebuilds (`node_modules`, `.next`, `dist`, `target`, `.venv` and their kind, inside the project): those run in observe mode with nothing copied, because nothing in them is the only copy of anything. Policies written before v0.20 have no floor markers; add `floor: true` to the rules you would never relax, or take the 38 from [`examples/policy.yaml`](examples/policy.yaml). Design and measurements: [docs/observe-mode.md](docs/observe-mode.md).
 
 **Supervised** (Unix) moves the authority. A daemon running as you makes every decision; the agent runs as a second account that cannot read the audit log, edit the backups, change the policy or stop the supervisor, because the operating system refuses, not the code.
 
@@ -418,7 +418,7 @@ Every bug found in real use, with how it was found and where it was fixed, is in
 
 ## Contributing
 
-Rust 2021, ~17,200 lines of production code and ~17,700 of tests, 564 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
+Rust 2021, ~18,000 lines of production code and ~18,400 of tests, 583 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
 
 ## Security
 

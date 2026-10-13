@@ -751,11 +751,6 @@ fn all_overwrite_paths(
     }
 }
 
-#[cfg(test)]
-fn overwrite_paths(redirects: &[crate::shell::Overwrite], cwd: &Path) -> Option<Vec<PathBuf>> {
-    overwrite_paths_in(redirects, Some(cwd))
-}
-
 fn overwrite_paths_in(
     redirects: &[crate::shell::Overwrite],
     cwd: Option<&Path>,
@@ -771,11 +766,6 @@ fn overwrite_paths_in(
     } else {
         Some(paths)
     }
-}
-
-#[cfg(test)]
-fn rm_targets(tokens: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
-    rm_targets_in(tokens, Some(cwd))
 }
 
 /// A path resolved in `cwd`, or, when the directory is unknown (a `cd` the
@@ -1283,6 +1273,21 @@ fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+// Test-only views, kept after the production code: RELEASING.md counts a
+// file's production lines as everything before its first whole-line
+// `#[cfg(test)]`, and a test-only item above the production code moves the
+// rest of the file into the test count.
+
+#[cfg(test)]
+fn overwrite_paths(redirects: &[crate::shell::Overwrite], cwd: &Path) -> Option<Vec<PathBuf>> {
+    overwrite_paths_in(redirects, Some(cwd))
+}
+
+#[cfg(test)]
+fn rm_targets(tokens: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
+    rm_targets_in(tokens, Some(cwd))
 }
 
 #[cfg(test)]

@@ -421,42 +421,6 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
 // target extraction
 // ---------------------------------------------------------------------------
 
-/// Pull delete targets out of a command string, across the three shells the
-/// classifier already knows about. Deliberately conservative: if we can't
-/// confidently identify a target we return nothing rather than guessing, and
-/// the caller falls back to no preview.
-///
-/// A projection of `extract_targets_detailed` — one extractor, two views
-/// (decision #37: two engines parsing the same command differently is the
-/// bug class this module exists to close). Callers that need to know whether
-/// a target can be resolved at all take the detailed form.
-#[cfg(test)]
-pub fn extract_targets(command: &str) -> Vec<String> {
-    extract_targets_detailed(command)
-        .into_iter()
-        .map(|t| t.text)
-        .collect()
-}
-
-/// Delete targets with their quoting provenance attached.
-///
-/// The provenance exists because of what `tokenize` throws away: after quote
-/// stripping, `'lit$SID'` and `$SID` are indistinguishable strings, and only
-/// one of them expands. Keeping the quotes in the token text instead — the
-/// obvious fix — breaks `resolve_head`, which must keep recognising `"rm"`
-/// as `rm` (the quoting shape this project has already shipped a bypass
-/// for). So the text stays exactly what it was, and what the quotes *meant*
-/// travels beside it.
-/// Production reads targets with their directories (`targets_in`); this
-/// whole-line view stays for the tests that pin what the extractor finds.
-#[cfg(test)]
-pub fn extract_targets_detailed(command: &str) -> Vec<Tok> {
-    crate::shell::split_segments_deep(command)
-        .iter()
-        .flat_map(segment_targets)
-        .collect()
-}
-
 /// The delete targets of one segment, from its own words.
 pub fn segment_targets(segment: &crate::shell::Segment) -> Vec<Tok> {
     // The segment's own words. The split already found every redirection;
@@ -1933,6 +1897,52 @@ fn short(p: &str) -> String {
     }
     let tail: String = p.chars().skip(n - (MAX - 1)).collect();
     format!("…{tail}")
+}
+
+// ---------------------------------------------------------------------------
+// test-only views of the extractor
+// ---------------------------------------------------------------------------
+
+// Production reads targets with the directory each resolves in (`targets_in`).
+// Test-only views, kept after the production code: RELEASING.md counts a
+// file's production lines as everything before its first whole-line
+// `#[cfg(test)]`, and a test-only item above the production code moves the
+// rest of the file into the test count.
+
+/// Pull delete targets out of a command string, across the three shells the
+/// classifier already knows about. Deliberately conservative: if we can't
+/// confidently identify a target we return nothing rather than guessing, and
+/// the caller falls back to no preview.
+///
+/// A projection of `extract_targets_detailed` — one extractor, two views
+/// (decision #37: two engines parsing the same command differently is the
+/// bug class this module exists to close). Callers that need to know whether
+/// a target can be resolved at all take the detailed form.
+#[cfg(test)]
+pub fn extract_targets(command: &str) -> Vec<String> {
+    extract_targets_detailed(command)
+        .into_iter()
+        .map(|t| t.text)
+        .collect()
+}
+
+/// Delete targets with their quoting provenance attached.
+///
+/// The provenance exists because of what `tokenize` throws away: after quote
+/// stripping, `'lit$SID'` and `$SID` are indistinguishable strings, and only
+/// one of them expands. Keeping the quotes in the token text instead — the
+/// obvious fix — breaks `resolve_head`, which must keep recognising `"rm"`
+/// as `rm` (the quoting shape this project has already shipped a bypass
+/// for). So the text stays exactly what it was, and what the quotes *meant*
+/// travels beside it.
+/// Production reads targets with their directories (`targets_in`); this
+/// whole-line view stays for the tests that pin what the extractor finds.
+#[cfg(test)]
+pub fn extract_targets_detailed(command: &str) -> Vec<Tok> {
+    crate::shell::split_segments_deep(command)
+        .iter()
+        .flat_map(segment_targets)
+        .collect()
 }
 
 #[cfg(test)]
