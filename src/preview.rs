@@ -63,17 +63,22 @@ pub fn generate(
     if let Some(p) = crate::delete::preview_for(command, root, cwd) {
         return Some(p);
     }
-    // Compound commands: preview the first segment that has one. A POSIX
-    // shell's -c string counts as segments of its own (#62).
+    // Preview the first segment that has one. A POSIX shell's -c string
+    // counts as segments of its own (#62). Each is previewed where it runs:
+    // after every `cd` before it, and past git's `-C`. `cd ../wt && git
+    // reset --hard` discards `../wt`'s changes, and read in the line's first
+    // directory its preview described another tree. A segment after a `cd`
+    // the gate cannot follow has no live preview: it would describe a
+    // directory nobody knows it runs in (#84).
     let segments = crate::shell::split_segments_deep(command);
-    if segments.len() > 1 {
-        if let Some(p) = segments.iter().find_map(|s| generate_one(s, cwd, live)) {
-            return Some(p);
-        }
-        // No per-command preview, but a segment may still overwrite something.
-        return overwrite_preview(command, root, cwd);
+    if let Some(p) = segments.iter().find_map(|s| {
+        let dir = crate::delete::operand_base(s, cwd)?;
+        generate_one(s, &dir, live)
+    }) {
+        return Some(p);
     }
-    generate_one(command, cwd, live).or_else(|| overwrite_preview(command, root, cwd))
+    // No per-command preview, but a segment may still overwrite something.
+    overwrite_preview(command, root, cwd)
 }
 
 /// What a command is about to write over.
@@ -228,7 +233,7 @@ fn generate_one(command: &str, cwd: &std::path::Path, live: bool) -> Option<Prev
             // providers and evaluates `external` data sources, which execute
             // arbitrary programs.
             return if live {
-                terraform_preview(&call.tool, sub == "destroy", call.chdir())
+                terraform_preview(&call.tool, sub == "destroy", call.chdir(), cwd)
             } else {
                 None
             };
@@ -626,7 +631,12 @@ fn git(args: &[&str]) -> Option<String> {
 /// the hook waiting for interactive input or a state lock. `chdir` is the
 /// directory the command names with `-chdir=`, passed the one way terraform
 /// accepts it: before the subcommand, with the equals sign.
-fn terraform_preview(bin: &str, destroy: bool, chdir: Option<&str>) -> Option<Preview> {
+fn terraform_preview(
+    bin: &str,
+    destroy: bool,
+    chdir: Option<&str>,
+    dir: &std::path::Path,
+) -> Option<Preview> {
     let mut args: Vec<String> = Vec::new();
     if let Some(dir) = chdir {
         args.push(format!("-chdir={dir}"));
@@ -637,7 +647,13 @@ fn terraform_preview(bin: &str, destroy: bool, chdir: Option<&str>) -> Option<Pr
     if destroy {
         args.push("-destroy".to_string());
     }
-    let out = match std::process::Command::new(bin).args(&args).output() {
+    // Planned where the command runs, which in the hook is the payload's
+    // directory, never the process's.
+    let out = match std::process::Command::new(bin)
+        .current_dir(dir)
+        .args(&args)
+        .output()
+    {
         Ok(out) => out,
         Err(_e) => {
             // Production stays best-effort and silent, as below. The test
@@ -1222,8 +1238,13 @@ mod terraform_stub_tests {
         let tmp = TempTree::new("tf-destroys");
         let bin = stub(tmp.path(), "faketf", DESTROYS_ONE, 0);
 
-        let p = terraform_preview(bin.to_str().expect("utf-8 path"), true, None)
-            .expect("a successful plan is a preview");
+        let p = terraform_preview(
+            bin.to_str().expect("utf-8 path"),
+            true,
+            None,
+            std::path::Path::new("."),
+        )
+        .expect("a successful plan is a preview");
         assert_eq!(p.summary, "plan: +2 ~0 -1");
         assert!(
             p.lines
@@ -1239,8 +1260,13 @@ mod terraform_stub_tests {
         let tmp = TempTree::new("tf-safe");
         let bin = stub(tmp.path(), "faketf", DESTROYS_NOTHING, 0);
 
-        let p = terraform_preview(bin.to_str().expect("utf-8 path"), false, None)
-            .expect("a successful plan is a preview");
+        let p = terraform_preview(
+            bin.to_str().expect("utf-8 path"),
+            false,
+            None,
+            std::path::Path::new("."),
+        )
+        .expect("a successful plan is a preview");
         assert_eq!(p.summary, "plan: +1 ~0 -0");
         assert!(
             !p.lines.iter().any(|l| l.contains("DESTROYED")),
@@ -1256,7 +1282,13 @@ mod terraform_stub_tests {
         let tmp = TempTree::new("tf-failed");
         let bin = stub(tmp.path(), "faketf", DESTROYS_ONE, 1);
 
-        assert!(terraform_preview(bin.to_str().expect("utf-8 path"), false, None).is_none());
+        assert!(terraform_preview(
+            bin.to_str().expect("utf-8 path"),
+            false,
+            None,
+            std::path::Path::new(".")
+        )
+        .is_none());
     }
 
     #[test]

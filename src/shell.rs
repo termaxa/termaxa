@@ -72,6 +72,7 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                     &chars[seg_start..i],
                     seg_start,
                     &mut cur_spans,
+                    Joiner::And,
                 );
                 seg_start = i + 2;
                 i += 1; // consume second &
@@ -91,6 +92,7 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                     &chars[seg_start..i],
                     seg_start,
                     &mut cur_spans,
+                    Joiner::Background,
                 );
                 seg_start = i + 1;
             }
@@ -161,6 +163,11 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                 continue;
             }
             '|' => {
+                let joiner = if i + 1 < chars.len() && chars[i + 1] == '|' {
+                    Joiner::Or
+                } else {
+                    Joiner::Pipe
+                };
                 flush(
                     &mut segments,
                     &mut cur,
@@ -168,6 +175,7 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                     &chars[seg_start..i],
                     seg_start,
                     &mut cur_spans,
+                    joiner,
                 );
                 if i + 1 < chars.len() && chars[i + 1] == '|' {
                     i += 1; // `||` — consume second |
@@ -182,6 +190,7 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                     &chars[seg_start..i],
                     seg_start,
                     &mut cur_spans,
+                    Joiner::Sequence,
                 );
                 seg_start = i + 1;
             }
@@ -238,6 +247,7 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
         &chars[seg_start..],
         seg_start,
         &mut cur_spans,
+        Joiner::End,
     );
     segments
 }
@@ -327,11 +337,21 @@ const MAX_WRAP_DEPTH: usize = 4;
 /// asked about that segment alone keep `split_segments`.
 pub fn split_segments_deep(s: &str) -> Vec<Segment> {
     let mut out = Vec::new();
-    expand_into(&mut out, split_segments(s), None, 0);
+    expand_into(&mut out, split_segments(s), None, 0, RunDir::Start);
     out
 }
 
-fn expand_into(out: &mut Vec<Segment>, segments: Vec<Segment>, via: Option<&str>, depth: usize) {
+/// Expands `segments` into `out`, starting in `start`, and returns where the
+/// shell is after the last of them: an `eval`'s string runs in the shell
+/// that evaluates it, so a `cd` inside one carries on after it; a `sh -c`
+/// string runs in a child, so its `cd` does not.
+fn expand_into(
+    out: &mut Vec<Segment>,
+    segments: Vec<Segment>,
+    via: Option<&str>,
+    depth: usize,
+    start: RunDir,
+) -> RunDir {
     // A variable assigned earlier in the same command line, in the clear, is
     // not unknown: `SNAPSHOT_FILE=/home/dev/.claude/…` on line one and
     // `>| "$SNAPSHOT_FILE"` on line four name the same file. The bindings
@@ -341,30 +361,94 @@ fn expand_into(out: &mut Vec<Segment>, segments: Vec<Segment>, via: Option<&str>
     // A name assigned twice is the later value from that point on, which
     // is what the shell would do.
     let mut bindings: Vec<(String, String)> = Vec::new();
+    // The bindings in force where each open `( … )` began: an assignment
+    // inside a subshell is gone when it closes.
+    let mut binding_scopes: Vec<Vec<(String, String)>> = Vec::new();
     let mut inner: Vec<Segment> = Vec::new();
+    // Whether each segment may not run at all: inside `if`/`while`/`until`/
+    // `for`/`case`/`select`, or after a stripped keyword (`then cd x`). A
+    // `cd` there may or may not have happened.
+    let mut conditional: Vec<bool> = Vec::new();
+    let mut control_depth = 0usize;
+    // What each segment's `cd` does, read from its own words with the
+    // bindings before it applied: `D=../wt; cd $D` moves to `../wt`.
+    let mut cds: Vec<Option<CdEffect>> = Vec::new();
+    let mut parens: Vec<Parens> = Vec::new();
+    let mut prev: Option<Joiner> = None;
     for mut seg in segments {
         if let Some(v) = via {
             seg.via = Some(v.to_string());
         }
+        let pp = strip_subshell_parens(&mut seg);
+        for _ in 0..pp.opens {
+            binding_scopes.push(bindings.clone());
+        }
         if !bindings.is_empty() {
             substitute_bindings(&mut seg, &bindings);
         }
+        // Every control keyword in front of the command opens a level:
+        // `then if x` is a nested `if`, and its `fi` must not close the
+        // outer one.
+        let opened = seg
+            .text
+            .split_whitespace()
+            .take_while(|w| CONTROL_LEADERS.contains(w))
+            .filter(|w| matches!(*w, "if" | "while" | "until" | "for" | "case" | "select"))
+            .count();
+        control_depth += opened;
+        let first = seg.text.split_whitespace().next().unwrap_or("").to_string();
         let (keyword_only, keyword_stripped) = strip_control_keywords(&mut seg);
         if keyword_only {
             seg.keyword = true;
         }
+        conditional.push(control_depth > 0 || keyword_stripped);
+        // After the keyword is off (`then cd x` is a `cd`), and with the
+        // bindings made before this segment.
+        cds.push(cd_effect(&with_bindings(seg.command(), &bindings)));
+        if matches!(first.as_str(), "fi" | "done" | "esac") {
+            control_depth = control_depth.saturating_sub(1);
+        }
         // An assignment under a condition or in a loop body (`then X=…`,
         // `do X=…`) may never run, so it does not bind (#94's rule): the
-        // segments after it are read as written.
-        if let Some((name, value)) = simple_assignment(&seg).filter(|_| !keyword_stripped) {
+        // segments after it are read as written. Nor does one in a
+        // pipeline or sent to the background: it ran in a subshell.
+        let own =
+            prev != Some(Joiner::Pipe) && !matches!(seg.joiner, Joiner::Pipe | Joiner::Background);
+        if let Some((name, value)) = simple_assignment(&seg).filter(|_| !keyword_stripped && own) {
             bindings.retain(|(n, _)| n != &name);
             bindings.push((name, value));
             seg.binds = true;
         }
+        for _ in 0..pp.closes {
+            if let Some(outer) = binding_scopes.pop() {
+                bindings = outer;
+            }
+        }
+        prev = Some(seg.joiner);
+        parens.push(pp);
         inner.push(seg);
     }
     let snapshot = via.is_some() && claude_snapshot_inner(&inner).is_some();
-    for mut seg in inner {
+    let mut here = start;
+    // A `( … )` subshell or a `$( … )` substitution split across segments:
+    // where the shell was when it opened, restored when it closes.
+    let mut subshells: Vec<RunDir> = Vec::new();
+    let mut prev_joiner: Option<Joiner> = None;
+    // The `&&`/`||` list the segment belongs to. Within a list, a segment
+    // after a `cd` runs only where that `cd` went. Once the list ends (`;`,
+    // a newline), what follows runs whether or not the list's `cd` ran, so
+    // the list's moves count only if each one is certain to have been
+    // attempted: first in the list, or after nothing but other `cd`s.
+    let mut list_start = here.clone();
+    let mut list_only_cds = true;
+    let mut list_uncertain = false;
+    let mut list_exit_guarded = false;
+    let n = inner.len();
+    let next_words: Vec<String> = inner
+        .iter()
+        .map(|s| s.text.split_whitespace().next().unwrap_or("").to_string())
+        .collect();
+    for (i, mut seg) in inner.into_iter().enumerate() {
         // Scaffolding is only ever a harness's, and a harness only ever
         // speaks through a `-c` string; typed at the top level, the same
         // words are a person's command and are judged as one. Claude Code's
@@ -372,22 +456,362 @@ fn expand_into(out: &mut Vec<Segment>, segments: Vec<Segment>, via: Option<&str>
         // first line and by every one of its writes going to the file that
         // line names (`claude_snapshot`).
         seg.scaffold = via.is_some() && (snapshot || harness_scaffold(&seg));
-        let inner = if depth < MAX_WRAP_DEPTH {
+        let pp = parens[i];
+        for _ in 0..pp.opens {
+            subshells.push(here.clone());
+        }
+        seg.dir = here.clone();
+        // A segment piped from or into another, or sent to the background,
+        // runs in a subshell: a `cd` there moves nothing after it.
+        let piped_in = prev_joiner == Some(Joiner::Pipe);
+        let own_shell = !piped_in && !matches!(seg.joiner, Joiner::Pipe | Joiner::Background);
+        let gated_and = prev_joiner == Some(Joiner::And);
+        let gated_or = prev_joiner == Some(Joiner::Or);
+        let wrapped = if depth < MAX_WRAP_DEPTH {
             wrapped_command(&seg).or_else(|| wrapped_eval(&seg))
         } else {
             None
         };
-        seg.wraps = inner.is_some();
+        seg.wraps = wrapped.is_some();
+        // Where this segment, if it moves the shell, leaves it.
+        let mut moves_to: Option<RunDir> = cds[i]
+            .take()
+            .filter(|_| own_shell)
+            .map(|effect| moved(&here, effect, true));
+        let is_cd = moves_to.is_some();
+        let joiner = seg.joiner;
+        prev_joiner = Some(joiner);
         out.push(seg);
-        if let Some((shell, script)) = inner {
+        if let Some((shell, script)) = wrapped {
             let label = if shell == "eval" {
                 "eval".to_string()
             } else {
                 format!("{shell} -c")
             };
-            expand_into(out, split_segments(&script), Some(&label), depth + 1);
+            let after = expand_into(
+                out,
+                split_segments(&script),
+                Some(&label),
+                depth + 1,
+                here.clone(),
+            );
+            // An `eval` runs in this shell, so a `cd` inside it moves it.
+            if shell == "eval" && own_shell && after != here {
+                moves_to = Some(after);
+            }
+        }
+        if let Some(to) = moves_to {
+            here = if conditional[i] || gated_or || to == RunDir::Unknown {
+                // It may or may not have run, or ran only where something
+                // failed: nothing after it can say where the shell is.
+                RunDir::Unknown
+            } else {
+                if gated_and && !list_only_cds {
+                    // `ls && cd x`: in the rest of this list the shell is in
+                    // `x`; after the list, it depends on whether `ls`
+                    // succeeded.
+                    list_uncertain = true;
+                }
+                to
+            };
+            // `cd x || exit`: past it, the shell is in `x` or gone.
+            if joiner == Joiner::Or
+                && i + 1 < n
+                && matches!(next_words[i + 1].as_str(), "exit" | "return")
+            {
+                list_exit_guarded = true;
+            }
+        }
+        if !is_cd {
+            list_only_cds = false;
+        }
+        let mut closed = false;
+        for _ in 0..pp.closes {
+            if let Some(outer) = subshells.pop() {
+                here = outer;
+                closed = true;
+            }
+        }
+        match joiner {
+            Joiner::And | Joiner::Or | Joiner::Pipe => {}
+            Joiner::Background => {
+                // The whole list ran in the background, in a subshell.
+                here = list_start.clone();
+                list_start = here.clone();
+                (list_only_cds, list_uncertain, list_exit_guarded) = (true, false, false);
+            }
+            Joiner::Sequence | Joiner::End => {
+                if !closed {
+                    here = if list_uncertain {
+                        RunDir::Unknown
+                    } else if list_exit_guarded || joiner == Joiner::End {
+                        // At the end of the line nothing follows; at the end
+                        // of an `eval`'s string, the line around it decides.
+                        here
+                    } else {
+                        // Each move this list made counts only if its
+                        // directory exists: the shell carries on past a
+                        // `cd` that failed.
+                        unsure_since(&list_start, here)
+                    };
+                }
+                list_start = here.clone();
+                (list_only_cds, list_uncertain, list_exit_guarded) = (true, false, false);
+            }
         }
     }
+    here
+}
+
+/// Words that may stand in front of a command and open or continue a
+/// control structure.
+const CONTROL_LEADERS: [&str; 11] = [
+    "then", "do", "else", "elif", "!", "if", "while", "until", "for", "case", "select",
+];
+
+/// `here` with every move made since `start` marked as counting only if its
+/// directory exists.
+fn unsure_since(start: &RunDir, here: RunDir) -> RunDir {
+    let kept = match start {
+        RunDir::Moved(steps) => steps.len(),
+        RunDir::Start | RunDir::Unknown => 0,
+    };
+    match here {
+        RunDir::Moved(mut steps) => {
+            for step in steps.iter_mut().skip(kept) {
+                step.sure = false;
+            }
+            RunDir::Moved(steps)
+        }
+        other => other,
+    }
+}
+
+/// What a `cd` does, when the segment is one.
+enum CdEffect {
+    /// Moves to this path, as written.
+    To(String),
+    /// Moves somewhere the gate cannot name.
+    Unknown,
+}
+
+/// `here` after a `cd`. A path that does not depend on where the shell is
+/// (absolute, `~`) is known even after an unknown move.
+fn moved(here: &RunDir, effect: CdEffect, sure: bool) -> RunDir {
+    let path = match effect {
+        CdEffect::To(p) => p,
+        CdEffect::Unknown => return RunDir::Unknown,
+    };
+    let step = CdStep { path, sure };
+    match here {
+        RunDir::Start => RunDir::Moved(vec![step]),
+        RunDir::Moved(steps) => {
+            let mut steps = steps.clone();
+            steps.push(step);
+            RunDir::Moved(steps)
+        }
+        RunDir::Unknown if crate::delete::is_dir_independent(&step.path) => {
+            RunDir::Moved(vec![step])
+        }
+        RunDir::Unknown => RunDir::Unknown,
+    }
+}
+
+/// The `cd` this segment performs, if it is one: `cd`, `chdir`, `pushd`,
+/// `popd`, PowerShell's `Set-Location`/`sl`/`Push-Location`/`Pop-Location`,
+/// past `builtin`/`command` and a subshell's opening parenthesis.
+fn cd_effect(command: &str) -> Option<CdEffect> {
+    // A brace group runs in this shell, so `{ cd x; …; }` moves it too.
+    let words = command.trim_start().trim_start_matches(['(', '{', ' ']);
+    let toks = crate::delete::tokenize_detailed(words);
+    let mut k = 0;
+    // `builtin cd`, `command cd`, `time cd`, `X=1 cd`: still a cd.
+    while let Some(t) = toks.get(k) {
+        let w = t.text.as_str();
+        let assignment = w.split_once('=').is_some_and(|(n, _)| {
+            !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        if matches!(w, "builtin" | "command" | "time" | "-p") || assignment {
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    let head = toks
+        .get(k)?
+        .text
+        .trim_start_matches('\\')
+        .to_ascii_lowercase();
+    let powershell = matches!(head.as_str(), "set-location" | "sl" | "push-location");
+    match head.as_str() {
+        "cd" | "chdir" | "pushd" => {}
+        _ if powershell => {}
+        "popd" | "pop-location" => return Some(CdEffect::Unknown),
+        _ => return None,
+    }
+    let args = &toks[k + 1..];
+    // `pushd -n` adds to the stack and leaves the shell where it is.
+    if head == "pushd" && args.iter().any(|t| t.text == "-n") {
+        return None;
+    }
+    let mut paths: Vec<&crate::delete::Tok> = Vec::new();
+    let mut j = 0;
+    while let Some(t) = args.get(j) {
+        let w = t.text.as_str();
+        let lw = w.to_ascii_lowercase();
+        if powershell || head == "cd" {
+            // PowerShell takes the path by name as well as by position.
+            if lw == "-path" || lw == "-literalpath" {
+                if let Some(v) = args.get(j + 1) {
+                    paths.push(v);
+                }
+                j += 2;
+                continue;
+            }
+            if powershell && lw.starts_with('-') {
+                j += 1;
+                continue;
+            }
+        }
+        match w {
+            "-P" | "-L" | "-e" | "-@" | "--" => {}
+            // cmd.exe's `cd /d D:\x` changes drive as well. Alone, `/d` is
+            // a directory: bash's `cd /d` goes there.
+            _ if lw == "/d" && (head == "cd" || head == "chdir") && j + 1 < args.len() => {}
+            _ => paths.push(t),
+        }
+        j += 1;
+    }
+    match paths.as_slice() {
+        [] if head == "cd" || head == "chdir" => Some(CdEffect::To("~".into())),
+        [] => Some(CdEffect::Unknown),
+        [t] => {
+            let w = t.text.as_str();
+            let opaque = w == "-"
+                || t.has_unexpanded_var()
+                || t.has_glob()
+                || w.contains('`')
+                || w.contains("$(")
+                // `~-`, `~+` and `~user` name directories the gate cannot
+                // read; `~` and `~/x` are home.
+                || (w.starts_with('~') && w != "~" && !w.starts_with("~/") && !w.starts_with("~\\"))
+                || ((w.starts_with('+') || w.starts_with('-'))
+                    && w[1..].chars().all(|c| c.is_ascii_digit()));
+            Some(if opaque {
+                CdEffect::Unknown
+            } else {
+                CdEffect::To(w.to_string())
+            })
+        }
+        // `cd a b` is an error in bash and a substitution in zsh.
+        _ => Some(CdEffect::Unknown),
+    }
+}
+
+/// What a segment does to the stack of subshells: how many `(` it opens at
+/// its start (taken off its words), how many more open inside it without
+/// closing there (a `$(` or `<(` whose `)` is in a later segment, as in
+/// `echo $(cd x; pwd)`), and how many `)` close one it did not open.
+#[derive(Debug, Clone, Copy, Default)]
+struct Parens {
+    opens: usize,
+    closes: usize,
+}
+
+/// Takes a `( … )` subshell's own parentheses off the words a segment's
+/// targets are read from, its command and its redirect targets, and returns
+/// what it does to the stack of subshells. The text the string rules match
+/// stays as typed. `(cd .claude && echo {} > settings.json)` splits into
+/// `(cd .claude` and `echo {} > settings.json)`; read as written, the
+/// redirect target was `settings.json)`, which no path rule names, and the
+/// write to the hook config was allowed (Oct 12, 2026). A leading `(` hid
+/// the head of `(rm -r x)` from the delete preview the same way.
+fn strip_subshell_parens(seg: &mut Segment) -> Parens {
+    let (lead, inner_open, closes) = subshell_parens(&seg.text);
+    if lead > 0 {
+        let mut rest = seg.command.trim_start();
+        for _ in 0..lead {
+            rest = rest.strip_prefix('(').unwrap_or(rest).trim_start();
+        }
+        seg.command = rest.to_string();
+    }
+    let mut left = closes;
+    for r in seg.redirects.iter_mut().rev() {
+        while left > 0 && r.target.ends_with(')') {
+            r.target.pop();
+            left -= 1;
+        }
+    }
+    while left > 0 && seg.command.trim_end().ends_with(')') {
+        let trimmed = seg.command.trim_end();
+        seg.command = trimmed[..trimmed.len() - 1].trim_end().to_string();
+        left -= 1;
+    }
+    Parens {
+        opens: lead + inner_open,
+        closes,
+    }
+}
+
+/// `(leading, unclosed, closing)`: the `(`s a segment starts with, the `(`s
+/// inside it still open at its end, and the `)`s that close something it
+/// did not open. `(cd x && rm -r y)` splits into `(cd x` and `rm -r y)`.
+/// Quotes and escapes hide parentheses, and a `case` pattern's `)` (`a)
+/// ls`) is the pattern's.
+fn subshell_parens(text: &str) -> (usize, usize, usize) {
+    let t = text.trim();
+    let lead_len = t
+        .chars()
+        .take_while(|c| *c == '(' || c.is_whitespace())
+        .count();
+    let lead = t.chars().take(lead_len).filter(|c| *c == '(').count();
+    let chars: Vec<char> = t.chars().collect();
+    let mut i = lead_len + case_pattern_len(&chars[lead_len..]);
+    let mut depth = 0usize;
+    let mut closes = 0usize;
+    let (mut single, mut double) = (false, false);
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if !single => i += 1,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '(' if !single && !double => depth += 1,
+            ')' if !single && !double => {
+                if depth > 0 {
+                    depth -= 1;
+                } else {
+                    closes += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (lead, depth, closes)
+}
+
+/// How many characters at the start of `chars` are a `case` header's or
+/// arm's pattern, up to and including its `)`: `case $x in a)` or `a|b)`.
+/// Zero when there is none.
+fn case_pattern_len(chars: &[char]) -> usize {
+    let text: String = chars.iter().collect();
+    let first = text.split_whitespace().next().unwrap_or("");
+    let upto = |from: usize| -> usize {
+        text[from..]
+            .find(')')
+            .map(|k| text[..from + k + 1].chars().count())
+            .unwrap_or(0)
+    };
+    if first == "case" {
+        return match text.find(" in ") {
+            Some(k) => upto(k + 4),
+            None => 0,
+        };
+    }
+    if first.ends_with(')') && !first.contains('(') && text.split_whitespace().nth(1).is_some() {
+        return first.chars().count() + (text.len() - text.trim_start().len());
+    }
+    0
 }
 
 /// `NAME=value` or `export NAME=value` and nothing else: the name a shell
@@ -525,52 +949,6 @@ fn strip_control_keywords(seg: &mut Segment) -> (bool, bool) {
 }
 
 fn substitute_bindings(seg: &mut Segment, bindings: &[(String, String)]) {
-    // `$NAME` and `${NAME}` outside single quotes; inside them the shell
-    // expands nothing, so the text stays what it is. `$NAMEX` is a different
-    // name and stays too.
-    fn subst(text: &str, name: &str, value: &str) -> String {
-        let chars: Vec<char> = text.chars().collect();
-        let mut out = String::with_capacity(text.len());
-        let mut in_single = false;
-        let mut i = 0;
-        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-        while i < chars.len() {
-            let c = chars[i];
-            if c == '\\' && !in_single && i + 1 < chars.len() {
-                out.push(c);
-                out.push(chars[i + 1]);
-                i += 2;
-                continue;
-            }
-            if c == '\'' {
-                in_single = !in_single;
-                out.push(c);
-                i += 1;
-                continue;
-            }
-            if c == '$' && !in_single {
-                let rest: String = chars[i + 1..].iter().collect();
-                if let Some(after) = rest.strip_prefix('{') {
-                    if let Some(tail) = after.strip_prefix(name) {
-                        if tail.starts_with('}') {
-                            out.push_str(value);
-                            i += 1 + 1 + name.chars().count() + 1;
-                            continue;
-                        }
-                    }
-                } else if let Some(tail) = rest.strip_prefix(name) {
-                    if !tail.chars().next().is_some_and(ident) {
-                        out.push_str(value);
-                        i += 1 + name.chars().count();
-                        continue;
-                    }
-                }
-            }
-            out.push(c);
-            i += 1;
-        }
-        out
-    }
     if !seg.text.contains('$') {
         return;
     }
@@ -580,6 +958,65 @@ fn substitute_bindings(seg: &mut Segment, bindings: &[(String, String)]) {
             r.target = subst(&r.target, name, value);
         }
     }
+}
+
+/// `text` with every binding substituted, the way `substitute_bindings`
+/// substitutes a segment's text.
+fn with_bindings(text: &str, bindings: &[(String, String)]) -> String {
+    let mut out = text.to_string();
+    if out.contains('$') {
+        for (name, value) in bindings {
+            out = subst(&out, name, value);
+        }
+    }
+    out
+}
+
+// `$NAME` and `${NAME}` outside single quotes; inside them the shell
+// expands nothing, so the text stays what it is. `$NAMEX` is a different
+// name and stays too.
+fn subst(text: &str, name: &str, value: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut in_single = false;
+    let mut i = 0;
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && !in_single && i + 1 < chars.len() {
+            out.push(c);
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if c == '\'' {
+            in_single = !in_single;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '$' && !in_single {
+            let rest: String = chars[i + 1..].iter().collect();
+            if let Some(after) = rest.strip_prefix('{') {
+                if let Some(tail) = after.strip_prefix(name) {
+                    if tail.starts_with('}') {
+                        out.push_str(value);
+                        i += 1 + 1 + name.chars().count() + 1;
+                        continue;
+                    }
+                }
+            } else if let Some(tail) = rest.strip_prefix(name) {
+                if !tail.chars().next().is_some_and(ident) {
+                    out.push_str(value);
+                    i += 1 + name.chars().count();
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// Claude Code's startup snapshot, run once per session as
@@ -871,6 +1308,91 @@ pub struct Segment {
     /// command -v x`, `then echo`, `if [ -f x ]`) is stripped so the
     /// command is what is judged; `do rm -rf x` is still `rm -rf x`.
     pub keyword: bool,
+    /// The operator that ended this segment, which decides whether a `cd`
+    /// in it carries over to the next one: through `&&`, `;` and a newline
+    /// it does; through `|` and `&` it ran in a subshell and does not.
+    pub(crate) joiner: Joiner,
+    /// The directory this segment runs in, relative to the one the command
+    /// line starts in: every `cd` before it on the same line, in order.
+    /// `split_segments_deep` fills it; read it with `run_dir`.
+    ///
+    /// Until Oct 2026 every reader resolved a relative path against the
+    /// directory the line started in, whatever came before it. `cd .termaxa
+    /// && echo x > policy.yaml` was judged as a write to `./policy.yaml`,
+    /// matched no path rule, and was allowed through the hook while the
+    /// same write spelled `echo x > .termaxa/policy.yaml` was a floor deny;
+    /// `cd .claude && echo {} > settings.json` unhooked the gate the same
+    /// way. Allowed from v0.18.6, when `cd *` joined the starter, through
+    /// v0.21.3 (measured Oct 12, 2026, each release binary against its own
+    /// starter). The preview and the insurance had the same blind spot:
+    /// `cd ../wt && rm -r data` counted and copied `./data` (Max
+    /// Petrusenko's field report, Oct 9, 2026).
+    pub dir: RunDir,
+}
+
+/// The operator between two segments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Joiner {
+    /// `&&`: the next segment runs only if this one succeeded.
+    And,
+    /// `||`: the next segment runs only if this one failed.
+    Or,
+    /// `;` or a newline: the next segment runs either way.
+    Sequence,
+    /// `|`: both sides run in subshells.
+    Pipe,
+    /// `&`: this segment runs in the background, in a subshell.
+    Background,
+    /// The end of the line.
+    End,
+}
+
+/// Where a segment runs, as `Segment::dir` records it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RunDir {
+    /// The directory the command line starts in.
+    #[default]
+    Start,
+    /// Moved by the `cd`s before it, in order, each applied to the last.
+    Moved(Vec<CdStep>),
+    /// A `cd` the gate cannot follow came first: `cd "$X"`, `cd -`, `popd`,
+    /// a `cd` under `if` or after `||`. A relative path after it names
+    /// nothing the gate can know.
+    Unknown,
+}
+
+/// One `cd`, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdStep {
+    pub path: String,
+    /// False when the shell carries on whether or not the `cd` succeeded
+    /// (`;`, a newline): then it counts only if the directory exists. After
+    /// `&&` the rest runs only where the `cd` went, so it always counts.
+    pub sure: bool,
+}
+
+impl Segment {
+    /// The directory this segment runs in when the line starts in `start`,
+    /// or `None` when a `cd` before it cannot be followed.
+    pub fn run_dir(&self, start: &std::path::Path) -> Option<std::path::PathBuf> {
+        match &self.dir {
+            RunDir::Start => Some(start.to_path_buf()),
+            RunDir::Unknown => None,
+            RunDir::Moved(steps) => {
+                let mut dir = start.to_path_buf();
+                for step in steps {
+                    let next = crate::delete::resolve_path_in(&step.path, &dir);
+                    if !step.sure && !next.is_dir() {
+                        // `mkdir x; cd x; …` or a typo: whether the shell is
+                        // in `x` or still here depends on what ran first.
+                        return None;
+                    }
+                    dir = next;
+                }
+                Some(dir)
+            }
+        }
+    }
 }
 
 impl Segment {
@@ -948,6 +1470,7 @@ fn flush(
     source: &[char],
     seg_start: usize,
     spans: &mut Vec<(usize, usize)>,
+    joiner: Joiner,
 ) {
     let t = cur.trim();
     if !t.is_empty() {
@@ -972,6 +1495,8 @@ fn flush(
             scaffold: false,
             binds: false,
             keyword: false,
+            joiner,
+            dir: RunDir::Start,
         });
     } else {
         // Nothing but whitespace between separators: whatever the redirect
@@ -2104,5 +2629,240 @@ mod tests {
                 "{real} is an ordinary file"
             );
         }
+    }
+}
+
+/// The directory each segment runs in (`Segment::dir`). Found Oct 12, 2026:
+/// every reader resolved relative paths against the line's first directory,
+/// so `cd .termaxa && echo x > policy.yaml` was allowed through the hook.
+#[cfg(test)]
+mod segment_directory_tests {
+    use super::*;
+
+    /// The directory recorded for the first segment whose text starts with
+    /// `which`.
+    fn dir_of(command: &str, which: &str) -> RunDir {
+        split_segments_deep(command)
+            .into_iter()
+            .find(|s| s.text.starts_with(which))
+            .unwrap_or_else(|| panic!("no segment starting {which:?} in {command:?}"))
+            .dir
+    }
+
+    fn sure(path: &str) -> CdStep {
+        CdStep {
+            path: path.into(),
+            sure: true,
+        }
+    }
+
+    fn unsure(path: &str) -> CdStep {
+        CdStep {
+            path: path.into(),
+            sure: false,
+        }
+    }
+
+    #[test]
+    fn a_cd_carries_through_and_and_sequence_and_newline() {
+        assert_eq!(dir_of("cd a && rm x", "rm"), RunDir::Moved(vec![sure("a")]));
+        assert_eq!(dir_of("cd a; rm x", "rm"), RunDir::Moved(vec![unsure("a")]));
+        assert_eq!(dir_of("cd a\nrm x", "rm"), RunDir::Moved(vec![unsure("a")]));
+        assert_eq!(
+            dir_of("cd a && cd b && rm x", "rm"),
+            RunDir::Moved(vec![sure("a"), sure("b")])
+        );
+        // The segment before the `cd` is where the line started.
+        assert_eq!(dir_of("ls && cd a && rm x", "ls"), RunDir::Start);
+        assert_eq!(dir_of("cd a && rm x", "cd"), RunDir::Start);
+    }
+
+    #[test]
+    fn a_cd_in_a_subshell_moves_nothing_after_it() {
+        // Both sides of a pipe, and a backgrounded command, run in
+        // subshells.
+        assert_eq!(dir_of("cd a | rm x", "rm"), RunDir::Start);
+        assert_eq!(dir_of("ls | cd a && rm x", "rm"), RunDir::Start);
+        assert_eq!(dir_of("cd a & rm x", "rm"), RunDir::Start);
+        // A parenthesised subshell moves what is inside it, and the shell
+        // is back where it was after the closing parenthesis.
+        assert_eq!(
+            dir_of("(cd a && rm x); rm y", "rm x"),
+            RunDir::Moved(vec![sure("a")])
+        );
+        assert_eq!(dir_of("(cd a && rm x); rm y", "rm y"), RunDir::Start);
+        // A list sent to the background ran in a subshell, `cd` and all.
+        assert_eq!(dir_of("cd a && ls & rm x", "rm"), RunDir::Start);
+        // A `cd` inside a substitution split across segments stays there.
+        assert_eq!(dir_of("echo $(cd /tmp; pwd); rm x", "rm"), RunDir::Start);
+        // A case pattern's `)` closes no subshell.
+        assert_eq!(
+            dir_of("(cd a; case z in z) ls;; esac; rm x)", "rm"),
+            RunDir::Moved(vec![unsure("a")])
+        );
+        // A `$( … )` closes nothing.
+        assert_eq!(
+            dir_of("cd a && echo $(pwd) && rm x", "rm"),
+            RunDir::Moved(vec![sure("a")])
+        );
+    }
+
+    #[test]
+    fn a_sh_c_string_runs_in_a_child_and_an_eval_does_not() {
+        // The string inherits where the shell was...
+        assert_eq!(
+            dir_of("cd a && sh -c 'cd b && rm x'", "rm"),
+            RunDir::Moved(vec![sure("a"), sure("b")])
+        );
+        // ...and its `cd` stays in the child.
+        assert_eq!(dir_of("sh -c 'cd b'; rm y", "rm"), RunDir::Start);
+        // `eval` runs in this shell, so its `cd` carries on.
+        assert_eq!(
+            dir_of("eval 'cd b' && rm y", "rm"),
+            RunDir::Moved(vec![sure("b")])
+        );
+    }
+
+    #[test]
+    fn a_cd_the_gate_cannot_follow_makes_the_directory_unknown() {
+        for c in [
+            "cd \"$X\" && rm y",
+            "cd $X && rm y",
+            "cd - && rm y",
+            "cd a b && rm y",
+            "cd $(git rev-parse --show-toplevel) && rm y",
+            "popd && rm y",
+            "pushd +1 && rm y",
+            "if true; then cd a; fi; rm y",
+            "for d in a b; do cd $d; done; rm y",
+            "then cd a\nrm y",
+            // A `cd` gated by another command, read after its list ends:
+            // it ran only if that command succeeded (or failed).
+            "cd a; ls && cd b; rm y",
+            "cd a; ls || cd b; rm y",
+            "ls || cd b && rm y",
+            // A nested `if`: the inner `fi` does not close the outer one.
+            "if ls; then if ls; then ls; fi; cd /tmp; fi; rm y",
+            "while x; do for d in a; do ls; done; cd b; done; rm y",
+            // A conditional `eval` may have moved the shell.
+            "if ls; then eval 'cd b'; fi; rm y",
+            // After an unknown move, `..` is no better known.
+            "cd \"$X\" && cd .. && rm y",
+            "cd ~- && rm y",
+            "cd ~other && rm y",
+        ] {
+            assert_eq!(dir_of(c, "rm"), RunDir::Unknown, "{c}");
+        }
+        // Inside its own list, a gated `cd` is where the rest runs.
+        assert_eq!(
+            dir_of("cd a; ls && cd b && rm y", "rm"),
+            RunDir::Moved(vec![unsure("a"), sure("b")])
+        );
+        // An absolute `cd` after an unknown one is known again.
+        assert_eq!(
+            dir_of("cd \"$X\" && cd /srv/app && rm y", "rm"),
+            RunDir::Moved(vec![sure("/srv/app")])
+        );
+    }
+
+    #[test]
+    fn the_spellings_of_cd() {
+        let x = RunDir::Moved(vec![sure("a")]);
+        for c in [
+            "cd a && rm y",
+            "builtin cd a && rm y",
+            "command cd a && rm y",
+            "cd -P a && rm y",
+            "cd -- a && rm y",
+            "chdir a && rm y",
+            "pushd a && rm y",
+            "cd \"a\" && rm y",
+            "Set-Location a && rm y",
+            "Set-Location -Path a && rm y",
+            "sl a && rm y",
+            "Push-Location -LiteralPath a && rm y",
+            "cd /d a && rm y",
+            "time cd a && rm y",
+            "X=1 cd a && rm y",
+            "\\cd a && rm y",
+        ] {
+            assert_eq!(dir_of(c, "rm"), x, "{c}");
+        }
+        // `cd a || true`: the shell carries on in `a` if it exists, and
+        // where it was if not.
+        assert_eq!(
+            dir_of("cd a || true; rm y", "rm"),
+            RunDir::Moved(vec![unsure("a")])
+        );
+        // A brace group runs in this shell; the `;` inside it ends a list,
+        // so the move counts if `a` exists.
+        assert_eq!(
+            dir_of("{ cd a; } && rm y", "rm"),
+            RunDir::Moved(vec![unsure("a")])
+        );
+        // Alone, `/d` is a directory, as bash reads it.
+        assert_eq!(
+            dir_of("cd /d && rm y", "rm"),
+            RunDir::Moved(vec![sure("/d")])
+        );
+        // `pushd -n` changes the stack, not the directory.
+        assert_eq!(dir_of("pushd -n /srv && rm y", "rm"), RunDir::Start);
+        // `cd x || exit` leaves the shell in `x` past it.
+        assert_eq!(
+            dir_of("cd a || exit 1; rm y", "rm"),
+            RunDir::Moved(vec![sure("a")])
+        );
+        // A bare `cd` goes home.
+        assert_eq!(dir_of("cd && rm y", "rm"), RunDir::Moved(vec![sure("~")]));
+        // A variable bound earlier on the line is known (#94).
+        assert_eq!(
+            dir_of("D=a; cd $D && rm y", "rm"),
+            RunDir::Moved(vec![sure("a")])
+        );
+        // Not a cd.
+        assert_eq!(dir_of("cdk deploy && rm y", "rm"), RunDir::Start);
+    }
+
+    #[test]
+    fn a_subshells_parentheses_are_not_part_of_its_words() {
+        let segs = split_segments_deep("(cd .claude && echo {} > settings.json)");
+        assert_eq!(segs[0].command(), "cd .claude");
+        assert_eq!(segs[1].redirects[0].target, "settings.json");
+        // The text the string rules match is left as typed.
+        assert_eq!(segs[1].text, "echo {} > settings.json)");
+        let segs = split_segments_deep("(rm -r data)");
+        assert_eq!(segs[0].command(), "rm -r data");
+        // A quoted parenthesis is a file name's, and a substitution's are
+        // its own.
+        let segs = split_segments_deep("rm \"a)\" && echo $(pwd) > out");
+        assert_eq!(segs[0].command(), "rm \"a)\"");
+        assert_eq!(segs[1].redirects[0].target, "out");
+    }
+
+    #[test]
+    fn run_dir_resolves_the_steps_and_admits_an_unknown() {
+        let tmp = crate::testutil::TempTree::new("run-dir");
+        let start = tmp.path().to_path_buf();
+        let wt = tmp.dir("wt");
+        let seg = |c: &str| {
+            split_segments_deep(c)
+                .into_iter()
+                .find(|s| s.text.starts_with("rm"))
+                .expect("an rm segment")
+        };
+        assert_eq!(seg("cd wt && rm x").run_dir(&start), Some(wt.clone()));
+        assert_eq!(seg("cd wt; rm x").run_dir(&start), Some(wt.clone()));
+        // After `;` a `cd` into a directory that is not there fails and the
+        // shell carries on where it was, unless something earlier on the
+        // line made it: either way the gate cannot say.
+        assert_eq!(seg("cd nowhere; rm x").run_dir(&start), None);
+        // After `&&` the rest runs only if the `cd` worked, so it is read
+        // as being there.
+        assert_eq!(
+            seg("cd nowhere && rm x").run_dir(&start),
+            Some(start.join("nowhere"))
+        );
+        assert_eq!(seg("cd \"$X\" && rm x").run_dir(&start), None);
+        assert_eq!(seg("rm x").run_dir(&start), Some(start.clone()));
     }
 }

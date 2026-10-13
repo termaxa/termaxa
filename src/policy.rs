@@ -587,7 +587,10 @@ impl Policy {
         let total = segments.len();
         let mut worst: Option<(usize, Decision)> = None;
         for (i, seg) in segments.iter().enumerate() {
-            let d = self.evaluate(seg, ctx);
+            // Judged where it runs: `cd .termaxa && echo x > policy.yaml`
+            // writes `.termaxa/policy.yaml`, and the path rule on the gate's
+            // own files has to see that path, not `./policy.yaml`.
+            let d = self.evaluate(seg, &ctx.for_segment(seg));
             // A shell wrapper whose string was read is transparent unless a
             // rule names it. Under a policy with no rule for `sh`, the
             // wrapper segment fell to the default and outranked the allow
@@ -3061,5 +3064,118 @@ mod combined_gate_tests {
         // shell path guards, independent of both.
         assert!(crate::protect::classify(".", ".termaxa/policy.yaml").is_some());
         assert!(crate::protect::classify(".", "src/main.rs").is_none());
+    }
+}
+
+/// The gate's own files after a `cd` (found Oct 12, 2026). Each relative
+/// target is judged in the directory its segment runs in. Before, `cd
+/// .termaxa && echo x > policy.yaml` was judged as a write to `./policy.yaml`
+/// and allowed by the starter through the hook, from v0.18.6 (when `cd *`
+/// joined it) through v0.21.3, while `echo x > .termaxa/policy.yaml` was a
+/// floor deny.
+#[cfg(test)]
+mod segment_directory_tests {
+    use super::*;
+
+    fn project() -> (crate::testutil::TempTree, crate::resolve::EvalContext) {
+        let tmp = crate::testutil::TempTree::new("policy-cd");
+        tmp.file(".termaxa/policy.yaml", "default: ask\nrules: []\n");
+        tmp.file(".claude/settings.json", "{}\n");
+        tmp.file("wt/data/a.txt", "a\n");
+        tmp.file("notes.md", "n\n");
+        let ctx = crate::resolve::EvalContext::at(tmp.path());
+        (tmp, ctx)
+    }
+
+    #[test]
+    fn a_cd_does_not_hide_the_gates_own_files() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for c in [
+            "cd .termaxa && echo x > policy.yaml",
+            "cd .termaxa; echo x > policy.yaml",
+            "cd .termaxa\necho x > policy.yaml",
+            "cd .termaxa && rm policy.yaml",
+            "cd .termaxa && rm -f policy.yaml",
+            "cd .termaxa && cp /dev/null policy.yaml",
+            "cd wt && cd ../.termaxa && echo x > policy.yaml",
+            "cd .claude && echo {} > settings.json",
+            "Set-Location .termaxa; echo x > policy.yaml",
+            "sh -c 'cd .termaxa && echo x > policy.yaml'",
+            "D=.termaxa; cd $D && echo x > policy.yaml",
+            // A parenthesised subshell: its `)` is not part of the file name.
+            "(cd .claude && echo {} > settings.json)",
+            "(cd .termaxa && echo x > policy.yaml)",
+            "(cd .termaxa; rm policy.yaml)",
+        ] {
+            let d = p.evaluate_command(c, &ctx);
+            assert_eq!(d.action, Action::Deny, "{c}: {}", d.reason);
+            assert!(
+                d.matched_rule
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("path:")),
+                "{c}: denied by the path rule, not by luck: {:?} {}",
+                d.matched_rule,
+                d.reason
+            );
+        }
+    }
+
+    #[test]
+    fn an_assignment_in_a_subshell_binds_nothing_after_it() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        // The subshell's `F` is gone when it closes, so the write is `.env`.
+        // Denied before the parentheses were read (as an unbound variable
+        // in an unknown command); allowed by the first cut of this change,
+        // which bound the subshell's assignment; denied again here, by the
+        // `.env` path rule.
+        for c in [
+            "F=.env; (F=notes.md); echo x > $F",
+            "F=.env; F=notes.md | true; echo x > $F",
+        ] {
+            let d = p.evaluate_command(c, &ctx);
+            assert_eq!(d.action, Action::Deny, "{c}: {}", d.reason);
+        }
+    }
+
+    #[test]
+    fn a_cd_in_a_subshell_or_a_read_is_not_a_write_there() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        // The `cd` runs in a subshell, so the write lands where the line
+        // started: `./policy.yaml`, nobody's config.
+        for c in [
+            "cd .termaxa | echo x > policy.yaml",
+            "cd .termaxa & echo x > policy.yaml",
+            "(cd .termaxa) && echo x > policy.yaml",
+        ] {
+            assert_eq!(p.evaluate_command(c, &ctx).action, Action::Allow, "{c}");
+        }
+        // Reading the gate's files after a `cd` is ordinary work.
+        assert_eq!(
+            p.evaluate_command("cd .termaxa && cat policy.yaml", &ctx)
+                .action,
+            Action::Allow
+        );
+        assert_eq!(
+            p.evaluate_command("cd wt && ls", &ctx).action,
+            Action::Allow
+        );
+    }
+
+    #[test]
+    fn a_relative_target_after_an_unreadable_cd_is_unresolved() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        // Refused rather than guessed at, the way a variable in the path
+        // is: the reason says why.
+        let d = p.evaluate_command("cd \"$X\" && rm -r data", &ctx);
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        assert!(d.reason.contains("cannot be resolved"), "{}", d.reason);
+        assert!(d.reason.contains("`cd`"), "{}", d.reason);
+        // An absolute target is the same file wherever the shell is.
+        let d = p.evaluate_command("cd \"$X\" && echo x > /tmp/termaxa-cd-abs", &ctx);
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
     }
 }

@@ -55,6 +55,11 @@ pub struct EvalContext {
     pub cwd: PathBuf,
     /// The project root, used only to answer the outside-the-project question.
     pub root: PathBuf,
+    /// False when `cwd` is only where the line started and a `cd` before
+    /// this segment moved the shell somewhere the gate cannot read
+    /// (`cd "$X"`, `cd -`): a relative target then resolves to nothing the
+    /// gate can know, and is reported as such.
+    pub cwd_known: bool,
 }
 
 impl EvalContext {
@@ -64,6 +69,7 @@ impl EvalContext {
         Self {
             cwd: cwd.into(),
             root: root.into(),
+            cwd_known: true,
         }
     }
 
@@ -75,6 +81,7 @@ impl EvalContext {
         Self {
             cwd: d.clone(),
             root: d,
+            cwd_known: true,
         }
     }
 
@@ -91,7 +98,37 @@ impl EvalContext {
         Self {
             cwd: cwd.into(),
             root,
+            cwd_known: true,
         }
+    }
+
+    /// This context moved to `dir`, or marked unknown when `dir` is `None`.
+    fn in_dir(&self, dir: Option<PathBuf>) -> Self {
+        match dir {
+            Some(d) if self.cwd_known => Self {
+                cwd: d,
+                root: self.root.clone(),
+                cwd_known: true,
+            },
+            _ => Self {
+                cwd: self.cwd.clone(),
+                root: self.root.clone(),
+                cwd_known: false,
+            },
+        }
+    }
+
+    /// The context one segment of a command line runs in: where every `cd`
+    /// before it on the line left the shell (`Segment::run_dir`). A redirect
+    /// target resolves here.
+    pub fn for_segment(&self, seg: &crate::shell::Segment) -> Self {
+        self.in_dir(seg.run_dir(&self.cwd))
+    }
+
+    /// Where a segment's own operands resolve: `for_segment`, then git's
+    /// `-C` for a git command (`delete::operand_base`).
+    pub fn for_operands(&self, seg: &crate::shell::Segment) -> Self {
+        self.in_dir(delete::operand_base(seg, &self.cwd))
     }
 }
 
@@ -120,6 +157,10 @@ pub enum SensitiveShape {
     /// restating the list, so the write path and the command path cannot
     /// disagree about what is protected (#37).
     ProtectedName,
+    /// A relative path after a `cd` the gate cannot follow (`cd "$X" &&
+    /// rm -r build`). Like a variable, it makes the target unresolvable:
+    /// the directory it is relative to is not known until the shell runs.
+    UnknownDirectory,
 }
 
 impl SensitiveShape {
@@ -131,6 +172,9 @@ impl SensitiveShape {
             SensitiveShape::OutsideRoot => "resolves outside the project",
             SensitiveShape::UnderUserProfile => "resolves to a user profile",
             SensitiveShape::ProtectedName => "names the gate's own files",
+            SensitiveShape::UnknownDirectory => {
+                "is relative to a directory an earlier `cd` moved to, which the gate cannot read"
+            }
         }
     }
 }
@@ -240,49 +284,79 @@ impl ResolvedTarget {
 /// read. That is the same mistake as matching a path rule against a
 /// command's source, which shipped once already.
 pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> {
-    let mut out: Vec<(String, TargetRole)> = Vec::new();
-
-    // Redirects: the unified scanner already extracted them, with truncation
-    // decided there. An append still names a destination - it does not
-    // truncate, but the path is still one the command writes.
+    // Each segment resolves where it runs: a redirect where every `cd`
+    // before it left the shell, the command's own operands there too, and
+    // a git command's after its `-C`. Read against the line's first
+    // directory, `cd .termaxa && echo x > policy.yaml` was a write to
+    // `./policy.yaml` that no path rule named, and was allowed.
+    // (as written, role, which segment, operand or redirect). Sorted on the
+    // first two as before, so a reason names the same target it always did.
+    let mut out: Vec<(String, TargetRole, usize, bool)> = Vec::new();
+    let mut contexts: Vec<(EvalContext, EvalContext)> = Vec::new();
     for seg in crate::shell::split_segments_deep(segment) {
+        let k = contexts.len();
+        contexts.push((ctx.for_segment(&seg), ctx.for_operands(&seg)));
+        let mut add = |raw: String, role: TargetRole, operand: bool| {
+            out.push((raw, role, k, operand));
+        };
+
+        // Redirects: the unified scanner already extracted them, with
+        // truncation decided there. An append still names a destination -
+        // it does not truncate, but the path is still one the command
+        // writes.
         for o in &seg.redirects {
-            out.push((o.target.clone(), TargetRole::Destination));
+            add(o.target.clone(), TargetRole::Destination, false);
         }
-    }
 
-    // Deletes: destroyed in place, which is what Removed means.
-    for t in crate::delete::extract_targets(segment) {
-        out.push((t, TargetRole::Removed));
-    }
+        // Deletes: destroyed in place, which is what Removed means.
+        for t in crate::delete::segment_targets(&seg) {
+            add(t.text, TargetRole::Removed, true);
+        }
 
-    // Per-command grammars, over the segment's own words: a redirect's
-    // target is a Destination above, not an operand here (#61).
-    for seg in crate::shell::split_segments_deep(segment) {
+        // Per-command grammars, over the segment's own words: a redirect's
+        // target is a Destination above, not an operand here (#61).
         let tokens = crate::delete::tokenize_public(seg.command());
         let Some((head, at)) = crate::delete::resolve_head(&tokens) else {
             continue;
         };
         let args = &tokens[at + 1..];
-        match head.as_str() {
-            "cp" | "copy" => out.extend(copy_move_targets(&head, args, TargetRole::Source)),
-            "mv" | "move" => out.extend(copy_move_targets(&head, args, TargetRole::Removed)),
-            "tee" => out.extend(tee_targets(args)),
-            "dd" => out.extend(dd_targets(args)),
-            _ => {}
+        let grammar: Vec<(String, TargetRole)> = match head.as_str() {
+            "cp" | "copy" => copy_move_targets(&head, args, TargetRole::Source),
+            "mv" | "move" => copy_move_targets(&head, args, TargetRole::Removed),
+            "tee" => tee_targets(args),
+            "dd" => dd_targets(args),
+            _ => Vec::new(),
+        };
+        for (raw, role) in grammar {
+            add(raw, role, true);
         }
-        out.extend(
-            option_write_targets(&head, args)
-                .into_iter()
-                .map(|p| (p, TargetRole::Destination)),
-        );
+        for p in option_write_targets(&head, args) {
+            add(p, TargetRole::Destination, true);
+        }
     }
 
     out.sort();
     out.dedup();
-    out.into_iter()
-        .map(|(raw, role)| target(&raw, role, ctx))
-        .collect()
+    let mut resolved: Vec<ResolvedTarget> = out
+        .into_iter()
+        .map(|(raw, role, k, operand)| {
+            let (shell, operands) = &contexts[k];
+            target(&raw, role, if operand { operands } else { shell })
+        })
+        .collect();
+    // The same path named by two segments, or as an operand and a
+    // redirect, is one target: the dedup above saw two keys.
+    let mut seen: Vec<(TargetRole, String, Option<PathBuf>)> = Vec::new();
+    resolved.retain(|t| {
+        let key = (t.role, t.as_written.clone(), t.resolved.clone());
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
+    resolved
 }
 
 /// Files a command writes through its own options rather than through a
@@ -459,6 +533,16 @@ pub fn target(raw: &str, role: TargetRole, ctx: &EvalContext) -> ResolvedTarget 
         // happily join `$HOME/.ssh` onto the cwd and produce a real-looking
         // path that points nowhere true. A confident wrong answer is worse
         // than an admitted unknown in a tool that reports blast radius.
+        return ResolvedTarget {
+            role,
+            as_written,
+            resolved: None,
+            shapes,
+        };
+    }
+
+    if !ctx.cwd_known && !delete::is_dir_independent(&as_written) {
+        shapes.push(SensitiveShape::UnknownDirectory);
         return ResolvedTarget {
             role,
             as_written,

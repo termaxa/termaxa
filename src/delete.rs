@@ -115,7 +115,7 @@ pub fn reproducible_within(
 }
 
 pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Option<Preview> {
-    let targets = extract_targets_detailed(command);
+    let targets = targets_in(command, cwd);
     if targets.is_empty() {
         return None;
     }
@@ -127,8 +127,33 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
     // Computed while the preview walks its targets; reported, not acted on.
     let mut uninsurable = false;
 
-    for tok in targets.iter().take(3) {
+    for (tok, base) in targets.iter().take(3) {
         let raw = &tok.text;
+        // The directory this target resolves in: where a `cd` earlier on the
+        // line left the shell, and git's `-C` for `git rm`. A relative
+        // target after a `cd` the gate cannot follow is an admitted unknown,
+        // like a variable: no count, no copy, and the summary says so.
+        let cwd: &Path = match base {
+            Some(b) => b,
+            None if is_dir_independent(raw) => cwd,
+            None => {
+                lines.push(format!("  target      : {}", raw));
+                lines.push(
+                    "  ⚠ UNRESOLVED: relative to a directory a `cd` earlier on the line \
+                     moved to, which the gate cannot read"
+                        .into(),
+                );
+                lines.push(
+                    "  ✗ insurance : cannot back up a path whose directory is unknown \
+                     — NOT recoverable"
+                        .into(),
+                );
+                worst_first.push("UNRESOLVED directory".into());
+                uninsurable = true;
+                summary_parts.push(format!("{} — directory unknown", short(raw)));
+                continue;
+            }
+        };
 
         // Issue #11: a target carrying a variable the shell has not expanded
         // yet. `resolve_path_in` would happily join `x/$SID` onto the cwd and
@@ -405,6 +430,7 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
 /// (decision #37: two engines parsing the same command differently is the
 /// bug class this module exists to close). Callers that need to know whether
 /// a target can be resolved at all take the detailed form.
+#[cfg(test)]
 pub fn extract_targets(command: &str) -> Vec<String> {
     extract_targets_detailed(command)
         .into_iter()
@@ -421,32 +447,55 @@ pub fn extract_targets(command: &str) -> Vec<String> {
 /// as `rm` (the quoting shape this project has already shipped a bypass
 /// for). So the text stays exactly what it was, and what the quotes *meant*
 /// travels beside it.
+/// Production reads targets with their directories (`targets_in`); this
+/// whole-line view stays for the tests that pin what the extractor finds.
+#[cfg(test)]
 pub fn extract_targets_detailed(command: &str) -> Vec<Tok> {
-    let mut out = Vec::new();
-    for segment in crate::shell::split_segments_deep(command) {
-        // The segment's own words. The split already found every
-        // redirection; reading the full text here made `2>/dev/null` and
-        // `/dev/null` into targets, and the insurance that then tried to
-        // copy a device failed — with the real target deleted uninsured
-        // behind it (#61).
-        let tokens = tokenize_detailed(segment.command());
-        if tokens.is_empty() {
-            continue;
-        }
-        let texts: Vec<String> = tokens.iter().map(|t| t.text.clone()).collect();
-        let Some((head, at)) = delete_head(&texts) else {
-            continue;
-        };
+    crate::shell::split_segments_deep(command)
+        .iter()
+        .flat_map(segment_targets)
+        .collect()
+}
 
-        // Targets start after the command, not after token zero: with a
-        // wrapper present those are different positions, and reading from
-        // token zero would take the wrapper's own arguments as targets.
-        for t in tokens.iter().skip(at + 1) {
-            if is_flag(&head, &t.text) {
-                continue;
-            }
-            out.push(t.clone());
+/// The delete targets of one segment, from its own words.
+pub fn segment_targets(segment: &crate::shell::Segment) -> Vec<Tok> {
+    // The segment's own words. The split already found every redirection;
+    // reading the full text here made `2>/dev/null` and `/dev/null` into
+    // targets, and the insurance that then tried to copy a device failed —
+    // with the real target deleted uninsured behind it (#61).
+    let tokens = tokenize_detailed(segment.command());
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let texts: Vec<String> = tokens.iter().map(|t| t.text.clone()).collect();
+    let Some((head, at)) = delete_head(&texts) else {
+        return Vec::new();
+    };
+    // Targets start after the command, not after token zero: with a
+    // wrapper present those are different positions, and reading from
+    // token zero would take the wrapper's own arguments as targets.
+    tokens
+        .iter()
+        .skip(at + 1)
+        .filter(|t| !is_flag(&head, &t.text))
+        .cloned()
+        .collect()
+}
+
+/// Every delete target in the command, with the directory it resolves in
+/// (`operand_base`), or `None` where a `cd` before it cannot be followed.
+/// `cd ../wt && rm -r data` deletes `../wt/data`; read against the line's
+/// starting directory it counted and copied `./data` (Max Petrusenko's
+/// field report, Oct 9, 2026).
+pub fn targets_in(command: &str, start: &Path) -> Vec<(Tok, Option<PathBuf>)> {
+    let mut out = Vec::new();
+    for seg in crate::shell::split_segments_deep(command) {
+        let targets = segment_targets(&seg);
+        if targets.is_empty() {
+            continue;
         }
+        let base = operand_base(&seg, start);
+        out.extend(targets.into_iter().map(|t| (t, base.clone())));
     }
     out
 }
@@ -762,6 +811,101 @@ pub fn git_without_global_options(tokens: &[String]) -> Option<Vec<String>> {
     let mut out: Vec<String> = tokens[..=at].to_vec();
     out.extend_from_slice(&tokens[i.min(tokens.len())..]);
     Some(out)
+}
+
+/// The directories git's `-C` options move it to, in order, when `tokens`
+/// is a git command: `git -C ../wt -C sub rm x` runs in `../wt/sub`, and
+/// its paths are that directory's. Empty for anything else. Read over the
+/// same global options `git_without_global_options` steps past, so the
+/// policy and the preview agree on where the subcommand starts.
+pub fn git_dirs(tokens: &[String]) -> Vec<String> {
+    let mut dirs = Vec::new();
+    let Some((head, at)) = resolve_head(tokens) else {
+        return dirs;
+    };
+    if head != "git" {
+        return dirs;
+    }
+    let mut i = at + 1;
+    while let Some(t) = tokens.get(i) {
+        if t == "-C" {
+            if let Some(d) = tokens.get(i + 1).filter(|d| !d.is_empty()) {
+                dirs.push(d.clone());
+            }
+            i += 2;
+        } else if matches!(
+            t.as_str(),
+            "-c" | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--exec-path"
+                | "--super-prefix"
+                | "--config-env"
+        ) {
+            i += 2;
+        } else if t.starts_with('-') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    dirs
+}
+
+/// Where a segment's own operands resolve: the directory it runs in
+/// (`Segment::run_dir`, every `cd` before it), then git's `-C` when the
+/// segment is a git command. `None` when a `cd` before it cannot be
+/// followed.
+pub fn operand_base(seg: &crate::shell::Segment, start: &Path) -> Option<PathBuf> {
+    let mut base = seg.run_dir(start)?;
+    for t in git_dir_tokens(seg.command()) {
+        // `git -C "$WT" rm -r src`: where `$WT` points is not known here.
+        if t.has_unexpanded_var() || t.has_glob() || t.text.contains('`') || t.text.contains("$(") {
+            return None;
+        }
+        base = resolve_path_in(&t.text, &base);
+    }
+    Some(base)
+}
+
+/// `git_dirs`, as tokens with their quoting, so a variable is seen.
+fn git_dir_tokens(command: &str) -> Vec<Tok> {
+    let toks = tokenize_detailed(command);
+    let texts: Vec<String> = toks.iter().map(|t| t.text.clone()).collect();
+    let dirs = git_dirs(&texts);
+    let mut out = Vec::new();
+    let mut want = dirs.iter().peekable();
+    let mut i = 0;
+    while let (Some(d), Some(t)) = (want.peek(), toks.get(i)) {
+        if t.text == "-C" && toks.get(i + 1).is_some_and(|v| &&v.text == d) {
+            out.push(toks[i + 1].clone());
+            want.next();
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// True when `raw` names the same path wherever the shell is: absolute, a
+/// drive path, or `~`. Such a target is known even after a `cd` the gate
+/// cannot follow.
+pub fn is_dir_independent(raw: &str) -> bool {
+    // By its spelling: compared after resolution, `..` climbs past any
+    // one-level base to the root and a relative `../x` looked absolute.
+    let s = raw.trim().trim_matches('"').trim_matches('\'');
+    let b = s.as_bytes();
+    let drive = b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/');
+    s.starts_with('/')
+        || s.starts_with('\\')
+        || drive
+        || s == "~"
+        || s.starts_with("~/")
+        || s.starts_with("~\\")
 }
 
 /// How many words one of `tool`'s global options spans when it is written
@@ -1695,9 +1839,13 @@ pub fn target_signature(command: &str, cwd: &Path) -> Option<TargetSignature> {
     let mut files = 0usize;
     let mut dirs = 0usize;
     let mut bytes: Vec<u8> = Vec::new();
-    let roots: Vec<PathBuf> = extract_targets(command)
+    let roots: Vec<PathBuf> = targets_in(command, cwd)
         .iter()
-        .map(|t| resolve_path_in(t, cwd))
+        .filter_map(|(t, base)| match base {
+            Some(b) => Some(resolve_path_in(&t.text, b)),
+            None if is_dir_independent(&t.text) => Some(resolve_path_in(&t.text, cwd)),
+            None => None,
+        })
         .filter(|p| p.exists())
         .collect();
     if roots.is_empty() {
@@ -2754,5 +2902,95 @@ mod tests {
             !names.contains(&"notes.txt"),
             "ordinary files are not findings: {names:?}"
         );
+    }
+}
+
+/// Max Petrusenko's field report (Oct 9, 2026): his projects use worktrees,
+/// and `cd ../wt && rm -r data` was previewed and insured as `./data`.
+#[cfg(test)]
+mod segment_directory_tests {
+    use super::*;
+
+    fn tree() -> (crate::testutil::TempTree, PathBuf, PathBuf) {
+        let tmp = crate::testutil::TempTree::new("delete-cd");
+        let main = tmp.dir("main");
+        for i in 0..7 {
+            tmp.file(&format!("wt/data/d{i}.txt"), "x\n");
+        }
+        let wt = tmp.path().join("wt");
+        (tmp, main, wt)
+    }
+
+    #[test]
+    fn the_preview_counts_the_target_where_the_segment_runs() {
+        let (_tmp, main, wt) = tree();
+        for c in [
+            "cd ../wt && rm -r data",
+            "cd ../wt; rm -r data",
+            "git -C ../wt rm -r data",
+            "cd .. && git -C wt rm -r data",
+            "(cd ../wt && rm -r data)",
+        ] {
+            let p = preview_for(c, Some(&main), &main).expect("a delete preview");
+            let target = resolve_path_in("data", &wt).display().to_string();
+            assert!(
+                p.lines.iter().any(|l| l.contains(&target)),
+                "{c}: names {target}: {:?}",
+                p.lines
+            );
+            assert!(
+                p.lines.iter().any(|l| l.contains("7 files")),
+                "{c}: counts what is there: {:?}",
+                p.lines
+            );
+            assert!(
+                !p.lines.iter().any(|l| l.contains("does not exist")),
+                "{c}: {:?}",
+                p.lines
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_after_an_unreadable_cd_is_admitted_unknown() {
+        let (_tmp, main, _wt) = tree();
+        let p = preview_for("cd \"$WT\" && rm -r data", Some(&main), &main).expect("a preview");
+        assert!(p.uninsurable, "{:?}", p.lines);
+        assert!(p.summary.contains("UNRESOLVED directory"), "{}", p.summary);
+        assert!(
+            !p.lines.iter().any(|l| l.contains("does not exist")),
+            "never a confident wrong answer: {:?}",
+            p.lines
+        );
+    }
+
+    #[test]
+    fn a_git_dash_c_through_a_variable_is_admitted_unknown() {
+        let (_tmp, main, _wt) = tree();
+        let p = preview_for("git -C \"$WT\" rm -r data", Some(&main), &main).expect("a preview");
+        assert!(p.uninsurable, "{:?}", p.lines);
+        assert!(p.summary.contains("UNRESOLVED directory"), "{}", p.summary);
+    }
+
+    #[test]
+    fn dir_independence_is_read_from_the_spelling() {
+        for raw in ["/srv/x", "~", "~/x", "C:\\x", "C:/x", "\\\\server\\share"] {
+            assert!(is_dir_independent(raw), "{raw}");
+        }
+        // `..` climbs from wherever the shell is: not independent, however
+        // far it climbs.
+        for raw in ["x", "./x", "..", "../x", "../../../../x", "C:x"] {
+            assert!(!is_dir_independent(raw), "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_recheck_signs_the_target_where_the_segment_runs() {
+        let (_tmp, main, _wt) = tree();
+        assert!(
+            target_signature("cd ../wt && rm -r data", &main).is_some(),
+            "#73's re-check must see the tree it will delete"
+        );
+        assert!(target_signature("rm -r data", &main).is_none());
     }
 }

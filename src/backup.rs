@@ -51,16 +51,28 @@ fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
     // `/dev/null` among rm's operands — it exists, so it was planned, and
     // copying a device is what made `take` fail on the real target (#61).
     let tokens = crate::pg::shell_tokens(segment.command());
-    if let Some((remote, branch)) = git_force_push_target(&tokens) {
+    // Where the segment runs (every `cd` before it), and where its operands
+    // resolve (that, then git's `-C`). `None` after a `cd` the gate cannot
+    // follow: a relative path there is not insured, because nobody knows
+    // which file it is.
+    let shell = segment.run_dir(cwd);
+    let operands = crate::delete::operand_base(segment, cwd);
+    if let Some((remote, branch)) = operands
+        .as_deref()
+        .and_then(|dir| git_force_push_target(&tokens, dir))
+    {
         return Some(format!(
             "snapshot {}/{} to a local backup branch before it is overwritten",
             remote, branch
         ));
     }
-    if let Some(scope) = git_discard_target(&tokens, cwd) {
+    if let Some((dir, scope)) = operands
+        .as_deref()
+        .and_then(|dir| git_discard_target(&tokens, dir).map(|s| (dir, s)))
+    {
         // Nothing uncommitted under the scope means nothing to lose, and no
         // plan: the command then carries whatever verdict it had.
-        return match git_discard_losses(cwd, &scope) {
+        return match git_discard_losses(dir, &scope) {
             Some(files) if !files.is_empty() => Some(format!(
                 "snapshot the uncommitted changes in {} file(s) with git stash before they are discarded",
                 files.len()
@@ -79,7 +91,7 @@ fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
             }
         ));
     }
-    if let Some(paths) = rm_targets(&tokens, cwd) {
+    if let Some(paths) = rm_targets_in(&tokens, operands.as_deref()) {
         // The count `take` will copy: a reproducible directory past the
         // budget is left out there, so it is left out here.
         let root = project_root_of(cwd);
@@ -102,13 +114,18 @@ fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
     // report and the mechanism disagreeing is the bug shape this release
     // keeps finding; found by roadmap 2.2, which is the first caller to ask
     // `plan` about a write.
-    if let Some(paths) = all_overwrite_paths(&segment.redirects, &tokens, cwd) {
+    if let Some(paths) = all_overwrite_paths(
+        &segment.redirects,
+        &tokens,
+        shell.as_deref(),
+        operands.as_deref(),
+    ) {
         return Some(format!(
             "copy {} path(s) to .termaxa/backups before they are overwritten",
             paths.len()
         ));
     }
-    if tf_state_target(&tokens).is_some() {
+    if tf_state_target(&tokens, shell.as_deref()).is_some() {
         return Some(
             "copy local terraform.tfstate before apply/destroy (remote state not covered)".into(),
         );
@@ -142,7 +159,10 @@ fn skipped_as_reproducible(p: &Path, root: Option<&Path>) -> bool {
 /// Oct 9, 2026 only `terraform apply` written plainly was insured, so
 /// `terraform -chdir=infra apply` ran with nothing copied while its plain
 /// spelling had its state copied first.
-fn tf_state_target(tokens: &[String]) -> Option<PathBuf> {
+fn tf_state_target(tokens: &[String], dir: Option<&Path>) -> Option<PathBuf> {
+    // The state file is where the command runs, which in the hook is the
+    // payload's directory (and any `cd` before it), never the process's.
+    let dir = dir?;
     let call = crate::delete::tool_call(tokens)?;
     if call.tool != "terraform" && call.tool != "tofu" {
         return None;
@@ -152,8 +172,8 @@ fn tf_state_target(tokens: &[String]) -> Option<PathBuf> {
         return None;
     }
     let state = match call.chdir() {
-        Some(dir) => PathBuf::from(dir).join("terraform.tfstate"),
-        None => PathBuf::from("terraform.tfstate"),
+        Some(sub) => crate::delete::resolve_path_in(sub, dir).join("terraform.tfstate"),
+        None => dir.join("terraform.tfstate"),
     };
     if state.exists() {
         Some(state)
@@ -206,17 +226,26 @@ fn take_segment(
     let redirects = &segment.redirects;
     let (ts_ms, ts) = now();
     let id = format!("b-{}", ts_ms);
+    // The same directories `plan_segment` reads: what the preview promised
+    // is what is copied.
+    let shell = segment.run_dir(cwd);
+    let operands = crate::delete::operand_base(segment, cwd);
+    let git_dir = operands.as_deref();
 
-    let record = if let Some((remote, branch)) = git_force_push_target(&tokens) {
-        backup_git_ref(&id, &ts, command, &remote, &branch)?
-    } else if let Some(scope) = git_discard_target(&tokens, cwd) {
-        match backup_git_stash(&id, &ts, command, cwd, &scope)? {
+    let record = if let Some((dir, (remote, branch))) =
+        git_dir.and_then(|d| git_force_push_target(&tokens, d).map(|t| (d, t)))
+    {
+        backup_git_ref(&id, &ts, command, dir, &remote, &branch)?
+    } else if let Some((dir, scope)) =
+        git_dir.and_then(|d| git_discard_target(&tokens, d).map(|s| (d, s)))
+    {
+        match backup_git_stash(&id, &ts, command, dir, &scope)? {
             Some(record) => record,
             None => return Ok(None),
         }
     } else if let Some((tables, data_only)) = pg_backup_targets(command) {
         backup_pg(termaxa_dir, &id, &ts, command, &tokens, &tables, data_only)?
-    } else if let Some(paths) = rm_targets(&tokens, cwd) {
+    } else if let Some(paths) = rm_targets_in(&tokens, operands.as_deref()) {
         // A directory a build rebuilds, past the budget, is not copied and
         // not a failure: the preview said "not copied" for it, and the
         // other operands still get their copy. Before v0.21.3 the budget
@@ -239,9 +268,11 @@ fn take_segment(
             );
         }
         record
-    } else if let Some(state) = tf_state_target(&tokens) {
+    } else if let Some(state) = tf_state_target(&tokens, shell.as_deref()) {
         backup_files(termaxa_dir, &id, &ts, command, &[state])?
-    } else if let Some(paths) = all_overwrite_paths(redirects, &tokens, cwd) {
+    } else if let Some(paths) =
+        all_overwrite_paths(redirects, &tokens, shell.as_deref(), operands.as_deref())
+    {
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else {
         return Ok(None);
@@ -255,7 +286,12 @@ fn take_segment(
 // git: pin the remote ref about to be clobbered by a force push
 // ---------------------------------------------------------------------------
 
-fn git_force_push_target(tokens: &[String]) -> Option<(String, String)> {
+fn git_force_push_target(tokens: &[String], dir: &Path) -> Option<(String, String)> {
+    // Read past git's global options, as the policy does: `git -C ../wt
+    // push --force` is a force push of `../wt`'s branch, and until Oct 2026
+    // it pinned nothing because its second word is `-C`.
+    let stripped = crate::delete::git_without_global_options(tokens);
+    let tokens: &[String] = stripped.as_deref().unwrap_or(tokens);
     if tokens.first().map(|t| t.as_str()) != Some("git")
         || tokens.get(1).map(|t| t.as_str()) != Some("push")
     {
@@ -287,7 +323,7 @@ fn git_force_push_target(tokens: &[String]) -> Option<(String, String)> {
     let branch = positional
         .get(1)
         .map(|s| s.to_string())
-        .or_else(current_branch)
+        .or_else(|| current_branch(dir))
         .unwrap_or_else(|| "main".into());
     Some((remote, branch))
 }
@@ -296,15 +332,22 @@ fn backup_git_ref(
     id: &str,
     ts: &str,
     command: &str,
+    dir: &Path,
     remote: &str,
     branch: &str,
 ) -> Result<BackupRecord> {
+    // In the repository the push runs in: the hook's own process directory
+    // is the harness's, and a `cd` or `-C` may name another repository.
     // Best effort: refresh our view of the remote first.
-    let _ = Command::new("git").args(["fetch", remote, branch]).output();
-    let sha = git_out(&["rev-parse", &format!("{}/{}", remote, branch)])
+    let _ = Command::new("git")
+        .current_dir(dir)
+        .args(["fetch", remote, branch])
+        .output();
+    let sha = git_out(dir, &["rev-parse", &format!("{}/{}", remote, branch)])
         .context("cannot resolve remote branch — is it pushed?")?;
     let backup_branch = format!("termaxa/backup/{}", id);
     let out = Command::new("git")
+        .current_dir(dir)
         .args(["branch", &backup_branch, &sha])
         .output()?;
     if !out.status.success() {
@@ -318,7 +361,10 @@ fn backup_git_ref(
         ts: ts.into(),
         kind: "git-ref".into(),
         command: command.into(),
-        data: serde_json::json!({ "branch": backup_branch, "sha": sha, "remote": remote, "target": branch }),
+        data: serde_json::json!({
+            "branch": backup_branch, "sha": sha, "remote": remote, "target": branch,
+            "repo": dir.display().to_string()
+        }),
         note: format!(
             "{}/{} @ {} pinned to {}",
             remote,
@@ -669,11 +715,11 @@ fn backup_pg(
 /// Existing files a command writes through its own options (`find -fprint`,
 /// `git … --output`, `sed -i`/`w`, `psql -o`), insured the way a redirect's
 /// target is: copied before the command runs.
-fn option_overwrite_paths(tokens: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
+fn option_overwrite_paths(tokens: &[String], cwd: Option<&Path>) -> Option<Vec<PathBuf>> {
     let (head, at) = crate::delete::resolve_head(tokens)?;
     let paths: Vec<PathBuf> = crate::resolve::option_write_targets(&head, &tokens[at + 1..])
         .iter()
-        .map(|p| crate::delete::resolve_path_in(p, cwd))
+        .filter_map(|p| resolve_in(p, cwd))
         .filter(|p| p.is_file())
         .collect();
     if paths.is_empty() {
@@ -684,13 +730,16 @@ fn option_overwrite_paths(tokens: &[String], cwd: &Path) -> Option<Vec<PathBuf>>
 }
 
 /// A redirect's targets and an option's written files, together, each once.
+/// A redirect resolves where the shell is (`shell`); an option's file is the
+/// command's own operand (`operands`, after git's `-C`).
 fn all_overwrite_paths(
     redirects: &[crate::shell::Overwrite],
     tokens: &[String],
-    cwd: &Path,
+    shell: Option<&Path>,
+    operands: Option<&Path>,
 ) -> Option<Vec<PathBuf>> {
-    let mut paths = overwrite_paths(redirects, cwd).unwrap_or_default();
-    for p in option_overwrite_paths(tokens, cwd).unwrap_or_default() {
+    let mut paths = overwrite_paths_in(redirects, shell).unwrap_or_default();
+    for p in option_overwrite_paths(tokens, operands).unwrap_or_default() {
         if !paths.contains(&p) {
             paths.push(p);
         }
@@ -702,11 +751,19 @@ fn all_overwrite_paths(
     }
 }
 
+#[cfg(test)]
 fn overwrite_paths(redirects: &[crate::shell::Overwrite], cwd: &Path) -> Option<Vec<PathBuf>> {
+    overwrite_paths_in(redirects, Some(cwd))
+}
+
+fn overwrite_paths_in(
+    redirects: &[crate::shell::Overwrite],
+    cwd: Option<&Path>,
+) -> Option<Vec<PathBuf>> {
     let paths: Vec<PathBuf> = redirects
         .iter()
         .filter(|o| o.truncates)
-        .map(|o| crate::delete::resolve_path_in(&o.target, cwd))
+        .filter_map(|o| resolve_in(&o.target, cwd))
         .filter(|p| p.is_file())
         .collect();
     if paths.is_empty() {
@@ -716,7 +773,24 @@ fn overwrite_paths(redirects: &[crate::shell::Overwrite], cwd: &Path) -> Option<
     }
 }
 
+#[cfg(test)]
 fn rm_targets(tokens: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
+    rm_targets_in(tokens, Some(cwd))
+}
+
+/// A path resolved in `cwd`, or, when the directory is unknown (a `cd` the
+/// gate cannot follow), only if it does not depend on one.
+fn resolve_in(raw: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    match cwd {
+        Some(c) => Some(crate::delete::resolve_path_in(raw, c)),
+        None if crate::delete::is_dir_independent(raw) => {
+            Some(crate::delete::resolve_path_in(raw, Path::new("/")))
+        }
+        None => None,
+    }
+}
+
+fn rm_targets_in(tokens: &[String], cwd: Option<&Path>) -> Option<Vec<PathBuf>> {
     // Same head resolution the classifier and the preview use. When these
     // disagreed, a command could be CLASSIFIED destructive and take no
     // insurance - gated without a net, which is worse than missing both.
@@ -724,7 +798,7 @@ fn rm_targets(tokens: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
     let paths: Vec<PathBuf> = tokens[at + 1..]
         .iter()
         .filter(|t| !crate::delete::is_flag(&head, t))
-        .map(|t| crate::delete::resolve_path_in(t, cwd))
+        .filter_map(|t| resolve_in(t, cwd))
         .filter(|p| p.exists())
         .collect();
     if paths.is_empty() {
@@ -1092,9 +1166,14 @@ pub fn restore(termaxa_dir: &Path, id: &str) -> Result<String> {
             let remote = record.data["remote"].as_str().context("bad record")?;
             let target = record.data["target"].as_str().context("bad record")?;
             let refspec = format!("{}:refs/heads/{}", sha, target);
-            let out = Command::new("git")
-                .args(["push", "--force", remote, &refspec])
-                .output()?;
+            // From the repository the pin was taken in. Records written
+            // before the repository was recorded push from here, as they
+            // always did.
+            let mut push = Command::new("git");
+            if let Some(repo) = record.data["repo"].as_str() {
+                push.current_dir(repo);
+            }
+            let out = push.args(["push", "--force", remote, &refspec]).output()?;
             if !out.status.success() {
                 bail!(
                     "restore push failed: {}",
@@ -1185,12 +1264,16 @@ pub fn restore(termaxa_dir: &Path, id: &str) -> Result<String> {
     }
 }
 
-fn current_branch() -> Option<String> {
-    git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+fn current_branch(dir: &Path) -> Option<String> {
+    git_out(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
-fn git_out(args: &[&str]) -> Option<String> {
-    let out = Command::new("git").args(args).output().ok()?;
+fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1465,7 +1548,7 @@ mod tests {
             "git push -d origin refs/heads/old",
         ] {
             assert_eq!(
-                git_force_push_target(&tokens_of(c)),
+                git_force_push_target(&tokens_of(c), &test_cwd()),
                 Some(("origin".to_string(), "old".to_string())),
                 "{c}"
             );
@@ -1475,20 +1558,27 @@ mod tests {
             "git push --mirror origin",
             "git push --prune origin main",
         ] {
-            assert_eq!(git_force_push_target(&tokens_of(c)), None, "{c}");
+            assert_eq!(
+                git_force_push_target(&tokens_of(c), &test_cwd()),
+                None,
+                "{c}"
+            );
         }
     }
 
     #[test]
     fn a_forced_push_names_the_ref_it_would_overwrite() {
         assert_eq!(
-            git_force_push_target(&tokens_of("git push --force origin main")),
+            git_force_push_target(&tokens_of("git push --force origin main"), &test_cwd()),
             Some(("origin".to_string(), "main".to_string()))
         );
         // Flags are not positional arguments: reading them as one would pin
         // `--force-with-lease` instead of the branch about to be lost.
         assert_eq!(
-            git_force_push_target(&tokens_of("git push origin main --force-with-lease")),
+            git_force_push_target(
+                &tokens_of("git push origin main --force-with-lease"),
+                &test_cwd()
+            ),
             Some(("origin".to_string(), "main".to_string()))
         );
     }
@@ -1497,14 +1587,17 @@ mod tests {
     fn every_spelling_of_force_counts_and_an_ordinary_push_does_not() {
         for flag in ["--force", "-f", "--force-with-lease"] {
             assert!(
-                git_force_push_target(&tokens_of(&format!("git push {flag} origin main")))
-                    .is_some(),
+                git_force_push_target(
+                    &tokens_of(&format!("git push {flag} origin main")),
+                    &test_cwd()
+                )
+                .is_some(),
                 "{flag} is a force push"
             );
         }
         // An ordinary push only adds commits; there is nothing to insure.
         assert_eq!(
-            git_force_push_target(&tokens_of("git push origin main")),
+            git_force_push_target(&tokens_of("git push origin main"), &test_cwd()),
             None
         );
     }
@@ -1512,11 +1605,11 @@ mod tests {
     #[test]
     fn only_git_push_itself_is_a_forced_push() {
         assert_eq!(
-            git_force_push_target(&tokens_of("git commit --force")),
+            git_force_push_target(&tokens_of("git commit --force"), &test_cwd()),
             None
         );
         assert_eq!(
-            git_force_push_target(&tokens_of("hub push --force origin main")),
+            git_force_push_target(&tokens_of("hub push --force origin main"), &test_cwd()),
             None
         );
     }
@@ -1567,27 +1660,26 @@ mod tests {
 
     #[test]
     fn local_terraform_state_is_insured_only_for_apply_and_destroy() {
-        let mut env = TestEnv::new("bk-tfstate");
+        let env = TestEnv::new("bk-tfstate");
         let stack = env.root().join("stack");
         std::fs::create_dir_all(&stack).expect("stack dir must be creatable");
         std::fs::write(stack.join("terraform.tfstate"), "{}").expect("state must be writable");
-        env.chdir(&stack);
 
         for bin in ["terraform", "tofu"] {
             for verb in ["apply", "destroy"] {
                 assert!(
-                    tf_state_target(&tokens_of(&format!("{bin} {verb}"))).is_some(),
+                    tf_state_target(&tokens_of(&format!("{bin} {verb}")), Some(&stack)).is_some(),
                     "{bin} {verb} rewrites state"
                 );
             }
             assert_eq!(
-                tf_state_target(&tokens_of(&format!("{bin} plan"))),
+                tf_state_target(&tokens_of(&format!("{bin} plan")), Some(&stack)),
                 None,
                 "a plan changes nothing"
             );
         }
         assert_eq!(
-            tf_state_target(&tokens_of("ansible apply")),
+            tf_state_target(&tokens_of("ansible apply"), Some(&stack)),
             None,
             "another tool's apply is not terraform's"
         );
@@ -1596,8 +1688,10 @@ mod tests {
         // no local file there is nothing here to copy.
         let empty = env.root().join("remote-backend");
         std::fs::create_dir_all(&empty).expect("dir must be creatable");
-        env.chdir(&empty);
-        assert_eq!(tf_state_target(&tokens_of("terraform destroy")), None);
+        assert_eq!(
+            tf_state_target(&tokens_of("terraform destroy"), Some(&empty)),
+            None
+        );
     }
 
     /// Max Petrusenko's field report (Oct 9, 2026): rollback restored every
@@ -1651,14 +1745,16 @@ mod tests {
     /// policy reads it: past a wrapper, by its name whatever its path.
     #[test]
     fn a_chdir_spelling_insures_the_state_in_that_directory() {
-        let mut env = TestEnv::new("bk-tfstate-chdir");
+        let env = TestEnv::new("bk-tfstate-chdir");
         let work = env.root().join("work");
         let infra = work.join("infra");
         std::fs::create_dir_all(&infra).expect("infra dir must be creatable");
         std::fs::write(infra.join("terraform.tfstate"), "{}").expect("state must be writable");
-        env.chdir(&work);
 
-        let expected = Some(PathBuf::from("infra").join("terraform.tfstate"));
+        // Resolved where the command runs, passed explicitly: the hook's own
+        // process directory is the harness's, not the command's.
+        let expected =
+            Some(crate::delete::resolve_path_in("infra", &work).join("terraform.tfstate"));
         for c in [
             "terraform -chdir=infra destroy -auto-approve",
             "terraform -chdir=infra apply",
@@ -1666,15 +1762,15 @@ mod tests {
             "/usr/local/bin/terraform -chdir=infra apply",
             "sudo terraform -chdir=infra destroy",
         ] {
-            assert_eq!(tf_state_target(&tokens_of(c)), expected, "{c}");
+            assert_eq!(tf_state_target(&tokens_of(c), Some(&work)), expected, "{c}");
         }
         assert_eq!(
-            tf_state_target(&tokens_of("terraform -chdir=infra plan")),
+            tf_state_target(&tokens_of("terraform -chdir=infra plan"), Some(&work)),
             None,
             "a plan changes nothing, in any directory"
         );
         assert_eq!(
-            tf_state_target(&tokens_of("terraform apply")),
+            tf_state_target(&tokens_of("terraform apply"), Some(&work)),
             None,
             "control: the working directory itself has no state to copy"
         );
@@ -2173,11 +2269,11 @@ mod tests {
         let work = repo_with_remote(&env, "release/7");
         env.chdir(&work);
 
-        assert_eq!(current_branch(), Some("release/7".to_string()));
+        assert_eq!(current_branch(&work), Some("release/7".to_string()));
         // A force push that names no branch insures the branch you are on,
         // not a guessed `main`.
         assert_eq!(
-            git_force_push_target(&tokens_of("git push --force")),
+            git_force_push_target(&tokens_of("git push --force"), &test_cwd()),
             Some(("origin".to_string(), "release/7".to_string()))
         );
     }
@@ -2192,6 +2288,7 @@ mod tests {
             "b-1",
             "2026-01-01T00:00:00Z",
             "git push --force origin main",
+            &work,
             "origin",
             "main",
         )
@@ -2343,6 +2440,7 @@ mod tests {
             "b-1",
             "2026-01-01T00:00:00Z",
             "git push --force origin main",
+            &work,
             "origin",
             "main",
         )
@@ -2369,6 +2467,7 @@ mod tests {
             "b-collide",
             "2026-01-01T00:00:00Z",
             "git push --force origin main",
+            &work,
             "origin",
             "main",
         )
@@ -2530,5 +2629,133 @@ mod tests {
             std::fs::read_to_string(work.join("app.py")).expect("readable"),
             "print(2)\n"
         );
+    }
+}
+
+/// Insurance for a command whose segment runs somewhere else: after a `cd`,
+/// or past git's `-C`. Before Oct 2026 the copy was taken (or not) in the
+/// directory the line started in (Max Petrusenko's field report, Oct 9).
+#[cfg(test)]
+mod segment_directory_tests {
+    use super::*;
+    use crate::testutil::TempTree;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.email=tests@termaxa.invalid",
+                "-c",
+                "user.name=termaxa tests",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git must be available");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn a_delete_after_cd_is_copied_from_where_it_runs() {
+        let tmp = TempTree::new("bk-cd-rm");
+        let main = tmp.dir("main");
+        let data = tmp.dir("wt/data");
+        tmp.file("wt/data/a.txt", "a\n");
+        let state = tmp.dir("state");
+
+        for c in ["cd ../wt && rm -r data", "git -C ../wt rm -r data"] {
+            assert_eq!(
+                plan(c, &main).as_deref(),
+                Some("copy 1 path(s) to .termaxa/backups before deletion"),
+                "{c}"
+            );
+            let record = take(&state, c, &main)
+                .expect("the copy must be taken")
+                .expect("there is something to insure");
+            let copied = originals(&record);
+            assert!(copied.contains(&canonical(&data)), "{c}: copied {copied:?}");
+        }
+        // Control: the same words with no `cd` name nothing in `main`.
+        assert!(plan("rm -r data", &main).is_none());
+    }
+
+    /// The paths a files backup copied, as its record names them.
+    fn originals(record: &BackupRecord) -> Vec<PathBuf> {
+        record.data["items"]
+            .as_array()
+            .expect("a files backup lists its items")
+            .iter()
+            .map(|i| PathBuf::from(i["original"].as_str().expect("an item names its original")))
+            .collect()
+    }
+
+    /// `path` as the record spells it. The record holds `canonicalize()` of
+    /// what was copied, which on Windows is a `\\?\` path and on macOS
+    /// resolves the temp directory's symlink; compared as strings with the
+    /// path a test built, the two never matched on Windows (Oct 13, 2026:
+    /// `…\wt/data` against `\\?\C:\…\wt\data`). Compared as paths, after the
+    /// same canonicalization, they do.
+    fn canonical(path: &Path) -> PathBuf {
+        path.canonicalize().expect("the test's tree exists")
+    }
+
+    #[test]
+    fn an_overwrite_after_cd_is_copied_from_where_it_runs() {
+        let tmp = TempTree::new("bk-cd-write");
+        let main = tmp.dir("main");
+        tmp.file("main/notes.md", "main\n");
+        let wt_notes = tmp.file("wt/notes.md", "worktree\n");
+        let state = tmp.dir("state");
+
+        let record = take(&state, "cd ../wt && echo x > notes.md", &main)
+            .expect("the copy must be taken")
+            .expect("there is something to insure");
+        let copied = originals(&record);
+        assert!(copied.contains(&canonical(&wt_notes)), "copied {copied:?}");
+        // A `cd` the gate cannot follow insures no relative path: which
+        // file it is depends on where the shell is.
+        assert!(plan("cd \"$WT\" && echo x > notes.md", &main).is_none());
+    }
+
+    #[test]
+    fn a_discard_after_cd_or_dash_c_snapshots_that_tree() {
+        let tmp = TempTree::new("bk-cd-discard");
+        let main = tmp.dir("main");
+        let wt = tmp.dir("wt");
+        git(&wt, &["init", "-q"]);
+        std::fs::write(wt.join("notes.md"), "one\n").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-q", "-m", "seed"]);
+        std::fs::write(wt.join("notes.md"), "edit\n").unwrap();
+        let state = tmp.dir("state");
+
+        for c in ["cd ../wt && git reset --hard", "git -C ../wt reset --hard"] {
+            assert_eq!(
+                plan(c, &main).as_deref(),
+                Some("snapshot the uncommitted changes in 1 file(s) with git stash before they are discarded"),
+                "{c}"
+            );
+        }
+        let record = take(&state, "git -C ../wt reset --hard", &main)
+            .expect("the snapshot must be taken")
+            .expect("there is an uncommitted edit");
+        assert_eq!(record.kind, "git-stash");
+        assert_eq!(
+            record.data["repo"].as_str(),
+            Some(
+                crate::delete::resolve_path_in("../wt", &main)
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
+        // `main` is not a repository: read there, nothing was found.
+        assert!(plan("git reset --hard", &main).is_none());
     }
 }
