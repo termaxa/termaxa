@@ -422,7 +422,7 @@ Rust 2021, ~18,000 lines of production code and ~18,400 of tests, 583 tests on L
 
 ## Security
 
-Found a bypass? [SECURITY.md](SECURITY.md) says how to report it and what happens next; five advisories are published there, one from an outside researcher, each with its exposure window in UTC.
+Found a bypass? [SECURITY.md](SECURITY.md) says how to report it and what happens next; six advisories are published there, one from an outside researcher, each with its exposure window in UTC.
 
 ## License
 

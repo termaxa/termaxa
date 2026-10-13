@@ -190,6 +190,7 @@ The affected range and publication date are on each advisory's page.
 | [GHSA-m854-p747-v3gw](https://github.com/termaxa/termaxa/security/advisories/GHSA-m854-p747-v3gw) | Moderate | A denied `terraform destroy` still ran `terraform plan` | v0.9.0, 2026-07-04 | v0.14.2, 2026-08-10 | 2026-08-10 | 37 |
 | [GHSA-rv66-7qcx-c45j](https://github.com/termaxa/termaxa/security/advisories/GHSA-rv66-7qcx-c45j) | High | A compound command could inherit a benign prefix's verdict | v0.7.0, 2026-07-02 | v0.16.0, 2026-08-17 | 2026-08-17 | 46 |
 | [GHSA-36jf-95xr-37f2](https://github.com/termaxa/termaxa/security/advisories/GHSA-36jf-95xr-37f2) | Moderate | Options on commands allowed for reading could write, overwrite a branch or run a command | v0.6.1, 2026-07-02 | v0.19.6, 2026-09-28 | 2026-09-28 | 88 |
+| [GHSA-3hg6-x893-mfr4](https://github.com/termaxa/termaxa/security/advisories/GHSA-3hg6-x893-mfr4) | High | Path rules, previews and backups did not follow a `cd` earlier on the command line | v0.7.0, 2026-07-02 | v0.21.4, 2026-10-13 | 2026-10-13 | 103 |
 
 "Days exposed" is the window a user of the first affected release was
 exposed without knowing it: from that release to the public advisory. It
