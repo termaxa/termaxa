@@ -193,6 +193,12 @@ The field report's lead item shipped in v0.21.4, not v0.21.3, and it was more th
 - The release workflow's winget job needs a token with `workflow` as well as `public_repo`: syncing the fork carries upstream's own workflow changes, and v0.20.1's job failed without it (#134).
 - 547 tests.
 
+### Correction, Oct 22, 2026
+
+Cursor's support confirmed the Auto-review behaviour on Oct 5, 2026 (the forum
+reply is dated Oct 5, 08:45 UTC), not Oct 6. The README's harness table carries
+the right date since this correction.
+
 ## v0.20.1 — observe mode says nothing
 
 **In plain words:** v0.20.0's observe mode answered Cursor and Copilot `allow` for commands outside the floor. Copilot treats a hook's `allow` as an approval, so in Copilot, turning observe mode on skipped Copilot's own prompts. Observe mode now says nothing in every harness, which each harness treats as no opinion. Enforce mode is unchanged.

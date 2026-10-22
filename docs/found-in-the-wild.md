@@ -14,7 +14,7 @@ wording of each entry kept close to the changelog's own.
 Entries are dated by the day the changelog gives for the finding; where it
 gives none, by the release that fixed it.
 
-**34 bugs, in 21 episodes, as of v0.20.1.**
+**48 bugs, in 26 episodes, as of v0.21.5.**
 
 ## 2026
 
@@ -223,6 +223,76 @@ trial. Fixed the same day in
 [v0.20.1](https://github.com/termaxa/termaxa/releases/tag/v0.20.1)
 ([#132](https://github.com/termaxa/termaxa/issues/132)): an observed verdict is
 silence in every harness. 1 bug.
+
+### October 9 — a question from the launch thread: a global option hid the hard stop
+
+The starter denies `kubectl delete`, `terraform destroy`, `tofu destroy` and
+`docker system prune`, and a global option in front of the subcommand hid it
+from the rule: `kubectl -n prod delete deploy api` and `terraform -chdir=infra
+destroy` got the policy default, an ask under enforce mode and a run under
+observe mode, and so did a program named by its path, `/usr/local/bin/terraform
+destroy`. Found answering a question on the Product Hunt launch thread (Gal
+Dayan), measured on v0.21.0 through the Claude Code hook. Fixed in
+[v0.21.1](https://github.com/termaxa/termaxa/releases/tag/v0.21.1)
+([#141](https://github.com/termaxa/termaxa/issues/141)): the options are read
+past, and a program named by its path is read by its name for deny rules.
+2 bugs.
+
+### October 9 — the first field report (Max Petrusenko)
+
+A Replay over 57,000 real Claude Code and Codex commands, a 38-command suite and
+a second reviewer. Checked against the release binary: `rm -r -f /` and `rm
+--recursive --force /` were asks where `rm -rf /` is a hard stop; `rm -rf /*`
+ran in observe mode, its glob read as a path that does not exist and the hook's
+floor narrower than `run`'s; a variable in a path the command only reads (`cp
+"$HOME/x" /tmp/x`) was refused as if it were the target; rollback put the
+copy's private modes back in place of the original's; `log` and `report` said
+nothing when the chain did not verify; `replay` cut reasons at 120 characters.
+Fixed in [v0.21.2](https://github.com/termaxa/termaxa/releases/tag/v0.21.2)
+([#143](https://github.com/termaxa/termaxa/issues/143)). 7 bugs.
+
+### October 9 — a real project's commands, before its observe week
+
+Preparing the first observe-mode week on a live Next.js project with worktrees,
+46 commands such a project runs went through the v0.21.2 hook in observe mode.
+Three were held that should not have been: `rm -rf node_modules` and `rm -rf
+.next`, past the copy budget and so read as unrecoverable, when an install
+rebuilds them; and `cat .claude/settings.json`, denied by the rule written to
+stop an agent editing the hook config. Measuring the second found `cat
+.termaxa/policy.yaml > .termaxa/policy.yaml` allowed in both modes, which would
+have truncated the policy to nothing. Fixed in
+[v0.21.3](https://github.com/termaxa/termaxa/releases/tag/v0.21.3)
+([#145](https://github.com/termaxa/termaxa/issues/145)): a directory a build
+rebuilds is not a loss, reading a hook config is ordinary work, and the gate's
+own files are path rules on the floor. (Fixing the last also found, by reading,
+that no path rule could ever have been on the floor; that one is the
+changelog's.) 3 bugs.
+
+### October 9–12 — the field report's lead item: a path after a `cd` was judged where the hook was called
+
+From a main checkout, `cd ../wt && rm -r data` was previewed as "does not
+exist" and nothing was copied: the preview and the copy aside resolved every
+relative path against the directory the hook was called from, so a worktree
+command's `insured` label was wrong. Reported in the field report; fixed in
+[v0.21.4](https://github.com/termaxa/termaxa/releases/tag/v0.21.4)
+([#148](https://github.com/termaxa/termaxa/issues/148)): each part of a command
+line is judged, previewed and copied in the directory it runs in, after `cd`,
+`pushd`, a subshell or git's `-C`. Fixing it found, by reading, that the path
+rules shared the blind spot, published as
+[GHSA-3hg6-x893-mfr4](https://github.com/termaxa/termaxa/security/advisories/GHSA-3hg6-x893-mfr4);
+that one is the changelog's and SECURITY.md's. 1 bug.
+
+### October 17 — winget's validation: the Windows exe needed the VC++ runtime
+
+Every Windows build so far linked the C runtime dynamically, so on a Windows
+without the Visual C++ 2015+ redistributable `termaxa.exe` exited at once with
+`0xC0000135` (STATUS_DLL_NOT_FOUND), and a hook that cannot start fails open.
+Found by winget's validation of 0.21.4
+([microsoft/winget-pkgs#452044](https://github.com/microsoft/winget-pkgs/pull/452044)),
+which ran the exe on such a machine. Fixed in
+[v0.21.5](https://github.com/termaxa/termaxa/releases/tag/v0.21.5)
+([#151](https://github.com/termaxa/termaxa/issues/151)): the Windows build links
+the C runtime statically. 1 bug.
 
 ## Adding an entry
 
