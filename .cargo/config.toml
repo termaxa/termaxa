@@ -1,0 +1,8 @@
+# The Windows asset must start on a Windows that has never had the Visual C++
+# redistributable installed. A Rust MSVC build links the C runtime dynamically
+# by default (VCRUNTIME140.dll and the UCRT api-sets), and winget's validation
+# of 0.21.4 ran the exe on such a machine: exit 0xC0000135, STATUS_DLL_NOT_FOUND
+# (microsoft/winget-pkgs#452044, Oct 17, 2026). A hook that cannot start fails
+# open. Link the CRT statically, so the exe carries its runtime.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
