@@ -86,6 +86,22 @@ the unsandboxed attempt. The payload's `cwd` is empty; the project is in
 Copilot's `toolArgs` arrives as an inline object on Windows (tool
 `powershell`), which the reader has accepted since the Sep 9 capture.
 
+### Claude Code's bypass mode
+
+A `PreToolUse` hook's `ask` is honoured under `--dangerously-skip-permissions`,
+where an `ask` rule in `settings.json` is not
+([anthropics/claude-code#95741](https://github.com/anthropics/claude-code/issues/95741),
+open). Measured on Claude Code 2.1.283 (Sep 29, 2026) and again on 2.1.302
+(Oct 16, 2026), on Linux, with a probe hook answering `ask` for a command that
+creates a file only if it runs. Interactively, with the footer showing "bypass
+permissions on", the dialog appears ("Hook PreToolUse:Bash requires
+confirmation for this command … Do you want to proceed?") and declining
+interrupts the call; headless (`claude -p`), the call is refused with the
+hook's reason, listed under `permission_denials` in the result, and the agent
+reports that it did not run. In both, the file is not created. So in bypass
+mode the gate's `ask` still stops for a human, or refuses unattended, and
+`deny` holds as everywhere.
+
 ## Native writes
 
 The write matcher delivers `Write`, `Edit`, `MultiEdit` and `NotebookEdit`
