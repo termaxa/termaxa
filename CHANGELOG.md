@@ -2,6 +2,19 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.21.5 — the Windows exe carries its runtime
+
+**In plain words:** every Windows build of Termaxa so far needed the Visual C++ 2015+ redistributable to start. Most developer machines have it; a clean Windows does not, and there `termaxa.exe` exited at once with `0xC0000135` (STATUS_DLL_NOT_FOUND), before any policy was read. A hook that cannot start fails open: the harness treats the error as non-blocking and runs the command anyway. winget's validation of 0.21.4 found it on Oct 17, 2026 ([microsoft/winget-pkgs#452044](https://github.com/microsoft/winget-pkgs/pull/452044)). The exe now links the C runtime statically and depends on nothing but Windows.
+
+### Fixed
+
+- The Windows asset no longer imports `VCRUNTIME140.dll` or the `api-ms-win-crt-*` sets. `.cargo/config.toml` sets `target-feature=+crt-static` for `x86_64-pc-windows-msvc`, so the release build, CI and a local build all link the same way; the imports left are `kernel32`, `ntdll`, `api-ms-win-core-synch-l1-2-0`, `bcryptprimitives`, `bcrypt`, `ADVAPI32` and `WS2_32`, all part of Windows. The 0.20.1, 0.21.3 and 0.21.4 assets all carried the dependency; until a machine without the redistributable upgrades, `winget install Microsoft.VCRedist.2015+.x64` makes those start (#151).
+
+### Measured and documented
+
+- `dumpbin /dependents` on the release build, a byte search of the exe for both names, and the Windows gate: 502 passed, 0 failed, every test binary linked statically too. A run on a Windows without the redistributable was not possible on the build machine; winget's validation of this release runs the exe on one, and its result is the end-to-end check.
+- Nothing else changed: 583 tests on Linux, the starter policy as in v0.21.3.
+
 ## v0.21.4 — a path after a cd is where the cd went
 
 **In plain words:** a write or delete spelled after a `cd` was judged as if the `cd` had not run. `cd .claude && echo {} > settings.json` matched no path rule, and the starter allowed it from v0.18.6 on, while `echo {} > .claude/settings.json` is a floor deny; the gate's own policy, `.cursor/hooks.json`, `.codex/hooks.json` and any rule of yours that names a directory were sidestepped the same way. The preview and the copy aside had the same blind spot, which is how the lead item of Max Petrusenko's field report found it: from a main checkout, `cd ../wt && rm -r data` was previewed as "does not exist" and, in observe mode, ran with nothing copied. Every part of a command line is now judged in the directory it runs in.
