@@ -624,22 +624,37 @@ fn moved(here: &RunDir, effect: CdEffect, sure: bool) -> RunDir {
             RunDir::Moved(vec![step])
         }
         // A glob cannot be expanded against a directory the gate cannot
-        // name; a literal relative path is the end of wherever the shell
-        // is: `cd "$X" && cd .claude` ends in `.claude`, whatever `$X` is.
-        RunDir::Unknown | RunDir::Ending(_) if glob => RunDir::Unknown,
+        // name, but what follows the glob is literal: `cd "$X" && cd
+        // wt*/.claude` ends in `.claude`. A literal relative path is the
+        // end of wherever the shell is: `cd "$X" && cd .claude` ends in
+        // `.claude`, whatever `$X` is.
+        RunDir::Unknown | RunDir::Ending(_) if glob => ending_after_glob(&step.path),
         RunDir::Unknown => ending(&[], &step.path),
         RunDir::Ending(end) => ending(end, &step.path),
     }
 }
 
 /// A directory known only at its end, `end`, after a relative `path` from
-/// it; unknown when nothing of the end is left.
+/// it; unknown when nothing of the end is left. After `;` the move is taken
+/// as made: the gate cannot check that the directory exists, and a `cd`
+/// that failed then costs a deny the write did not need, the loud side
+/// (#44), never an allow.
 fn ending(end: &[String], path: &str) -> RunDir {
     let end = crate::delete::join_end(end, path);
     if end.is_empty() {
         RunDir::Unknown
     } else {
         RunDir::Ending(end)
+    }
+}
+
+/// A directory reached through a glob the gate could not expand: known
+/// only at the end that follows the glob (`wt*/.claude` ends in `.claude`;
+/// `.cla*` in nothing).
+fn ending_after_glob(path: &str) -> RunDir {
+    match crate::delete::readable_end_of(path) {
+        Some(end) if !end.is_empty() => RunDir::Ending(end),
+        _ => RunDir::Unknown,
     }
 }
 
@@ -1465,25 +1480,30 @@ impl Segment {
     /// `start_end` is `None` when the directory the line starts in is known,
     /// and otherwise what is known of its end (a segment read on its own,
     /// from a line that moved before it); a `cd` on this line extends it.
-    /// `None` when the directory is known.
+    /// `None` when the directory is known. A glob step `run_dir` could not
+    /// expand leaves the directory unknown past the glob, so what follows
+    /// the glob is the end (`wt*/.claude` ends in `.claude`); when it did
+    /// expand, the directory is known and this is not read.
     pub fn run_dir_end(&self, start_end: Option<&[String]>) -> Option<Vec<String>> {
         match &self.dir {
             RunDir::Ending(end) => Some(end.clone()),
             RunDir::Unknown => Some(Vec::new()),
             RunDir::Start => start_end.map(<[String]>::to_vec),
             RunDir::Moved(steps) => {
-                let mut end = start_end?.to_vec();
+                let mut end: Option<Vec<String>> = start_end.map(<[String]>::to_vec);
                 for step in steps {
-                    // An absolute step would make the directory known, which
-                    // `run_dir` does not follow from an unknown start; a
-                    // glob cannot be expanded against an unknown one. Either
-                    // way nothing is known of the end past it.
-                    if step.glob || crate::delete::is_dir_independent(&step.path) {
-                        return Some(Vec::new());
+                    if step.glob {
+                        end = Some(crate::delete::readable_end_of(&step.path).unwrap_or_default());
+                    } else if crate::delete::is_dir_independent(&step.path) {
+                        // An absolute step would make the directory known,
+                        // which `run_dir` does not follow from an unknown
+                        // start: nothing is known of the end past it.
+                        end = end.map(|_| Vec::new());
+                    } else if let Some(e) = end.as_mut() {
+                        *e = crate::delete::join_end(e, &step.path);
                     }
-                    end = crate::delete::join_end(&end, &step.path);
                 }
-                Some(end)
+                end
             }
         }
     }
@@ -2905,6 +2925,15 @@ mod segment_directory_tests {
         ] {
             assert_eq!(dir_of(c, "rm"), ending(&[".claude"]), "{c}");
         }
+        // A glob after a directory nothing or only the end is known of
+        // cannot be expanded; what follows the glob is still the end.
+        for c in [
+            "cd \"$X\" && cd wt*/.claude && rm y",
+            "cd \"$(pwd)/a\" && cd */.claude && rm y",
+            "cd \"$X\" && cd .cl*/../.claude && rm y",
+        ] {
+            assert_eq!(dir_of(c, "rm"), ending(&[".claude"]), "{c}");
+        }
         // Nothing readable at the end, or climbing out of it: unknown, as
         // before.
         for c in [
@@ -2915,8 +2944,9 @@ mod segment_directory_tests {
             "cd \"$(pwd)/.claude/..\" && rm y",
             "cd \"$(pwd)/.claude\" && cd .. && rm y",
             "cd \"$X\" && cd .cla* && rm y",
-            // A glob after a directory known only at its end cannot be
-            // expanded; a conditional move may not have happened.
+            // A glob in the last component after a directory known only
+            // at its end cannot be expanded and ends in nothing; a
+            // conditional move may not have happened.
             "cd \"$(pwd)/a\" && cd .cla* && rm y",
             "if x; then cd \"$(pwd)/.claude\"; fi; rm y",
             "ls || cd \"$(pwd)/.claude\" && rm y",
@@ -2980,6 +3010,24 @@ mod segment_directory_tests {
         assert_eq!(seg("cd nowhere* && rm y").run_dir(&start), None);
         assert_eq!(seg("cd only.* && rm y").run_dir(&start), None);
         assert_eq!(seg("cd */sub && rm y").run_dir(&start), None);
+        // What follows a glob the gate could not expand is the end, from a
+        // known start as from an unknown one; a glob in the last component
+        // ends in nothing.
+        let end = |c: &str, start_end: Option<&[String]>| seg(c).run_dir_end(start_end);
+        let claude_end = Some(vec![".claude".to_string()]);
+        assert_eq!(end("cd wt*/.claude && rm y", None), claude_end);
+        assert_eq!(
+            end("cd */sub/.claude && rm y", None),
+            Some(vec!["sub".to_string(), ".claude".to_string()])
+        );
+        assert_eq!(end("cd .cl*/../.claude && rm y", None), claude_end);
+        assert_eq!(end("cd wt* && cd .claude && rm y", None), claude_end);
+        assert_eq!(end("cd wt* && rm y", None), Some(Vec::new()));
+        assert_eq!(end("cd wt*/.claude && rm y", Some(&[])), claude_end);
+        // Without a glob, from a known start, the directory is known and
+        // there is no end to speak of.
+        assert_eq!(end("cd wt1 && rm y", None), None);
+        assert_eq!(end("rm y", None), None);
     }
 
     #[test]
