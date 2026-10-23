@@ -3228,8 +3228,14 @@ mod segment_directory_tests {
             "cd \"$(git rev-parse --show-toplevel)/.termaxa\" && tee policy.yaml",
             "cd \"$(git rev-parse --show-toplevel)/.cursor\" && echo {} > hooks.json",
             // A glob the shell expands, expanded against the directory the
-            // `cd` runs in (`project()` has one `.claude`).
+            // `cd` runs in (`project()` has one `.claude`); one the gate
+            // cannot expand (a glob in a directory component, two matches)
+            // still ends in what follows it.
             "cd .cla* && echo {} > settings.json",
+            "cd wt*/.claude && echo {} > settings.json",
+            "cd */.claude && echo {} > settings.json",
+            "cd .cl*/../.claude && echo {} > settings.json",
+            "cd \"$X\" && cd wt*/.claude && echo {} > settings.json",
             // Nothing known of the directory, and the target's own path is
             // the end: wherever `$X` is, these land on the files named.
             "cd \"$X\" && echo {} > .claude/settings.json",
