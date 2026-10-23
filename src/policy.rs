@@ -124,6 +124,31 @@ impl Rule {
         match_components(&pat, &seg)
     }
 
+    /// Does this rule's `match_path` pattern match a path whose start the
+    /// gate cannot read and whose end is `end`? After `cd "$(git rev-parse
+    /// --show-toplevel)/.claude"`, a write to `settings.json` lands on a
+    /// path ending `.claude/settings.json`, wherever the repository is.
+    ///
+    /// Only a pattern that starts with `*`, matching at any depth, can be
+    /// sure: whatever the unknown start is, the `*` consumes it, so matching
+    /// the end alone is matching the whole. `*/.claude/settings*.json`
+    /// matches that end; `/etc/*` matches no end, because the start could
+    /// be anything; `*/src/*` does not match an end of `.claude/x`, though
+    /// the unknown start might hold `src`, so a match found this way is
+    /// never a guess and a miss is the reading an unknown directory always
+    /// had.
+    pub fn matches_path_end(&self, end: &[String]) -> bool {
+        let Some(pattern) = &self.match_path else {
+            return false;
+        };
+        let pat: Vec<String> = crate::protect::segments(pattern);
+        if pat.first().map(String::as_str) != Some("*") {
+            return false;
+        }
+        let seg: Vec<String> = crate::protect::segments(&end.join("/"));
+        match_components(&pat, &seg)
+    }
+
     /// Does this rule's STRING pattern match a reading? A rule with no
     /// `match:` matches no string - it speaks only about paths, and saying
     /// otherwise is how the over-blocking bug happened.
@@ -412,8 +437,15 @@ impl Policy {
                 if !t.role.is_destructive() {
                     continue;
                 }
-                let Some(p) = &t.resolved else { continue };
-                if rule.matches_path(&p.display().to_string()) {
+                // A resolved target by its path; one in a directory the
+                // gate could read only the end of, by the end of its path,
+                // which only a rule matching at any depth can name.
+                let hit = match (&t.resolved, &t.end) {
+                    (Some(p), _) => rule.matches_path(&p.display().to_string()),
+                    (None, Some(end)) => rule.matches_path_end(end),
+                    (None, None) => false,
+                };
+                if hit {
                     let better = match &path_hit {
                         None => true,
                         Some((bi, br, _, _)) => {
@@ -3077,6 +3109,10 @@ mod combined_gate_tests {
 mod segment_directory_tests {
     use super::*;
 
+    fn policy_from(yaml: &str) -> Policy {
+        serde_yaml::from_str(yaml).expect("policy must parse")
+    }
+
     fn project() -> (crate::testutil::TempTree, crate::resolve::EvalContext) {
         let tmp = crate::testutil::TempTree::new("policy-cd");
         tmp.file(".termaxa/policy.yaml", "default: ask\nrules: []\n");
@@ -3162,6 +3198,115 @@ mod segment_directory_tests {
             p.evaluate_command("cd wt && ls", &ctx).action,
             Action::Allow
         );
+    }
+
+    /// Found Oct 14, 2026, measured on v0.21.4 and v0.21.5: the `cd`
+    /// spellings whose argument the gate could read only the end of left the
+    /// directory unknown as a whole, and the write after them was allowed by
+    /// `echo *` (or `cat *`), while the direct spelling and `cd .claude &&
+    /// …` were floor denies. The end of such a path is known, and a path
+    /// rule matching at any depth names it.
+    #[test]
+    fn a_cd_read_only_at_its_end_does_not_hide_the_gates_own_files() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for c in [
+            "cd \"$(git rev-parse --show-toplevel)/.claude\" && echo {} > settings.json",
+            "cd $(git rev-parse --show-toplevel)/.claude && echo {} > settings.json",
+            "cd \"$(git rev-parse --show-toplevel)/.claude\" && cat > settings.json",
+            "cd \"$(git rev-parse --show-toplevel)/.claude\"; echo {} > settings.json",
+            "cd `git rev-parse --show-toplevel`/.claude && echo {} > settings.json",
+            "cd \"$ROOT/.claude\" && echo {} > settings.json",
+            "cd ${ROOT}/.claude && echo {} > settings.json",
+            "cd ~other/.claude && echo {} > settings.json",
+            "pushd \"$(git rev-parse --show-toplevel)/.claude\" && echo {} > settings.json",
+            "(cd \"$(git rev-parse --show-toplevel)/.claude\" && echo {} > settings.json)",
+            "cd \"$(git rev-parse --show-toplevel)\" && cd .claude && echo {} > settings.json",
+            "cd \"$(git rev-parse --show-toplevel)/x\" && echo {} > ../.claude/settings.json",
+            "cd \"$(git rev-parse --show-toplevel)/.termaxa\" && echo x > policy.yaml",
+            "cd \"$(git rev-parse --show-toplevel)/.termaxa\" && rm policy.yaml",
+            "cd \"$(git rev-parse --show-toplevel)/.termaxa\" && tee policy.yaml",
+            "cd \"$(git rev-parse --show-toplevel)/.cursor\" && echo {} > hooks.json",
+            // A glob the shell expands, expanded against the directory the
+            // `cd` runs in (`project()` has one `.claude`).
+            "cd .cla* && echo {} > settings.json",
+            // Nothing known of the directory, and the target's own path is
+            // the end: wherever `$X` is, these land on the files named.
+            "cd \"$X\" && echo {} > .claude/settings.json",
+            "cd \"$X\" && rm -r .termaxa",
+            "cd \"$X\" && echo x > .env",
+            "cd \"$X\" && cd .claude && echo {} > settings.json",
+            // A variable at the start of the target itself: what follows
+            // it is the end (the adversarial pass on this change found
+            // `.env` the one protected file no string rule also names).
+            "echo KEY=1 > $PWD/.env",
+            "cat .env.example > $PWD/.env",
+            "echo KEY=1 >> \"${ROOT}/.env\"",
+            "echo x > \"$ROOT/.termaxa/policy.yaml\"",
+            "echo {} > %USERPROFILE%\\.claude\\settings.json",
+        ] {
+            let d = p.evaluate_command(c, &ctx);
+            assert_eq!(d.action, Action::Deny, "{c}: {}", d.reason);
+            assert!(
+                d.matched_rule
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("path:")),
+                "{c}: denied by the path rule, not by luck: {:?} {}",
+                d.matched_rule,
+                d.reason
+            );
+        }
+        // The reason says what was known of the path.
+        let d = p.evaluate_command(
+            "cd \"$(git rev-parse --show-toplevel)/.claude\" && echo {} > settings.json",
+            &ctx,
+        );
+        assert!(
+            d.reason.contains("`…/.claude/settings.json`"),
+            "{}",
+            d.reason
+        );
+        // Still allowed: an end no rule names, and a directory nothing is
+        // known of, where the explicit allow outranks the unresolved target
+        // as it did (decision #134; SECURITY.md's documented limit).
+        for c in [
+            "cd \"$(git rev-parse --show-toplevel)\" && echo x > notes.md",
+            "cd \"$(git rev-parse --show-toplevel)/src\" && echo x > notes.md",
+            "cd \"$(git rev-parse --show-toplevel)/.vscode\" && echo {} > settings.json",
+            "cd \"$(git rev-parse --show-toplevel)/.claude/..\" && echo {} > settings.json",
+            "cd \"$(git rev-parse --show-toplevel)/.claude\" && cat settings.json",
+            "cd \"$X\" && echo {} > settings.json",
+            "cd \"$(echo .claude)\" && echo {} > settings.json",
+            "cd \"$(git rev-parse --show-toplevel)/.cla*\" && echo {} > settings.json",
+            // Decision #134's example: `policy.yaml` is `./policy.yaml` or
+            // `.termaxa/policy.yaml`, and its end says which of the two it
+            // is not. Decision #62's: a variable at the start of a target
+            // whose end names no rule.
+            "cd .termaxa; ls && cd ..; echo x > policy.yaml",
+            "echo x > \"$X/policy.yaml\"",
+            "echo x > $OUT/notes.txt",
+        ] {
+            let d = p.evaluate_command(c, &ctx);
+            assert_eq!(d.action, Action::Allow, "{c}: {}", d.reason);
+        }
+        // A variable in a source: read, not written, so no path rule fires
+        // (Max Petrusenko's field report, Oct 9, 2026); the starter has no
+        // rule for `cp`, so it is the default.
+        let d = p.evaluate_command("cp \"$HOME/.env\" /tmp/env-copy", &ctx);
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
+        // A rule anchored at the root cannot be sure of a path whose start
+        // is unknown; one matching at any depth can.
+        let allows = "default: ask\nrules:\n  - match: \"cd *\"\n    action: allow\n  - match: \"echo *\"\n    action: allow\n";
+        let anchored = policy_from(&format!(
+            "{allows}  - match_path: \"/etc/*\"\n    action: deny\n"
+        ));
+        let d = anchored.evaluate_command("cd \"$ROOT/etc\" && echo x > passwd", &ctx);
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        let any_depth = policy_from(&format!(
+            "{allows}  - match_path: \"*/etc/*\"\n    action: deny\n"
+        ));
+        let d = any_depth.evaluate_command("cd \"$ROOT/etc\" && echo x > passwd", &ctx);
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
     }
 
     #[test]

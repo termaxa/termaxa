@@ -60,6 +60,13 @@ pub struct EvalContext {
     /// (`cd "$X"`, `cd -`): a relative target then resolves to nothing the
     /// gate can know, and is reported as such.
     pub cwd_known: bool,
+    /// When `cwd_known` is false: what is known of the end of the
+    /// directory, as path components. `cd "$(git rev-parse
+    /// --show-toplevel)/.claude"` leaves the shell somewhere ending in
+    /// `.claude`; `cd "$X"` somewhere nothing is known of (empty). A
+    /// relative target after either has a known end, this and then its own
+    /// path, which a path rule matching at any depth can name.
+    pub cwd_end: Vec<String>,
 }
 
 impl EvalContext {
@@ -70,6 +77,7 @@ impl EvalContext {
             cwd: cwd.into(),
             root: root.into(),
             cwd_known: true,
+            cwd_end: Vec::new(),
         }
     }
 
@@ -82,6 +90,7 @@ impl EvalContext {
             cwd: d.clone(),
             root: d,
             cwd_known: true,
+            cwd_end: Vec::new(),
         }
     }
 
@@ -99,21 +108,27 @@ impl EvalContext {
             cwd: cwd.into(),
             root,
             cwd_known: true,
+            cwd_end: Vec::new(),
         }
     }
 
-    /// This context moved to `dir`, or marked unknown when `dir` is `None`.
-    fn in_dir(&self, dir: Option<PathBuf>) -> Self {
+    /// This context moved to `dir`, or, when the directory is not known,
+    /// marked unknown with whatever is known of its end (`end`; `None` when
+    /// the segment's own reading had the directory known, which a `cd`
+    /// that failed to resolve can still leave unknown).
+    fn in_dir(&self, dir: Option<PathBuf>, end: Option<Vec<String>>) -> Self {
         match dir {
             Some(d) if self.cwd_known => Self {
                 cwd: d,
                 root: self.root.clone(),
                 cwd_known: true,
+                cwd_end: Vec::new(),
             },
             _ => Self {
                 cwd: self.cwd.clone(),
                 root: self.root.clone(),
                 cwd_known: false,
+                cwd_end: end.unwrap_or_default(),
             },
         }
     }
@@ -122,13 +137,26 @@ impl EvalContext {
     /// before it on the line left the shell (`Segment::run_dir`). A redirect
     /// target resolves here.
     pub fn for_segment(&self, seg: &crate::shell::Segment) -> Self {
-        self.in_dir(seg.run_dir(&self.cwd))
+        self.in_dir(seg.run_dir(&self.cwd), seg.run_dir_end(self.start_end()))
     }
 
     /// Where a segment's own operands resolve: `for_segment`, then git's
     /// `-C` for a git command (`delete::operand_base`).
     pub fn for_operands(&self, seg: &crate::shell::Segment) -> Self {
-        self.in_dir(delete::operand_base(seg, &self.cwd))
+        self.in_dir(
+            delete::operand_base(seg, &self.cwd),
+            delete::operand_end(seg, self.start_end()),
+        )
+    }
+
+    /// What `Segment::run_dir_end` wants to know of this context: `None`
+    /// when the directory is known, otherwise what is known of its end.
+    fn start_end(&self) -> Option<&[String]> {
+        if self.cwd_known {
+            None
+        } else {
+            Some(&self.cwd_end)
+        }
     }
 }
 
@@ -237,6 +265,14 @@ pub struct ResolvedTarget {
     /// completed — today that means an unexpanded variable, the one thing
     /// lexical resolution genuinely cannot see through.
     pub resolved: Option<PathBuf>,
+    /// When `resolved` is `None` because the directory is unknown: the end
+    /// of the path, what is known of the directory's end
+    /// (`EvalContext::cwd_end`) and then the target's own path.
+    /// `settings.json` after `cd "$(git rev-parse --show-toplevel)/.claude"`
+    /// ends in `.claude/settings.json`; `.claude/settings.json` after `cd
+    /// "$X"` ends in the same; a path rule matching at any depth can name
+    /// either. Empty only when `..` climbed out of everything known.
+    pub end: Option<Vec<String>>,
     /// Everything notable about this target, in a stable order.
     pub shapes: Vec<SensitiveShape>,
 }
@@ -260,9 +296,17 @@ impl ResolvedTarget {
     /// judgement `delete.rs` makes when it decides whether to print an
     /// "as written" line.
     pub fn display(&self) -> String {
-        match &self.resolved {
-            Some(p) => p.display().to_string(),
-            None => self.as_written.clone(),
+        match (&self.resolved, &self.end) {
+            (Some(p), _) => p.display().to_string(),
+            // A variable in the target: what was typed says where it goes
+            // better than its end does.
+            (None, _) if self.shapes.contains(&SensitiveShape::UnexpandedVar) => {
+                self.as_written.clone()
+            }
+            // The directory's start is not known; the path's end is, and
+            // is what a rule named.
+            (None, Some(end)) => format!("…/{}", end.join("/")),
+            (None, None) => self.as_written.clone(),
         }
     }
 }
@@ -533,20 +577,37 @@ pub fn target(raw: &str, role: TargetRole, ctx: &EvalContext) -> ResolvedTarget 
         // happily join `$HOME/.ssh` onto the cwd and produce a real-looking
         // path that points nowhere true. A confident wrong answer is worse
         // than an admitted unknown in a tool that reports blast radius.
+        // What follows the variable is literal, though: `$PWD/.env` is a
+        // `.env` wherever `$PWD` is, and a path rule matching at any depth
+        // names that end. `$X/policy.yaml` ends in a name no rule has, and
+        // stays the documented limit.
+        let end = delete::readable_end_of(&as_written).filter(|e| !e.is_empty());
         return ResolvedTarget {
             role,
             as_written,
             resolved: None,
+            end,
             shapes,
         };
     }
 
     if !ctx.cwd_known && !delete::is_dir_independent(&as_written) {
         shapes.push(SensitiveShape::UnknownDirectory);
+        // What is known of the directory's end, then the target: the
+        // path's end, wherever the directory is. `~other/x` is in another
+        // user's home, not in the directory, and ends in what follows the
+        // `~other`.
+        let end = if as_written.starts_with('~') {
+            delete::readable_end_of(&as_written)
+        } else {
+            Some(delete::join_end(&ctx.cwd_end, &as_written))
+        }
+        .filter(|e| !e.is_empty());
         return ResolvedTarget {
             role,
             as_written,
             resolved: None,
+            end,
             shapes,
         };
     }
@@ -572,6 +633,7 @@ pub fn target(raw: &str, role: TargetRole, ctx: &EvalContext) -> ResolvedTarget 
         role,
         as_written,
         resolved: Some(resolved),
+        end: None,
         shapes,
     }
 }
@@ -1002,6 +1064,84 @@ mod tests {
         );
         assert!(r.has(SensitiveShape::OutsideRoot), "{:?}", r.shapes);
         assert!(r.has(SensitiveShape::ProtectedName), "{:?}", r.shapes);
+    }
+
+    /// After a `cd` the gate could read only the end of, a relative target
+    /// has a known end and no resolved path (found Oct 14, 2026: `cd "$(git
+    /// rev-parse --show-toplevel)/.claude" && echo {} > settings.json` was
+    /// allowed by `echo *` through v0.21.5, the direct spelling a floor
+    /// deny).
+    #[test]
+    fn a_target_in_a_directory_known_only_at_its_end_has_a_known_end() {
+        let t = TempTree::new("resolve-end");
+        let start = EvalContext::at(t.path());
+        let ending = EvalContext {
+            cwd_known: false,
+            cwd_end: vec![".claude".to_string()],
+            ..start.clone()
+        };
+        let r = target("settings.json", TargetRole::Destination, &ending);
+        assert!(r.is_unresolved());
+        assert!(r.has(SensitiveShape::UnknownDirectory), "{:?}", r.shapes);
+        assert_eq!(
+            r.end.as_deref(),
+            Some(&[".claude".to_string(), "settings.json".to_string()][..])
+        );
+        assert_eq!(r.display(), "…/.claude/settings.json");
+        // `..` climbs the known end, then into what is unknown.
+        let r = target("../x", TargetRole::Destination, &ending);
+        assert_eq!(r.end.as_deref(), Some(&["x".to_string()][..]));
+        let r = target("../../x", TargetRole::Destination, &ending);
+        assert_eq!(r.end.as_deref(), Some(&["x".to_string()][..]));
+        // Climbing out of the end entirely leaves nothing known: no end.
+        let r = target("..", TargetRole::Destination, &ending);
+        assert_eq!(r.end, None);
+        // An absolute target is the same file wherever the shell is.
+        let r = target("/tmp/x", TargetRole::Destination, &ending);
+        assert!(r.resolved.is_some());
+        assert_eq!(r.end, None);
+        // Another user's home is not under the directory: its end is what
+        // follows the `~other`, not `.claude/…`.
+        let r = target("~other/.claude/x", TargetRole::Destination, &ending);
+        assert!(r.is_unresolved());
+        assert_eq!(
+            r.end.as_deref(),
+            Some(&[".claude".to_string(), "x".to_string()][..])
+        );
+        let r = target("~other/x", TargetRole::Destination, &ending);
+        assert_eq!(r.end.as_deref(), Some(&["x".to_string()][..]));
+        // A variable in the target is unresolved for its own reason, and
+        // ends in what follows the variable, not in the directory's end:
+        // `$X` may be absolute.
+        let r = target("$X/policy.yaml", TargetRole::Destination, &ending);
+        assert!(r.has(SensitiveShape::UnexpandedVar));
+        assert_eq!(r.end.as_deref(), Some(&["policy.yaml".to_string()][..]));
+        let r = target("$PWD/.env", TargetRole::Destination, &start);
+        assert!(r.has(SensitiveShape::UnexpandedVar));
+        assert_eq!(r.end.as_deref(), Some(&[".env".to_string()][..]));
+        assert_eq!(r.display(), "$PWD/.env");
+        let r = target("$X", TargetRole::Destination, &start);
+        assert_eq!(r.end, None);
+        assert_eq!(r.display(), "$X");
+        // With nothing known of the directory, the target's own path is
+        // the end: wherever the shell is, this write lands on a
+        // `.claude/settings.json`.
+        let unknown = EvalContext {
+            cwd_known: false,
+            cwd_end: Vec::new(),
+            ..start.clone()
+        };
+        let r = target(".claude/settings.json", TargetRole::Destination, &unknown);
+        assert_eq!(
+            r.end.as_deref(),
+            Some(&[".claude".to_string(), "settings.json".to_string()][..])
+        );
+        assert_eq!(r.display(), "…/.claude/settings.json");
+        let r = target("../x", TargetRole::Destination, &unknown);
+        assert_eq!(r.end.as_deref(), Some(&["x".to_string()][..]));
+        let r = target("..", TargetRole::Destination, &unknown);
+        assert_eq!(r.end, None);
+        assert_eq!(r.display(), "..");
     }
 
     #[test]
