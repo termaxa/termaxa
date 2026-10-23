@@ -414,11 +414,11 @@ Termaxa is pre-1.0. It's real and tested, and it is not magic.
 - **The format may still change.** Pin a release.
 - **Windows PowerShell 5.1 mangles redirected Unicode.** `termaxa report > out.txt` writes UTF-16 and garbles the box-drawing glyphs. Use PowerShell 7, or `termaxa report --md | Out-File -Encoding utf8 report.md`.
 
-Every bug found in real use, with how it was found and where it was fixed, is in [docs/found-in-the-wild.md](docs/found-in-the-wild.md): 34 so far. The threat model and the published advisories are in [SECURITY.md](SECURITY.md).
+Every bug found in real use, with how it was found and where it was fixed, is in [docs/found-in-the-wild.md](docs/found-in-the-wild.md): 48 so far. The threat model and the published advisories are in [SECURITY.md](SECURITY.md).
 
 ## Contributing
 
-Rust 2021, ~18,000 lines of production code and ~18,400 of tests, 583 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
+Rust 2021, ~18,400 lines of production code and ~18,800 of tests, 589 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
 
 ## Security
 

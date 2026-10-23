@@ -2,6 +2,33 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.21.6 — a path read only at its end is judged by its end
+
+**In plain words:** a `cd` whose argument the gate could read only part of, `cd "$(git rev-parse --show-toplevel)/.claude"`, `cd "$ROOT/.claude"` or `cd .cla*`, left the directory unknown as a whole, so a write after it was unresolved and the starter's `echo *` outranked that: `… && echo {} > settings.json` was allowed from v0.18.6 (the substitution spelling from v0.19.3), while `cd .claude && echo {} > settings.json` has been a floor deny since v0.21.4 and the direct spelling since v0.14.2. The same held for a target that starts with a variable: `cat .env.example > $PWD/.env` was allowed from v0.15.0, the release that first denied `> .env`. The end of such a path is literal, and the path rules now read it: wherever the start is, that write lands on a `.claude/settings.json`, or a `.env`.
+
+Security release for [GHSA-4mqm-4c42-2xxc](https://github.com/termaxa/termaxa/security/advisories/GHSA-4mqm-4c42-2xxc) (High), found on Oct 14, 2026 while checking GHSA-3hg6-x893-mfr4's list of unreadable `cd`s and measured on the released 0.21.4 and 0.21.5. Two code PRs (#154, #155). The advisory lists, release by release, when each form started.
+
+### Security
+
+- A path the gate can read only the end of is judged by its end. After `cd "$(git rev-parse --show-toplevel)/.claude"` the shell is somewhere ending in `.claude`, a relative target there ends in `.claude/<target>`, and a `match_path` rule whose first component is `*`, matching at any depth, names that end with certainty, because the `*` consumes whatever the start is; a rule anchored at the root (`/etc/*`) cannot be sure and does not match. The floor rules on `.termaxa/`, `.claude/settings*.json`, `.cursor/hooks.json`, `.codex/hooks.json` and `.github/hooks/*` fire on these spellings in both modes, `*/.env` in enforce mode. The preview and the copy aside still treat the directory as unknown; only the verdict changes (#154).
+- A `cd` from a directory nothing is known of ends in its own path: `cd "$X" && cd .claude && echo {} > settings.json` is denied (#154).
+- A target that starts with a variable ends in what follows it: `cat .env.example > $PWD/.env`, `echo KEY=1 >> "${ROOT}/.env"` and `echo {} > %USERPROFILE%\.claude\settings.json` are denied. `echo x > "$X/policy.yaml"` ends in a name no rule has and stays allowed, as SECURITY.md says (#154).
+- A glob in a `cd` is expanded against the directory it runs in, as the delete preview expands a target's since v0.21.2, and counts when exactly one directory matches: `cd .cla* && echo {} > settings.json` is denied, and `cd .cla* && rm -r data` is previewed and copied where it runs. A glob the gate cannot expand (`cd wt*/.claude`, two matches, none) still ends in what follows it (#154, #155).
+- An unquoted `$(git rev-parse --show-toplevel)/.claude` was three words to the tokenizer and is read as the one word it is to the shell, for `cd` (#154).
+
+### Measured and documented
+
+- Each release's own starter, through the hook: the `.env` spelling allowed from v0.15.0; the variable, glob and relative-after-unknown `cd` spellings from v0.18.6; the substitution spelling from v0.19.3; all denied here. The advisory carries the table.
+- On one list of 31 `cd` spellings against 0.21.5: 17 go from allow to deny by the path rule, `pushd …` and `tee policy.yaml` from ask to deny; the reads after a `cd` and the documented limits keep their verdicts.
+- Two reviews ran on the change, as on #148. The code review found the glob case #155 fixes, and that after `;` a move into such a directory is taken as made: the gate cannot check it exists, so a `cd` that failed costs a deny the write did not need, never an allow. The adversarial pass, 165 spellings, found no `cd` spelling an agent would write that passes and no wrong deny from the end-matching; it found the `.env` variable case, fixed in #154, and that the starter's string rules over-match ordinary work (`git commit -m "update .claude settings"` and `grep hook .claude/settings.json` deny), which predates this release and is on the roadmap.
+- Still the documented limit: a `cd` nothing can be read of (`cd "$X"`, `cd "$(cd .claude && pwd)"`) followed by a relative write whose own path names no rule, and, on Windows, `cd "$ROOT\.claude"` with the backslash inside double quotes, which the tokenizer reads as `$ROOT.claude` (#50's documented divergence; the two lexers move together, next). SECURITY.md's list of unreadable `cd`s says so.
+- The README's count of bugs found in the wild reads 48, the list's length since #153.
+- 589 tests on Linux (six new), 508 on Windows.
+
+### Upgrade note — a policy from before v0.21.3
+
+As for v0.21.4: a policy initialised before v0.21.3 guards these files with string rules, which see one segment at a time, so with that policy this release changes nothing for the `cd` spellings. Paste the five path rules from the v0.21.4 entry's upgrade note at the top of `rules:`.
+
 ## v0.21.5 — the Windows exe carries its runtime
 
 **In plain words:** every Windows build of Termaxa so far needed the Visual C++ 2015+ redistributable to start. Most developer machines have it; a clean Windows does not, and there `termaxa.exe` exited at once with `0xC0000135` (STATUS_DLL_NOT_FOUND), before any policy was read. A hook that cannot start fails open: the harness treats the error as non-blocking and runs the command anyway. winget's validation of 0.21.4 found it on Oct 17, 2026 ([microsoft/winget-pkgs#452044](https://github.com/microsoft/winget-pkgs/pull/452044)). The exe now links the C runtime statically and depends on nothing but Windows.
