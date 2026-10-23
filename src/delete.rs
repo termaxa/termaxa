@@ -832,6 +832,32 @@ pub fn operand_base(seg: &crate::shell::Segment, start: &Path) -> Option<PathBuf
     Some(base)
 }
 
+/// What is known of the end of the directory a segment's operands resolve
+/// in, when the directory itself is not known (`Segment::run_dir_end`, from
+/// `start_end`), followed through git's `-C` when that is a literal
+/// relative path. Nothing (empty) is known past a `-C` the gate cannot read
+/// (`git -C "$WT"`) or one that is absolute (`git -C /srv/app`, which
+/// `operand_base` does not follow from an unknown directory). `None` when
+/// the directory is known.
+pub fn operand_end(
+    seg: &crate::shell::Segment,
+    start_end: Option<&[String]>,
+) -> Option<Vec<String>> {
+    let mut end = seg.run_dir_end(start_end)?;
+    for t in git_dir_tokens(seg.command()) {
+        if t.has_unexpanded_var()
+            || t.has_glob()
+            || t.text.contains('`')
+            || t.text.contains("$(")
+            || is_dir_independent(&t.text)
+        {
+            return Some(Vec::new());
+        }
+        end = join_end(&end, &t.text);
+    }
+    Some(end)
+}
+
 /// `git_dirs`, as tokens with their quoting, so a variable is seen.
 fn git_dir_tokens(command: &str) -> Vec<Tok> {
     let toks = tokenize_detailed(command);
@@ -1344,6 +1370,207 @@ impl Tok {
         }
         false
     }
+}
+
+/// The components of a path after the last part of it the gate cannot read,
+/// in order: `$(git rev-parse --show-toplevel)/.claude` ends in `.claude`,
+/// `$ROOT/a/b` in `a` then `b`, `~other/.claude` in `.claude`, `%ROOT%\x` in
+/// `x`. The component holding the unreadable part is not known at all, so
+/// `$X/.cla*` and `$(pwd)` end in nothing (an empty list), and `..` right
+/// after the unreadable part climbs into what is unknown and is dropped.
+/// `None` when every part of the path is readable.
+///
+/// The unreadable parts are the ones `has_unexpanded_var`, `has_glob` and
+/// the substitution check read: `$NAME`, `${…}`, the positional and special
+/// parameters, `%NAME%`, `$( … )` to its matching parenthesis, a backtick
+/// pair, `*` and `?`, and `~` naming another user's home. A single-quoted
+/// token expands nothing and is readable throughout.
+pub(crate) fn readable_end(t: &Tok) -> Option<Vec<String>> {
+    readable_end_in(&t.text, t.single_quoted, &t.literal_dollars)
+}
+
+/// `readable_end` for a path with no token behind it: a redirect's target,
+/// as the scanner hands it over with its quotes stripped. Read as unquoted.
+pub(crate) fn readable_end_of(text: &str) -> Option<Vec<String>> {
+    readable_end_in(text, false, &[])
+}
+
+fn readable_end_in(
+    text: &str,
+    single_quoted: bool,
+    literal_dollars: &[usize],
+) -> Option<Vec<String>> {
+    let chars: Vec<char> = text.chars().collect();
+    // Index just past the last unreadable part.
+    let mut after: Option<usize> = None;
+    let mut i = 0;
+    let is_name = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
+    if chars.first() == Some(&'~') && !matches!(chars.get(1), None | Some('/') | Some('\\')) {
+        // `~user`, `~-`, `~+`: up to the first separator.
+        let end = chars
+            .iter()
+            .position(|c| *c == '/' || *c == '\\')
+            .unwrap_or(chars.len());
+        after = Some(end);
+        i = end;
+    }
+    while i < chars.len() {
+        let c = chars[i];
+        let escaped = (i > 0 && chars[i - 1] == '\\') || literal_dollars.contains(&i);
+        let next = chars.get(i + 1).copied();
+        let end = match c {
+            '$' if !escaped && next == Some('(') => {
+                let mut depth = 0usize;
+                let mut j = i + 1;
+                loop {
+                    match chars.get(j) {
+                        // Unterminated: nothing after it can be read.
+                        None => return Some(Vec::new()),
+                        Some('(') => depth += 1,
+                        Some(')') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                Some(j + 1)
+            }
+            '$' if !escaped && !single_quoted && next == Some('{') => Some(
+                chars[i..]
+                    .iter()
+                    .position(|c| *c == '}')
+                    .map(|p| i + p + 1)
+                    .unwrap_or(chars.len()),
+            ),
+            '$' if !escaped && !single_quoted && next.as_ref().is_some_and(is_name) => {
+                let mut j = i + 1;
+                while chars.get(j).is_some_and(is_name) {
+                    j += 1;
+                }
+                Some(j)
+            }
+            '$' if !escaped
+                && !single_quoted
+                && matches!(next, Some('@' | '*' | '#' | '?' | '$' | '!')) =>
+            {
+                Some(i + 2)
+            }
+            '`' => Some(
+                chars[i + 1..]
+                    .iter()
+                    .position(|c| *c == '`')
+                    .map(|p| i + p + 2)
+                    .unwrap_or(chars.len()),
+            ),
+            '%' if !single_quoted => {
+                // `%NAME%`, as `resolve::has_unexpanded_var` reads it.
+                let name_len = chars[i + 1..].iter().take_while(|c| is_name(c)).count();
+                match chars.get(i + 1 + name_len) {
+                    Some('%') if name_len > 0 => Some(i + name_len + 2),
+                    _ => None,
+                }
+            }
+            '*' | '?' if !single_quoted => Some(i + 1),
+            _ => None,
+        };
+        match end {
+            Some(e) => {
+                after = Some(e);
+                i = e;
+            }
+            None => i += 1,
+        }
+    }
+    let after = after?;
+    let rest: String = chars[after..].iter().collect();
+    // Up to the first separator is the rest of the component the unreadable
+    // part sits in; the components after it are literal.
+    let mut end: Vec<String> = Vec::new();
+    for comp in rest.split(['/', '\\']).skip(1) {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                end.pop();
+            }
+            c => end.push(c.to_string()),
+        }
+    }
+    Some(end)
+}
+
+/// `end`, the known end of a directory, after a relative `path` from it:
+/// `.claude` then `sub` is `.claude/sub`; `.claude` then `../x` is `x`; a
+/// `..` past the start climbs into the unknown and is dropped, so `.claude`
+/// then `../../x` is `x` too, under a directory as unknown as before.
+pub(crate) fn join_end(end: &[String], path: &str) -> Vec<String> {
+    let mut out: Vec<String> = end.to_vec();
+    let p = path.trim().trim_matches('"').trim_matches('\'');
+    for comp in p.split(['/', '\\']) {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            c => out.push(c.to_string()),
+        }
+    }
+    out
+}
+
+/// `toks` with an unquoted command substitution kept as the one word it is
+/// to the shell: `$(git rev-parse --show-toplevel)/.claude` splits on its
+/// spaces into three tokens, and `cd` read them as `cd a b`, which it
+/// cannot follow. Tokens are joined, with the space put back, from one
+/// opening `$(` or backtick to the token that closes it; a substitution
+/// that never closes takes the rest. Only `cd`'s argument is read this way
+/// so far: the other readers see the tokens they always did.
+pub(crate) fn merge_substitutions(toks: Vec<Tok>) -> Vec<Tok> {
+    fn open_after(text: &str, mut depth: usize, mut ticks: usize) -> (usize, usize) {
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '$' if chars.get(i + 1) == Some(&'(') => {
+                    depth += 1;
+                    i += 1;
+                }
+                '(' if depth > 0 => depth += 1,
+                ')' if depth > 0 => depth -= 1,
+                '`' => ticks ^= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        (depth, ticks)
+    }
+    let mut out: Vec<Tok> = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    for t in toks {
+        if let Some((depth, ticks)) = open {
+            let last = out.last_mut().expect("an open token was pushed");
+            let shift = last.text.chars().count() + 1;
+            last.text.push(' ');
+            last.text.push_str(&t.text);
+            last.single_quoted = false;
+            last.literal_dollars
+                .extend(t.literal_dollars.iter().map(|i| i + shift));
+            let (depth, ticks) = open_after(&t.text, depth, ticks);
+            open = (depth > 0 || ticks > 0).then_some((depth, ticks));
+            continue;
+        }
+        let (depth, ticks) = if t.single_quoted {
+            (0, 0)
+        } else {
+            open_after(&t.text, 0, 0)
+        };
+        open = (depth > 0 || ticks > 0).then_some((depth, ticks));
+        out.push(t);
+    }
+    out
 }
 
 /// `tokenize`, keeping provenance instead of discarding it. The `text` field
@@ -2992,6 +3219,79 @@ mod segment_directory_tests {
         for raw in ["x", "./x", "..", "../x", "../../../../x", "C:x"] {
             assert!(!is_dir_independent(raw), "{raw}");
         }
+    }
+
+    /// What a `cd` argument ends in, past the part the gate cannot read.
+    #[test]
+    fn the_readable_end_of_a_path_follows_its_last_unreadable_part() {
+        let end = |raw: &str| {
+            let toks = merge_substitutions(tokenize_detailed(raw));
+            assert_eq!(toks.len(), 1, "{raw}");
+            readable_end(&toks[0])
+        };
+        let v = |parts: &[&str]| Some(parts.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            end("\"$(git rev-parse --show-toplevel)/.claude\""),
+            v(&[".claude"])
+        );
+        assert_eq!(
+            end("$(git rev-parse --show-toplevel)/.claude/"),
+            v(&[".claude"])
+        );
+        assert_eq!(end("\"$ROOT/.claude\""), v(&[".claude"]));
+        assert_eq!(end("${ROOT}/.claude"), v(&[".claude"]));
+        assert_eq!(end("$1/a/b"), v(&["a", "b"]));
+        assert_eq!(end("~other/.claude"), v(&[".claude"]));
+        assert_eq!(end("~-/.claude"), v(&[".claude"]));
+        assert_eq!(end("%ROOT%\\.claude"), v(&[".claude"]));
+        assert_eq!(
+            end("`git rev-parse --show-toplevel`/.claude"),
+            v(&[".claude"])
+        );
+        // A substitution with a separator inside ends where it closes.
+        assert_eq!(
+            end("$(git -C a/b rev-parse --show-toplevel)/.claude"),
+            v(&[".claude"])
+        );
+        assert_eq!(end("$(dirname \"$(pwd)\")/.claude"), v(&[".claude"]));
+        // The last unreadable part decides: a glob after a substitution, a
+        // variable in the last component, leave nothing readable after.
+        assert_eq!(end("\"$(pwd)/.cla*\""), v(&[]));
+        assert_eq!(end("$(pwd)/.cla$X"), v(&[]));
+        assert_eq!(end("$X"), v(&[]));
+        assert_eq!(end("\"$(pwd)\""), v(&[]));
+        // The component holding the unreadable part is not known at all.
+        assert_eq!(end("\"$(pwd)\".claude"), v(&[]));
+        assert_eq!(end("$X-wt/.claude"), v(&[".claude"]));
+        // `..` climbs: within the end, or into what is unknown.
+        assert_eq!(end("$(pwd)/.claude/.."), v(&[]));
+        assert_eq!(end("$(pwd)/../.claude"), v(&[".claude"]));
+        assert_eq!(end("$(pwd)/a/../.claude/./"), v(&[".claude"]));
+        // A glob earlier in the path, a readable end after it.
+        assert_eq!(end("\"$(pwd)/*/.claude\""), v(&[".claude"]));
+        // Nothing unreadable: no end to speak of.
+        assert_eq!(end(".claude"), None);
+        assert_eq!(end("\"a b/.claude\""), None);
+        assert_eq!(end("~/.claude"), None);
+        // Single quotes expand nothing: `$ROOT` is a directory's name.
+        assert_eq!(end("'$ROOT/.claude'"), None);
+        // An escaped dollar reached the shell as one.
+        assert_eq!(end("\\$ROOT/.claude"), None);
+    }
+
+    #[test]
+    fn a_known_end_is_extended_by_a_relative_path() {
+        let e = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            join_end(&e(&[".claude"]), "settings.json"),
+            e(&[".claude", "settings.json"])
+        );
+        assert_eq!(join_end(&e(&[".claude"]), "sub/"), e(&[".claude", "sub"]));
+        assert_eq!(join_end(&e(&[".claude"]), "./x"), e(&[".claude", "x"]));
+        assert_eq!(join_end(&e(&[".claude"]), "../x"), e(&["x"]));
+        assert_eq!(join_end(&e(&[".claude"]), "../../x"), e(&["x"]));
+        assert_eq!(join_end(&e(&[".claude"]), ".."), e(&[]));
+        assert_eq!(join_end(&e(&["a", "b"]), "..\\c"), e(&["a", "c"]));
     }
 
     #[test]

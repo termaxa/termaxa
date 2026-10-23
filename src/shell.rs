@@ -574,7 +574,7 @@ const CONTROL_LEADERS: [&str; 11] = [
 fn unsure_since(start: &RunDir, here: RunDir) -> RunDir {
     let kept = match start {
         RunDir::Moved(steps) => steps.len(),
-        RunDir::Start | RunDir::Unknown => 0,
+        RunDir::Start | RunDir::Unknown | RunDir::Ending(_) => 0,
     };
     match here {
         RunDir::Moved(mut steps) => {
@@ -591,6 +591,13 @@ fn unsure_since(start: &RunDir, here: RunDir) -> RunDir {
 enum CdEffect {
     /// Moves to this path, as written.
     To(String),
+    /// Moves to a path the shell expands first (`cd .cla*`). Where it goes
+    /// is read from the disk once the line's directory is known.
+    Glob(String),
+    /// Moves to a directory whose start the gate cannot read and whose end
+    /// it can: `cd "$(git rev-parse --show-toplevel)/.claude"` goes
+    /// somewhere ending in `.claude`, wherever the repository is.
+    Ending(Vec<String>),
     /// Moves somewhere the gate cannot name.
     Unknown,
 }
@@ -598,11 +605,14 @@ enum CdEffect {
 /// `here` after a `cd`. A path that does not depend on where the shell is
 /// (absolute, `~`) is known even after an unknown move.
 fn moved(here: &RunDir, effect: CdEffect, sure: bool) -> RunDir {
-    let path = match effect {
-        CdEffect::To(p) => p,
+    let (path, glob) = match effect {
+        CdEffect::To(p) => (p, false),
+        CdEffect::Glob(p) => (p, true),
+        // Whatever came before, the start of this path is unreadable.
+        CdEffect::Ending(end) => return RunDir::Ending(end),
         CdEffect::Unknown => return RunDir::Unknown,
     };
-    let step = CdStep { path, sure };
+    let step = CdStep { path, sure, glob };
     match here {
         RunDir::Start => RunDir::Moved(vec![step]),
         RunDir::Moved(steps) => {
@@ -610,10 +620,26 @@ fn moved(here: &RunDir, effect: CdEffect, sure: bool) -> RunDir {
             steps.push(step);
             RunDir::Moved(steps)
         }
-        RunDir::Unknown if crate::delete::is_dir_independent(&step.path) => {
+        RunDir::Unknown | RunDir::Ending(_) if crate::delete::is_dir_independent(&step.path) => {
             RunDir::Moved(vec![step])
         }
-        RunDir::Unknown => RunDir::Unknown,
+        // A glob cannot be expanded against a directory the gate cannot
+        // name; a literal relative path is the end of wherever the shell
+        // is: `cd "$X" && cd .claude` ends in `.claude`, whatever `$X` is.
+        RunDir::Unknown | RunDir::Ending(_) if glob => RunDir::Unknown,
+        RunDir::Unknown => ending(&[], &step.path),
+        RunDir::Ending(end) => ending(end, &step.path),
+    }
+}
+
+/// A directory known only at its end, `end`, after a relative `path` from
+/// it; unknown when nothing of the end is left.
+fn ending(end: &[String], path: &str) -> RunDir {
+    let end = crate::delete::join_end(end, path);
+    if end.is_empty() {
+        RunDir::Unknown
+    } else {
+        RunDir::Ending(end)
     }
 }
 
@@ -623,7 +649,9 @@ fn moved(here: &RunDir, effect: CdEffect, sure: bool) -> RunDir {
 fn cd_effect(command: &str) -> Option<CdEffect> {
     // A brace group runs in this shell, so `{ cd x; …; }` moves it too.
     let words = command.trim_start().trim_start_matches(['(', '{', ' ']);
-    let toks = crate::delete::tokenize_detailed(words);
+    // An unquoted `$(git rev-parse --show-toplevel)/.claude` is one word to
+    // the shell and three to the tokenizer; read it as the one.
+    let toks = crate::delete::merge_substitutions(crate::delete::tokenize_detailed(words));
     let mut k = 0;
     // `builtin cd`, `command cd`, `time cd`, `X=1 cd`: still a cd.
     while let Some(t) = toks.get(k) {
@@ -687,20 +715,35 @@ fn cd_effect(command: &str) -> Option<CdEffect> {
         [] => Some(CdEffect::Unknown),
         [t] => {
             let w = t.text.as_str();
-            let opaque = w == "-"
-                || t.has_unexpanded_var()
-                || t.has_glob()
-                || w.contains('`')
-                || w.contains("$(")
-                // `~-`, `~+` and `~user` name directories the gate cannot
-                // read; `~` and `~/x` are home.
-                || (w.starts_with('~') && w != "~" && !w.starts_with("~/") && !w.starts_with("~\\"))
+            // `cd -`, `pushd +1`: the directory stack, which the gate does
+            // not keep.
+            let stack = w == "-"
                 || ((w.starts_with('+') || w.starts_with('-'))
                     && w[1..].chars().all(|c| c.is_ascii_digit()));
-            Some(if opaque {
-                CdEffect::Unknown
-            } else {
-                CdEffect::To(w.to_string())
+            if stack {
+                return Some(CdEffect::Unknown);
+            }
+            // `~-`, `~+` and `~user` name directories the gate cannot
+            // read; `~` and `~/x` are home.
+            let anothers_home =
+                w.starts_with('~') && w != "~" && !w.starts_with("~/") && !w.starts_with("~\\");
+            let substitutes = w.contains('`') || w.contains("$(");
+            let unreadable = anothers_home || substitutes || t.has_unexpanded_var();
+            if !unreadable && !t.has_glob() {
+                return Some(CdEffect::To(w.to_string()));
+            }
+            if !unreadable {
+                return Some(CdEffect::Glob(w.to_string()));
+            }
+            // What the gate cannot read is the start of the path, or all of
+            // it. Until v0.21.6 the whole argument was unknown either way,
+            // so `cd "$(git rev-parse --show-toplevel)/.claude" && echo {}
+            // > settings.json` wrote a hook config past the path rule that
+            // names it, allowed by `echo *` (found Oct 14, 2026, while
+            // checking the v0.21.4 advisory's list of unreadable `cd`s).
+            Some(match crate::delete::readable_end(t) {
+                Some(end) if !end.is_empty() => CdEffect::Ending(end),
+                _ => CdEffect::Unknown,
             })
         }
         // `cd a b` is an error in bash and a substitution in zsh.
@@ -1355,6 +1398,12 @@ pub enum RunDir {
     Start,
     /// Moved by the `cd`s before it, in order, each applied to the last.
     Moved(Vec<CdStep>),
+    /// A `cd` the gate could read only the end of came first: after `cd
+    /// "$(git rev-parse --show-toplevel)/.claude"` the shell is somewhere
+    /// ending in `.claude`, wherever the repository is. A relative path
+    /// after it has a known end too, and a path rule written to match at
+    /// any depth (`*/.claude/settings*.json`) can match that end.
+    Ending(Vec<String>),
     /// A `cd` the gate cannot follow came first: `cd "$X"`, `cd -`, `popd`,
     /// a `cd` under `if` or after `||`. A relative path after it names
     /// nothing the gate can know.
@@ -1369,19 +1418,35 @@ pub struct CdStep {
     /// (`;`, a newline): then it counts only if the directory exists. After
     /// `&&` the rest runs only where the `cd` went, so it always counts.
     pub sure: bool,
+    /// The shell expands the path before `cd` sees it (`cd .cla*`). It is
+    /// expanded against the directory it runs in, as the delete preview
+    /// expands a target (`delete::expand_glob`), and counts only when
+    /// exactly one directory matches.
+    pub glob: bool,
 }
 
 impl Segment {
     /// The directory this segment runs in when the line starts in `start`,
-    /// or `None` when a `cd` before it cannot be followed.
+    /// or `None` when a `cd` before it cannot be followed, in full or in
+    /// part (`run_dir_end` has the part).
     pub fn run_dir(&self, start: &std::path::Path) -> Option<std::path::PathBuf> {
         match &self.dir {
             RunDir::Start => Some(start.to_path_buf()),
-            RunDir::Unknown => None,
+            RunDir::Unknown | RunDir::Ending(_) => None,
             RunDir::Moved(steps) => {
                 let mut dir = start.to_path_buf();
                 for step in steps {
-                    let next = crate::delete::resolve_path_in(&step.path, &dir);
+                    let next = if step.glob {
+                        let pattern = crate::delete::resolve_path_in(&step.path, &dir);
+                        match crate::delete::expand_glob(&pattern).as_deref() {
+                            Some([one]) if one.is_dir() => one.clone(),
+                            // Nothing, several, or a glob in a directory
+                            // component: the shell's choice is not known.
+                            _ => return None,
+                        }
+                    } else {
+                        crate::delete::resolve_path_in(&step.path, &dir)
+                    };
                     if !step.sure && !next.is_dir() {
                         // `mkdir x; cd x; …` or a typo: whether the shell is
                         // in `x` or still here depends on what ran first.
@@ -1390,6 +1455,35 @@ impl Segment {
                     dir = next;
                 }
                 Some(dir)
+            }
+        }
+    }
+
+    /// What is known of the end of the directory this segment runs in, when
+    /// the directory itself is not: `.claude` after `cd "$(git rev-parse
+    /// --show-toplevel)/.claude"`, nothing (empty) after `cd "$X"`.
+    /// `start_end` is `None` when the directory the line starts in is known,
+    /// and otherwise what is known of its end (a segment read on its own,
+    /// from a line that moved before it); a `cd` on this line extends it.
+    /// `None` when the directory is known.
+    pub fn run_dir_end(&self, start_end: Option<&[String]>) -> Option<Vec<String>> {
+        match &self.dir {
+            RunDir::Ending(end) => Some(end.clone()),
+            RunDir::Unknown => Some(Vec::new()),
+            RunDir::Start => start_end.map(<[String]>::to_vec),
+            RunDir::Moved(steps) => {
+                let mut end = start_end?.to_vec();
+                for step in steps {
+                    // An absolute step would make the directory known, which
+                    // `run_dir` does not follow from an unknown start; a
+                    // glob cannot be expanded against an unknown one. Either
+                    // way nothing is known of the end past it.
+                    if step.glob || crate::delete::is_dir_independent(&step.path) {
+                        return Some(Vec::new());
+                    }
+                    end = crate::delete::join_end(&end, &step.path);
+                }
+                Some(end)
             }
         }
     }
@@ -2653,6 +2747,7 @@ mod segment_directory_tests {
         CdStep {
             path: path.into(),
             sure: true,
+            glob: false,
         }
     }
 
@@ -2660,6 +2755,7 @@ mod segment_directory_tests {
         CdStep {
             path: path.into(),
             sure: false,
+            glob: false,
         }
     }
 
@@ -2763,6 +2859,127 @@ mod segment_directory_tests {
             dir_of("cd \"$X\" && cd /srv/app && rm y", "rm"),
             RunDir::Moved(vec![sure("/srv/app")])
         );
+    }
+
+    /// A `cd` whose argument the gate can read only the end of (found Oct
+    /// 14, 2026, measured on v0.21.4 and v0.21.5): the directory is unknown
+    /// and ends in what was read. Before, the whole argument was unknown,
+    /// and `cd "$(git rev-parse --show-toplevel)/.claude" && echo {} >
+    /// settings.json` was allowed by `echo *`.
+    #[test]
+    fn a_cd_read_only_at_its_end_leaves_the_directory_ending_there() {
+        let ending = |parts: &[&str]| RunDir::Ending(parts.iter().map(|p| p.to_string()).collect());
+        for c in [
+            "cd \"$(git rev-parse --show-toplevel)/.claude\" && rm y",
+            "cd $(git rev-parse --show-toplevel)/.claude && rm y",
+            "cd `git rev-parse --show-toplevel`/.claude && rm y",
+            "cd \"$ROOT/.claude\" && rm y",
+            "cd $ROOT/.claude && rm y",
+            "cd ${ROOT}/.claude && rm y",
+            "cd ~other/.claude && rm y",
+            "pushd \"$(pwd)/.claude\" && rm y",
+            "Set-Location \"$env:ROOT/.claude\"; rm y",
+            // A `;` after it: the move counts either way, since a write
+            // there is the worse case and the gate cannot check the disk.
+            "cd \"$(pwd)/.claude\"; rm y",
+            // A relative `cd` after it extends the end; `..` climbs it.
+            "cd \"$(pwd)/a\" && cd ../.claude && rm y",
+            "cd \"$(pwd)/.claude/sub\" && cd .. && rm y",
+        ] {
+            assert_eq!(dir_of(c, "rm"), ending(&[".claude"]), "{c}");
+        }
+        assert_eq!(
+            dir_of("cd \"$(pwd)/.claude\" && cd sub && rm y", "rm"),
+            ending(&[".claude", "sub"])
+        );
+        assert_eq!(
+            dir_of("cd \"$(pwd)/a\" && cd .claude && rm y", "rm"),
+            ending(&["a", ".claude"])
+        );
+        // A relative `cd` from a directory nothing is known of ends there
+        // too, whatever the start.
+        for c in [
+            "cd \"$X\" && cd .claude && rm y",
+            "cd \"$(git rev-parse --show-toplevel)\" && cd .claude && rm y",
+            "cd - && cd a && cd ../.claude && rm y",
+        ] {
+            assert_eq!(dir_of(c, "rm"), ending(&[".claude"]), "{c}");
+        }
+        // Nothing readable at the end, or climbing out of it: unknown, as
+        // before.
+        for c in [
+            "cd \"$(pwd)\" && rm y",
+            "cd \"$(echo .claude)\" && rm y",
+            "cd \"$X\" && rm y",
+            "cd \"$(pwd)/.cla*\" && rm y",
+            "cd \"$(pwd)/.claude/..\" && rm y",
+            "cd \"$(pwd)/.claude\" && cd .. && rm y",
+            "cd \"$X\" && cd .cla* && rm y",
+            // A glob after a directory known only at its end cannot be
+            // expanded; a conditional move may not have happened.
+            "cd \"$(pwd)/a\" && cd .cla* && rm y",
+            "if x; then cd \"$(pwd)/.claude\"; fi; rm y",
+            "ls || cd \"$(pwd)/.claude\" && rm y",
+        ] {
+            assert_eq!(dir_of(c, "rm"), RunDir::Unknown, "{c}");
+        }
+        // An absolute `cd` after it is known again.
+        assert_eq!(
+            dir_of("cd \"$(pwd)/.claude\" && cd /srv/app && rm y", "rm"),
+            RunDir::Moved(vec![sure("/srv/app")])
+        );
+        // Before it, the line's own moves are not part of the end: the
+        // unreadable start replaces them.
+        assert_eq!(
+            dir_of("cd a && cd \"$(pwd)/.claude\" && rm y", "rm"),
+            ending(&[".claude"])
+        );
+    }
+
+    /// `cd .cla*`: the shell expands the glob, and so does the gate, against
+    /// the directory the `cd` runs in, when exactly one directory matches.
+    #[test]
+    fn a_glob_in_a_cd_is_expanded_where_it_runs() {
+        let tmp = crate::testutil::TempTree::new("run-dir-glob");
+        let start = tmp.path().to_path_buf();
+        let claude = tmp.dir(".claude");
+        tmp.dir("wt1");
+        tmp.dir("wt2");
+        tmp.file("only.txt", "x\n");
+        let seg = |c: &str| {
+            split_segments_deep(c)
+                .into_iter()
+                .find(|s| s.text.starts_with("rm"))
+                .expect("an rm segment")
+        };
+        let glob = |path: &str| CdStep {
+            path: path.into(),
+            sure: true,
+            glob: true,
+        };
+        assert_eq!(
+            dir_of("cd .cla* && rm y", "rm"),
+            RunDir::Moved(vec![glob(".cla*")])
+        );
+        assert_eq!(
+            seg("cd .cla* && rm y").run_dir(&start),
+            Some(claude.clone())
+        );
+        assert_eq!(
+            seg("cd .cla?de && rm y").run_dir(&start),
+            Some(claude.clone())
+        );
+        assert_eq!(seg("cd .cla*; rm y").run_dir(&start), Some(claude.clone()));
+        assert_eq!(
+            seg("cd .cla* && cd .. && rm y").run_dir(&start),
+            Some(start.clone())
+        );
+        // Two matches, none, a file, or a glob in a directory component:
+        // the shell's choice is not known.
+        assert_eq!(seg("cd wt* && rm y").run_dir(&start), None);
+        assert_eq!(seg("cd nowhere* && rm y").run_dir(&start), None);
+        assert_eq!(seg("cd only.* && rm y").run_dir(&start), None);
+        assert_eq!(seg("cd */sub && rm y").run_dir(&start), None);
     }
 
     #[test]
