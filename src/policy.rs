@@ -1378,6 +1378,37 @@ mod tests {
         );
     }
 
+    /// A quote the shell does not read as one, in a comment or in a
+    /// heredoc's body, hides no command. Until Oct 2026 such a quote carried
+    /// the lines after it into one segment: `git status # it's clean` above
+    /// `kubectl delete namespace staging` was allowed by `git status*`, and
+    /// a body line `echo it's` before the delimiter line lent its allow to
+    /// whatever followed the heredoc. A comment alone on its line asked.
+    #[test]
+    fn a_quote_in_a_comment_or_a_heredoc_body_hides_no_command() {
+        let p = Policy::builtin().unwrap();
+        for cmd in [
+            "git status # it's clean\nkubectl delete namespace staging",
+            "git status # it's clean\nterraform destroy -auto-approve",
+            "git status # it's clean\ndocker system prune -af",
+            "# sync with the remote, it's diverged\ngit push --force origin main",
+            "cat <<EOF\necho it's\nEOF\nkubectl delete namespace staging",
+            "cat > notes.md <<'EOF'\nIt's a note\nEOF\nkubectl delete namespace staging",
+            "cat > notes.md <<\"E'O\"F\nnote\nE'OF\nterraform destroy -auto-approve",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd, &here()).action,
+                Action::Deny,
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            p.evaluate_command("# list the files\nls -la", &here())
+                .action,
+            Action::Allow
+        );
+    }
+
     /// Severity across readings, against the #16 exception block. A quoted
     /// spelling only the tokenized reading recognises as the excepted command
     /// fails CLOSED — the raw reading hits the `*.termaxa*` deny below the
