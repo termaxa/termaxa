@@ -38,10 +38,17 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     let (mut in_single, mut in_double) = (false, false);
+    // Inside a comment, to the end of the line (see the `#` arm).
+    let mut in_comment = false;
+    // Heredocs named on the current line, whose bodies start after its
+    // newline (see the newline arm).
+    let mut pending: Vec<PendingHeredoc> = Vec::new();
 
     while i < chars.len() {
         let c = chars[i];
         match c {
+            // Nothing quotes or escapes inside a comment.
+            '\'' | '"' | '\\' if in_comment => cur.push(c),
             '\'' if !in_double => {
                 in_single = !in_single;
                 cur.push(c);
@@ -64,6 +71,23 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                 i += 1;
             }
             _ if in_single || in_double => cur.push(c),
+            // A comment: a `#` that starts a word, to the end of its line.
+            // bash, zsh and PowerShell read none of it; cmd.exe has no
+            // comments and reads it as words. So the walk still splits it
+            // at operators and still counts its redirections, which can only
+            // read more than a shell runs, and keeps it in the text a rule
+            // matches. What every one of those shells agrees on is that a
+            // quote or a backslash in it is literal: until Oct 2026 the walk
+            // took the `'` in `git status # it's clean` for a quote, which
+            // carried the lines after it into this segment, where a rule
+            // anchored at the start (`kubectl delete*`) could not see them
+            // and the first line's allow (`git status*`) covered them; a
+            // backslash ending the comment joined the next line the same
+            // way. A comment alone on its line runs nothing (`flush`).
+            '#' if !in_comment && starts_comment(&chars, i) => {
+                in_comment = true;
+                cur.push(c);
+            }
             '&' if i + 1 < chars.len() && chars[i + 1] == '&' => {
                 flush(
                     &mut segments,
@@ -152,7 +176,7 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                     i = j;
                     continue;
                 }
-                let (target, end) = target_word(&chars, &mut cur, j);
+                let (target, end) = target_word(&chars, &mut cur, j, in_comment);
                 if !target.is_empty() && !prev_is_amp && !prev_is_lt && !is_sink(&target) {
                     cur_redirects.push(Overwrite { target, truncates });
                 }
@@ -183,6 +207,9 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                 seg_start = i + 1;
             }
             ';' | '\n' => {
+                if c == '\n' {
+                    in_comment = false;
+                }
                 flush(
                     &mut segments,
                     &mut cur,
@@ -193,6 +220,24 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                     Joiner::Sequence,
                 );
                 seg_start = i + 1;
+                // A heredoc's body starts on the line after the one that
+                // named it and is data to the shell, which finds its end by
+                // the delimiter line alone: a quote in the body (`it's`) or
+                // in that line is a character, not the start of a string.
+                // Until Oct 2026 the walk went on over the body as over any
+                // other text, so such a quote carried the lines after the
+                // delimiter into one segment, where a rule anchored at the
+                // start never saw them and the first line's allow covered
+                // them. Each line up to the shell's delimiter line is still
+                // read as a command, as before, but each on its own.
+                if c == '\n' && !pending.is_empty() {
+                    let heredocs = std::mem::take(&mut pending);
+                    let end = heredoc_bodies_end(&chars, i + 1, &heredocs);
+                    read_lines(&mut segments, &chars[i + 1..end]);
+                    seg_start = end;
+                    i = end;
+                    continue;
+                }
             }
             // An input redirection: `< file`, `<< WORD` (heredoc), `<<< word`
             // (here-string), `<> file`, `<& n`. None of them names a file the
@@ -205,12 +250,22 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                 let start = span_start(&chars, seg_start, i);
                 cur.push(c);
                 let mut j = i + 1;
+                // `<<` and `<<-` open a heredoc; `<<<` is a here-string.
+                let mut heredoc = false;
+                let mut strip_tabs = false;
                 if chars.get(j) == Some(&'<') {
                     cur.push('<');
                     j += 1;
                     if chars.get(j) == Some(&'<') {
                         cur.push('<');
                         j += 1;
+                    } else {
+                        heredoc = true;
+                        if chars.get(j) == Some(&'-') {
+                            cur.push('-');
+                            j += 1;
+                            strip_tabs = true;
+                        }
                     }
                 } else if chars.get(j) == Some(&'>') {
                     cur.push('>');
@@ -231,7 +286,22 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                     i = j;
                     continue;
                 }
-                let (_, end) = target_word(&chars, &mut cur, j);
+                // A heredoc's word ends where the shell's does, at the first
+                // metacharacter outside quotes: `<<'EOF'>f` is the word
+                // `'EOF'` and a redirection. A `<<` inside a comment opens
+                // no heredoc.
+                let end = if heredoc && !in_comment {
+                    let end = heredoc_word_end(&chars, j);
+                    cur.extend(&chars[j..end]);
+                    let raw: String = chars[j..end].iter().collect();
+                    pending.push(PendingHeredoc {
+                        delim: heredoc_delimiter(&raw).map(|(d, _)| d),
+                        strip_tabs,
+                    });
+                    end
+                } else {
+                    target_word(&chars, &mut cur, j, in_comment).1
+                };
                 cur_spans.push((start, end));
                 i = end;
                 continue;
@@ -250,6 +320,139 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
         Joiner::End,
     );
     segments
+}
+
+/// A heredoc named on the line being walked, whose body has not been
+/// reached yet: `cat <<'EOF'` names its delimiter, and the body starts on
+/// the next line.
+struct PendingHeredoc {
+    /// The delimiter after the shell's quote removal; `None` for a word the
+    /// walk cannot take apart as the shell does, whose body then runs, here,
+    /// to the end of the input.
+    delim: Option<String>,
+    /// `<<-`: the shell strips leading tabs from each body line and from
+    /// the delimiter line before comparing.
+    strip_tabs: bool,
+}
+
+/// Where a heredoc's word ends: at the first metacharacter outside quotes
+/// (whitespace, `|`, `&`, `;`, `(`, `)`, `<`, `>`), as in the shell. An
+/// escaped character is part of the word.
+fn heredoc_word_end(chars: &[char], mut j: usize) -> usize {
+    let mut quote: Option<char> = None;
+    while j < chars.len() {
+        let d = chars[j];
+        match quote {
+            Some(q) if d == q => quote = None,
+            Some('"') if d == '\\' => j += 1,
+            Some(_) => {}
+            None if d == '\'' || d == '"' => quote = Some(d),
+            None if d == '\\' => j += 1,
+            None if d.is_whitespace() || matches!(d, '|' | '&' | ';' | '(' | ')' | '<' | '>') => {
+                break
+            }
+            None => {}
+        }
+        j += 1;
+    }
+    j.min(chars.len())
+}
+
+/// The delimiter a heredoc's word names, after the shell's quote removal,
+/// and whether any part of it was quoted, in which case the shell expands
+/// nothing in the body. Removal as the shell does it: a quote of the other
+/// kind inside quotes stays, and so does a backslash inside single quotes
+/// or before an ordinary character inside double quotes (`'E"OF'` is
+/// `E"OF`, `"E\xOF"` is `E\xOF`, `E\"OF` is `E"OF`). `None` for a word that
+/// is empty, spans lines, leaves a quote open, or uses `$'…'` or `$"…"`,
+/// whose removal the walk does not model.
+fn heredoc_delimiter(raw: &str) -> Option<(String, bool)> {
+    let mut out = String::new();
+    let mut literal = false;
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') if c == '\'' => quote = None,
+            Some('\'') => out.push(c),
+            Some(_) if c == '"' => quote = None,
+            Some(_) if c == '\\' => match chars.peek() {
+                Some(&n) if matches!(n, '$' | '`' | '"' | '\\') => {
+                    out.push(n);
+                    chars.next();
+                }
+                _ => out.push(c),
+            },
+            Some(_) => out.push(c),
+            None if c == '$' && matches!(chars.peek(), Some('\'' | '"')) => return None,
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                literal = true;
+            }
+            None if c == '\\' => {
+                literal = true;
+                out.extend(chars.next());
+            }
+            None => out.push(c),
+        }
+    }
+    (quote.is_none() && !out.trim().is_empty() && !out.contains('\n')).then_some((out, literal))
+}
+
+/// Where the bodies of `heredocs` end, read in order from `from`: each runs
+/// to its delimiter line, compared as the shell compares it (the whole
+/// line, leading tabs stripped under `<<-`, nothing else), or to the end of
+/// the input when that line never comes.
+fn heredoc_bodies_end(chars: &[char], from: usize, heredocs: &[PendingHeredoc]) -> usize {
+    let mut pos = from;
+    for h in heredocs {
+        while pos < chars.len() {
+            let line_end = chars[pos..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(chars.len(), |k| pos + k);
+            let line: String = chars[pos..line_end].iter().collect();
+            pos = (line_end + 1).min(chars.len());
+            let line = if h.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line.as_str()
+            };
+            if h.delim.as_deref() == Some(line) {
+                break;
+            }
+        }
+    }
+    pos
+}
+
+/// Each line of `lines` read as a command line of its own, its segments
+/// appended: a heredoc's body, read as commands in case something runs it,
+/// with no quote in one line reaching the next.
+fn read_lines(segments: &mut Vec<Segment>, lines: &[char]) {
+    let text: String = lines.iter().collect();
+    for line in text.split('\n') {
+        let mut read = split_segments(line);
+        if let Some(last) = read.last_mut() {
+            last.joiner = Joiner::Sequence;
+        }
+        segments.append(&mut read);
+    }
+}
+
+/// Whether the `#` at `i` starts a comment: it begins a word, at the start
+/// of the input or after whitespace or an operator that is not itself
+/// escaped. `a#b`, `$#`, `${#x}`, `"#"`, `\#` and `a\ #b` hold none. After
+/// `<` or `>` the word is a redirection's target, read by its own arm.
+fn starts_comment(chars: &[char], i: usize) -> bool {
+    let Some(k) = i.checked_sub(1) else {
+        return true;
+    };
+    let prev = chars[k];
+    if !(prev.is_whitespace() || matches!(prev, ';' | '&' | '|' | '(' | ')')) {
+        return false;
+    }
+    chars[..k].iter().rev().take_while(|&&c| c == '\\').count() % 2 == 0
 }
 
 /// Where a redirection's span begins: at the operator, or at the file
@@ -283,8 +486,9 @@ fn descriptor(chars: &[char], cur: &mut String, mut j: usize) -> usize {
 /// Backslashes are RETAINED in the target string, as they always were for
 /// non-boundary characters. Every character is pushed to the segment text;
 /// returns the target with its surrounding quotes stripped, and the index
-/// after it.
-fn target_word(chars: &[char], cur: &mut String, mut j: usize) -> (String, usize) {
+/// after it. In a comment (`literal`) nothing quotes or escapes, so the
+/// target ends at the line's end at the latest, as the comment does.
+fn target_word(chars: &[char], cur: &mut String, mut j: usize, literal: bool) -> (String, usize) {
     let mut target = String::new();
     let mut quote: Option<char> = None;
     while j < chars.len() {
@@ -292,8 +496,8 @@ fn target_word(chars: &[char], cur: &mut String, mut j: usize) -> (String, usize
         match quote {
             Some(q) if d == q => quote = None,
             Some(_) => {}
-            None if d == '\'' || d == '"' => quote = Some(d),
-            None if d == '\\' && j + 1 < chars.len() => {
+            None if !literal && (d == '\'' || d == '"') => quote = Some(d),
+            None if !literal && d == '\\' && j + 1 < chars.len() => {
                 cur.push(d);
                 target.push(d);
                 j += 1;
@@ -1364,7 +1568,9 @@ pub struct Segment {
     /// matched no rule and fell to the default (measured in a live Herdr
     /// session, Sep 24, 2026). A leading keyword before a command (`do
     /// command -v x`, `then echo`, `if [ -f x ]`) is stripped so the
-    /// command is what is judged; `do rm -rf x` is still `rm -rf x`.
+    /// command is what is judged; `do rm -rf x` is still `rm -rf x`. A
+    /// comment alone on its line (`# list the files`) runs nothing either
+    /// and is marked the same way; until Oct 2026 it was an unmatched ask.
     pub keyword: bool,
     /// The operator that ended this segment, which decides whether a `cd`
     /// in it carries over to the next one: through `&&`, `;` and a newline
@@ -1608,7 +1814,9 @@ fn flush(
             wraps: false,
             scaffold: false,
             binds: false,
-            keyword: false,
+            // A segment that starts with a comment is all comment: the `#`
+            // starts a word, and the comment runs to the end of the line.
+            keyword: t.starts_with('#'),
             joiner,
             dir: RunDir::Start,
         });
@@ -1709,6 +1917,22 @@ pub fn has_substitution(s: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// bash, by its absolute path, for the tests that measure the split against
+/// it. Spawned by name it is looked up on `PATH`, which tests elsewhere in
+/// the suite replace while they run: a lookup that lands then finds no
+/// bash. `None` on a machine without one.
+#[cfg(all(test, unix))]
+fn bash_for_tests() -> Option<&'static str> {
+    [
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/usr/local/bin/bash",
+        "/opt/homebrew/bin/bash",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists())
 }
 
 #[cfg(test)]
@@ -2550,6 +2774,198 @@ mod tests {
         );
     }
 
+    /// A `#` that starts a word begins a comment, to the end of its line.
+    /// A quote or a backslash in it is literal, so the line after it is a
+    /// segment of its own; until Oct 2026 the quote in `# it's clean`
+    /// carried the next line into the comment's segment. A comment alone on
+    /// its line runs nothing. The walk still splits a comment at operators
+    /// and keeps it in the text, because cmd.exe has no comments.
+    #[test]
+    fn a_quote_in_a_comment_is_literal_and_a_comment_line_runs_nothing() {
+        let texts = |cmd: &str| -> Vec<String> {
+            split_segments(cmd).iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(
+            texts("git status # it's clean\nkubectl delete namespace staging"),
+            [
+                "git status # it's clean",
+                "kubectl delete namespace staging"
+            ]
+        );
+        assert_eq!(texts("true # \"x\nls"), ["true # \"x", "ls"]);
+        assert_eq!(texts("true #c \\\nls"), ["true #c \\", "ls"]);
+        assert_eq!(texts("true;#c 'q\nls"), ["true", "#c 'q", "ls"]);
+        assert_eq!(texts("(#c 'q\nls)"), ["(#c 'q", "ls)"]);
+        assert_eq!(texts("true &&#c 'q\nls"), ["true", "#c 'q", "ls"]);
+        // a redirection in a comment ends with the line, quotes or not
+        let segs = split_segments("true # > 'x\nkubectl delete namespace staging\n'");
+        assert!(
+            segs.iter()
+                .any(|s| &**s == "kubectl delete namespace staging"),
+            "{segs:?}"
+        );
+        // a comment alone on its line runs nothing; one after a command is
+        // that command's
+        let segs = split_segments("# list the files, it's quick\nls -la # don't recurse");
+        assert_eq!(segs.len(), 2);
+        assert!(segs[0].keyword);
+        assert!(!segs[1].keyword);
+        // a `#` that does not start a word is no comment, and a quote after
+        // it still quotes
+        for cmd in [
+            "echo a#b",
+            "echo $# ${#HOME}",
+            "echo \"#q\" '#r' \\#s",
+            "echo a\\ #b",
+            "echo {#,x}",
+            "git log --format=%h#%s",
+        ] {
+            assert_eq!(texts(cmd), [cmd], "{cmd}");
+        }
+        assert_eq!(texts("echo a#'b;c'"), ["echo a#'b;c'"]);
+        assert_eq!(texts("echo a\\ #b 'c;d'"), ["echo a\\ #b 'c;d'"]);
+        // and the comment ends with its line: what follows quotes again
+        assert_eq!(texts("# it's\necho 'a;b'"), ["# it's", "echo 'a;b'"]);
+        // `<#` opens a PowerShell block comment, which can end mid-line
+        assert_eq!(
+            texts("<# note #> Remove-Item -Recurse x; ls"),
+            ["<# note #> Remove-Item -Recurse x", "ls"]
+        );
+    }
+
+    /// A heredoc's body is read a line at a time, to the delimiter line as
+    /// the shell finds it: a quote in a body line, or in the delimiter line
+    /// itself, reaches no further, and what follows the heredoc is read as
+    /// its own commands. Until Oct 2026 the walk went on over the body as
+    /// over any other text.
+    #[test]
+    fn a_heredoc_body_is_read_a_line_at_a_time_to_the_shells_delimiter_line() {
+        let texts = |cmd: &str| -> Vec<String> {
+            split_segments(cmd).iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(
+            texts("cat <<EOF\necho it's\nEOF\nkubectl delete namespace staging"),
+            [
+                "cat <<EOF",
+                "echo it's",
+                "EOF",
+                "kubectl delete namespace staging"
+            ]
+        );
+        assert_eq!(
+            texts("ssh host <<'EOF'\nIt's late\nEOF\nls"),
+            ["ssh host <<'EOF'", "It's late", "EOF", "ls"]
+        );
+        // the delimiter the shell computes: quotes of the other kind stay
+        assert_eq!(
+            texts("sh <<'E\"OF'\nit's\nE\"OF\nls"),
+            ["sh <<'E\"OF'", "it's", "E\"OF", "ls"]
+        );
+        assert_eq!(
+            texts("cat <<\"E'O\"F | cat\nE'OF\nls"),
+            ["cat <<\"E'O\"F", "cat", "E'OF", "ls"]
+        );
+        // its word ends at a metacharacter: here a heredoc and a write
+        let segs = split_segments("sh <<'EOF'>f\nbody\nEOF\nls");
+        assert_eq!(
+            texts("sh <<'EOF'>f\nbody\nEOF\nls"),
+            ["sh <<'EOF'>f", "body", "EOF", "ls"]
+        );
+        assert_eq!(segs[0].redirects[0].target, "f");
+        // `<<-` strips leading tabs before comparing; a trailing space or a
+        // carriage return is no delimiter line, and the body goes on
+        assert_eq!(
+            texts("sh <<-'EOF'\n\tit's\n\tEOF\nls"),
+            ["sh <<-'EOF'", "it's", "EOF", "ls"]
+        );
+        assert_eq!(
+            texts("cat <<'EOF'\nit's\nEOF \nls\nEOF\nrm -rf x"),
+            ["cat <<'EOF'", "it's", "EOF", "ls", "EOF", "rm -rf x"]
+        );
+        // a delimiter line the shell would not end on keeps the body going,
+        // so a quote in a line after it is still body, read on its own line
+        assert_eq!(
+            texts("cat <<'EOF'\nbody\nEOF \nit's\nEOF\nkubectl delete namespace staging"),
+            [
+                "cat <<'EOF'",
+                "body",
+                "EOF",
+                "it's",
+                "EOF",
+                "kubectl delete namespace staging"
+            ]
+        );
+        // and where the shell ends the body, the walk goes on as the shell
+        // does: a string after it can span lines
+        for (cmd, owner) in [
+            (
+                "cat > f <<'E\"OF'\nx\nE\"OF\necho \"a\nb\"",
+                "cat > f <<'E\"OF'",
+            ),
+            ("cat <<-'EOF'\n\tx\n\tEOF\necho \"a\nb\"", "cat <<-'EOF'"),
+        ] {
+            let read = texts(cmd);
+            assert_eq!(read.first().map(String::as_str), Some(owner), "{cmd:?}");
+            assert_eq!(
+                read.last().map(String::as_str),
+                Some("echo \"a\nb\""),
+                "{cmd:?}"
+            );
+        }
+        // two on one line, read in order
+        assert_eq!(
+            texts("cat <<A; cat <<'B'\nit's\nA\nit's\nB\nls"),
+            ["cat <<A", "cat <<'B'", "it's", "A", "it's", "B", "ls"]
+        );
+        // a `<<` inside a comment opens nothing
+        assert_eq!(
+            texts("ls # <<EOF\necho \"a\nb\""),
+            ["ls # <<EOF", "echo \"a\nb\""]
+        );
+    }
+
+    /// The same property against bash itself: every command bash runs after
+    /// a comment is a segment here. Each `echo M<n>` bash prints must be
+    /// read.
+    #[cfg(unix)]
+    #[test]
+    fn a_comment_hides_nothing_the_shell_runs() {
+        for case in [
+            "true # it's clean\necho M1",
+            "true # \"x\necho M1",
+            "true # `x\necho M1",
+            "true # $(x\necho M1",
+            "true #c \\\necho M1",
+            "true;#c 'q\necho M1",
+            "(#c 'q\necho M1)",
+            "true |#c 'q\ncat; echo M1",
+            "true &&#c 'q\necho M1",
+            "true # > 'x\necho M1\n'",
+            "true # < \"x\necho M1",
+            "# it's a comment line\necho M1\n# and 'another\necho M2",
+            "echo a\\ #b 'q\necho M1",
+        ] {
+            let Some(bash) = super::bash_for_tests() else {
+                return; // no bash on this machine: nothing to measure against
+            };
+            let Ok(out) = std::process::Command::new(bash)
+                .arg("-c")
+                .arg(case)
+                .output()
+            else {
+                return; // no bash on this machine: nothing to measure against
+            };
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let segs = split_segments_deep(case);
+            for m in stdout.lines().map(str::trim).filter(|l| l.starts_with('M')) {
+                assert!(
+                    segs.iter().any(|s| s.command() == format!("echo {m}")),
+                    "{case:?}: bash ran `echo {m}`, the split did not read it: {segs:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn substitution_detected() {
         assert!(has_substitution("echo $(rm -rf /)"));
@@ -3129,5 +3545,389 @@ mod segment_directory_tests {
         );
         assert_eq!(seg("cd \"$X\" && rm x").run_dir(&start), None);
         assert_eq!(seg("rm x").run_dir(&start), Some(start.clone()));
+    }
+}
+
+/// A differential harness: generated command strings run through `bash -c`,
+/// with every line that might run spelled `echo M<n>`, asserting that each
+/// marker bash actually printed is read back by `split_segments_deep` as a
+/// segment whose command begins `echo M<n>`. The property is the one
+/// `a_comment_hides_nothing_the_shell_runs` tests on a fixed list, driven
+/// from a grammar of heredocs, comments and groupings, so a line the split
+/// hides from the gate while the shell runs it is caught wherever it is.
+/// Written by an independent conformance review of the comment and heredoc
+/// changes (Oct 27, 2026), which found with it that a quote in a heredoc's
+/// body carried the lines after the delimiter into one segment. Everything
+/// executed is harmless: `echo` markers, `true`, and `cat`/`tee` writing
+/// files only under the test's own temp dir, which is the shell's working
+/// directory.
+#[cfg(all(test, unix))]
+mod differential_harness {
+    use super::*;
+    use std::process::Command;
+
+    /// A reproducible xorshift so a red run names the same cases every time.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[self.below(xs.len())]
+        }
+        fn chance(&mut self, pct: usize) -> bool {
+            self.below(100) < pct
+        }
+    }
+
+    /// The markers bash actually printed: lines that are exactly `M<digits>`.
+    /// A heredoc body read as data is printed by `cat` verbatim (`echo M1`,
+    /// which starts with `e`), so only an *executed* `echo M1` — which prints
+    /// `M1` — is counted.
+    fn bash_markers(case: &str, cwd: &std::path::Path) -> Vec<String> {
+        let out = Command::new(bash_for_tests().expect("bash"))
+            .arg("-c")
+            .arg(case)
+            .current_dir(cwd)
+            .output()
+            .expect("bash runs");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut v: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| {
+                l.len() > 1 && l.starts_with('M') && l[1..].bytes().all(|b| b.is_ascii_digit())
+            })
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The markers bash ran that NO segment reads: the commands the gate
+    /// would never judge. A marker is read when some segment's command begins
+    /// with the two words `echo M<n>`. That tolerates the module's deliberate
+    /// over-reads — a `#` comment is kept in the segment text and its
+    /// operators and redirects are still counted ("can only read more than a
+    /// shell runs"), so `echo M1 #x` stays `echo M1 #x` and still reads
+    /// `echo M1` — while still catching a command the split hides entirely,
+    /// and a command bash runs separately that the split folds into another
+    /// segment (its first two words are then the other command's, so this
+    /// one is missed).
+    fn missed(case: &str, cwd: &std::path::Path) -> Vec<String> {
+        let segs = split_segments_deep(case);
+        bash_markers(case, cwd)
+            .into_iter()
+            .filter(|m| {
+                !segs.iter().any(|s| {
+                    let mut w = s.command().split_whitespace();
+                    w.next() == Some("echo") && w.next() == Some(m.as_str())
+                })
+            })
+            .collect()
+    }
+
+    /// Delimiter words over the core `EOF`, each with the delimiter bash
+    /// removes quotes to. Every one but the bare word is quoted, so bash
+    /// expands nothing in the body and the split is entitled to step over it.
+    /// The cases exercise single quotes, double quotes, backslashes, partial
+    /// quoting, and quotes of one kind inside the other.
+    const DELIMS: [(&str, &str); 18] = [
+        ("EOF", "EOF"),
+        ("'EOF'", "EOF"),
+        ("\"EOF\"", "EOF"),
+        ("\\EOF", "EOF"),
+        ("E\\OF", "EOF"),
+        ("EO\\F", "EOF"),
+        ("E'O'F", "EOF"),
+        ("E\"O\"F", "EOF"),
+        ("'EO'F", "EOF"),
+        ("E'OF'", "EOF"),
+        ("\"EO\"F", "EOF"),
+        ("E\"OF\"", "EOF"),
+        ("'E'\"O\"F", "EOF"),
+        ("E\\'OF", "E'OF"),
+        ("E\\\"OF", "E\"OF"),
+        ("'E\"O'F", "E\"OF"),
+        ("\"E'O\"F", "E'OF"),
+        ("E\\$OF", "E$OF"),
+    ];
+
+    const OWNERS: [&str; 5] = ["cat", "cat > f", "cat >> f", "tee f", "tee -a f"];
+    const OPS: [&str; 2] = ["<<", "<<-"];
+    /// Glued directly onto the delimiter word, no space: a following
+    /// metacharacter the shell takes as the end of the word.
+    const GLUE: [&str; 6] = ["", ">g", ">>g", ";", "|cat", "&&:"];
+
+    /// One generated heredoc case, and the marker ids it places after the
+    /// terminator (the commands bash is expected to run and the split to
+    /// read).
+    fn gen_heredoc(rng: &mut Rng, ctr: &mut usize) -> String {
+        let mut m = || {
+            *ctr += 1;
+            format!("echo M{ctr}", ctr = *ctr)
+        };
+        let owner = *rng.pick(&OWNERS);
+        let op = *rng.pick(&OPS);
+        let (raw, actual) = *rng.pick(&DELIMS);
+        let space = if rng.chance(50) { " " } else { "" };
+        let glue = *rng.pick(&GLUE);
+        // The heredoc-opening line. A neighbour sometimes shares it.
+        let lead = if rng.chance(25) { "true && " } else { "" };
+        let mut s = format!("{lead}{owner} {op}{space}{raw}{glue}\n");
+        // The body: lines of echo markers (printed as data, never run while
+        // the delimiter is quoted) plus the occasional blank or indented one,
+        // and sometimes a "hazard" line of the kind real file contents hold —
+        // an apostrophe, a quote, a paren — which a shell reads as literal
+        // heredoc data and never as syntax.
+        const HAZARD: [&str; 7] = ["'", "\"", "it's", "say \"hi\"", "a)", "(b", "a;b"];
+        if rng.chance(45) {
+            s.push_str(rng.pick(&HAZARD));
+            s.push('\n');
+        }
+        for _ in 0..=rng.below(2) {
+            if op == "<<-" && rng.chance(50) {
+                s.push('\t');
+            }
+            s.push_str(&m());
+            s.push('\n');
+        }
+        // The terminator line, in one of its shapes.
+        let indent = if op == "<<-" && rng.chance(60) {
+            "\t"
+        } else {
+            ""
+        };
+        let term: String = match rng.below(6) {
+            0 => format!("{indent}{actual}\n"),   // exact
+            1 => format!("{indent}{actual} \n"),  // trailing space
+            2 => format!("{indent}{actual}\r\n"), // CRLF
+            3 => format!("{indent} {actual}\n"),  // leading space (not <<-)
+            4 => String::new(),                   // missing
+            _ => format!("{indent}{actual}\n"),
+        };
+        s.push_str(&term);
+        // Lines after the heredoc: commands bash runs once the body ends.
+        for _ in 0..=rng.below(2) {
+            s.push_str(&m());
+            s.push('\n');
+        }
+        s.trim_end().to_string()
+    }
+
+    /// Comment pieces: content a `#` comment might hold, each a hazard for a
+    /// hand-written walk (a quote, a backtick, a substitution opener, a
+    /// trailing backslash, a heredoc opener, an embedded separator).
+    const CBODY: [&str; 12] = [
+        "it's clean",
+        "\"x",
+        "`x",
+        "$(x",
+        "a\\",
+        "<<EOF",
+        "; rm",
+        "| cat",
+        "&& echo",
+        "> f",
+        "< f",
+        "done )",
+    ];
+    /// Where the `#` sits: alone on its line, or after a command, a `;`, an
+    /// `&&`, a pipe, or an open paren. `PRE` is a command that shares the
+    /// comment's line (bash runs it, so the split reads it with the comment
+    /// attached — not the marker this case asserts on).
+    const CPOS: [&str; 6] = ["", "PRE ", "PRE; ", "PRE && ", "PRE | cat ", "( "];
+
+    fn gen_comment(rng: &mut Rng, ctr: &mut usize) -> String {
+        let mut m = || {
+            *ctr += 1;
+            format!("echo M{ctr}", ctr = *ctr)
+        };
+        // A marker that shares the comment's line is NOT asserted on (the
+        // split keeps the comment in its text by design); it is spelled
+        // `true` here so no stray marker is printed and the case stays about
+        // what follows the comment.
+        let pos = rng.pick(&CPOS).replace("PRE", "true");
+        let blank = *rng.pick(&[" ", "\t", ""]);
+        let body = rng.pick(&CBODY);
+        // The comment line. What comes after the newline is a command bash
+        // runs and the split must read as its own clean segment: this is
+        // where a comment that swallows its newline (a trailing backslash it
+        // treats as a continuation) or opens a heredoc (a `<<WORD` inside it)
+        // would hide the line.
+        let mut s = format!("{pos}{blank}#{body}\n{marker}", marker = m());
+        if rng.chance(50) {
+            // A second following line, so a `<<EOF` in the comment has a
+            // "body" and "terminator" to (wrongly) step over.
+            s.push('\n');
+            s.push_str(&m());
+            if rng.chance(50) {
+                s.push_str("\nEOF\n");
+                s.push_str(&m());
+            }
+        }
+        s.trim_end().to_string()
+    }
+
+    /// Grouping and continuation that change how lines bind, around a body
+    /// the split might step over.
+    fn gen_grouped(rng: &mut Rng, ctr: &mut usize) -> String {
+        let mut m = || {
+            *ctr += 1;
+            format!("echo M{ctr}", ctr = *ctr)
+        };
+        let (raw, actual) = *rng.pick(&DELIMS);
+        let owner = *rng.pick(&OWNERS);
+        let inner = format!("{owner} <<{raw}\n{body}\n{actual}", body = m());
+        let tail = m();
+        match rng.below(6) {
+            0 => format!("{{\n{inner}\n}}\n{tail}"),
+            1 => format!("(\n{inner}\n)\n{tail}"),
+            2 => format!("if true; then\n{inner}\nfi\n{tail}"),
+            3 => format!("for i in 1; do\n{inner}\ndone\n{tail}"),
+            4 => format!("{inner} \\\n{tail}"),
+            _ => format!("{inner}\n{tail}"),
+        }
+    }
+
+    /// Reduce a failing case to a minimal one by dropping whole lines while a
+    /// marker bash runs is still hidden, so the panic names the smallest
+    /// reproduction.
+    fn minimize(case: &str, cwd: &std::path::Path) -> String {
+        let mut best = case.to_string();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let lines: Vec<&str> = best.split('\n').collect();
+            for drop in 0..lines.len() {
+                let candidate: String = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != drop)
+                    .map(|(_, l)| *l)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if candidate.trim().is_empty() {
+                    continue;
+                }
+                if !missed(&candidate, cwd).is_empty() {
+                    best = candidate;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        best
+    }
+
+    /// The divergence the generator found, pinned minimal: bash reads a
+    /// heredoc's body as data whatever its delimiter, so a quote in it is a
+    /// character. The walk read the body as shell syntax, and the apostrophe
+    /// in `it's` opened a string that took in the delimiter line and every
+    /// command after it, so `echo M1` was the head of no segment.
+    #[test]
+    fn an_apostrophe_in_a_read_heredoc_body_hides_the_next_command() {
+        if bash_for_tests().is_none() {
+            return;
+        }
+        let tmp = crate::testutil::TempTree::new("hd-apostrophe");
+        let cwd = tmp.path();
+        // bash runs `cat` (body `it's` is data, printed literally) then
+        // `echo M1`. The delimiter is unquoted, so the body is read, and the
+        // `'` in `it's` swallows the rest of the input.
+        let case = "cat <<EOF\nit's\nEOF\necho M1";
+        assert!(
+            missed(case, cwd).is_empty(),
+            "bash ran {:?}, the split did not read it: {:?}",
+            bash_markers(case, cwd),
+            split_segments_deep(case)
+                .iter()
+                .map(|s| s.command().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The same root reached through the delimiter line: `"E'O"F` is the
+    /// delimiter `E'OF`, and the line that ends the body carries the quote.
+    #[test]
+    fn a_read_heredocs_terminator_line_leaks_its_quote() {
+        if bash_for_tests().is_none() {
+            return;
+        }
+        let tmp = crate::testutil::TempTree::new("hd-terminator");
+        let cwd = tmp.path();
+        // bash runs `cat | cat` (empty body) then `echo M1`.
+        let case = "cat <<\"E'O\"F | cat\nE'OF\necho M1";
+        assert!(
+            missed(case, cwd).is_empty(),
+            "bash ran {:?}, the split did not read it: {:?}",
+            bash_markers(case, cwd),
+            split_segments_deep(case)
+                .iter()
+                .map(|s| s.command().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn differential_split_reads_every_command_bash_runs() {
+        if bash_for_tests().is_none() {
+            return; // no bash on this machine: nothing to measure against
+        }
+        let tmp = crate::testutil::TempTree::new("diff-harness");
+        let cwd = tmp.path().to_path_buf();
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        let mut ctr = 0usize;
+        // 1,500 cases run in a few seconds; the review ran 6,000. Raise it
+        // for a deeper run.
+        let total = 1500usize;
+        let mut failures: Vec<(String, Vec<String>)> = Vec::new();
+        for n in 0..total {
+            let case = match n % 3 {
+                0 => gen_heredoc(&mut rng, &mut ctr),
+                1 => gen_comment(&mut rng, &mut ctr),
+                _ => gen_grouped(&mut rng, &mut ctr),
+            };
+            let miss = missed(&case, &cwd);
+            if !miss.is_empty() {
+                let minimal = minimize(&case, &cwd);
+                let miss = missed(&minimal, &cwd);
+                failures.push((minimal, miss));
+            }
+            if ctr > 1_000_000 {
+                ctr = 0;
+            }
+        }
+        // Deduplicate to distinct minimal reproductions, shortest first.
+        failures.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
+        failures.dedup_by(|a, b| a.0 == b.0);
+        if !failures.is_empty() {
+            let mut report = format!(
+                "{} generated cases, {} distinct minimal divergences where bash \
+                 ran a command the split did not read:\n",
+                total,
+                failures.len()
+            );
+            for (case, miss) in failures.iter().take(12) {
+                report.push_str(&format!(
+                    "  missed {miss:?} in {:?}  segments={:?}\n",
+                    case,
+                    split_segments_deep(case)
+                        .iter()
+                        .map(|s| s.command().to_string())
+                        .collect::<Vec<_>>()
+                ));
+            }
+            panic!("{report}");
+        }
     }
 }
