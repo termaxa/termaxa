@@ -614,6 +614,13 @@ impl Policy {
     pub fn evaluate_command(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
         let segments = crate::shell::split_segments_deep(command);
         if segments.len() <= 1 {
+            // A file written through a literal heredoc (`cat > page.tsx
+            // <<'EOF' … EOF`) is judged as the write, by its path, the way
+            // the Write tool is: the segment leaves the body out, the line
+            // as typed still carries it.
+            if let Some(seg) = segments.first().filter(|s| s.literal_body) {
+                return self.evaluate(seg, &ctx.for_segment(seg));
+            }
             return self.evaluate(command, ctx);
         }
         let total = segments.len();

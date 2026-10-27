@@ -25,6 +25,14 @@
 ///     disagreed, decision #37). Each `Segment` carries the `Overwrite`s
 ///     found in it; there is no second scanner to feed different input.
 pub fn split_segments(s: &str) -> Vec<Segment> {
+    split_with(s, true)
+}
+
+/// `split_segments`, stepping over a literal heredoc's body only when
+/// `bodies_as_data` allows it. A `-c` or `eval` string is read with it off
+/// when what surrounds the wrapper could send the string's output somewhere
+/// that runs it (`expand_into`): `sh -c "cat <<'EOF' … EOF" | sh`.
+fn split_with(s: &str, bodies_as_data: bool) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut cur = String::new();
     let mut cur_redirects = Vec::new();
@@ -230,10 +238,27 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                 // start never saw them and the first line's allow covered
                 // them. Each line up to the shell's delimiter line is still
                 // read as a command, as before, but each on its own.
+                //
+                // When every body due here is a file's contents
+                // (`literal_data`) and the shell ends each where a looser
+                // reading would too, the walk steps over them instead: they
+                // are data. Whether the rest of the line leaves them data is
+                // decided once it is read (`quiet`, at the end).
                 if c == '\n' && !pending.is_empty() {
                     let heredocs = std::mem::take(&mut pending);
-                    let end = heredoc_bodies_end(&chars, i + 1, &heredocs);
-                    read_lines(&mut segments, &chars[i + 1..end]);
+                    let end = heredoc_bodies_end(&chars, i + 1, &heredocs, true);
+                    let data = bodies_as_data
+                        && end == heredoc_bodies_end(&chars, i + 1, &heredocs, false)
+                        && heredocs
+                            .iter()
+                            .all(|h| h.literal && segments.get(h.owner).is_some_and(literal_data));
+                    if data {
+                        for h in &heredocs {
+                            segments[h.owner].literal_body = true;
+                        }
+                    } else {
+                        read_lines(&mut segments, &chars[i + 1..end]);
+                    }
                     seg_start = end;
                     i = end;
                     continue;
@@ -294,8 +319,14 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
                     let end = heredoc_word_end(&chars, j);
                     cur.extend(&chars[j..end]);
                     let raw: String = chars[j..end].iter().collect();
+                    let delim = heredoc_delimiter(&raw);
+                    // The segment being built is the heredoc's: it is not
+                    // empty (it holds the operator), so it is the next one
+                    // `flush` pushes.
                     pending.push(PendingHeredoc {
-                        delim: heredoc_delimiter(&raw).map(|(d, _)| d),
+                        owner: segments.len(),
+                        literal: delim.as_ref().is_some_and(|(_, literal)| *literal),
+                        delim: delim.map(|(d, _)| d),
                         strip_tabs,
                     });
                     end
@@ -319,6 +350,12 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
         &mut cur_spans,
         Joiner::End,
     );
+    // A body stepped over stays data only on a line that does nothing else
+    // that could run the file or change what wrote it (`quiet`). Otherwise
+    // the line is read again with every body read line by line, as before.
+    if bodies_as_data && segments.iter().any(|s| s.literal_body) && !segments.iter().all(quiet) {
+        return split_with(s, false);
+    }
     segments
 }
 
@@ -326,6 +363,11 @@ pub fn split_segments(s: &str) -> Vec<Segment> {
 /// reached yet: `cat <<'EOF'` names its delimiter, and the body starts on
 /// the next line.
 struct PendingHeredoc {
+    /// The segment the heredoc belongs to, by the index it has once flushed.
+    owner: usize,
+    /// Whether any part of the delimiter was quoted (`'EOF'`, `"EOF"`,
+    /// `\EOF`, `E"O"F`), in which case the shell expands nothing in the body.
+    literal: bool,
     /// The delimiter after the shell's quote removal; `None` for a word the
     /// walk cannot take apart as the shell does, whose body then runs, here,
     /// to the end of the input.
@@ -402,8 +444,16 @@ fn heredoc_delimiter(raw: &str) -> Option<(String, bool)> {
 /// Where the bodies of `heredocs` end, read in order from `from`: each runs
 /// to its delimiter line, compared as the shell compares it (the whole
 /// line, leading tabs stripped under `<<-`, nothing else), or to the end of
-/// the input when that line never comes.
-fn heredoc_bodies_end(chars: &[char], from: usize, heredocs: &[PendingHeredoc]) -> usize {
+/// the input when that line never comes. Not `exact`: a line ends a body
+/// when it equals the delimiter once both are trimmed, which is how a body
+/// is checked before it is stepped over, so that a line the shell would
+/// not end on (a trailing space, a carriage return) keeps it read.
+fn heredoc_bodies_end(
+    chars: &[char],
+    from: usize,
+    heredocs: &[PendingHeredoc],
+    exact: bool,
+) -> usize {
     let mut pos = from;
     for h in heredocs {
         while pos < chars.len() {
@@ -418,7 +468,12 @@ fn heredoc_bodies_end(chars: &[char], from: usize, heredocs: &[PendingHeredoc]) 
             } else {
                 line.as_str()
             };
-            if h.delim.as_deref() == Some(line) {
+            let ends = match &h.delim {
+                Some(d) if exact => d == line,
+                Some(d) => d.trim() == line.trim(),
+                None => false,
+            };
+            if ends {
                 break;
             }
         }
@@ -438,6 +493,259 @@ fn read_lines(segments: &mut Vec<Segment>, lines: &[char]) {
         }
         segments.append(&mut read);
     }
+}
+
+/// Whether a literal heredoc fed to this segment is a file's contents.
+///
+/// The segment is `cat` or `tee` named plainly: as the word itself or by
+/// its system path, with nothing in front but a bare `sudo`. A wrapper can
+/// make the body something else (`env -S 'sh -s' cat` runs a shell on it,
+/// `xargs tee` makes it arguments, `env PATH=… cat` runs another `cat`), and
+/// so can a path (`./cat`). And nothing on the segment can hand the body to
+/// something that runs it: not a pipe, not a process substitution, not a
+/// duplicated descriptor, not a command substitution, and no file it
+/// writes is a descriptor's path (`/dev/fd/3`, `/proc/self/fd/3`, read past
+/// quote removal and escapes: `"/de""v/fd/3"` is the same path; `$'…'` can
+/// spell anything, so it keeps the lines read) or a file that runs on its
+/// own (`runs_on_its_own`), where the body is code that will run.
+fn literal_data(seg: &Segment) -> bool {
+    if matches!(seg.joiner, Joiner::Pipe | Joiner::Background) {
+        return false;
+    }
+    if ["$(", "`", "<(", ">(", ">&", "$'"]
+        .iter()
+        .any(|p| seg.text.contains(p))
+    {
+        return false;
+    }
+    written_files(seg).is_some_and(|files| {
+        !files.iter().any(|f| {
+            let path = f.replace(['"', '\'', '\\'], "");
+            ((path.contains("/dev/") || path.contains("/proc/")) && !is_sink(&path))
+                || runs_on_its_own(&path)
+        })
+    })
+}
+
+/// The files a segment writes when it is `cat` or `tee` named plainly (see
+/// `literal_data`): the targets of its redirections, and `tee`'s own
+/// operands. `None` when the segment is anything else.
+fn written_files(seg: &Segment) -> Option<Vec<String>> {
+    let words = crate::delete::tokenize_public(seg.command());
+    let at = usize::from(words.first().is_some_and(|w| w == "sudo"));
+    let tee = match words.get(at)?.as_str() {
+        "cat" | "/bin/cat" | "/usr/bin/cat" => false,
+        "tee" | "/bin/tee" | "/usr/bin/tee" => true,
+        _ => return None,
+    };
+    let tee_files = words[at + 1..]
+        .iter()
+        .filter(|w| tee && !w.starts_with('-'))
+        .cloned();
+    Some(
+        seg.redirects
+            .iter()
+            .map(|r| r.target.clone())
+            .chain(tee_files)
+            .collect(),
+    )
+}
+
+/// Whether a file runs without anyone naming it: a shell's startup files
+/// run with the next shell (Claude Code sources the user's at the start of
+/// every session), git runs its hooks on a commit, a checkout, a push, and
+/// runs what its config names (a filter, a pager, `core.fsmonitor`) on an
+/// `add` or a `status`.
+/// Written through a literal heredoc, such a file's body is read as
+/// commands, as every body was before Oct 27, 2026: it is code that will
+/// run, and a write there under a name no rule has would otherwise pass as
+/// an ordinary file. By name or by directory, so `cd .git/hooks && cat >
+/// pre-push` counts; case-blind, as the filesystems that matter here are.
+/// A dotfiles repository keeps the startup files without their dot
+/// (`zshrc`, linked to `~/.zshrc`), so those names count too.
+fn runs_on_its_own(target: &str) -> bool {
+    const STARTUP: [&str; 21] = [
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".bash_logout",
+        ".profile",
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".zlogin",
+        ".zlogout",
+        ".envrc",
+        "bashrc",
+        "bash_profile",
+        "bash_login",
+        "bash_logout",
+        "zshrc",
+        "zshenv",
+        "zprofile",
+        "zlogin",
+        "zlogout",
+        "bash.bashrc",
+    ];
+    const GIT_HOOKS: [&str; 24] = [
+        "applypatch-msg",
+        "pre-applypatch",
+        "post-applypatch",
+        "pre-commit",
+        "pre-merge-commit",
+        "prepare-commit-msg",
+        "commit-msg",
+        "post-commit",
+        "pre-rebase",
+        "post-checkout",
+        "post-merge",
+        "pre-push",
+        "pre-receive",
+        "update",
+        "proc-receive",
+        "post-receive",
+        "post-update",
+        "reference-transaction",
+        "push-to-checkout",
+        "pre-auto-gc",
+        "post-rewrite",
+        "sendemail-validate",
+        "fsmonitor-watchman",
+        "post-index-change",
+    ];
+    let path = format!("/{}", target.replace('\\', "/").to_ascii_lowercase());
+    let name = path.rsplit('/').next().unwrap_or_default();
+    STARTUP.contains(&name)
+        || GIT_HOOKS.contains(&name)
+        || matches!(name, ".gitconfig" | "gitconfig")
+        || [
+            "/.git/hooks/",
+            "/.githooks/",
+            "/.husky/",
+            "/.git/config",
+            "/.config/git/config",
+            "/etc/profile",
+            "/etc/zsh",
+        ]
+        .iter()
+        .any(|d| path.contains(d))
+}
+
+/// Whether a segment, on a line that writes a file through a literal
+/// heredoc, leaves that file a file: it runs nothing that could run it,
+/// changes nothing about what wrote it, and writes nothing that runs on its
+/// own. Hand-walked (decision #56): commands that look around, make or
+/// remove files and directories, or move between them; git's commands that
+/// read or stage; `set` with options alone; a comment; a harness's own
+/// scaffolding; and a wrapper, whose string is read on its own. Everything else
+/// keeps every body on the line read, as all of them were before Oct 27,
+/// 2026: an interpreter, a build or package tool, a shell, `eval`, `exec`,
+/// `source`, `sudo`, `env`, `cp` or `mv` (which can put the file where it
+/// runs), a function, an assignment (`PATH`, or a variable the next program
+/// reads), a group, a condition or a loop (piped as a whole), a
+/// substitution. Each of those was measured making bash run a body this
+/// change would otherwise have stepped over. The cost of the wide reading
+/// is a false hold on a line that writes and builds at once, never a line
+/// the shell runs unread.
+fn quiet(seg: &Segment) -> bool {
+    if seg.literal_body || seg.scaffold {
+        return true;
+    }
+    // A wrapper's string is read on its own, and whether its bodies are data
+    // was decided where it was read (`output_stays` in `expand_into`).
+    if seg.wraps {
+        return true;
+    }
+    let text = seg.text.trim();
+    if text.starts_with('#') {
+        return true;
+    }
+    if ["$(", "`", "<(", ">(", "$'"]
+        .iter()
+        .any(|p| text.contains(p))
+    {
+        return false;
+    }
+    let words: Vec<String> = crate::delete::tokenize_public(seg.command())
+        .into_iter()
+        .map(|w| w.replace('\\', ""))
+        .collect();
+    let Some(head) = words.first() else {
+        return false;
+    };
+    let looks = match head.as_str() {
+        "cd" | "pushd" | "popd" | "ls" | "pwd" | "echo" | "cat" | "tee" | "head" | "tail"
+        | "wc" | "grep" | "diff" | "stat" | "file" | "which" | "test" | "[" | "[[" | "true"
+        | "false" | "sleep" | "mkdir" | "touch" | "chmod" | "rm" | "rmdir" => true,
+        // options only: zsh's `set -A path …` assigns
+        "set" => words[1..].iter().all(|w| {
+            (w.starts_with(['-', '+']) && !w.contains('A'))
+                || w.chars().all(|c| c.is_ascii_lowercase())
+        }),
+        "git" => words.get(1).is_some_and(|w| {
+            matches!(
+                w.as_str(),
+                "add"
+                    | "status"
+                    | "diff"
+                    | "log"
+                    | "show"
+                    | "rev-parse"
+                    | "ls-files"
+                    | "branch"
+                    | "init"
+            )
+        }),
+        _ => false,
+    };
+    // and what it writes, by name: `cat x >> ~/.bashrc` is a startup file
+    let tee_files = words[1..]
+        .iter()
+        .filter(|w| head == "tee" && !w.starts_with('-'))
+        .map(String::as_str);
+    looks
+        && !seg
+            .redirects
+            .iter()
+            .map(|r| r.target.as_str())
+            .chain(tee_files)
+            .any(|f| runs_on_its_own(&f.replace(['"', '\'', '\\'], "")))
+}
+
+/// Where a file a literal heredoc writes lands, as a path the shell
+/// would read: the directory its `cd`s lead to, then the target. `None`
+/// where a `cd` before it cannot be followed.
+fn landing(seg: &Segment, target: &str) -> Option<String> {
+    let target = target.replace(['"', '\'', '\\'], "");
+    if target.starts_with(['/', '~', '$']) {
+        return Some(target);
+    }
+    match &seg.dir {
+        RunDir::Start => Some(target),
+        RunDir::Moved(steps) => Some(
+            steps
+                .iter()
+                .map(|s| s.path.as_str())
+                .chain([target.as_str()])
+                .collect::<Vec<_>>()
+                .join("/"),
+        ),
+        RunDir::Ending(end) => Some(format!("{}/{target}", end.join("/"))),
+        RunDir::Unknown => None,
+    }
+}
+
+/// Whether a write through a literal heredoc lands on a file that runs on
+/// its own once its `cd`s are followed: `cd /etc/profile.d && cat > x.sh`
+/// writes what the next login shell runs, though `x.sh` alone names nothing
+/// (the independent review, Oct 27, 2026). A `cd` the gate cannot follow
+/// counts too.
+fn lands_where_it_runs(seg: &Segment) -> bool {
+    seg.literal_body
+        && written_files(seg)
+            .unwrap_or_default()
+            .iter()
+            .any(|f| landing(seg, f).is_none_or(|path| runs_on_its_own(&path)))
 }
 
 /// Whether the `#` at `i` starts a comment: it begins a word, at the start
@@ -540,21 +848,44 @@ const MAX_WRAP_DEPTH: usize = 4;
 /// whole command line use this; callers handed one segment's text and
 /// asked about that segment alone keep `split_segments`.
 pub fn split_segments_deep(s: &str) -> Vec<Segment> {
+    let out = expand_line(s, true);
+    // As `split_with` checks a line, for the whole of it read through its
+    // wrappers, and with each heredoc's write followed to where it lands.
+    if out.iter().any(|seg| seg.literal_body)
+        && (!out.iter().all(quiet) || out.iter().any(lands_where_it_runs))
+    {
+        return expand_line(s, false);
+    }
+    out
+}
+
+/// `split_segments_deep`'s reading, with literal heredoc bodies stepped over
+/// as data where `bodies` allows it.
+fn expand_line(s: &str, bodies: bool) -> Vec<Segment> {
+    let segments = if bodies {
+        split_segments(s)
+    } else {
+        split_with(s, false)
+    };
     let mut out = Vec::new();
-    expand_into(&mut out, split_segments(s), None, 0, RunDir::Start);
+    expand_into(&mut out, segments, None, 0, RunDir::Start, bodies);
     out
 }
 
 /// Expands `segments` into `out`, starting in `start`, and returns where the
 /// shell is after the last of them: an `eval`'s string runs in the shell
 /// that evaluates it, so a `cd` inside one carries on after it; a `sh -c`
-/// string runs in a child, so its `cd` does not.
+/// string runs in a child, so its `cd` does not. `bodies` is whether the
+/// line these segments came from let a literal heredoc's body be stepped
+/// over (`split_with`); a string read here inherits it, and keeps it only
+/// while its wrapper's output stays where the line's goes.
 fn expand_into(
     out: &mut Vec<Segment>,
     segments: Vec<Segment>,
     via: Option<&str>,
     depth: usize,
     start: RunDir,
+    bodies: bool,
 ) -> RunDir {
     // A variable assigned earlier in the same command line, in the clear, is
     // not unknown: `SNAPSHOT_FILE=/home/dev/.claude/…` on line one and
@@ -685,6 +1016,11 @@ fn expand_into(
         let is_cd = moves_to.is_some();
         let joiner = seg.joiner;
         prev_joiner = Some(joiner);
+        // A string's heredocs are data only where the line's are, the
+        // wrapper sits in no condition, loop or subshell, and its output
+        // stays where the line's goes (`output_stays`). The line as a whole
+        // is checked once it is read (`split_segments_deep`).
+        let string_bodies = bodies && !conditional[i] && subshells.is_empty() && output_stays(&seg);
         out.push(seg);
         if let Some((shell, script)) = wrapped {
             let label = if shell == "eval" {
@@ -694,10 +1030,11 @@ fn expand_into(
             };
             let after = expand_into(
                 out,
-                split_segments(&script),
+                split_with(&script, string_bodies),
                 Some(&label),
                 depth + 1,
                 here.clone(),
+                string_bodies,
             );
             // An `eval` runs in this shell, so a `cd` inside it moves it.
             if shell == "eval" && own_shell && after != here {
@@ -1439,6 +1776,12 @@ fn wrapped_eval(seg: &Segment) -> Option<(String, String)> {
 pub fn context_text(command: &str) -> String {
     let segs = split_segments_deep(command);
     if segs.len() <= 1 {
+        // A file's contents written through a literal heredoc are not part
+        // of what runs: a `production` or a template literal in a page of
+        // code is not a signal about the command that writes it.
+        if let Some(seg) = segs.first().filter(|s| s.literal_body) {
+            return seg.text.clone();
+        }
         return command.to_string();
     }
     let kept: Vec<&str> = segs
@@ -1503,6 +1846,72 @@ fn wrapped_command(seg: &Segment) -> Option<(String, String)> {
         i += 1;
     }
     None
+}
+
+/// Whether what a `-c` or `eval` string writes stays where the line's own
+/// output goes, so a literal heredoc inside it can be a file's contents as
+/// it would be typed at the top level. The wrapper is named plainly (`env
+/// BASH_ENV=… sh -c` runs a file first), is not piped or sent to the
+/// background, and none of its own redirections, outside the string, leads
+/// to a process, to a descriptor other than stdout and stderr, or to a
+/// descriptor's path: `sh -c "cat <<'EOF' … EOF" | sh` runs the body.
+fn output_stays(seg: &Segment) -> bool {
+    if matches!(seg.joiner, Joiner::Pipe | Joiner::Background) {
+        return false;
+    }
+    let plain = crate::delete::tokenize_public(seg.command())
+        .first()
+        .map(|w| crate::delete::command_head(w))
+        .is_some_and(|h| h == "eval" || POSIX_SHELLS.contains(&h.as_str()));
+    if !plain {
+        return false;
+    }
+    let outside = unquoted(&seg.text);
+    if outside.contains(">(") {
+        return false;
+    }
+    // `2>&1` and `>&2` keep the output where it was going; `>&3` sends it
+    // to whatever descriptor 3 is.
+    let dup_elsewhere = outside.match_indices(">&").any(|(k, _)| {
+        let fd: String = outside[k + 2..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        fd != "1" && fd != "2"
+    });
+    !dup_elsewhere
+        && !seg
+            .redirects
+            .iter()
+            .any(|r| r.target.contains("/dev/") || r.target.contains("/proc/"))
+}
+
+/// `text` with every quoted part left out, escapes honored: what the shell
+/// reads as operators and words of this segment itself, not of a string it
+/// passes on.
+fn unquoted(text: &str) -> String {
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '\\' => {
+                chars.next();
+            }
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None => {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// One shell segment, carrying the redirect targets found in it.
@@ -1572,6 +1981,26 @@ pub struct Segment {
     /// comment alone on its line (`# list the files`) runs nothing either
     /// and is marked the same way; until Oct 2026 it was an unmatched ask.
     pub keyword: bool,
+    /// True when this segment feeds a heredoc with a quoted delimiter to
+    /// `cat` or `tee` (`cat > src/app/page.tsx <<'EOF' … EOF`). The body is
+    /// the file's contents, so the split steps over it and the segment is
+    /// judged as the write it is, by its path and with the copy aside, the
+    /// way a write through the Write tool is (decision of Oct 27, 2026).
+    /// Until then every line of the body was a segment of its own, judged as
+    /// a command: an agent writing a file through Bash was asked about each
+    /// line of code, and a line naming `production` or holding a template
+    /// literal escalated the write of an ordinary source file. On the first
+    /// SynCircles run (Oct 25, 2026) that was the largest class of asks on
+    /// real work. An unquoted delimiter expands `$(…)` and backticks in the
+    /// body, so its lines are still read; so are the lines of a body fed to
+    /// anything else, or through a pipe, a process substitution or a
+    /// duplicated descriptor, because there the body runs; so are the lines
+    /// of a file that runs on its own, a shell's startup file or a git hook
+    /// (`runs_on_its_own`); and so is every body on a line that does
+    /// anything else that could run the file or change what wrote it (an
+    /// interpreter, a build tool, a shell, a function, an assignment, a group
+    /// piped as a whole: `quiet`).
+    pub literal_body: bool,
     /// The operator that ended this segment, which decides whether a `cd`
     /// in it carries over to the next one: through `&&`, `;` and a newline
     /// it does; through `|` and `&` it ran in a subshell and does not.
@@ -1817,6 +2246,7 @@ fn flush(
             // A segment that starts with a comment is all comment: the `#`
             // starts a word, and the comment runs to the end of the line.
             keyword: t.starts_with('#'),
+            literal_body: false,
             joiner,
             dir: RunDir::Start,
         });
@@ -2262,6 +2692,512 @@ mod tests {
         );
         assert!(!is_literal_heredoc("cat file"));
         assert!(!is_literal_heredoc("rm -rf /"));
+    }
+
+    /// A literal heredoc fed to `cat` or `tee` is a file's contents, and the
+    /// split steps over it: one segment, judged as the write. Agents write
+    /// files through Bash this way, and until Oct 2026 every line of the file
+    /// was a segment of its own (the first SynCircles run, Oct 25, 2026).
+    /// Whatever follows the delimiter line is still split and judged, and
+    /// anything that could make the body run keeps its lines read.
+    #[test]
+    fn a_literal_heredoc_to_cat_or_tee_is_data_and_what_follows_it_is_read() {
+        let page = concat!(
+            "cat > src/app/page.tsx <<'EOF'\n",
+            "import Link from \"next/link\";\n",
+            "const s = `hi ${name}`; // production\n",
+            "rm -rf ~\n",
+            "EOF",
+        );
+        let segs = split_segments(page);
+        assert_eq!(segs.len(), 1, "{segs:?}");
+        assert_eq!(&*segs[0], "cat > src/app/page.tsx <<'EOF'");
+        assert_eq!(segs[0].command(), "cat");
+        assert!(segs[0].literal_body);
+        assert_eq!(segs[0].redirects[0].target, "src/app/page.tsx");
+
+        // the spellings of the same write
+        for cmd in [
+            "cat >> notes.md <<'EOF'\nline\nEOF",
+            "cat <<'EOF' > notes.md\nline\nEOF",
+            "cat > notes.md << \"EOF\"\nline\nEOF",
+            "cat > notes.md <<\\EOF\nline\nEOF",
+            "cat > notes.md <<E'O'F\nline\nEOF",
+            "cat > notes.md <<-'EOF'\n\tline\n\tEOF",
+            "tee notes.md <<'EOF'\nline\nEOF",
+            "sudo tee /tmp/x.conf <<'EOF'\nline\nEOF",
+            "/bin/cat > notes.md <<'EOF'\nline\nEOF",
+            "cat > notes.md <<'EOF' && git add notes.md\nline\nEOF",
+            "cat > notes.md <<'EOF' 2>/dev/null\nline\nEOF",
+            "cat > notes.md <<'EOF' # the notes\nline\nEOF",
+            "cat > notes.md <<'EOF'\nline",
+        ] {
+            let segs = split_segments(cmd);
+            assert!(segs.iter().all(|s| !s.contains("line")), "{cmd}: {segs:?}");
+            assert!(segs[0].literal_body, "{cmd}");
+        }
+        // and on a line that otherwise only looks around, makes
+        // directories, writes files or stages them (`quiet`)
+        for cmd in [
+            "mkdir -p src/{lib,ui} && cat > src/lib/z.ts <<'EOF'\nline\nEOF",
+            "cd src && cat > lib/y.ts <<'EOF'\nline\nEOF",
+            "set -euo pipefail\ncat > a.ts <<'EOF'\nline\nEOF",
+            "[ -d s ] || mkdir s\ncat > s/seed.sql <<'EOF'\nline\nEOF",
+            "cat > a.ts <<'EOF'\nline\nEOF\ncat > b.ts <<'EOF'\nline\nEOF",
+            "cat > a.ts <<'EOF'\nline\nEOF\ngit add a.ts && git status --short",
+            "# the page\ncat > page.tsx <<'EOF'\nline\nEOF\nwc -l page.tsx",
+        ] {
+            let segs = split_segments(cmd);
+            assert!(segs.iter().all(|s| !s.contains("line")), "{cmd}: {segs:?}");
+            assert!(segs.iter().any(|s| s.literal_body), "{cmd}");
+        }
+
+        // what follows the delimiter line is a command, and is read
+        let texts = |cmd: &str| -> Vec<String> {
+            split_segments(cmd).iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(
+            texts("cat > f <<'EOF'\nbody\nEOF\nrm -rf ~"),
+            ["cat > f <<'EOF'", "rm -rf ~"]
+        );
+        // two heredocs on one line, their bodies read in order
+        assert_eq!(
+            texts("cat <<'A' > a; cat <<'B' > b\none\nA\ntwo\nB\nrm -rf ~"),
+            ["cat <<'A' > a", "cat <<'B' > b", "rm -rf ~"]
+        );
+        // the delimiter is the shell's: a quote of the other kind or an
+        // escaped one stays in it, and its word ends at a metacharacter
+        for (cmd, owner) in [
+            (
+                "cat > f <<'E\"OF'\nbody\nE\"OF\nrm -rf ~",
+                "cat > f <<'E\"OF'",
+            ),
+            (
+                "cat > f <<\"E'OF\"\nbody\nE'OF\nrm -rf ~",
+                "cat > f <<\"E'OF\"",
+            ),
+            (
+                "cat > f <<E\\\"OF\nbody\nE\"OF\nrm -rf ~",
+                "cat > f <<E\\\"OF",
+            ),
+            (
+                "cat > f <<'EO\\F'\nbody\nEO\\F\nrm -rf ~",
+                "cat > f <<'EO\\F'",
+            ),
+            (
+                "cat > f <<\"E\\xF\"\nbody\nE\\xF\nrm -rf ~",
+                "cat > f <<\"E\\xF\"",
+            ),
+            ("cat <<'EOF'>f\nbody\nEOF\nrm -rf ~", "cat <<'EOF'>f"),
+        ] {
+            let segs = split_segments(cmd);
+            assert_eq!(texts(cmd), [owner, "rm -rf ~"], "{cmd:?}");
+            assert!(segs[0].literal_body, "{cmd:?}");
+            assert_eq!(segs[0].redirects[0].target, "f", "{cmd:?}");
+        }
+        // a delimiter line the shell might not end on (trailing space, a
+        // carriage return, indentation) still ends it here: the body here
+        // never runs past the shell's
+        for cmd in [
+            "cat > f <<'EOF'\nbody\nEOF \nrm -rf ~",
+            "cat > f <<'EOF'\r\nbody\r\nEOF\r\nrm -rf ~",
+            "cat > f <<'EOF'\nbody\n  EOF\nrm -rf ~",
+            "cat > f <<' EOF '\nbody\n EOF \nrm -rf ~",
+        ] {
+            assert_eq!(
+                texts(cmd).last().map(|s| s.trim().to_string()),
+                Some("rm -rf ~".to_string()),
+                "{cmd:?}"
+            );
+        }
+
+        // where the body can run, its lines are read as before
+        for (cmd, line) in [
+            ("cat <<'EOF' | sh\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("cat <<'EOF' > >(sh)\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("cat <<'EOF' >&3\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("cat <<'EOF' > /dev/fd/3\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("tee /proc/self/fd/3 <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("cat <<'EOF' |& sh\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("exec 3<<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("{ cat > f <<'EOF'; }\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("bash <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("ssh host <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("python3 - <<'EOF'\nimport os\nEOF", "import os"),
+            ("xargs tee <<'EOF'\n/etc/passwd\nEOF", "/etc/passwd"),
+            ("cat > f <<EOF\n$(rm -rf ~)\nEOF", "$(rm -rf ~)"),
+            ("x=$(cat <<'EOF'\nrm -rf ~\nEOF\n)", "rm -rf ~"),
+            // the program may not be `cat`: a wrapper or a path can make it
+            // a shell or another file
+            ("env -S 'sh -s' cat <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("env PATH=/tmp/t cat <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("./cat <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            // a descriptor's path, past quote removal
+            ("tee \"/de\"\"v/fd/3\" <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("cat > \"/de\"\"v/fd/3\" <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("cat > /de\\v/fd/3 <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("cat > $'\\x2fdev/fd/3' <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            // a line that does anything else that could run the file or
+            // change what wrote it: every body on it is read
+            ("cat > x.sh <<'EOF'\nrm -rf ~\nEOF\nbash x.sh", "rm -rf ~"),
+            ("cat > x <<'EOF'\nrm -rf ~\nEOF\nsh < x", "rm -rf ~"),
+            ("cat > x <<'EOF'\nrm -rf ~\nEOF\ncat x | sh", "rm -rf ~"),
+            ("cat > x.js <<'EOF'\nrm -rf ~\nEOF\nnode < x.js", "rm -rf ~"),
+            ("cat > x <<'EOF'\nrm -rf ~\nEOF\nX=x; sh $X", "rm -rf ~"),
+            (
+                "cat > package.json <<'EOF'\nrm -rf ~\nEOF\nnpm run build",
+                "rm -rf ~",
+            ),
+            ("cat > Makefile <<'EOF'\nrm -rf ~\nEOF\nmake", "rm -rf ~"),
+            (
+                "cat > a.ts <<'EOF'\nrm -rf ~\nEOF\nnpx prettier --write a.ts",
+                "rm -rf ~",
+            ),
+            ("cat > x <<'EOF'\nrm -rf ~\nEOF\ncp x ~/.bashrc", "rm -rf ~"),
+            (
+                "cat > x <<'EOF'\nrm -rf ~\nEOF\ncat x >> ~/.bashrc",
+                "rm -rf ~",
+            ),
+            (
+                "cat > f <<'EOF'\nrm -rf ~\nEOF\ngit add f && git commit -m f",
+                "rm -rf ~",
+            ),
+            (
+                "cat >> .git/config <<'EOF'\nrm -rf ~\nEOF\ngit add f",
+                "rm -rf ~",
+            ),
+            ("cat >> ~/.gitconfig <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            (
+                "mkfifo p; sh < p & cat > p <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "LD_PRELOAD=./x.so ls\ncat > f <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "cat > x <<'EOF'\nrm -rf ~\nEOF\nbash -c 'cat x' > >(sh)",
+                "rm -rf ~",
+            ),
+            // a command that only looks around, running something inside it
+            (
+                "cat > x <<'EOF'\nrm -rf ~\nEOF\necho \"$(sh x)\"",
+                "rm -rf ~",
+            ),
+            ("cat > x <<'EOF'\nrm -rf ~\nEOF\ntee >(sh) < x", "rm -rf ~"),
+            (
+                "cat > x.sh <<'EOF'\nrm -rf ~\nEOF\nchmod +x x.sh && ./x.sh",
+                "rm -rf ~",
+            ),
+            (
+                "cat > lib/x.sh <<'EOF'\nrm -rf ~\nEOF\nsource ./lib/x.sh",
+                "rm -rf ~",
+            ),
+            (
+                "tee x.js <<'EOF'\nrm -rf ~\nEOF\ntime node x.js",
+                "rm -rf ~",
+            ),
+            (
+                "cat > x.py <<'EOF'\nrm -rf ~\nEOF\nsudo python3 x.py",
+                "rm -rf ~",
+            ),
+            // a file that runs on its own: the next shell, a git hook
+            ("cat >> ~/.bashrc <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("tee -a \"$HOME/.zshrc\" <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("cat > dotfiles/zshrc <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            (
+                "cat > .git/hooks/pre-commit <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "cd .git/hooks && cat > pre-push <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            ("cat > .husky/pre-commit <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            (
+                "sudo tee /etc/profile.d/x.sh <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            // a `<<` in a comment opens nothing, and the lines below run
+            ("cat > f # <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            // something run before the owner makes `cat` a shell, or sends
+            // its output to one: a group, a condition, a loop or a function
+            // piped as a whole, a function or an alias named `cat`, `hash`,
+            // `PATH` however it is set, `exec`, `trap`, `eval`, `source`, a
+            // substitution left open
+            ("{\ncat <<'EOF'\nrm -rf ~\nEOF\n} | sh", "rm -rf ~"),
+            ("(\ncat <<'EOF'\nrm -rf ~\nEOF\n) | sh", "rm -rf ~"),
+            (
+                "if true; then\ncat <<'EOF'\nrm -rf ~\nEOF\nfi | sh",
+                "rm -rf ~",
+            ),
+            (
+                "for i in 1; do\ncat <<'EOF'\nrm -rf ~\nEOF\ndone | sh",
+                "rm -rf ~",
+            ),
+            (
+                "case x in\nx)\ncat <<'EOF'\nrm -rf ~\nEOF\n;; esac | sh",
+                "rm -rf ~",
+            ),
+            ("f() {\ncat <<'EOF'\nrm -rf ~\nEOF\n}\nf | sh", "rm -rf ~"),
+            ("cat() { sh; }\ncat <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            (
+                "function cat { sh; }\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "shopt -s expand_aliases\nalias cat=sh\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "hash -p /bin/sh cat\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "2>/dev/null hash -p /bin/sh cat\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "\\hash -p /bin/sh cat\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "{hash,-p,/bin/sh,cat}\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            ("PATH=/tmp/t:$PATH\ncat <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("export PATH=/tmp/t\ncat <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            (
+                "read PATH <<< /tmp/t\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "printf -v PATH /tmp/t\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "declare \"PA\"\"TH=/tmp/t\"\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "for PATH in /tmp/t; do :; done\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "path=(/tmp/t $path)\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "commands[cat]=/bin/sh\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            ("exec > >(sh)\ncat <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("command exec 1>&3\ncat <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            (
+                "trap 'exec > >(sh)' DEBUG\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (
+                "eval 'cat() { sh; }'\ncat <<'EOF'\nrm -rf ~\nEOF",
+                "rm -rf ~",
+            ),
+            (". ./x.sh\ncat <<'EOF'\nrm -rf ~\nEOF", "rm -rf ~"),
+            ("x=$(\ncat <<'EOF'\nrm -rf ~\nEOF\n)\n$x", "rm -rf ~"),
+        ] {
+            let segs = split_segments(cmd);
+            assert!(segs.iter().any(|s| &**s == line), "{cmd}: {segs:?}");
+            assert!(segs.iter().all(|s| !s.literal_body), "{cmd}");
+        }
+        // a here-string is not a heredoc
+        assert_eq!(
+            texts("cat <<< 'EOF'\nrm -rf ~"),
+            ["cat <<< 'EOF'", "rm -rf ~"]
+        );
+        // and a `<<` inside a comment opens none: one body here, not two
+        assert_eq!(
+            texts("cat <<'A' > a # <<'B'\none\nA\nrm -rf ~"),
+            ["cat <<'A' > a # <<'B'", "rm -rf ~"]
+        );
+
+        // In a `-c` or `eval` string, a write where the same line typed at
+        // the top level would be one; read where the wrapper's output goes
+        // on, or where anything before it changed the shell.
+        let reads = |cmd: &str| {
+            split_segments_deep(cmd)
+                .iter()
+                .any(|s| s.trim() == "rm -rf ~")
+        };
+        for cmd in [
+            "bash -lc \"cat > f <<'EOF'\nrm -rf ~\nEOF\"",
+            "cd src && sh -c \"cat > f <<'EOF'\nrm -rf ~\nEOF\" 2>&1",
+            "eval \"cat > f <<'EOF'\nrm -rf ~\nEOF\"",
+        ] {
+            assert!(!reads(cmd), "{cmd}: {:?}", split_segments_deep(cmd));
+        }
+        for cmd in [
+            "sh -c \"cat <<'EOF'\nrm -rf ~\nEOF\" | sh",
+            "bash -c \"cat <<'EOF'\nrm -rf ~\nEOF\" > >(sh)",
+            "bash -c \"cat <<'EOF'\nrm -rf ~\nEOF\" >&3",
+            "bash -c \"cat <<'EOF'\nrm -rf ~\nEOF\" > /dev/fd/3",
+            "eval \"cat <<'EOF'\nrm -rf ~\nEOF\" | sh",
+            "env BASH_ENV=./x.sh sh -c \"cat <<'EOF'\nrm -rf ~\nEOF\"",
+            "exec > >(sh); sh -c \"cat <<'EOF'\nrm -rf ~\nEOF\"",
+            "( sh -c \"cat <<'EOF'\nrm -rf ~\nEOF\" ) | sh",
+            "(\nsh -c \"cat <<'EOF'\nrm -rf ~\nEOF\"\n) | sh",
+            "sh -c \"sh -c 'cat <<\\\"EOF\\\"\nrm -rf ~\nEOF'\" | sh",
+            "if true; then sh -c \"cat <<'EOF'\nrm -rf ~\nEOF\"; fi | sh",
+            "sh -c \"cat <<'EOF'\nrm -rf ~\nEOF\n\" | sh",
+            "sh -c \"cat() { sh; }; cat <<'EOF'\nrm -rf ~\nEOF\"",
+        ] {
+            assert!(reads(cmd), "{cmd}: {:?}", split_segments_deep(cmd));
+        }
+        // A write followed to where its `cd`s put it: a startup file or a
+        // hook directory reached by a `cd` keeps the body read, and so does
+        // a write after a `cd` the gate cannot follow.
+        for cmd in [
+            "cd /etc/profile.d && cat > x.sh <<'EOF'\nrm -rf ~\nEOF",
+            "cd /etc && cat > profile <<'EOF'\nrm -rf ~\nEOF",
+            "cd .husky && cat > _/husky.sh <<'EOF'\nrm -rf ~\nEOF",
+            "cd .git && cd hooks && cat > x <<'EOF'\nrm -rf ~\nEOF",
+            "cd .git && cat >> config <<'EOF'\nrm -rf ~\nEOF",
+            "cd \"$X\" && cat > f <<'EOF'\nrm -rf ~\nEOF",
+        ] {
+            assert!(reads(cmd), "{cmd}: {:?}", split_segments_deep(cmd));
+        }
+        assert!(!reads("cd src && cat > lib/y.ts <<'EOF'\nrm -rf ~\nEOF"));
+        // Claude Code's own wrapping, under `wrap` (Sep 10, 2026): the
+        // preamble is scaffolding and changes nothing here, and the
+        // command in the `eval` is a write as it would be in the hook
+        let eval = crate::runner::shell_join(&[
+            "eval".to_string(),
+            "cat > f <<'EOF'\nrm -rf ~\nEOF".to_string(),
+        ]);
+        let script = format!(
+            "shopt -u extglob 2>/dev/null || true && {eval} < /dev/null \
+             && pwd -P >| /tmp/claude-ab12-cwd"
+        );
+        let argv: Vec<String> = ["bash", "-c", "-l", &script]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let command = crate::runner::shell_join(&argv);
+        let segs = split_segments_deep(&command);
+        assert!(!reads(&command), "{command}: {segs:?}");
+        assert!(segs.iter().any(|s| s.literal_body), "{segs:?}");
+    }
+
+    /// The property the step over a body rests on, measured against the
+    /// shell itself: every command bash runs after a literal heredoc is a
+    /// segment here. Each line after the delimiter is `echo M<n>`; whatever
+    /// bash prints must be read. Where bash keeps reading the body (a
+    /// delimiter line with a trailing space, an indented one under `<<`, a
+    /// missing one), the split may end it sooner and read more, never less.
+    /// And where something makes bash run the body itself (a group piped to
+    /// a shell, a function or an alias named `cat`, `hash -p`, `PATH`,
+    /// `exec`, a wrapper, a comment), its lines are read.
+    #[cfg(unix)]
+    #[test]
+    fn a_heredoc_body_here_never_runs_past_the_shells() {
+        let tmp = crate::testutil::TempTree::new("heredoc-shell");
+        let bin = tmp.dir("bin");
+        std::os::unix::fs::symlink("/bin/sh", bin.join("cat")).expect("symlink");
+        let bin = bin.display().to_string();
+        let mut cases: Vec<String> = [
+            "cat > /dev/null <<'EOF'\nbody\nEOF\necho M1\necho M2",
+            "cat > /dev/null <<'EOF'\nbody\nEOF \necho M1",
+            "cat > /dev/null <<'EOF'\nbody\n\tEOF\necho M1\nEOF\necho M2",
+            "cat > /dev/null <<-'EOF'\n\tbody\n\tEOF\necho M1",
+            "cat > /dev/null <<'EOF'\r\nbody\r\nEOF\r\necho M1",
+            "cat > /dev/null <<'E O F'\nbody\nE O F\necho M1",
+            "cat > /dev/null << 'EOF'  # a comment\nbody\nEOF\necho M1",
+            "cat > /dev/null <<\"EOF\"\n$(echo INNER)\nEOF\necho M1",
+            "cat > /dev/null <<EOF'X'\nbody\nEOFX\necho M1",
+            "cat > /dev/null <<'E;F'\nbody\nE;F\necho M1",
+            "cat > /dev/null <<'EOF'\nbody\nEOF; echo M1\nEOF\necho M2",
+            "cat > /dev/null <<'A'; cat > /dev/null <<'B'\none\nA\ntwo\nB\necho M1",
+            "true && cat > /dev/null <<'EOF' && echo M1\nbody\nEOF\necho M2",
+            "echo x | cat > /dev/null <<'EOF'\nbody\nEOF\necho M1",
+            "cat > /dev/null <<'EOF'\nbody\necho M1",
+            "{\ncat <<'EOF'\necho M1\nEOF\n} | sh",
+            "(\ncat <<'EOF'\necho M1\nEOF\n) | sh",
+            "if true; then\ncat <<'EOF'\necho M1\nEOF\nfi | sh",
+            "for i in 1; do\ncat <<'EOF'\necho M1\nEOF\ndone | sh",
+            "case x in\nx)\ncat <<'EOF'\necho M1\nEOF\n;; esac | sh",
+            "f() {\ncat <<'EOF'\necho M1\nEOF\n}\nf | sh",
+            "cat() { sh; }\ncat <<'EOF'\necho M1\nEOF",
+            "function cat { sh; }\ncat <<'EOF'\necho M1\nEOF",
+            "shopt -s expand_aliases\nalias cat=sh\ncat <<'EOF'\necho M1\nEOF",
+            "hash -p /bin/sh cat\ncat <<'EOF'\necho M1\nEOF",
+            "2>/dev/null hash -p /bin/sh cat\ncat <<'EOF'\necho M1\nEOF",
+            "\\hash -p /bin/sh cat\ncat <<'EOF'\necho M1\nEOF",
+            "exec > >(sh)\ncat <<'EOF'\necho M1\nEOF",
+            "trap 'exec > >(sh)' DEBUG\ncat <<'EOF'\necho M1\nEOF",
+            "eval 'cat() { sh; }'\ncat <<'EOF'\necho M1\nEOF",
+            "coproc cat <<'EOF'\necho M1\nEOF\nsh <&\"${COPROC[0]}\"",
+            "x=$(\ncat <<'EOF'\necho M1\nEOF\n)\n$x",
+            "env -S 'sh -s' cat <<'EOF'\necho M1\nEOF",
+            "cat > /dev/null # <<'EOF'\necho M1\nEOF",
+            "sh -c \"cat <<'EOF'\necho M1\nEOF\" | sh",
+            "eval \"cat <<'EOF'\necho M1\nEOF\" | sh",
+            "(\nsh -c \"cat <<'EOF'\necho M1\nEOF\"\n) | sh",
+            "sh -c \"sh -c 'cat <<\\\"EOF\\\"\necho M1\nEOF'\" | sh",
+            // the shell's own delimiter, quotes inside quotes and escapes
+            "cat > /dev/null <<'E\"OF'\nbody\nE\"OF\necho M1",
+            "cat > /dev/null <<\"E'OF\"\nbody\nE'OF\necho M1",
+            "cat > /dev/null <<E\\\"OF\nbody\nE\"OF\necho M1",
+            "cat > /dev/null <<'EO\\F'\nbody\nEO\\F\necho M1",
+            "cat > /dev/null <<\"E\\xF\"\nbody\nE\\xF\necho M1",
+            "cat > /dev/null <<\"E\\\"F\"\nbody\nE\"F\necho M1",
+            "cat <<'EOF'>/dev/null\nbody\nEOF\necho M1",
+            "cat <<'EOF'</dev/null\nbody\nEOF\necho M1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // a file the same line writes, then runs
+        let dir = tmp.path().display().to_string();
+        cases.extend([
+            format!("cat > {dir}/in.sh <<'EOF'\necho M1\nEOF\nsh < {dir}/in.sh"),
+            format!("cat > {dir}/in.sh <<'EOF'\necho M1\nEOF\ncat {dir}/in.sh | sh"),
+            format!("cat > {dir}/in.sh <<'EOF'\necho M1\nEOF\nX={dir}/in.sh; sh $X"),
+            format!("cat > {dir}/run.sh <<'EOF'\necho M1\nEOF\nsh {dir}/run.sh"),
+            format!("cd {dir} && cat > run.sh <<'EOF'\necho M1\nEOF\nchmod +x run.sh && ./run.sh"),
+            format!("cat > {dir}/lib.sh <<'EOF'\necho M1\nEOF\n. {dir}/lib.sh"),
+        ]);
+        // `cat` is a shell in this directory
+        cases.extend([
+            format!("PATH={bin}:$PATH\ncat <<'EOF'\necho M1\nEOF"),
+            format!("export PATH={bin}:$PATH\ncat <<'EOF'\necho M1\nEOF"),
+            format!("read PATH <<< {bin}\ncat <<'EOF'\necho M1\nEOF"),
+            format!("printf -v PATH {bin}\ncat <<'EOF'\necho M1\nEOF"),
+            format!("env PATH={bin} cat <<'EOF'\necho M1\nEOF"),
+            format!("{bin}/cat <<'EOF'\necho M1\nEOF"),
+        ]);
+        for case in &cases {
+            let Some(bash) = super::bash_for_tests() else {
+                return; // no bash on this machine: nothing to measure against
+            };
+            let Ok(out) = std::process::Command::new(bash)
+                .arg("-c")
+                .arg(case)
+                .output()
+            else {
+                return; // no bash on this machine: nothing to measure against
+            };
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let ran: Vec<&str> = stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with('M'))
+                .collect();
+            let segs = split_segments_deep(case);
+            for m in ran {
+                assert!(
+                    segs.iter().any(|s| s.trim() == format!("echo {m}")),
+                    "{case:?}: bash ran `echo {m}`, the split did not read it: {segs:?}"
+                );
+            }
+        }
     }
 
     /// Claude Code's startup snapshot, in the shape the record holds (Sep
