@@ -325,6 +325,51 @@ mod tests {
         }
     }
 
+    /// A file written through a literal heredoc is judged as the write, by
+    /// its path, the way the Write tool is (decision of Oct 27, 2026). On
+    /// the first SynCircles run (Oct 25, 2026) every line of every file an
+    /// agent wrote this way was a command: a line of code matched no rule
+    /// and asked, and a page naming `production` or holding a template
+    /// literal escalated. What runs is still judged: a protected path, a
+    /// command after the delimiter line, a body fed to a shell.
+    #[test]
+    fn a_file_written_through_a_literal_heredoc_is_judged_by_its_path() {
+        let policy = crate::policy::Policy::builtin().expect("the starter parses");
+        let ctx = crate::resolve::EvalContext::at(std::path::Path::new("."));
+        let verdict = |c: &str| {
+            let d = policy.evaluate_command(c, &ctx);
+            let signals = gather_with(c, &|inner| policy.allows_explicitly(inner, &ctx));
+            apply(d, &signals).0.action
+        };
+        let page = concat!(
+            "cat > src/app/page.tsx <<'EOF'\n",
+            "import Link from \"next/link\";\n",
+            "export const live = process.env.NODE_ENV === 'production';\n",
+            "const s = `hi ${name}`;\n",
+            "// to clean: rm -rf .next && git push --force\n",
+            "EOF",
+        );
+        assert_eq!(verdict(page), Action::Allow);
+        assert_eq!(
+            verdict("cat > supabase/migrations/1_x.sql <<'EOF'\ndrop table if exists stray;\nEOF"),
+            Action::Allow
+        );
+        for cmd in [
+            "cat > .env <<'EOF'\nKEY=1\nEOF",
+            "cat > .claude/settings.json <<'EOF'\n{}\nEOF",
+            "cat > f.sh <<'EOF'\necho hi\nEOF\nrm -rf ~",
+            "bash <<'EOF'\nrm -rf ~\nEOF",
+            "cat <<'EOF' | sh\nrm -rf ~\nEOF",
+            // the file runs on its own, and the starter has no path rule for
+            // it: the body is read, and decides, as it did before
+            "cat >> ~/.bashrc <<'EOF'\nalias ls='rm -rf ~'\nEOF",
+            "cat > .git/hooks/pre-commit <<'EOF'\nrm -rf ~\nEOF",
+            "{\ncat <<'EOF'\nrm -rf ~\nEOF\n} | sh",
+        ] {
+            assert_eq!(verdict(cmd), Action::Deny, "{cmd}");
+        }
+    }
+
     /// Claude Code's preamble carries `unset -f`; read raw it was a
     /// destructive flag on every command the agent ran, and every allow
     /// became an ask (Sep 10, 2026). The signals come off the command the
