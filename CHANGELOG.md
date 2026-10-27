@@ -2,6 +2,30 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.21.7 — a comment hides no command, and a file written through a heredoc is judged by its path
+
+**In plain words:** the shell reads neither a `#` comment nor a heredoc's body as syntax, but the gate did: a quote in either (`# it's clean`, a body line `echo it's`) opened a string that carried the lines after it into the same segment, where the first line's verdict covered them. With the starter, `git status # it's clean` above `kubectl delete namespace staging` was allowed by `git status*`, though `kubectl delete*` is a hard stop. Comments and heredoc bodies are now read the way the shell reads them. And a file written with `cat > file <<'EOF'`, which is how agents write files through the shell, was read a line at a time as commands: on the first SynCircles run (Oct 25, 2026) that was the largest class of asks on real work, about 8 of 26. A literal heredoc that `cat` or `tee` writes to a file is now judged as the write it is, by its path, as a write through the Write tool is.
+
+Security release for [GHSA-rp8h-f4h4-w4j3](https://github.com/termaxa/termaxa/security/advisories/GHSA-rp8h-f4h4-w4j3) (High), found on Oct 27, 2026 while reviewing the heredoc change, and measured on each release's own starter back to v0.7.0. Two code PRs (#158, #159). The advisory lists when each form started.
+
+### Security
+
+- A `#` that starts a word opens a comment that runs to the end of its line, and inside it a quote or a backslash is literal; a `<<` in it opens no heredoc. `a#b`, `$#`, `${#x}`, `"#"`, `\#` and `a\ #b` hold no comment, as in bash. The split still divides a comment at operators and keeps its text for rule matching, because cmd.exe has no comments and the hook receives its commands too: a comment that mentions `rm -rf` still denies. A comment alone on its line runs nothing, and its segment is transparent the way a `do` or a `fi` is (#158).
+- A heredoc's body is read up to its delimiter line as the shell finds it: the word after `<<` ends at the first metacharacter, the delimiter is what the shell's quote removal leaves, the line must equal it (with leading tabs stripped under `<<-`), and each body line is read on its own, so nothing in it reaches the lines after (#158).
+- A test runs the split against bash on generated command lines, 1,500 on every run, and fails if a command bash runs is not a segment here (#158).
+
+### Changed
+
+- A literal heredoc (a quoted delimiter, so the shell expands nothing in it) that plain `cat` or `tee` writes to a file is the file's contents, and the segment is judged as the write: by its path, with the copy aside. It stays data only where nothing can run it. The owner is not piped or sent to the background and writes no descriptor's path and no file that runs on its own (a shell's startup file, a git hook, git's config); every other command on the line is one that cannot run the file or change what wrote it, from a short hand-walked list (`cd`, `mkdir`, `ls`, `echo`, `cat`, `tee`, `rm`, `chmod`, `test`, `set` with options, git's `add`, `status`, `diff`, `log` and a few more); and the shell ends the body where a looser reading would too. Anything else on the line keeps every body on it read as before (#159).
+- The trade, as decided on Oct 27: a body that spells a hard stop no longer denies the write of an ordinary file on a quiet line. `cat > cleanup.sh <<'EOF'` / `rm -rf ~` / `EOF` is a write, and running the file later is judged as running any script is, the same as for a file the Write tool wrote. v0.19.3's rule that a heredoc body spelling a hard stop still trips it now holds for unquoted heredocs, for a line that also builds or runs, and for anything piped (#159).
+
+### Measured and documented
+
+- With `termaxa check` and the starter against the released 0.21.6: `git status # it's clean` above `kubectl delete namespace staging`, the same comment above `terraform destroy -auto-approve` or `docker system prune -af`, and `cat <<EOF` / `echo it's` / `EOF` above it go from allow to deny; a comment holding a quote above `git push --force`, `kubectl delete`, `terraform destroy`, `dd` to a device or `mkfs` goes from ask to deny; `# list the files` above `ls -la` from ask to allow (#158).
+- A Next.js page written through a heredoc goes from ask to allow; a note that mentions `rm -rf`, from deny to allow; `cat >> .gitignore`, a write then `git add`, and `cd src && cat > ...`, from ask to allow; the same page written through `bash -lc` and through Claude Code's `eval` wrapping, from ask to allow. `.env`, `.claude/settings.json`, a command after the body, `bash <<'EOF'`, `| sh`, an unquoted `$(rm -rf ~)`, `~/.bashrc`, a git hook and a script written and run on one line deny as before, and all 78 heredoc shapes from the reviews keep their 0.21.6 deny or ask (#159).
+- SECURITY.md says a literal heredoc written to a file is judged by its path, and that comments and heredoc bodies are read as the shell reads them. The README states the advisory policy instead of a count, and RELEASING.md's security step matches.
+- 599 tests on Linux (ten new), 513 on Windows.
+
 ## v0.21.6 — a path read only at its end is judged by its end
 
 **In plain words:** a `cd` whose argument the gate could read only part of, `cd "$(git rev-parse --show-toplevel)/.claude"`, `cd "$ROOT/.claude"` or `cd .cla*`, left the directory unknown as a whole, so a write after it was unresolved and the starter's `echo *` outranked that: `… && echo {} > settings.json` was allowed from v0.18.6 (the substitution spelling from v0.19.3), while `cd .claude && echo {} > settings.json` has been a floor deny since v0.21.4 and the direct spelling since v0.14.2. The same held for a target that starts with a variable: `cat .env.example > $PWD/.env` was allowed from v0.15.0, the release that first denied `> .env`. The end of such a path is literal, and the path rules now read it: wherever the start is, that write lands on a `.claude/settings.json`, or a `.env`.
