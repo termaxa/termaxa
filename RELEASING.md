@@ -71,6 +71,7 @@
     advisory's proof of concept with deny, because the playground runs the
     real gate in public. Request the CVE on the draft, publish, read the
     published page from outside with both version fields, then one docs PR
-    for SECURITY.md's row (UTC dates, days exposed) and the README's count of
-    advisories, the playground's solved challenge, the site's count, and
-    last the mail to whoever's report led to it.
+    for SECURITY.md's row (UTC dates, days exposed), and last the mail to
+    whoever's report led to it. The README and the site state the policy,
+    not a count, so a new advisory changes neither (Oct 28, 2026); the
+    playground's solved challenge is optional.

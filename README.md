@@ -418,11 +418,11 @@ Every bug found in real use, with how it was found and where it was fixed, is in
 
 ## Contributing
 
-Rust 2021, ~18,400 lines of production code and ~18,800 of tests, 589 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
+Rust 2021, ~19,100 lines of production code and ~20,000 of tests, 599 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
 
 ## Security
 
-Found a bypass? [SECURITY.md](SECURITY.md) says how to report it and what happens next; seven advisories are published there, one from an outside researcher, each with its exposure window in UTC.
+Found a bypass? [SECURITY.md](SECURITY.md) says how to report it and what happens next. Every bypass its decision rule calls a bug, whether we found it or someone reported it, is published there as an advisory with its exposure window in UTC; the rest are documented as limits.
 
 ## License
 
