@@ -1,14 +1,16 @@
 [English](README.md) · **日本語**
 
+> この日本語版は、英語版の README（v0.21.7、コミット `77ec8e1` 時点）を AI（Claude）で翻訳したもので、ネイティブスピーカーによる確認はまだ受けていません。英語版より古い場合があります。内容が食い違う場合は英語版が正です。誤訳や不自然な表現に気づいたら、[#60](https://github.com/termaxa/termaxa/issues/60) で教えてください。
+
 <div align="center">
 
 # 🛡 Termaxa
 
-**AI コーディングエージェントとシェルの間に立つ門番。** コマンドが実行される前に、Termaxa は何が壊れるかを見せ、復元できるバックアップを取り、読めるポリシーに従って確認を求めるか拒否します。Claude Code、Codex、Cursor、Copilot CLI を、ひとりでも、無人でも使う人向けです。
+**AI コーディングエージェントとシェルの間に立つ門番。** コマンドが実行される前に、Termaxa はそのコマンドが何を破壊するかを見せ、復元できるバックアップを取り、読めるポリシーに従って確認を求めるか拒否します。Claude Code、Codex、Cursor、Copilot CLI を、ひとりでも、無人でも使う人向けです。
 
 **十秒で試せます：** [play.termaxa.com](https://play.termaxa.com) では、使い捨てのプロジェクトで本物の門番が動きます。**インストール：** `brew install termaxa/tap/termaxa` または `cargo install termaxa`。
 
-<img src="https://termaxa.com/termaxa-claude-code-v2.gif" alt="承認をオフにした実際の Claude Code セッション：エージェントは scratch/ を調べ、rm -rf ./scratch を試み、Termaxa のフックが理由と、削除されるはずだった 12 個のファイルを示して止める。エージェントはそれを迂回するのをやめる" width="800">
+<img src="https://termaxa.com/termaxa-claude-code-v2.gif" alt="Claude Code 自身の承認をオフにした実際のセッション：エージェントは scratch/ を調べ、rm -rf ./scratch を試み、Termaxa のフックが理由と、削除されるはずだった 12 個のファイルを示して止める。エージェントはそれを迂回しようとしない" width="800">
 
 *承認をオフにした実際の Claude Code セッション。調べるコマンドは通り、`rm -rf` は理由と影響範囲を添えて止まり、エージェントは迂回しません。Claude Code 2.1.283 で録画。*
 
@@ -24,7 +26,7 @@
 
 コーディングエージェントは、自分でシェルコマンドを実行します。被害の原因は、巧妙な攻撃であることはまずありません。ありふれた作業を、いちばん強い書き方で実行してしまうことです。掃除に `rm -rf`、push に `--force`、取り消しに `reset --hard` といった具合です。これまでの選択肢は、全コマンドを見張るか（それではエージェントを使う意味がありません）、無条件に信用するか（うまくいくのは、うまくいかなくなるまでです）のどちらかでした。
 
-めったに起きない失敗ではありません。2026年10月に 36 モデルで測定したところ、「*直前のコミットを取り消して*」と頼まれて、そのうち 19 が `git reset --hard` を実行し、誰も話題にしていないファイルのコミットされていない作業を壊しました（[ベンチマーク](https://www.kaggle.com/benchmarks/devdoc83/destructive-reach)、[解説記事](https://dev.to/zerodrop/asked-to-undo-a-commit-19-of-36-models-destroyed-work-nobody-mentioned-54je)）。
+めったに起きない失敗ではありません。2026年10月に 36 モデルで測定したところ、「*直前のコミットを取り消して*」と頼まれて、そのうち 19 が `git reset --hard` を実行し、誰も話題にしていないファイルのコミットされていない作業を消しました（[ベンチマーク](https://www.kaggle.com/benchmarks/devdoc83/destructive-reach)、[解説記事](https://dev.to/zerodrop/asked-to-undo-a-commit-19-of-36-models-destroyed-work-nobody-mentioned-54je)）。
 
 ## Termaxa がすること
 
@@ -50,15 +52,15 @@ delete impact
   insurance   : copy 1 path(s) to .termaxa/backups before deletion (automatic on run/hook)
 ```
 
-*このページのコンソール出力はすべて、フィクスチャ上でバイナリから採取したものです。パスは短縮し、doctor と report の出力は省略しています。*
+*このページのコンソール出力はすべて、フィクスチャ上でバイナリから採取したものです。パスは短縮し、doctor と report の出力は一部を省略しています。*
 
-## すでにあるプロンプトでは足りない理由
+## すでにある確認プロンプトでは足りない理由
 
-**エージェント自身のプロンプト**が見せるのはコマンドです。Termaxa は、そのコマンドが何をするかを見せ、プロンプトを誰も見ていないときでも、危険な少数を止めます。上の録画は、エージェントの承認をオフにしたセッションです。
+**エージェント自身の確認プロンプト**が見せるのはコマンドです。Termaxa は、そのコマンドが何をするかを見せ、確認プロンプトを誰も見ていないときでも、数少ない危険なコマンドを止めます。上の録画は、エージェントの承認をオフにしたセッションです。
 
 **サンドボックス**は、コマンドが届く範囲を閉じ込めます。Termaxa は、与えた範囲の内側で、コマンドが何を壊すかを判断します。リポジトリを含むサンドボックスは `rm -rf ./src` を通してしまいます。両者は補い合うので、確実な保証が必要なときは両方を使ってください。
 
-**ポリシーエンジン**（OPA など）は、文字列をルールに照らして評価します。Termaxa は、文字列が持たない三つのものを足します。結果、バックアップ、記録です。ポリシーは今もリポジトリ内のファイルで、プルリクエストでレビューできます。
+**ポリシーエンジン**（OPA など）は、文字列をルールに照らして評価します。Termaxa は、文字列が持たない三つのものを足します。結果、バックアップ、記録です。それでも、ポリシーはリポジトリ内のファイルのままで、プルリクエストでレビューできます。
 
 ## クイックスタート
 
@@ -73,7 +75,7 @@ winget install Termaxa.Termaxa       # Windows (the winget manifest can lag a re
 scoop bucket add termaxa https://github.com/termaxa/scoop-bucket && scoop install termaxa   # Windows, always current
 ```
 
-または、お使いのプラットフォーム向けのアセットを [Releases](https://github.com/termaxa/termaxa/releases) からダウンロードしてください。どれも attestation とチェックサムが付いており、Linux 版は静的な musl ビルドで、どのディストリビューションでも動きます。`curl | sh` 形式のインストーラーは意図的に用意していません。Termaxa はこのパターンを危険として警告するので、門番のルールは門番自身にも適用されるからです。
+または、お使いのプラットフォーム向けのアセットを [Releases](https://github.com/termaxa/termaxa/releases) からダウンロードしてください。どれも attestation とチェックサムが付いており、Linux 版は静的な musl ビルドで、どのディストリビューションでも動きます。`curl | sh` 形式のインストーラーは意図的に用意していません。Termaxa はこのパターンを危険として警告し、門番のルールは門番自身にも適用されるからです。
 
 **2. エージェントがすでに実行したコマンドを判定する。** プロジェクトには何もインストールせず、何も実行しません。
 
@@ -92,7 +94,7 @@ termaxa init --claude-code --observe    # or --codex, --cursor, --copilot
 termaxa doctor                          # proves the hook fires; "configured" alone is not enough
 ```
 
-observe モードでは、すべてのコマンドがこれまでどおり実行され、バックアップも取られ、記録には、強制していたら*どうしたか*が溜まっていきます。フックは何も言わないので、エージェントのプロンプトは以前とまったく同じです。
+observe モードでは、すべてのコマンドがこれまでどおり実行され、バックアップも取られ、記録には、強制していたら*どうしたか*が溜まっていきます。フックは何も言わないので、エージェントの確認プロンプトは以前とまったく同じです。
 
 **4. レポートを読み、それから強制する。**
 
@@ -137,7 +139,7 @@ postgres impact
   insurance : pg_dump users before execution (automatic on run/hook)
 ```
 
-行数の見積もりはプランナーから取ります（`pg_class.reltuples`。`ANALYZE` の実行間では古くなります）。Termaxa がテーブルをスキャンすることはなく、プレビューがあなたのものを実行することもありません。ただし、一度だけ実行したことがあります。Postgres のプレビューが、解析中の SQL ファイルを実行できてしまったのです（[GHSA-gxg4-5fmj-534m](https://github.com/termaxa/termaxa/security/advisories/GHSA-gxg4-5fmj-534m)、v0.14.1 で修正）。そのため「拒否されたコマンドでは、プレビューは何も実行しない」は、いまではテスト付きのルールです。
+行数の見積もりはプランナーから取ります（`pg_class.reltuples`。`ANALYZE` の実行間では古くなります）。Termaxa がテーブルをスキャンすることはなく、プレビューがあなたのものを実行することもありません。ただし、かつては実行してしまうことがありました。Postgres のプレビューが、解析中の SQL ファイルを実行できてしまったのです（[GHSA-gxg4-5fmj-534m](https://github.com/termaxa/termaxa/security/advisories/GHSA-gxg4-5fmj-534m)、v0.14.1 で修正）。そのため「拒否されたコマンドでは、プレビューは何も実行しない」は、いまではテスト付きのルールです。
 
 ### 再試行するエージェントは、書き方を変えてもすり抜けられない
 
@@ -270,18 +272,18 @@ enforcement would have asked 4 and denied 2
 ran with no copy: 5
 ```
 
-どの行も、監査ログに出どころのある事実です。レポートはローカルの追記専用ログを読むだけで、ネットワークに出ず、テレメトリも送りません。`termaxa replay --against-record` はもう一歩進んで、エージェントのトランスクリプトをそのログと突き合わせ、シェル呼び出しをすべて「判定済み」「実行されたが記録されていない」「一度も実行されていない」に振り分けます。最初の実行では、九件の呼び出しを「一度も実行されていない」と判定しましたが、九件すべてが、自分のトランスクリプト読み取り側の不具合で、それぞれテストになっています。自分の発見を自分で覆せる道具であること。それがこの検査の狙いです。
+どの行も、監査ログに出どころのある事実です。レポートはローカルの追記専用ログを読むだけで、ネットワークに出ず、テレメトリも送りません。`termaxa replay --against-record` はもう一歩進んで、エージェントのトランスクリプトをそのログと突き合わせ、シェル呼び出しをすべて「判定済み」「フックは動いたが記録がない」「フックが一度も動いていない」に振り分けます。最初の実行では、九件の呼び出しを「フックが一度も動いていない」と判定しましたが、九件すべてが、自分のトランスクリプト読み取り側の不具合で、それぞれテストになっています。自分の発見を自分で覆せる道具であること。それがこの検査の狙いです。
 
 ## ハーネス
 
-| ハーネス | つなぎ方 | 判定がエージェントに届く経路 | 検証バージョン | 重要な注意点 |
+| ハーネス | つなぎ方 | 判定がエージェントに届く経路 | 測定した環境 | 重要な注意点 |
 |---|---|---|---|---|
 | **Claude Code** | `termaxa init --claude-code` → `.claude/settings.json`（`PreToolUse`、対象は `Bash` と書き込み系ツール） | 確認はエージェント内でプロンプトになる。拒否は理由とプレビューを運ぶ | 2.1.283（上の録画） | Bash の呼び出しはすべて前置きに包まれて届き、門番はそれを外枠として読む |
 | **Codex CLI** | `termaxa init --codex` → `.codex/hooks.json`（`Bash` と `apply_patch`） | **拒否のみ**：Codex は明示的な許可を受け付けず、確認の仕組みもないため、確認は理由つきの拒否になる。`apply_patch` は、書き込むファイルとして判定される | 0.155.1（2026年9月19日） | エージェントが拒否を読んで判断する。あなたにはプロンプトが出ない |
 | **Cursor** | `termaxa init --cursor` → `.cursor/hooks.json`（シェルとファイルのツール。`Delete` は削除として扱う） | 確認は、Allowlist と Run Everything で「Hook requested approval」と表示される。拒否はどのモードでもブロックされる | 3.21.16（2026年10月4日） | **Auto-review モードでは、Cursor のレビュアーがフックの確認を上書きして、コマンドを実行する。** 2026年10月5日に Cursor のサポートが確認し、開発チームにも報告済み。Termaxa では Allowlist か Run Everything を使うこと。`doctor` もそう表示する |
 | **Copilot CLI** | `termaxa init --copilot` → `.github/hooks/hooks.json` | 確認は Allow All でもプロンプトになる。拒否はブロックされる | 1.0.83 と 1.0.91（2026年10月4日） | Copilot は、フックの*許可*を承認として扱い、自分のプロンプトを省く。enforce モードでは、それは門番が承認していることになる。observe モードでは門番は黙っているので、Copilot のプロンプトは変わらない（v0.20.1 で、そうなっていなかった版を修正した） |
 | **Herdr** | `herdr plugin install termaxa/termaxa` | ペインが門番の下でエージェントを起動する。サイドバーに拒否が表示され、記録が隣に開く | [`herdr-plugin/`](herdr-plugin/) を参照 | プラグインは、自分が起動するハーネスをつなぐ |
-| **それ以外** | `termaxa run -- <cmd>`、または `termaxa wrap -- <agent>`（Unix） | `run` はコマンドを門番に通す。`wrap` は、エージェントが名前で解決するシェルにシムを置く | `wrap` 配下の Claude Code、Linux、zsh あり・なしの両方 | `/bin/sh` を絶対パスで指定するハーネスは `wrap` の外に出る。入口はフック |
+| **それ以外** | `termaxa run -- <cmd>`、または `termaxa wrap -- <agent>`（Unix） | `run` は一つのコマンドを門番に通す。`wrap` は、エージェントが名前で解決するシェルにシムを置く | `wrap` 配下の Claude Code、Linux、zsh あり・なしの両方 | `/bin/sh` を絶対パスで指定するハーネスは `wrap` の外に出る。入口はフック |
 
 ハーネスはそれぞれ独自の方言を話し、方言は変わります。Cursor 3.11 がフックのイベント名を変え、v0.11.4 で直るまで、四つのリリースのあいだ門番が効いていませんでした。方言はバージョンごとに [docs/dialects.md](docs/dialects.md) に記録してあります。そして、フックは読めないペイロードに対して、設計上、**フェイルオープン**します。ハーネスの更新のたびにフェイルクローズする門番は、それ自体が障害になるからです。ポリシーの `unrecognised: deny` を使うと、無人で動かすときはこれを反転できます。
 
@@ -291,7 +293,7 @@ ran with no copy: 5
 
 **Enforce** が既定です。確認は確認を求め、拒否は拒否し、実行の前に保険をかけます。
 
-**Observe**（`mode: observe`、`termaxa init --observe`、または一台のマシンだけに効かせる `TERMAXA_MODE=observe`）は、すべてを実行し、強制していたら何をしたかを、保険も含めて記録します。フックは黙っているので、エージェント自身のプロンプトは変わりません。例外は floor です。`floor: true` が付いた 38 個のスターターのルールは、どちらのモードでも強制されます。保険をかけられないコマンドも同じです。対象は、門番自身の設定と状態（v0.21.3 以降は書き込みが着地するパスで止め、v0.21.4 以降は `cd` のあとでも止めます。それらのファイルを読むのは普通の作業です）、マシン本体とその復旧ポイント、復旧の手段がないコマンドです：`rm -rf /`、`mkfs`、デバイスへの `dd`、シャドウコピーの削除、`drop database`、データベースのリセット、`kubectl delete`、`terraform destroy`、`docker system prune`、`find -delete`。コピーの予算を超える削除は保険をかけられないため止まります。ただし、ビルドで作り直せるディレクトリ（プロジェクト内の `node_modules`、`.next`、`dist`、`target`、`.venv` とその仲間）は別で、observe モードでは何もコピーせずに実行されます。その中のものは、どれも唯一のコピーではないからです。v0.20 より前に書いたポリシーには floor の印がありません。決して緩めないルールに `floor: true` を足すか、[`examples/policy.yaml`](examples/policy.yaml) から 38 個を取ってください。設計と計測：[docs/observe-mode.md](docs/observe-mode.md)。
+**Observe**（`mode: observe`、`termaxa init --observe`、または一台のマシンだけに効かせる `TERMAXA_MODE=observe`）は、すべてを実行し、強制していたら何をしたかを、保険も含めて記録します。フックは黙っているので、エージェント自身の確認プロンプトは変わりません。例外は floor です。`floor: true` が付いた 38 個のスターターのルールは、どちらのモードでも強制されます。保険をかけられないコマンドも同じです。対象は、門番自身の設定と状態（v0.21.3 以降は書き込みが着地するパスで止め、v0.21.4 以降は `cd` のあとでも止めます。それらのファイルを読むのは普通の作業です）、マシン本体とその復旧ポイント、復旧の手段がないコマンドです：`rm -rf /`、`mkfs`、デバイスへの `dd`、シャドウコピーの削除、`drop database`、データベースのリセット、`kubectl delete`、`terraform destroy`、`docker system prune`、`find -delete`。コピーの予算を超える削除は保険をかけられないため止まります。ただし、ビルドで作り直せるディレクトリ（プロジェクト内の `node_modules`、`.next`、`dist`、`target`、`.venv` とその仲間）は別で、observe モードでは何もコピーせずに実行されます。その中のものは、どれも唯一のコピーではないからです。v0.20 より前に書いたポリシーには floor の印がありません。決して緩めないルールに `floor: true` を足すか、[`examples/policy.yaml`](examples/policy.yaml) から 38 個を取ってください。設計と計測：[docs/observe-mode.md](docs/observe-mode.md)。
 
 **Supervised**（Unix）は、判断の権限を移します。あなたとして動くデーモンがすべての判断を下し、エージェントは、監査ログを読めず、バックアップを編集できず、ポリシーを変更できず、スーパーバイザーを止められない、もう一つのアカウントで動きます。拒否するのはコードではなく、オペレーティングシステムだからです。
 
@@ -305,7 +307,7 @@ sudo -u termaxa-agent termaxa wrap -- claude
 
 **`wrap`**（Unix）は、フックを持たないエージェント向けです。`termaxa wrap -- <agent>` は、エージェントが名前で解決するシェルにシムを置き、Claude Code 向けには `CLAUDE_CODE_SHELL` を設定します。Claude Code はこれに従います。
 
-## 保険の対象と、対象外
+## 保険をかけられるもの、かけられないもの
 
 破壊的だからといって、復旧できるとは限りません。各行はコードが実際に行うことで、最後の二行は行わないことです。
 
@@ -382,7 +384,7 @@ circuit_breaker:
 | `termaxa` | これが何か、次に何を試すか |
 | `termaxa init [--claude-code\|--codex\|--cursor\|--copilot] [--observe]` | `.termaxa/` を作り、ツールを検出し、フックをインストールする。`--observe` は observe モードで開始する |
 | `termaxa replay [paths…] [--all]` | エージェントのトランスクリプトにあるすべてのコマンドを判定する。何も実行しない |
-| `termaxa replay --against-record` | トランスクリプトをこのマシンの記録と突き合わせる：判定済み、実行されたが記録されていない、一度も実行されていない。どちらかのバイパスが見つかると終了コード 1 |
+| `termaxa replay --against-record` | トランスクリプトをこのマシンの記録と突き合わせる：判定済み、フックは動いたが記録がない、フックが一度も動いていない。どちらかのバイパスが見つかると終了コード 1 |
 | `termaxa demo` | 使い捨てのプロジェクトで門番を動かす：三つのチェックと記録 |
 | `termaxa wrap -- <agent>` | シェル経由のコマンドを門番に通してエージェントを起動する（Unix） |
 | `termaxa supervise` | 判断デーモンを自分として実行する。フックはこれを通して判断する（Unix） |
@@ -424,7 +426,7 @@ Rust 2021、本番コードは約 19,100 行、テストは約 20,000 行、Linu
 
 ## セキュリティ
 
-バイパスを見つけましたか？ 報告の方法とその後の流れは [SECURITY.md](SECURITY.md) にあります。そこにある判定ルールがバグと呼ぶバイパスは、自分たちで見つけたものも、誰かが報告したものも、すべて、露出していた期間を UTC で添えたアドバイザリとして公開されます。それ以外は、制限として文書化されています。
+バイパスを見つけましたか？ 報告の方法とその後の流れは [SECURITY.md](SECURITY.md) にあります。そこにある判定ルールがバグと呼ぶバイパスは、自分たちで見つけたものも、誰かが報告したものも、すべて、影響を受けていた期間を UTC で添えたアドバイザリとして、そこで公開されます。それ以外は、制限として文書化されています。
 
 ## ライセンス
 
