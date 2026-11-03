@@ -12,7 +12,13 @@
 
 #[test]
 fn the_shipped_docs_are_valid_utf8() {
-    for name in ["CHANGELOG.md", "README.md", "SECURITY.md", "RELEASING.md"] {
+    for name in [
+        "CHANGELOG.md",
+        "README.md",
+        "README.ja.md",
+        "SECURITY.md",
+        "RELEASING.md",
+    ] {
         let path = concat_root(name);
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
         if let Err(e) = std::str::from_utf8(&bytes) {

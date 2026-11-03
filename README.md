@@ -2,6 +2,8 @@
 
 # 🛡 Termaxa
 
+[日本語](README.ja.md)
+
 **A gate between an AI coding agent and your shell.** Before a command runs, Termaxa shows what it would destroy, takes a backup it can restore, and asks or refuses by a policy you can read. For people running Claude Code, Codex, Cursor or Copilot CLI, alone or unattended.
 
 **Try it in ten seconds:** [play.termaxa.com](https://play.termaxa.com) runs the real gate on a throwaway project. **Install:** `brew install termaxa/tap/termaxa` or `cargo install termaxa`.
