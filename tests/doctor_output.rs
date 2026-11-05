@@ -158,12 +158,16 @@ fn an_initialised_project_without_an_agent_has_nothing_to_fix() {
     let bin = controlled_path(&tmp);
     let proj = project(&tmp, DENIES);
     // `init` records the policy baseline, which is the remaining problem in
-    // an otherwise healthy tree.
+    // an otherwise healthy tree. It runs on the same controlled PATH as
+    // `doctor` below: with the developer's PATH it found a `claude` on a box
+    // that has one, wired the hook, and `doctor`, which cannot see that
+    // `claude`, reported the hook as not firing (roadmap §2d item 5).
     Command::new(env!("CARGO_BIN_EXE_termaxa"))
         .arg("init")
         .current_dir(&proj)
         .env("TERMAXA_HOME", tmp.join("home"))
         .env("NO_COLOR", "1")
+        .env("PATH", &bin)
         .output()
         .expect("the binary must be runnable");
 
