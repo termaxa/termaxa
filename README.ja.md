@@ -229,7 +229,7 @@ Termaxa doctor
 
 Policy
 ✓ /home/dev/proj/.termaxa/policy.yaml
-  224 rule(s), default ask
+  229 rule(s), default ask
   enforce mode (default)
   fingerprint 69edb158b1af
   ✓ unchanged since 2026-10-07T06:54:22Z
@@ -347,7 +347,7 @@ circuit_breaker:
   threshold: 2
 ```
 
-`init` が書き出すスターターには 224 個のルールがあります。内訳は許可 157、確認 14、拒否 53 で、うち 38 が floor です。ネイティブのファイルツール（Claude Code の `Write`、Cursor の `Delete`、Codex の `apply_patch`）は、同じパスのルールで、対象によって判定されます。門番自身のファイルは、読めるけれども、エージェントが気づかれずに書き換えることはできないルールで守られています。`doctor` がフィンガープリントを報告します。`unrecognised: deny` と `backup_failure: deny` は、無人で動かすときの二つのスイッチです。
+`init` が書き出すスターターには 229 個のルールがあります。内訳は許可 162、確認 14、拒否 53 で、うち 38 が floor です。ネイティブのファイルツール（Claude Code の `Write`、Cursor の `Delete`、Codex の `apply_patch`）は、同じパスのルールで、対象によって判定されます。門番自身のファイルは、読めるけれども、エージェントが気づかれずに書き換えることはできないルールで守られています。`doctor` がフィンガープリントを報告します。`unrecognised: deny` と `backup_failure: deny` は、無人で動かすときの二つのスイッチです。
 
 ## アーキテクチャ
 
@@ -418,11 +418,11 @@ Termaxa は 1.0 より前の版です。実際に動き、テストされてい�
 - **フォーマットはまだ変わるかもしれません。** リリースを固定してください。
 - **Windows PowerShell 5.1 は、リダイレクトした Unicode を壊します。** `termaxa report > out.txt` は UTF-16 で書き出し、罫線の文字を文字化けさせます。PowerShell 7 を使うか、`termaxa report --md | Out-File -Encoding utf8 report.md` を使ってください。
 
-実際の利用で見つかったバグは、どう見つかったか、どこで直したかとともに、すべて [docs/found-in-the-wild.md](docs/found-in-the-wild.md) にあります。現時点で 48 件です。脅威モデルと公開済みのアドバイザリは [SECURITY.md](SECURITY.md) にあります。
+実際の利用で見つかったバグは、どう見つかったか、どこで直したかとともに、すべて [docs/found-in-the-wild.md](docs/found-in-the-wild.md) にあります。現時点で 50 件です。脅威モデルと公開済みのアドバイザリは [SECURITY.md](SECURITY.md) にあります。
 
 ## コントリビュート
 
-Rust 2021、本番コードは約 19,100 行、テストは約 20,000 行、Linux 上のテストは 599 件、CI は Linux、macOS、Windows で動きます。`cargo fmt`、`cargo clippy -- -D warnings`、`cargo test` が関門で、門番のルールは門番自身にも適用されます。ここでは意見より計測が勝ちます。判定を変える変更には、それを示すフィクスチャを付けてください。
+Rust 2021、本番コードは約 19,300 行、テストは約 20,100 行、Linux 上のテストは 602 件、CI は Linux、macOS、Windows で動きます。`cargo fmt`、`cargo clippy -- -D warnings`、`cargo test` が関門で、門番のルールは門番自身にも適用されます。ここでは意見より計測が勝ちます。判定を変える変更には、それを示すフィクスチャを付けてください。
 
 ## セキュリティ
 

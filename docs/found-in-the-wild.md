@@ -14,7 +14,7 @@ wording of each entry kept close to the changelog's own.
 Entries are dated by the day the changelog gives for the finding; where it
 gives none, by the release that fixed it.
 
-**48 bugs, in 26 episodes, as of v0.21.5.**
+**50 bugs, in 27 episodes, as of v0.21.8.**
 
 ## 2026
 
@@ -293,6 +293,27 @@ which ran the exe on such a machine. Fixed in
 [v0.21.5](https://github.com/termaxa/termaxa/releases/tag/v0.21.5)
 ([#151](https://github.com/termaxa/termaxa/issues/151)): the Windows build links
 the C runtime statically. 1 bug.
+
+### November 5 — the SynCircles record: a line of a file judged as a command
+
+An agent (Claude Code, headless) built a real product under the gate in
+observe mode for ten days, Oct 26 to Nov 5, 2026, and its record, 123 hook
+verdicts, was replayed through `check` on each release. Two defects in the
+reading of heredocs came out of it, both on lines the shell never runs.
+
+The agent writes a file through a heredoc and builds, tests or commits in the
+same call, and that line keeps the body read line by line, so the first line
+of the file with no rule fell to the policy default: `cat > src/lib/photos.ts
+<<'EOF' … EOF` followed by `npm run build` asked on `import type {…}`, and 36
+of the 38 heredoc writes in the record did the same. And a `python3 - <<'EOF'`
+edit of `scripts/smoke.mjs` carried a JavaScript template literal,
+``console.log(`… / -> ${new URL(home.url).pathname}`)``, which read as a
+command was refused as an unresolved path; 0.21.6 had missed that line behind
+the quote bug GHSA-rp8h-f4h4-w4j3 fixed, and 0.21.7's correct split exposed
+the older refusal. Found by replaying the record. Fixed in
+[v0.21.8](https://github.com/termaxa/termaxa/releases/tag/v0.21.8)
+([#163](https://github.com/termaxa/termaxa/pull/163)): a line of a body the
+shell never runs is matched against deny rules only. 2 bugs.
 
 ## Adding an entry
 

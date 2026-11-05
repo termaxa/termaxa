@@ -2,6 +2,31 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.21.8 — a line of a file is not a command, and the demo runs on a project the gate can see
+
+**In plain words:** an agent that writes a file through a heredoc and builds, tests or commits in the same call was asked about the first line of the file that matched no rule, and once refused on a JavaScript line for looking like a path. The file's contents are now data: a hard stop spelled in them still denies, nothing else in them is a verdict, and the build or the commit after them is what gets judged. `termaxa demo` had been denying its own three checks since v0.21.3, because its scratch project sat under `~/.termaxa`, which the floor protects; it now builds in the temp directory. Five heads an unattended agent ran this week join the starter as allows.
+
+Measured on the SynCircles record: an agent (Claude Code, headless) building a real Next.js and Supabase product under the gate in observe mode, Oct 26 to Nov 5, 2026, 123 hook verdicts, every command replayed through `check` on each release. Two code PRs (#163, #164).
+
+### Changed
+
+- A line of a literal heredoc's body that the shell never runs, the contents of a file written by `cat` or `tee` or the program of an interpreter (`python3 -`, `node -`, `psql`), is matched against deny rules and nothing else, even when the rest of the line keeps the body read because it could run the file (`git commit`, `npm run build`, `supabase db push`, a `$(…)`). A hard stop in it denies, as before; a line that matches no rule is data, never the policy default; no target in it is resolved, previewed, insured, classified or read for context signals (`delete from` in a migration's text no longer escalates the write). A body a shell runs (`bash <<'EOF'`), an unquoted body, and a body written where it runs on its own (a git hook, `profile.d`) are commands, as before (#163).
+- The delimiter line that ends a heredoc is never a segment: the shell reads it only to end the body, and a line that kept its bodies read asked on `EOF` (#163).
+- `termaxa demo` builds its scratch project at `<temp dir>/termaxa-demo-<ts>`. Under `~/.termaxa/demo/project-<ts>`, where it sat since the demo shipped, the floor's path rule on the gate's own files (`*/.termaxa/*`, v0.21.3) denied all three checks with "Termaxa's own config is off limits", where the narration promised a counted blast radius, a `.env` rule and an ask with insurance planned. Its test now runs with a state directory named `.termaxa`, as a user's is, which is how the test had missed it (#164).
+- Starter: `mkdir *`, `ps`, `ps *`, `sleep *` and `tee *` are allows; 229 rules, 162 of them allows, 38 on the floor. `tee`'s file is judged by the path rules and copied first, as a redirect's target is (#164).
+
+### Measured and documented
+
+- On the record's 123 verdicts, with the repository's own policy (0.21.6's starter, observe mode): the hook's verdicts were 34 allow, 88 ask, 1 deny (a `drop table` the agent wrote by hand for a planted stray table, not on the floor, so it ran). `check` on the released 0.21.6 returns the same 123. On 0.21.7: 36 allow, 85 ask, 2 deny: two heredoc writes became allows, the only two with nothing else on the line, since 36 of the 38 were on a line that also built, tested or committed and that reading kept their bodies read; and one ask became a deny, the template literal (#163's commit message gives 0.21.7 the 0.21.6 figures; these are the measured ones). On this release: 36 allow, 86 ask, 1 deny, every remaining ask on a command, none on a line of a file. With eleven project rules for the project's own loop (`npm run build|smoke|lint`, `npm ci`, `npx eslint`, `mkdir`, `ps`, `supabase migration new|list`, `supabase db push --db-url`, `git revert`): 58 allow, 64 ask, 1 deny. What still asks is the Supabase CLI's `db query`, `python3 -` edits, `git push`, `timeout N <cmd>` (not stepped over as `env` is; next), `sed` reads of `.env.local`, `kill` and `pkill`, `curl` to localhost.
+- The two reading changes do not move the conformance test against bash, which still holds on 1,500 generated command lines per run.
+- SECURITY.md says which heredoc bodies are data and which are commands. docs/found-in-the-wild.md gains the two findings from the record, 50 now.
+- The doctor test's `init` runs on the same controlled PATH as its `doctor`; on a box with `claude` installed it had wired a hook the test could not see.
+- 602 tests on Linux (three new), 516 on Windows.
+
+### Docs
+
+- README.ja.md, a Japanese translation of the README as of v0.21.7, by Lesstep (#162), reviewed line by line against the English before merge; the English is authoritative and the translation says so.
+
 ## v0.21.7 — a comment hides no command, and a file written through a heredoc is judged by its path
 
 **In plain words:** the shell reads neither a `#` comment nor a heredoc's body as syntax, but the gate did: a quote in either (`# it's clean`, a body line `echo it's`) opened a string that carried the lines after it into the same segment, where the first line's verdict covered them. With the starter, `git status # it's clean` above `kubectl delete namespace staging` was allowed by `git status*`, though `kubectl delete*` is a hard stop. Comments and heredoc bodies are now read the way the shell reads them. And a file written with `cat > file <<'EOF'`, which is how agents write files through the shell, was read a line at a time as commands: on the first SynCircles run (Oct 25, 2026) that was the largest class of asks on real work, about 8 of 26. A literal heredoc that `cat` or `tee` writes to a file is now judged as the write it is, by its path, as a write through the Write tool is.
