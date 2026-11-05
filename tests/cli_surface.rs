@@ -112,11 +112,24 @@ fn run_termaxa(
 /// wrapper used to recurse without end (#65), and a hung test is worse
 /// than a failed one.
 fn termaxa_within(home: &Path, cwd: &Path, args: &[&str], stdin: &str, secs: u64) -> Output {
+    termaxa_within_env(home, cwd, args, stdin, secs, &[])
+}
+
+/// `termaxa_within` with extra environment variables for the child.
+fn termaxa_within_env(
+    home: &Path,
+    cwd: &Path,
+    args: &[&str],
+    stdin: &str,
+    secs: u64,
+    envs: &[(&str, &Path)],
+) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_termaxa"));
     cmd.args(args)
         .current_dir(cwd)
         .env("TERMAXA_HOME", home)
         .env("NO_COLOR", "1")
+        .envs(envs.iter().map(|(k, v)| (*k, *v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -670,11 +683,24 @@ fn wrap_hands_the_agent_the_shim_for_its_own_shell_by_name() {
 /// starter denying a recursive delete with its blast radius, a path rule on
 /// `.env`, an ask with insurance planned, and the record. Nothing left
 /// behind under the temp directory.
+///
+/// The state directory here is named `.termaxa`, as a user's is: until
+/// v0.21.8 the project sat under it, where the floor's `*/.termaxa/*` rule
+/// denied every check, and a home named anything else hid that. The temp
+/// directory is the scratch tree too (`TMPDIR` on Unix, `TMP` and `TEMP` on
+/// Windows), so the project's removal can be checked.
 #[test]
 fn demo_runs_the_real_gate_on_a_throwaway_project() {
     let tmp = scratch("demo");
-    let home = tmp.join("home");
-    let out = termaxa_within(&home, &tmp, &["demo"], "", 60);
+    let home = tmp.join(".termaxa");
+    let out = termaxa_within_env(
+        &home,
+        &tmp,
+        &["demo"],
+        "",
+        60,
+        &[("TMPDIR", &tmp), ("TMP", &tmp), ("TEMP", &tmp)],
+    );
     assert_eq!(
         out.code, 0,
         "stdout: {}\nstderr: {}",
@@ -694,10 +720,15 @@ fn demo_runs_the_real_gate_on_a_throwaway_project() {
             out.stdout
         );
     }
-    let leftovers: Vec<_> = std::fs::read_dir(home.join("demo"))
+    assert!(
+        !out.stdout.contains("off limits"),
+        "the demo's own project must not sit under the gate's files:\n{}",
+        out.stdout
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&tmp)
         .map(|d| {
             d.flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("project-"))
+                .filter(|e| e.file_name().to_string_lossy().starts_with("termaxa-demo-"))
                 .collect()
         })
         .unwrap_or_default();

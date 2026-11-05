@@ -1,13 +1,20 @@
 //! `termaxa demo`: the gate on a throwaway project, in twenty seconds.
 //!
-//! Builds a scratch project under the demo state directory (`~/.termaxa/demo`,
-//! where zero-setup `check` runs already keep their log) - twelve files
-//! in `scratch/`, a `.env`, the starter policy - and runs the real `check`
-//! and `log` subcommands in it through the current executable, with one line
-//! of narration before each. Nothing here is a mock: the previews, verdicts
+//! Builds a scratch project in the system temp directory - twelve files in
+//! `scratch/`, a `.env`, the starter policy - and runs the real `check` and
+//! `log` subcommands in it through the current executable, with one line of
+//! narration before each. Nothing here is a mock: the previews, verdicts
 //! and audit lines are the ones a user gets, on a tree that exists. The
 //! project is removed afterwards; the audit log stays under the state
 //! directory like any other project's.
+//!
+//! Until v0.21.8 the project sat under the demo state directory,
+//! `~/.termaxa/demo/project-<ts>`, and from v0.21.3, when the gate's own
+//! files became a path rule on the floor (`*/.termaxa/*`), every check in it
+//! was denied by that rule: the demo promised a blast radius, a `.env` rule
+//! and an ask, and printed "Termaxa's own config is off limits" three times
+//! (found Nov 2, 2026, writing a reviewer's quickstart). The test ran with a
+//! `TERMAXA_HOME` whose name was not `.termaxa`, so it never saw it.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -31,7 +38,7 @@ const STEPS: &[(&str, &str)] = &[
 
 pub fn run() -> Result<i32> {
     let exe = std::env::current_exe().context("cannot find the termaxa binary")?;
-    let root = crate::paths::demo_state_dir()?.join(format!("project-{}", crate::audit::now().0));
+    let root = std::env::temp_dir().join(format!("termaxa-demo-{}", crate::audit::now().0));
     build_project(&root)?;
     let result = play(&exe, &root);
     let _ = std::fs::remove_dir_all(&root);
