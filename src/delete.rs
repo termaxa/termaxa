@@ -453,7 +453,10 @@ pub fn segment_targets(segment: &crate::shell::Segment) -> Vec<Tok> {
 /// field report, Oct 9, 2026).
 pub fn targets_in(command: &str, start: &Path) -> Vec<(Tok, Option<PathBuf>)> {
     let mut out = Vec::new();
-    for seg in crate::shell::split_segments_deep(command) {
+    for seg in crate::shell::split_segments_deep(command)
+        .into_iter()
+        .filter(|s| !s.body_line)
+    {
         let targets = segment_targets(&seg);
         if targets.is_empty() {
             continue;

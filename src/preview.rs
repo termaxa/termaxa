@@ -71,7 +71,7 @@ pub fn generate(
     // the gate cannot follow has no live preview: it would describe a
     // directory nobody knows it runs in (#84).
     let segments = crate::shell::split_segments_deep(command);
-    if let Some(p) = segments.iter().find_map(|s| {
+    if let Some(p) = segments.iter().filter(|s| !s.body_line).find_map(|s| {
         let dir = crate::delete::operand_base(s, cwd)?;
         generate_one(s, &dir, live)
     }) {

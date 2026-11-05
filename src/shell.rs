@@ -244,11 +244,15 @@ fn split_with(s: &str, bodies_as_data: bool) -> Vec<Segment> {
                 // reading would too, the walk steps over them instead: they
                 // are data. Whether the rest of the line leaves them data is
                 // decided once it is read (`quiet`, at the end).
+                // The delimiter line itself runs nothing: the shell reads it
+                // only to end the body. Until Oct 2026 it was read as a
+                // command with the body, so a line that kept its bodies read
+                // (a write, then `npm run build`) asked on `EOF`.
                 if c == '\n' && !pending.is_empty() {
                     let heredocs = std::mem::take(&mut pending);
-                    let end = heredoc_bodies_end(&chars, i + 1, &heredocs, true);
+                    let (bodies, end) = heredoc_bodies(&chars, i + 1, &heredocs, true);
                     let data = bodies_as_data
-                        && end == heredoc_bodies_end(&chars, i + 1, &heredocs, false)
+                        && end == heredoc_bodies(&chars, i + 1, &heredocs, false).1
                         && heredocs
                             .iter()
                             .all(|h| h.literal && segments.get(h.owner).is_some_and(literal_data));
@@ -257,7 +261,19 @@ fn split_with(s: &str, bodies_as_data: bool) -> Vec<Segment> {
                             segments[h.owner].literal_body = true;
                         }
                     } else {
-                        read_lines(&mut segments, &chars[i + 1..end]);
+                        for (h, (from, to)) in heredocs.iter().zip(bodies) {
+                            // A literal body that is a file's contents or an
+                            // interpreter's program is data even when the
+                            // rest of the line keeps it read: its lines are
+                            // matched against deny rules and nothing else
+                            // (`body_line`). A body a shell runs, or one the
+                            // shell expands, is commands, as before.
+                            let data_lines = h.literal
+                                && segments
+                                    .get(h.owner)
+                                    .is_some_and(|o| literal_data(o) || interpreter_data(o));
+                            read_lines(&mut segments, &chars[from..to], data_lines);
+                        }
                     }
                     seg_start = end;
                     i = end;
@@ -441,22 +457,28 @@ fn heredoc_delimiter(raw: &str) -> Option<(String, bool)> {
     (quote.is_none() && !out.trim().is_empty() && !out.contains('\n')).then_some((out, literal))
 }
 
-/// Where the bodies of `heredocs` end, read in order from `from`: each runs
-/// to its delimiter line, compared as the shell compares it (the whole
-/// line, leading tabs stripped under `<<-`, nothing else), or to the end of
-/// the input when that line never comes. Not `exact`: a line ends a body
-/// when it equals the delimiter once both are trimmed, which is how a body
-/// is checked before it is stepped over, so that a line the shell would
+/// The bodies of `heredocs`, read in order from `from`, and where the last
+/// one's delimiter line ends. Each body runs to its delimiter line, compared
+/// as the shell compares it (the whole line, leading tabs stripped under
+/// `<<-`, nothing else), or to the end of the input when that line never
+/// comes; a body is a span of `chars` without its delimiter line, which the
+/// shell reads only to end the body and never runs. Not `exact`: a line ends
+/// a body when it equals the delimiter once both are trimmed, which is how a
+/// body is checked before it is stepped over, so that a line the shell would
 /// not end on (a trailing space, a carriage return) keeps it read.
-fn heredoc_bodies_end(
+fn heredoc_bodies(
     chars: &[char],
     from: usize,
     heredocs: &[PendingHeredoc],
     exact: bool,
-) -> usize {
+) -> (Vec<(usize, usize)>, usize) {
     let mut pos = from;
+    let mut bodies = Vec::with_capacity(heredocs.len());
     for h in heredocs {
+        let start = pos;
+        let mut body_end = None;
         while pos < chars.len() {
+            let line_start = pos;
             let line_end = chars[pos..]
                 .iter()
                 .position(|&c| c == '\n')
@@ -474,25 +496,70 @@ fn heredoc_bodies_end(
                 None => false,
             };
             if ends {
+                body_end = Some(line_start);
                 break;
             }
         }
+        bodies.push((start, body_end.unwrap_or(pos)));
     }
-    pos
+    (bodies, pos)
 }
 
 /// Each line of `lines` read as a command line of its own, its segments
 /// appended: a heredoc's body, read as commands in case something runs it,
 /// with no quote in one line reaching the next.
-fn read_lines(segments: &mut Vec<Segment>, lines: &[char]) {
+fn read_lines(segments: &mut Vec<Segment>, lines: &[char], data_lines: bool) {
     let text: String = lines.iter().collect();
     for line in text.split('\n') {
         let mut read = split_segments(line);
         if let Some(last) = read.last_mut() {
             last.joiner = Joiner::Sequence;
         }
+        if data_lines {
+            for seg in &mut read {
+                seg.body_line = true;
+            }
+        }
         segments.append(&mut read);
     }
+}
+
+/// Whether a literal heredoc fed to this segment is an interpreter's
+/// program, which the interpreter reads and the shell never runs (`python3 -
+/// <<'EOF'`, `node - <<'EOF'`, `psql … <<'EOF'`). The interpreter is named
+/// plainly as the segment's first word, and nothing on the segment can hand
+/// the body to the shell instead (the same exclusions as `literal_data`: no
+/// pipe, no substitution, no duplicated descriptor). A shell (`bash`, `sh`,
+/// `eval`, `source`) is not on the list: a body it reads is commands. Such a
+/// body's lines are still matched against deny rules (`body_line`), as a
+/// script file's are not: what the interpreter does with its program is the
+/// script-file limit, and a hard stop spelled in it still shows.
+fn interpreter_data(seg: &Segment) -> bool {
+    if matches!(seg.joiner, Joiner::Pipe | Joiner::Background) {
+        return false;
+    }
+    if ["$(", "`", "<(", ">(", ">&", "$'"]
+        .iter()
+        .any(|p| seg.text.contains(p))
+    {
+        return false;
+    }
+    let words = crate::delete::tokenize_public(seg.command());
+    matches!(
+        words.first().map(String::as_str),
+        Some(
+            "python"
+                | "python3"
+                | "python2"
+                | "node"
+                | "ruby"
+                | "perl"
+                | "php"
+                | "psql"
+                | "mysql"
+                | "sqlite3"
+        )
+    )
 }
 
 /// Whether a literal heredoc fed to this segment is a file's contents.
@@ -741,11 +808,16 @@ fn landing(seg: &Segment, target: &str) -> Option<String> {
 /// (the independent review, Oct 27, 2026). A `cd` the gate cannot follow
 /// counts too.
 fn lands_where_it_runs(seg: &Segment) -> bool {
-    seg.literal_body
-        && written_files(seg)
-            .unwrap_or_default()
-            .iter()
-            .any(|f| landing(seg, f).is_none_or(|path| runs_on_its_own(&path)))
+    seg.literal_body && writes_where_it_runs(seg)
+}
+
+/// Whether a `cat` or `tee` segment writes a file that runs on its own once
+/// its `cd`s are followed, or one whose directory the gate cannot follow.
+fn writes_where_it_runs(seg: &Segment) -> bool {
+    written_files(seg)
+        .unwrap_or_default()
+        .iter()
+        .any(|f| landing(seg, f).is_none_or(|path| runs_on_its_own(&path)))
 }
 
 /// Whether the `#` at `i` starts a comment: it begins a word, at the start
@@ -848,13 +920,21 @@ const MAX_WRAP_DEPTH: usize = 4;
 /// whole command line use this; callers handed one segment's text and
 /// asked about that segment alone keep `split_segments`.
 pub fn split_segments_deep(s: &str) -> Vec<Segment> {
-    let out = expand_line(s, true);
+    let mut out = expand_line(s, true);
     // As `split_with` checks a line, for the whole of it read through its
     // wrappers, and with each heredoc's write followed to where it lands.
     if out.iter().any(|seg| seg.literal_body)
         && (!out.iter().all(quiet) || out.iter().any(lands_where_it_runs))
     {
-        return expand_line(s, false);
+        out = expand_line(s, false);
+    }
+    // A body kept read is data (`Segment::body_line`) unless the line writes
+    // a file that runs on its own once its `cd`s are followed: that body is
+    // code that will run, and every line of it is a command, as before.
+    if out.iter().any(|seg| seg.body_line) && out.iter().any(writes_where_it_runs) {
+        for seg in &mut out {
+            seg.body_line = false;
+        }
     }
     out
 }
@@ -1784,9 +1864,12 @@ pub fn context_text(command: &str) -> String {
         }
         return command.to_string();
     }
+    // A line of a heredoc body the shell never runs is left out on the
+    // same terms as a literal body above: `delete from` in a migration's
+    // text is not a signal about the write that puts it in a file.
     let kept: Vec<&str> = segs
         .iter()
-        .filter(|s| !s.wraps && !s.scaffold && !s.binds)
+        .filter(|s| !s.wraps && !s.scaffold && !s.binds && !s.body_line)
         .map(|s| s.text.as_str())
         .collect();
     // Nothing left to judge - a `-c` string that is all preamble, or the
@@ -2001,6 +2084,21 @@ pub struct Segment {
     /// interpreter, a build tool, a shell, a function, an assignment, a group
     /// piped as a whole: `quiet`).
     pub literal_body: bool,
+    /// True when this segment is a line of a literal heredoc's body that the
+    /// shell never runs: a file's contents (`literal_data`) or an
+    /// interpreter's program (`interpreter_data`), kept read because the
+    /// rest of the line could run the file (`quiet`), or because the
+    /// interpreter reads it. Such a line is matched against deny rules and
+    /// nothing else: a hard stop spelled in it still denies, a line that
+    /// matches no rule is data and never the policy default, and no target
+    /// in it is resolved, previewed or insured. Until Nov 2026 every such
+    /// line was a command: on the SynCircles record (Oct 26 to Nov 5, 2026,
+    /// 123 verdicts) 36 of the 38 heredoc writes were on a line that also
+    /// built, tested or committed, so each asked on its first body line
+    /// without a rule (`import x from "y"`), and a JavaScript line with a
+    /// template literal in a `python3 -` body was refused as an unresolved
+    /// path (`${new URL(…)}`).
+    pub body_line: bool,
     /// The operator that ended this segment, which decides whether a `cd`
     /// in it carries over to the next one: through `&&`, `;` and a newline
     /// it does; through `|` and `&` it ran in a subshell and does not.
@@ -2247,6 +2345,7 @@ fn flush(
             // starts a word, and the comment runs to the end of the line.
             keyword: t.starts_with('#'),
             literal_body: false,
+            body_line: false,
             joiner,
             dir: RunDir::Start,
         });
@@ -2454,7 +2553,8 @@ mod tests {
             ("echo a >| log", vec!["echo a"]),
             ("cat > \"my file.txt\"", vec!["cat"]),
             ("rm > early -rf ./cache", vec!["rm  -rf ./cache"]),
-            ("cat <<EOF\nbody\nEOF", vec!["cat", "body", "EOF"]),
+            // the delimiter line ends the body and runs nothing
+            ("cat <<EOF\nbody\nEOF", vec!["cat", "body"]),
             ("cat <<< word", vec!["cat"]),
             ("exec 3<&0", vec!["exec"]),
             ("exec 3<> /tmp/f", vec!["exec"]),
@@ -2489,7 +2589,7 @@ mod tests {
                 vec!["rm -rf ./cache > /dev/null 2>&1"],
             ),
             ("sort < in.txt > out.txt", vec!["sort < in.txt > out.txt"]),
-            ("cat <<EOF\nbody\nEOF", vec!["cat <<EOF", "body", "EOF"]),
+            ("cat <<EOF\nbody\nEOF", vec!["cat <<EOF", "body"]),
             ("exec 3<&0", vec!["exec 3<&0"]),
             ("tee >(gzip) file", vec!["tee >(gzip) file"]),
             ("cat > \"my file.txt\"", vec!["cat > \"my file.txt\""]),
@@ -3773,7 +3873,68 @@ mod tests {
     /// the shell finds it: a quote in a body line, or in the delimiter line
     /// itself, reaches no further, and what follows the heredoc is read as
     /// its own commands. Until Oct 2026 the walk went on over the body as
-    /// over any other text.
+    /// over any other text. The delimiter line itself is no segment: the
+    /// shell reads it only to end the body and runs nothing there (until Oct
+    /// 2026 it was read with the body, and a line that kept its bodies read
+    /// asked on `EOF`).
+    /// A literal body kept read because the line also builds, tests or
+    /// commits, or because an interpreter reads it, is data: each of its
+    /// lines is a segment marked `body_line`, the delimiter line is no
+    /// segment, and the rest of the line is read as before. A body a shell
+    /// runs, an unquoted body, and a body written where it runs on its own
+    /// are commands, with no such mark.
+    #[test]
+    fn a_body_the_shell_never_runs_is_data_even_when_the_line_builds() {
+        let flagged = |cmd: &str| -> Vec<(String, bool)> {
+            split_segments_deep(cmd)
+                .iter()
+                .map(|s| (s.to_string(), s.body_line))
+                .collect()
+        };
+        // the SynCircles habit: write, then build, in one call
+        assert_eq!(
+            flagged("cat > src/x.ts <<'EOF'\nimport x from \"y\";\nEOF\nnpm run build"),
+            [
+                ("cat > src/x.ts <<'EOF'".to_string(), false),
+                ("import x from \"y\"".to_string(), true),
+                ("npm run build".to_string(), false),
+            ]
+        );
+        // `git commit` keeps the body read (it runs hooks); the delimiter
+        // line is still no segment
+        assert_eq!(
+            flagged("cat > a.txt <<'EOF'\nls\nEOF\ngit add a.txt && git commit -q -m x"),
+            [
+                ("cat > a.txt <<'EOF'".to_string(), false),
+                ("ls".to_string(), true),
+                ("git add a.txt".to_string(), false),
+                ("git commit -q -m x".to_string(), false),
+            ]
+        );
+        // an interpreter's program: data from the first reading
+        assert_eq!(
+            flagged("python3 - <<'EOF'\np='a'\nopen(p,'w').write('x')\nEOF"),
+            [
+                ("python3 - <<'EOF'".to_string(), false),
+                ("p='a'".to_string(), true),
+                ("open(p,'w').write('x')".to_string(), true),
+            ]
+        );
+        // commands, not data: a shell reads it, the shell expands it, or it
+        // lands where it runs on its own
+        for cmd in [
+            "bash <<'EOF'\nls\nEOF",
+            "cat > n.txt <<EOF\nls\nEOF\nnpm run build",
+            "cat > .git/hooks/pre-commit <<'EOF'\nls\nEOF\nnpm run build",
+            "cd /etc/profile.d && cat > x.sh <<'EOF'\nls\nEOF\nnpm run build",
+            "cat > a.txt <<'EOF' | sh\nls\nEOF",
+        ] {
+            let segs = split_segments_deep(cmd);
+            assert!(segs.iter().all(|s| !s.body_line), "{cmd}: {segs:?}");
+            assert!(segs.iter().any(|s| &**s == "ls"), "{cmd}: {segs:?}");
+        }
+    }
+
     #[test]
     fn a_heredoc_body_is_read_a_line_at_a_time_to_the_shells_delimiter_line() {
         let texts = |cmd: &str| -> Vec<String> {
@@ -3781,42 +3942,39 @@ mod tests {
         };
         assert_eq!(
             texts("cat <<EOF\necho it's\nEOF\nkubectl delete namespace staging"),
-            [
-                "cat <<EOF",
-                "echo it's",
-                "EOF",
-                "kubectl delete namespace staging"
-            ]
+            ["cat <<EOF", "echo it's", "kubectl delete namespace staging"]
         );
         assert_eq!(
             texts("ssh host <<'EOF'\nIt's late\nEOF\nls"),
-            ["ssh host <<'EOF'", "It's late", "EOF", "ls"]
+            ["ssh host <<'EOF'", "It's late", "ls"]
         );
         // the delimiter the shell computes: quotes of the other kind stay
         assert_eq!(
             texts("sh <<'E\"OF'\nit's\nE\"OF\nls"),
-            ["sh <<'E\"OF'", "it's", "E\"OF", "ls"]
+            ["sh <<'E\"OF'", "it's", "ls"]
         );
         assert_eq!(
             texts("cat <<\"E'O\"F | cat\nE'OF\nls"),
-            ["cat <<\"E'O\"F", "cat", "E'OF", "ls"]
+            ["cat <<\"E'O\"F", "cat", "ls"]
         );
         // its word ends at a metacharacter: here a heredoc and a write
         let segs = split_segments("sh <<'EOF'>f\nbody\nEOF\nls");
         assert_eq!(
             texts("sh <<'EOF'>f\nbody\nEOF\nls"),
-            ["sh <<'EOF'>f", "body", "EOF", "ls"]
+            ["sh <<'EOF'>f", "body", "ls"]
         );
         assert_eq!(segs[0].redirects[0].target, "f");
         // `<<-` strips leading tabs before comparing; a trailing space or a
-        // carriage return is no delimiter line, and the body goes on
+        // carriage return is no delimiter line, and the body goes on: that
+        // line is body, read like any other, and only the shell's delimiter
+        // line is left out
         assert_eq!(
             texts("sh <<-'EOF'\n\tit's\n\tEOF\nls"),
-            ["sh <<-'EOF'", "it's", "EOF", "ls"]
+            ["sh <<-'EOF'", "it's", "ls"]
         );
         assert_eq!(
             texts("cat <<'EOF'\nit's\nEOF \nls\nEOF\nrm -rf x"),
-            ["cat <<'EOF'", "it's", "EOF", "ls", "EOF", "rm -rf x"]
+            ["cat <<'EOF'", "it's", "EOF", "ls", "rm -rf x"]
         );
         // a delimiter line the shell would not end on keeps the body going,
         // so a quote in a line after it is still body, read on its own line
@@ -3827,7 +3985,6 @@ mod tests {
                 "body",
                 "EOF",
                 "it's",
-                "EOF",
                 "kubectl delete namespace staging"
             ]
         );
@@ -3851,7 +4008,7 @@ mod tests {
         // two on one line, read in order
         assert_eq!(
             texts("cat <<A; cat <<'B'\nit's\nA\nit's\nB\nls"),
-            ["cat <<A", "cat <<'B'", "it's", "A", "it's", "B", "ls"]
+            ["cat <<A", "cat <<'B'", "it's", "it's", "ls"]
         );
         // a `<<` inside a comment opens nothing
         assert_eq!(

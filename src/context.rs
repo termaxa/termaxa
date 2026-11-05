@@ -117,7 +117,10 @@ pub fn gather_with(command: &str, readable: &dyn Fn(&str) -> bool) -> Vec<Signal
 /// every write or run found, one per kind, in a stable order.
 pub fn option_effects(command: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for seg in crate::shell::split_segments_deep(command) {
+    for seg in crate::shell::split_segments_deep(command)
+        .into_iter()
+        .filter(|s| !s.body_line)
+    {
         let raw = crate::pg::shell_tokens(seg.command());
         let toks = crate::delete::without_any_wrappers(&raw).unwrap_or(raw);
         let Some(first) = toks.first() else {
@@ -715,6 +718,24 @@ mod tests {
         assert!(signals
             .iter()
             .any(|s| s.label.contains("destructive flag") && s.escalate));
+    }
+
+    /// A migration's text written through a heredoc is data even when the
+    /// line goes on to push it: `delete from` in the body escalated the
+    /// write of `supabase/migrations/…_invites_connections.sql` to an ask
+    /// on the SynCircles record (Oct 28, 2026). The same statement typed as
+    /// a command is still a signal.
+    #[test]
+    fn a_heredoc_body_the_shell_never_runs_is_no_signal() {
+        let signals = gather(
+            "cat > supabase/migrations/x.sql <<'EOF'\ndelete from public.connections where a = b;\nEOF\nsupabase db push",
+        );
+        assert!(
+            !signals.iter().any(|s| s.label.contains("destructive SQL")),
+            "{signals:?}"
+        );
+        let signals = gather("psql -c \"delete from users\"");
+        assert!(signals.iter().any(|s| s.label.contains("destructive SQL")));
     }
 
     #[test]

@@ -626,6 +626,27 @@ impl Policy {
         let total = segments.len();
         let mut worst: Option<(usize, Decision)> = None;
         for (i, seg) in segments.iter().enumerate() {
+            // A line of a heredoc's body that the shell never runs, kept
+            // read because the line could run the file it writes (`cat >
+            // next.config.ts <<'EOF' … EOF && npm run build`) or because an
+            // interpreter reads it (`python3 - <<'EOF'`): a hard stop
+            // spelled in it still denies, and nothing else in it is a
+            // verdict. Judged as a command, `import x from "y"` fell to the
+            // default and a JavaScript template literal was refused as an
+            // unresolved path (the SynCircles record, Oct 26 to Nov 5,
+            // 2026). No target in such a line is resolved.
+            if seg.body_line {
+                let Some(d) = self.deny_rule_for(seg) else {
+                    continue;
+                };
+                if worst
+                    .as_ref()
+                    .is_none_or(|(_, w)| severity(d.action) > severity(w.action))
+                {
+                    worst = Some((i, d));
+                }
+                continue;
+            }
             // Judged where it runs: `cd .termaxa && echo x > policy.yaml`
             // writes `.termaxa/policy.yaml`, and the path rule on the gate's
             // own files has to see that path, not `./policy.yaml`.
@@ -712,6 +733,49 @@ impl Policy {
                 d.reason
             ),
         }
+    }
+
+    /// The deny rule a line of data matches, if any: first match per
+    /// reading as `evaluate` finds it, so an allow written above the deny it
+    /// excepts still covers the reading, and the privilege-wrapper and
+    /// path-named readings are matched against deny rules as there. No
+    /// policy default, no path rule, no resolution: the line is a heredoc
+    /// body the shell never runs (`Segment::body_line`), so what it names
+    /// is not a target, and only a hard stop spelled in it is a verdict.
+    pub fn deny_rule_for(&self, line: &str) -> Option<Decision> {
+        let views = readings(line);
+        let mut best: Option<(usize, &Rule)> = None;
+        for pv in deny_only_readings(line)
+            .iter()
+            .filter(|pv| !views.iter().any(|v| v == *pv))
+        {
+            if let Some((idx, rule)) = self
+                .rules
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.action == Action::Deny && r.matches(pv))
+            {
+                if best.is_none_or(|(bi, _)| idx < bi) {
+                    best = Some((idx, rule));
+                }
+            }
+        }
+        for v in &views {
+            if let Some((idx, rule)) = self.rules.iter().enumerate().find(|(_, r)| r.matches(v)) {
+                if rule.action == Action::Deny && best.is_none_or(|(bi, _)| idx < bi) {
+                    best = Some((idx, rule));
+                }
+            }
+        }
+        best.map(|(_, rule)| Decision {
+            action: Action::Deny,
+            source: DecisionSource::ExplicitRule,
+            matched_rule: Some(rule.label()),
+            reason: rule
+                .reason
+                .clone()
+                .unwrap_or_else(|| format!("matched rule `{}`", rule.label())),
+        })
     }
 
     pub fn evaluate(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
@@ -1391,6 +1455,68 @@ mod tests {
     /// `kubectl delete namespace staging` was allowed by `git status*`, and
     /// a body line `echo it's` before the delimiter line lent its allow to
     /// whatever followed the heredoc. A comment alone on its line asked.
+    /// A line of a heredoc body the shell never runs is matched against deny
+    /// rules and nothing else (`Segment::body_line`). The SynCircles record
+    /// (Oct 26 to Nov 5, 2026): a write followed by a build on the same line
+    /// asked on its first body line without a rule, and a JavaScript template
+    /// literal in a `python3 -` body was refused as an unresolved path. A hard
+    /// stop spelled in such a body still denies, and the rest of the line is
+    /// judged as before.
+    #[test]
+    fn a_heredoc_body_line_is_matched_against_deny_rules_only() {
+        let p: Policy = serde_yaml::from_str(
+            "default: ask\nrules:\n  - match: \"*rm -rf*\"\n    action: deny\n  - match: \"cat *\"\n    action: allow\n  - match: \"npm run build*\"\n    action: allow\n  - match: \"git add*\"\n    action: allow\n  - match: \"git commit*\"\n    action: allow\n",
+        )
+        .expect("policy must parse");
+        // the write and the build, both allowed: the body is no verdict
+        let d = p.evaluate_command(
+            "cat > src/x.ts <<'EOF'\nimport x from \"y\";\nconst s = `${name} / -> ${new URL(u).pathname}`;\nEOF\nnpm run build",
+            &here(),
+        );
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        // the same with a commit after it
+        let d = p.evaluate_command(
+            "cat > src/x.ts <<'EOF'\nimport x from \"y\";\nEOF\ngit add src && git commit -q -m x",
+            &here(),
+        );
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        // what follows the body still decides: an unknown command asks there
+        let d = p.evaluate_command(
+            "cat > src/x.ts <<'EOF'\nimport x from \"y\";\nEOF\nsupabase db push",
+            &here(),
+        );
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
+        assert!(d.reason.contains("`supabase db push`"), "{}", d.reason);
+        // a hard stop in the body still denies, on that line
+        let d = p.evaluate_command(
+            "cat > Makefile <<'EOF'\nclean:\n\trm -rf ~\nEOF\nnpm run build",
+            &here(),
+        );
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        assert!(d.reason.contains("rm -rf ~"), "{}", d.reason);
+        // an interpreter's program: the ask is on the interpreter, never a
+        // refusal on a line of its program
+        let d = p.evaluate_command(
+            "python3 - <<'EOF'\ns = s.replace('a', `${x} / -> ${new URL(u).pathname}`)\nopen(p,'w').write(s)\nEOF",
+            &here(),
+        );
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
+        assert!(d.reason.contains("`python3 - <<'EOF'`"), "{}", d.reason);
+        let d = p.evaluate_command(
+            "python3 - <<'EOF'\nimport os; os.system('rm -rf /')\nEOF",
+            &here(),
+        );
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        // a body a shell runs is commands: no rule for `foo` means an ask on it
+        let d = p.evaluate_command("bash <<'EOF'\nfoo --bar\nEOF", &here());
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
+        assert!(
+            d.reason.contains("`bash <<'EOF'`") || d.reason.contains("`foo --bar`"),
+            "{}",
+            d.reason
+        );
+    }
+
     #[test]
     fn a_quote_in_a_comment_or_a_heredoc_body_hides_no_command() {
         let p = Policy::builtin().unwrap();
