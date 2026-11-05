@@ -94,6 +94,7 @@ impl Intent {
 pub fn classify_command(command: &str) -> Option<Intent> {
     crate::shell::split_segments_deep(command)
         .iter()
+        .filter(|s| !s.body_line)
         .filter_map(classify_segment)
         .max_by_key(|i| i.rank())
 }

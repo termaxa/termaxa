@@ -42,6 +42,8 @@ pub fn plan(command: &str, cwd: &Path) -> Option<String> {
     // without end.
     crate::shell::split_segments_deep(command)
         .iter()
+        // A heredoc body line the shell never runs names nothing to insure.
+        .filter(|s| !s.body_line)
         .find_map(|s| plan_segment(s, cwd))
 }
 
@@ -185,7 +187,10 @@ fn tf_state_target(tokens: &[String], dir: Option<&Path>) -> Option<PathBuf> {
 /// Take the backup. Returns the record on success, a printable error string
 /// on a failed attempt, or Ok(None) when the command needs no insurance.
 pub fn take(termaxa_dir: &Path, command: &str, cwd: &Path) -> Result<Option<BackupRecord>> {
-    for segment in crate::shell::split_segments_deep(command) {
+    for segment in crate::shell::split_segments_deep(command)
+        .into_iter()
+        .filter(|s| !s.body_line)
+    {
         if let Some(rec) = take_segment(termaxa_dir, &segment, cwd)? {
             return Ok(Some(rec)); // insure the first insurable segment
         }
