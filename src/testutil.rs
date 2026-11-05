@@ -622,7 +622,11 @@ mod tests {
                     queue.push(path);
                     continue;
                 }
+                // `demo.rs` builds the one temp path production code needs,
+                // the demo's scratch project, and removes it when the demo
+                // ends; its test checks that nothing is left behind.
                 if path.file_name() == Some(std::ffi::OsStr::new("testutil.rs"))
+                    || path.file_name() == Some(std::ffi::OsStr::new("demo.rs"))
                     || path.extension() != Some(std::ffi::OsStr::new("rs"))
                 {
                     continue;

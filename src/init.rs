@@ -515,6 +515,22 @@ rules:
   # in the middle of an otherwise allowed compound.
   - match: "echo"
     action: allow
+  # Four heads from the SynCircles record (an agent building a real product
+  # unattended, Oct 26 to Nov 5, 2026): `mkdir -p` asked four times, `ps aux`
+  # twice, `sleep 1` once, each in the middle of allowed work. `tee` is
+  # `cat >`'s twin: the file it writes is judged by the path rules and copied
+  # first, as a redirect's target is, and its heredoc body is data
+  # (v0.21.7).
+  - match: "mkdir *"
+    action: allow
+  - match: "ps"
+    action: allow
+  - match: "ps *"
+    action: allow
+  - match: "sleep *"
+    action: allow
+  - match: "tee *"
+    action: allow
   # Read-only Unix filters and probes. The demo video's own hero shot was an
   # ask on `head -5`; Claude Code's first act in a session is `bash -c env`
   # (Sep 10, 2026, under `wrap`), and an unattended ask on that is a session
