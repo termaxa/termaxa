@@ -227,7 +227,7 @@ Termaxa doctor
 
 Policy
 ✓ /home/dev/proj/.termaxa/policy.yaml
-  224 rule(s), default ask
+  229 rule(s), default ask
   enforce mode (default)
   fingerprint 69edb158b1af
   ✓ unchanged since 2026-10-07T06:54:22Z
@@ -345,7 +345,7 @@ circuit_breaker:
   threshold: 2
 ```
 
-The starter `init` writes has 224 rules: 157 allow, 14 ask, 53 deny, 38 of them floor. Native file tools (Claude Code's `Write`, Cursor's `Delete`, Codex's `apply_patch`) are judged by their target through the same path rules, and the gate's own files are protected by rules you can read but the agent cannot rewrite unnoticed: `doctor` reports the fingerprint. `unrecognised: deny` and `backup_failure: deny` are the two switches for unattended runs.
+The starter `init` writes has 229 rules: 162 allow, 14 ask, 53 deny, 38 of them floor. Native file tools (Claude Code's `Write`, Cursor's `Delete`, Codex's `apply_patch`) are judged by their target through the same path rules, and the gate's own files are protected by rules you can read but the agent cannot rewrite unnoticed: `doctor` reports the fingerprint. `unrecognised: deny` and `backup_failure: deny` are the two switches for unattended runs.
 
 ## Architecture
 
@@ -416,11 +416,11 @@ Termaxa is pre-1.0. It's real and tested, and it is not magic.
 - **The format may still change.** Pin a release.
 - **Windows PowerShell 5.1 mangles redirected Unicode.** `termaxa report > out.txt` writes UTF-16 and garbles the box-drawing glyphs. Use PowerShell 7, or `termaxa report --md | Out-File -Encoding utf8 report.md`.
 
-Every bug found in real use, with how it was found and where it was fixed, is in [docs/found-in-the-wild.md](docs/found-in-the-wild.md): 48 so far. The threat model and the published advisories are in [SECURITY.md](SECURITY.md).
+Every bug found in real use, with how it was found and where it was fixed, is in [docs/found-in-the-wild.md](docs/found-in-the-wild.md): 50 so far. The threat model and the published advisories are in [SECURITY.md](SECURITY.md).
 
 ## Contributing
 
-Rust 2021, ~19,100 lines of production code and ~20,000 of tests, 599 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
+Rust 2021, ~19,300 lines of production code and ~20,100 of tests, 602 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
 
 ## Security
 
