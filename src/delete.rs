@@ -553,14 +553,81 @@ pub fn command_head(token: &str) -> String {
 /// splitter produced; and `time` / `strace` / `watch`, which are diagnostic
 /// wrappers no agent has been observed reaching for in this codebase's field
 /// reports. Add them when something observes one, not before.
-const COMMAND_WRAPPERS: [&str; 7] = ["sudo", "doas", "env", "command", "nohup", "nice", "xargs"];
+///
+/// Nov 2026: that paragraph weighed a missed preview. It did not weigh
+/// observe mode, where the only thing held is the floor and the floor is a
+/// rule anchored on the command's first word. Measured Nov 13, 2026, on
+/// 0.21.8, with the starter in observe mode: `timeout 60 kubectl delete ns
+/// prod`, the same behind `time`, `exec`, `setsid`, `stdbuf -oL` and `watch
+/// -n 5`, `{ kubectl delete ns prod; }`, `! kubectl delete ns prod` and `f()
+/// { kubectl delete ns prod; }; f` all ran; in enforce mode each was an ask,
+/// where the plain spelling is a deny. `timeout N` is also the one an agent
+/// has been seen writing: five times in the SynCircles record (Oct 26 to Nov
+/// 5, 2026), each an ask in front of a command its own rule allowed. So the
+/// runners are here now, with the two pieces of shell syntax that stand in
+/// front of a command (`!`, `{`) and a function's header (`resolve_head`):
+/// the real command name is further along, for the classifier, the preview,
+/// the copy aside and every deny rule. Walked by hand again (decision #56);
+/// still not here: `strace`, `ionice`, `chrt`, `flock`, `script -c`, a
+/// container's or a remote shell's `exec`, and an interpreter's inline code,
+/// none of which anything has observed.
+const COMMAND_WRAPPERS: [&str; 15] = [
+    "sudo", "doas", "env", "command", "nohup", "nice", "xargs", "timeout", "time", "exec",
+    "setsid", "stdbuf", "watch", "!", "{",
+];
 
 /// The wrappers that add no privilege: what they run is what the user's own
 /// string rule should see. `sudo`/`doas` are left out of the string-rule
 /// reading on purpose — a rule that allows `apt-get install*` should not
 /// allow it under sudo — while the hard stops, spelled with a leading `*`,
-/// see through everything.
-const UNPRIVILEGED_WRAPPERS: [&str; 5] = ["env", "command", "nohup", "nice", "xargs"];
+/// see through everything. `timeout` joined in Nov 2026, the only one of the
+/// newer `COMMAND_WRAPPERS` an agent has been recorded using: `timeout 120
+/// npm test` reads as `npm test` to the rule that allows it. The others are
+/// seen through by deny rules only.
+const UNPRIVILEGED_WRAPPERS: [&str; 6] = ["env", "command", "nohup", "nice", "xargs", "timeout"];
+
+/// A wrapper whose first operand is its own, not the command: `timeout 60
+/// rm -rf x` runs `rm`, and `60` is how long it may take.
+fn wrapper_takes_operand(wrapper: &str) -> bool {
+    wrapper == "timeout"
+}
+
+/// How many tokens at `i` are a function's header, which stands in front of
+/// the first command of its body the way a wrapper does: `f()`, `f ()`,
+/// `function f` and `function f()`. The `{` after it is a wrapper of its
+/// own. `0` when there is no header there.
+fn function_header_len(tokens: &[String], i: usize) -> usize {
+    fn name(t: &str) -> bool {
+        !t.is_empty()
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
+            && !t.starts_with('-')
+    }
+    let Some(tok) = tokens.get(i) else {
+        return 0;
+    };
+    let next = tokens.get(i + 1).map(String::as_str);
+    if tok == "function" {
+        return match next {
+            Some(n) if name(n) => {
+                if tokens.get(i + 2).map(String::as_str) == Some("()") {
+                    3
+                } else {
+                    2
+                }
+            }
+            Some(n) if n.strip_suffix("()").is_some_and(name) => 2,
+            _ => 0,
+        };
+    }
+    if tok.strip_suffix("()").is_some_and(name) {
+        return 1;
+    }
+    if name(tok) && next == Some("()") {
+        return 2;
+    }
+    0
+}
 
 /// Flags on a wrapper that consume the FOLLOWING token as their value. Without
 /// this, `sudo -u alice rm -rf x` reads `alice` as the command name and the
@@ -573,6 +640,11 @@ fn wrapper_flag_takes_value(wrapper: &str, flag: &str) -> bool {
         ),
         "env" => matches!(flag, "-u" | "--unset" | "-S" | "--split-string"),
         "nice" => matches!(flag, "-n" | "--adjustment"),
+        "timeout" => matches!(flag, "-s" | "--signal" | "-k" | "--kill-after"),
+        "time" => matches!(flag, "-o" | "--output" | "-f" | "--format"),
+        "exec" => flag == "-a",
+        "stdbuf" => matches!(flag, "-i" | "-o" | "-e"),
+        "watch" => matches!(flag, "-n" | "--interval"),
         // `xargs -I {} rm -rf {}`: the classic spelling that hides the verb
         // behind a pipe (measured against Claude Code's own matcher, Sep 27,
         // 2026: `… | xargs -I{} <denied cmd> {}` runs there). `-I{}` attached
@@ -614,6 +686,14 @@ fn wrapper_flag_takes_value(wrapper: &str, flag: &str) -> bool {
 pub fn resolve_head(tokens: &[String]) -> Option<(String, usize)> {
     let mut i = 0;
     loop {
+        // A function's header, then the `{` that opens its body (a wrapper
+        // below): `f() { rm -rf x; }` runs `rm` when `f` is called, and the
+        // line that defines it is the only place the gate reads it.
+        let header = function_header_len(tokens, i);
+        if header > 0 && tokens.get(i + header).map(String::as_str) == Some("{") {
+            i += header;
+            continue;
+        }
         let head = command_head(tokens.get(i)?);
         if !COMMAND_WRAPPERS.contains(&head.as_str()) {
             return Some((head, i));
@@ -634,6 +714,9 @@ pub fn resolve_head(tokens: &[String]) -> Option<(String, usize)> {
             } else {
                 break;
             }
+        }
+        if wrapper_takes_operand(&wrapper) && tokens.get(i).is_some() {
+            i += 1;
         }
     }
 }
@@ -673,6 +756,9 @@ pub fn without_unprivileged_wrappers(tokens: &[String]) -> Option<Vec<String>> {
             } else {
                 break;
             }
+        }
+        if wrapper_takes_operand(&wrapper) && tokens.get(i).is_some() {
+            i += 1;
         }
     }
     let mut out: Vec<String> = tokens[i..].to_vec();
@@ -3142,6 +3228,82 @@ mod tests {
             !names.contains(&"notes.txt"),
             "ordinary files are not findings: {names:?}"
         );
+    }
+
+    /// The command is further along than a runner, a `!`, a `{` or a
+    /// function's header (Nov 2026). `timeout` owns its first operand.
+    #[test]
+    fn the_head_is_found_past_runners_and_shell_prefixes() {
+        let head = |words: &[&str]| -> Option<(String, usize)> {
+            let toks: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+            resolve_head(&toks)
+        };
+        let rm = |at: usize| Some(("rm".to_string(), at));
+        assert_eq!(head(&["timeout", "60", "rm", "-rf", "x"]), rm(2));
+        assert_eq!(
+            head(&["timeout", "-s", "KILL", "60", "rm", "-rf", "x"]),
+            rm(4)
+        );
+        assert_eq!(
+            head(&["timeout", "--signal=KILL", "-k", "5", "2m", "rm", "x"]),
+            rm(5)
+        );
+        assert_eq!(head(&["time", "-p", "rm", "x"]), rm(2));
+        assert_eq!(head(&["/usr/bin/time", "-o", "t.log", "rm", "x"]), rm(3));
+        assert_eq!(head(&["exec", "-a", "name", "rm", "x"]), rm(3));
+        assert_eq!(head(&["setsid", "-f", "rm", "x"]), rm(2));
+        assert_eq!(head(&["stdbuf", "-oL", "rm", "x"]), rm(2));
+        assert_eq!(head(&["stdbuf", "-o", "L", "rm", "x"]), rm(3));
+        assert_eq!(head(&["watch", "-n", "5", "rm", "x"]), rm(3));
+        assert_eq!(head(&["!", "rm", "x"]), rm(1));
+        assert_eq!(head(&["{", "rm", "x"]), rm(1));
+        assert_eq!(head(&["f()", "{", "rm", "x"]), rm(2));
+        assert_eq!(head(&["f", "()", "{", "rm", "x"]), rm(3));
+        assert_eq!(head(&["function", "f", "{", "rm", "x"]), rm(3));
+        assert_eq!(head(&["function", "f", "()", "{", "rm", "x"]), rm(4));
+        assert_eq!(
+            head(&["sudo", "timeout", "60", "env", "A=1", "rm", "x"]),
+            rm(5)
+        );
+        // A redirect-only `exec` and a wrapper with nothing after it name
+        // no command.
+        assert_eq!(head(&["exec"]), None);
+        assert_eq!(head(&["timeout", "60"]), None);
+        // A word that only looks like a header is the command it is.
+        assert_eq!(head(&["foo()", "bar"]), Some(("foo()".to_string(), 0)));
+        assert_eq!(head(&["function", "x"]), Some(("function".to_string(), 0)));
+    }
+
+    /// `timeout` is the one newer runner an allow rule reads through; the
+    /// others are stepped over for deny rules only.
+    #[test]
+    fn an_allow_rule_reads_through_timeout_and_no_other_new_runner() {
+        let strip = |words: &[&str]| -> Option<Vec<String>> {
+            let toks: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+            without_unprivileged_wrappers(&toks)
+        };
+        assert_eq!(
+            strip(&["timeout", "120", "npm", "test"]),
+            Some(vec!["npm".to_string(), "test".to_string()])
+        );
+        assert_eq!(
+            strip(&["timeout", "-k", "5", "120", "npm", "test"]),
+            Some(vec!["npm".to_string(), "test".to_string()])
+        );
+        for runner in ["time", "exec", "setsid", "stdbuf", "watch", "!", "{"] {
+            assert_eq!(strip(&[runner, "npm", "test"]), None, "{runner}");
+        }
+        let all = |words: &[&str]| -> Option<Vec<String>> {
+            let toks: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+            without_any_wrappers(&toks)
+        };
+        for runner in ["time", "exec", "setsid", "stdbuf", "watch", "!", "{"] {
+            assert_eq!(
+                all(&[runner, "kubectl", "delete", "ns", "prod"]).map(|v| v.join(" ")),
+                Some("kubectl delete ns prod".to_string()),
+                "{runner}"
+            );
+        }
     }
 }
 

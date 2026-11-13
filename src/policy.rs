@@ -611,9 +611,46 @@ impl Policy {
         self.rules.iter().any(|r| r.floor && r.label() == matched)
     }
 
+    /// Whether a decision is a deny by a rule on the floor.
+    fn held_by_floor(&self, d: &Decision) -> bool {
+        d.action == Action::Deny
+            && d.matched_rule
+                .as_deref()
+                .is_some_and(|m| self.is_floor_rule(m))
+    }
+
+    /// Whether `d` takes the place of `w` as a line's verdict: the more
+    /// severe one does; between two of the same severity, one a rule named
+    /// outranks a default, and a deny on the floor outranks a deny that is
+    /// not. Otherwise the earlier segment keeps it.
+    ///
+    /// The floor clause is of Nov 2026. A line's verdict carries one rule,
+    /// and observe mode holds a line only when that rule is on the floor
+    /// (or the insurance cannot be taken), so `rm -rf dist; kubectl delete
+    /// ns prod` was a deny by `*rm -rf*`, which is not on the floor, and ran
+    /// in observe mode with `dist` copied aside, the `kubectl delete` with
+    /// it (measured Nov 13, 2026, on 0.21.8). The reason now names the
+    /// segment no mode lets through.
+    fn outranks(&self, d: &Decision, w: &Decision) -> bool {
+        severity(d.action) > severity(w.action)
+            || (severity(d.action) == severity(w.action)
+                && ((w.matched_rule.is_none() && d.matched_rule.is_some())
+                    || (self.held_by_floor(d) && !self.held_by_floor(w))))
+    }
+
     pub fn evaluate_command(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
         let segments = crate::shell::split_segments_deep(command);
-        if segments.len() <= 1 {
+        // A segment read out of another's words (`Segment::inside`) is not
+        // one of the line's own: a line that is one command with a `$(git
+        // branch --show-current)` in it is still judged as that one command,
+        // unless what the substitution runs is denied.
+        let spoken = segments.iter().filter(|s| !s.inside).count();
+        let denied_inside = spoken <= 1
+            && segments
+                .iter()
+                .filter(|s| s.inside)
+                .any(|s| self.evaluate(s, &ctx.for_segment(s)).action == Action::Deny);
+        if spoken <= 1 && !denied_inside {
             // A file written through a literal heredoc (`cat > page.tsx
             // <<'EOF' … EOF`) is judged as the write, by its path, the way
             // the Write tool is: the segment leaves the body out, the line
@@ -639,9 +676,24 @@ impl Policy {
                 let Some(d) = self.deny_rule_for(seg) else {
                     continue;
                 };
-                if worst
-                    .as_ref()
-                    .is_none_or(|(_, w)| severity(d.action) > severity(w.action))
+                if worst.as_ref().is_none_or(|(_, w)| {
+                    severity(d.action) > severity(w.action)
+                        || (self.held_by_floor(&d) && !self.held_by_floor(w))
+                }) {
+                    worst = Some((i, d));
+                }
+                continue;
+            }
+            // A command the shell runs out of another's words (`$( … )`,
+            // backticks, `<( … )`): judged where it runs, by string rules
+            // and path rules alike, and only a deny is taken from it. What
+            // the line asked or allowed without it, it asks or allows with
+            // it: a substitution the policy does not explicitly allow still
+            // escalates the segment it sits in, as before (`context`).
+            if seg.inside {
+                let d = self.evaluate(seg, &ctx.for_segment(seg));
+                if d.action == Action::Deny
+                    && worst.as_ref().is_none_or(|(_, w)| self.outranks(&d, w))
                 {
                     worst = Some((i, d));
                 }
@@ -672,13 +724,9 @@ impl Policy {
             let replace = match &worst {
                 None => true,
                 // higher severity wins; on ties, an explicitly-matched rule
-                // out-ranks a default fallthrough — name the real threat.
-                Some((_, w)) => {
-                    severity(d.action) > severity(w.action)
-                        || (severity(d.action) == severity(w.action)
-                            && w.matched_rule.is_none()
-                            && d.matched_rule.is_some())
-                }
+                // out-ranks a default fallthrough, and a deny on the floor
+                // one that is not — name the real threat.
+                Some((_, w)) => self.outranks(&d, w),
             };
             if replace {
                 worst = Some((i, d));
@@ -3492,5 +3540,216 @@ mod segment_directory_tests {
         // An absolute target is the same file wherever the shell is.
         let d = p.evaluate_command("cd \"$X\" && echo x > /tmp/termaxa-cd-abs", &ctx);
         assert_eq!(d.action, Action::Allow, "{}", d.reason);
+    }
+
+    /// A hard stop is a hard stop wherever on the line the shell runs it
+    /// (Nov 2026). Measured Nov 13, 2026, on 0.21.8 with the starter: every
+    /// line here was an ask, or an allow, in enforce mode, and ran in
+    /// observe mode, the rule it names being anchored on a first word the
+    /// line does not start with.
+    #[test]
+    fn a_hard_stop_is_read_inside_a_substitution_and_behind_a_runner() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for (line, rule) in [
+            (
+                "out=$(kubectl delete ns prod 2>&1); echo \"$out\"",
+                "kubectl delete*",
+            ),
+            (
+                "echo \"$(terraform destroy -auto-approve)\"",
+                "terraform destroy*",
+            ),
+            ("echo `mkfs.ext4 /dev/sda1`", "mkfs*"),
+            ("cat <(dd if=/dev/zero of=/dev/sda)", "dd*of=/dev/*"),
+            ("echo $(kubectl delete ns prod; true)", "kubectl delete*"),
+            ("x=${y:-$(kubectl delete ns prod)}", "kubectl delete*"),
+            (
+                "for f in $(kubectl delete ns prod); do echo $f; done",
+                "kubectl delete*",
+            ),
+            // Two deep, the middle command one the starter allows: allowed
+            // outright until now, in both modes.
+            (
+                "git log $(echo $(terraform destroy -auto-approve))",
+                "terraform destroy*",
+            ),
+            ("cat $(echo $(dd if=/dev/zero of=/dev/sda))", "dd*of=/dev/*"),
+            // Behind a runner, a `!`, a group or a function's header.
+            ("timeout 60 kubectl delete ns prod", "kubectl delete*"),
+            ("time kubectl delete ns prod", "kubectl delete*"),
+            ("exec kubectl delete ns prod", "kubectl delete*"),
+            ("setsid kubectl delete ns prod", "kubectl delete*"),
+            ("stdbuf -oL kubectl delete ns prod", "kubectl delete*"),
+            ("watch -n 5 kubectl delete ns prod", "kubectl delete*"),
+            ("! kubectl delete ns prod", "kubectl delete*"),
+            ("{ kubectl delete ns prod; }", "kubectl delete*"),
+            ("f() { kubectl delete ns prod; }; f", "kubectl delete*"),
+            // The anchored rule, which is the one on the floor, and not the
+            // `*rm -rf*` that matches the line as typed.
+            ("x=$(rm -rf /)", "rm -rf /"),
+            ("f() { rm -rf /; }; f", "rm -rf /"),
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert_eq!(
+                d.matched_rule.as_deref(),
+                Some(rule),
+                "{line}: {}",
+                d.reason
+            );
+            assert!(p.is_floor_rule(rule), "{rule} is on the starter's floor");
+        }
+        let d = p.evaluate_command("x=$(rm -rf /)", &ctx);
+        assert!(
+            d.reason.contains("`rm -rf /` (inside a substitution)"),
+            "the reason names what was read, and where: {}",
+            d.reason
+        );
+    }
+
+    /// A write into the gate's own files or a hook config, spelled after a
+    /// `cd` inside a substitution. The `cd` was never read as one (it is the
+    /// substitution's first command), so the path rules saw `./policy.yaml`
+    /// and `./settings.json`: an ask in enforce mode, and in observe mode it
+    /// ran. Through a process substitution it was an allow in both
+    /// (measured Nov 13, 2026, on 0.21.8).
+    #[test]
+    fn a_cd_inside_a_substitution_does_not_hide_the_gates_own_files() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for line in [
+            "x=$(cd .claude && echo \"{}\" > settings.json)",
+            "x=$(cd .termaxa; echo \"default: allow\" > policy.yaml)",
+            "x=`cd .claude && echo \"{}\" > settings.json`",
+            "cat <(cd .claude && echo \"{}\" > settings.json)",
+            "x=$(cd .claude; echo \"{}\" | tee settings.json)",
+            "cd .claude && x=$(tee settings.json < /tmp/x)",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            let rule = d.matched_rule.clone().unwrap_or_default();
+            assert!(
+                rule.starts_with("path:"),
+                "{line}: by its path, not its spelling: {rule}"
+            );
+            assert!(p.is_floor_rule(&rule), "{line}: {rule}");
+        }
+        // And nothing after the substitution runs where its `cd` went.
+        let d = p.evaluate_command("x=$(cd .termaxa; pwd); echo n > notes.md", &ctx);
+        assert_ne!(d.action, Action::Deny, "{}", d.reason);
+    }
+
+    /// What the line asked or allowed without the reading, it asks or
+    /// allows with it: only a deny is taken from a command read out of
+    /// another's words, and a line that is one command keeps its reason.
+    #[test]
+    fn reading_a_substitution_changes_no_verdict_but_a_deny() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        let d = p.evaluate_command("echo $(git branch --show-current)", &ctx);
+        assert_eq!(
+            (d.action, d.reason.as_str()),
+            (Action::Allow, "matched rule `echo *`")
+        );
+        let d = p.evaluate_command("git log origin/$(git branch --show-current) -1", &ctx);
+        assert_eq!(
+            (d.action, d.reason.as_str()),
+            (Action::Allow, "matched rule `git log*`")
+        );
+        // `sort` has no rule, and a process substitution was never read:
+        // it is read for a deny now, and for nothing else.
+        let d = p.evaluate_command("diff <(sort a.txt) <(sort b.txt)", &ctx);
+        assert_eq!(
+            (d.action, d.reason.as_str()),
+            (Action::Allow, "matched rule `diff *`")
+        );
+        // `basename` has no rule either; the segment's own verdict stands
+        // (the hook escalates it, as before: `context`).
+        let d = p.evaluate_command("echo $(basename src/app.ts)", &ctx);
+        assert_eq!(
+            (d.action, d.reason.as_str()),
+            (Action::Allow, "matched rule `echo *`")
+        );
+        // Claude Code's commit message is data, hard stop spelled in it or
+        // not: the verdict is the line's, as it was.
+        let commit = "git commit -m \"$(cat <<'EOF'\nfix: typo\nEOF\n)\"";
+        assert_eq!(p.evaluate_command(commit, &ctx).action, Action::Allow);
+    }
+
+    /// Between two denies on one line, the one on the floor is the line's
+    /// verdict, so observe mode holds the line. `rm -rf dist; kubectl delete
+    /// ns prod` carried `*rm -rf*`, which is not on the floor, and ran in
+    /// observe mode with `dist` copied aside (measured Nov 13, 2026, on
+    /// 0.21.8). Between two that are both off the floor, or both on it, the
+    /// earlier segment still names the line.
+    #[test]
+    fn a_floor_deny_outranks_an_ordinary_deny_on_the_same_line() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for (line, rule, segment) in [
+            (
+                "rm -rf wt; kubectl delete ns prod",
+                "kubectl delete*",
+                "segment 2/2",
+            ),
+            (
+                "git push --force origin main; terraform destroy -auto-approve",
+                "terraform destroy*",
+                "segment 2/2",
+            ),
+            (
+                "echo KEY=1 > .env; mkfs.ext4 /dev/sda1",
+                "mkfs*",
+                "segment 2/2",
+            ),
+            (
+                "kubectl delete ns prod; rm -rf wt",
+                "kubectl delete*",
+                "segment 1/2",
+            ),
+            (
+                "rm -rf wt; git push --force origin main",
+                "*rm -rf*",
+                "segment 1/2",
+            ),
+            (
+                "kubectl delete ns prod; terraform destroy",
+                "kubectl delete*",
+                "segment 1/2",
+            ),
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert_eq!(
+                d.matched_rule.as_deref(),
+                Some(rule),
+                "{line}: {}",
+                d.reason
+            );
+            assert!(d.reason.starts_with(segment), "{line}: {}", d.reason);
+        }
+    }
+
+    /// `timeout N` in front of a command its own rule allows: allowed, by
+    /// that rule (five asks on the SynCircles record, Oct 26 to Nov 5,
+    /// 2026). The other runners are read through by deny rules only.
+    #[test]
+    fn an_allow_reads_through_timeout_and_only_timeout() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        let d = p.evaluate_command("timeout 60 npm test", &ctx);
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        assert_eq!(d.matched_rule.as_deref(), Some("npm test*"));
+        let d = p.evaluate_command("timeout -k 5 120 git status", &ctx);
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        for line in ["time npm test", "exec npm test", "watch -n 5 git status"] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_ne!(d.action, Action::Allow, "{line}: {}", d.reason);
+            assert_ne!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+        // What `timeout` runs is still judged: no rule, no allow.
+        let d = p.evaluate_command("timeout 60 npm run build", &ctx);
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
     }
 }
