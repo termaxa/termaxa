@@ -58,6 +58,25 @@ pub struct Rule {
     /// this file, a change the fingerprint records.
     #[serde(default, skip_serializing_if = "is_false")]
     pub floor: bool,
+    /// On a deny: the rule does not apply to a delete whose every target is,
+    /// or sits inside, a directory a build or an install rebuilds, inside
+    /// the project (`delete::REPRODUCIBLE`: `node_modules`, `.next`, `dist`,
+    /// `build`, `target`, `.venv` and their kind). Nothing in such a
+    /// directory is the only copy of anything, and observe mode has let the
+    /// delete run since v0.21.3 (decision #128, which left enforce mode's
+    /// deny for a decision of its own; taken Nov 13, 2026). With no other
+    /// rule naming the command it is allowed, by the gate and not by a
+    /// rule, so the harness's own prompt is what it was; the copy aside is
+    /// taken first when the directory is under the budget. Anything else on
+    /// the command (a target that is not such a directory, one outside the
+    /// project, a variable or a link in its place, a redirect) and the rule
+    /// applies as written.
+    ///
+    /// Written on the rule, and not decided by the binary, so that what a
+    /// policy file says is what the gate does: a policy written before this
+    /// field existed denies `rm -rf node_modules` until the line is added.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub except_rebuilt: bool,
     /// Match this rule against the command's RESOLVED targets rather than
     /// against the command string.
     ///
@@ -382,6 +401,11 @@ pub enum DecisionSource {
     /// A context signal raised the verdict - a production marker, a user
     /// profile target, command substitution.
     Context,
+    /// What the command deletes is rebuilt by a build, and the deny that
+    /// matched says `except_rebuilt` (`Rule::except_rebuilt`). The gate
+    /// read the delete and found no loss in it, so the recursive and force
+    /// flags it carries are not a reason to ask (`context::apply`).
+    Rebuilt,
 }
 
 impl DecisionSource {
@@ -392,7 +416,9 @@ impl DecisionSource {
         match self {
             DecisionSource::Default => "default",
             DecisionSource::ExplicitRule => "rule",
-            DecisionSource::Context => "context",
+            // On the record a reading of the command is `context`, as the
+            // startup snapshot's allow is; the reason says which.
+            DecisionSource::Context | DecisionSource::Rebuilt => "context",
         }
     }
 }
@@ -408,6 +434,40 @@ fn resolved_targets(
     ctx: &crate::resolve::EvalContext,
 ) -> Vec<crate::resolve::ResolvedTarget> {
     crate::resolve::command_targets(segment, ctx)
+}
+
+/// `Some((name, rebuilt_by))` when the segment deletes something and
+/// everything it changes is, or sits inside, a directory a build or an
+/// install rebuilds, inside the project root: the first such directory, for
+/// the reason. `None` when it deletes nothing, when any target is written
+/// rather than removed, is unresolved, lies outside the project or is
+/// anything else, when the directory the segment runs in is not known, and
+/// when the target is a link (what `rm -rf link/` empties is wherever the
+/// link points).
+fn rebuilt_only(
+    targets: &[crate::resolve::ResolvedTarget],
+    ctx: &crate::resolve::EvalContext,
+) -> Option<(&'static str, &'static str)> {
+    use crate::resolve::TargetRole;
+    if !ctx.cwd_known {
+        return None;
+    }
+    let mut first = None;
+    for t in targets {
+        match t.role {
+            TargetRole::Source => continue,
+            TargetRole::Removed => {
+                let path = t.resolved.as_ref()?;
+                if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return None;
+                }
+                let found = crate::delete::reproducible_within(path, Some(&ctx.root))?;
+                first.get_or_insert(found);
+            }
+            _ => return None,
+        }
+    }
+    first
 }
 
 impl Policy {
@@ -842,6 +902,14 @@ impl Policy {
         // spelling still allows.
         let views = readings(command);
         let mut best: Option<(usize, &Rule)> = None;
+        // Roadmap 2.4: the same rules, matched against what the command
+        // actually TOUCHES rather than how it was spelled. Resolution happens
+        // once per segment and is reused by every check below.
+        let targets = resolved_targets(command, ctx);
+        // A delete of nothing but directories a build rebuilds: a deny that
+        // says `except_rebuilt` does not apply to it (`Rule::except_rebuilt`).
+        let rebuilt = rebuilt_only(&targets, ctx);
+        let excepted = |r: &Rule| rebuilt.is_some() && r.except_rebuilt && r.action == Action::Deny;
         // A privilege wrapper is transparent to a DENY only: `sudo gh repo
         // delete …` must hit a `gh repo delete*` deny, while an allow written
         // for `apt-get install*` must not admit `sudo apt-get install`. The
@@ -858,7 +926,7 @@ impl Policy {
                 .rules
                 .iter()
                 .enumerate()
-                .find(|(_, r)| r.action == Action::Deny && r.matches(pv))
+                .find(|(_, r)| r.action == Action::Deny && !excepted(r) && r.matches(pv))
             {
                 if best.is_none_or(|(bi, _)| idx < bi) {
                     best = Some((idx, rule));
@@ -866,7 +934,12 @@ impl Policy {
             }
         }
         for v in &views {
-            if let Some((idx, rule)) = self.rules.iter().enumerate().find(|(_, r)| r.matches(v)) {
+            if let Some((idx, rule)) = self
+                .rules
+                .iter()
+                .enumerate()
+                .find(|(_, r)| !excepted(r) && r.matches(v))
+            {
                 best = Some(match best {
                     None => (idx, rule),
                     Some((bi, br)) => {
@@ -881,11 +954,6 @@ impl Policy {
                 });
             }
         }
-        // Roadmap 2.4: the same rules, matched against what the command
-        // actually TOUCHES rather than how it was spelled. Resolution happens
-        // once per segment and is reused by both checks below.
-        let targets = resolved_targets(command, ctx);
-
         // A `match_path` rule fires if ANY target matches, and the reason
         // names which one: a command with several targets is one command, and
         // the human approving it needs to know which path tripped the gate.
@@ -970,6 +1038,25 @@ impl Policy {
                     .clone()
                     .unwrap_or_else(|| format!("matched rule `{}`", rule.label())),
             },
+            // A deny that says `except_rebuilt` matched and stood aside,
+            // and nothing else names the command: the delete of a
+            // directory a build rebuilds runs, and the reason says what it
+            // is and what brings it back. Not the policy default, which
+            // would ask; and with no such rule matching, the default it is.
+            None if rebuilt.is_some()
+                && views
+                    .iter()
+                    .chain(deny_only_readings(command).iter())
+                    .any(|v| self.rules.iter().any(|r| excepted(r) && r.matches(v))) =>
+            {
+                let (name, by) = rebuilt.unwrap_or_default();
+                Decision {
+                    action: Action::Allow,
+                    source: DecisionSource::Rebuilt,
+                    matched_rule: None,
+                    reason: format!("`{name}` is rebuilt by {by}: not a loss"),
+                }
+            }
             None => Decision {
                 action: self.default,
                 matched_rule: None,
@@ -1263,6 +1350,7 @@ mod schema_and_severity_tests {
             action: Action::Allow,
             reason: None,
             floor: false,
+            except_rebuilt: false,
             case_sensitive: false,
             match_path: None,
         };
@@ -1277,6 +1365,7 @@ mod schema_and_severity_tests {
             action: Action::Deny,
             reason: None,
             floor: false,
+            except_rebuilt: false,
             case_sensitive: true,
             match_path: None,
         };
@@ -1446,6 +1535,7 @@ mod tests {
             action: Action::Deny,
             reason: None,
             floor: false,
+            except_rebuilt: false,
             case_sensitive: true,
             match_path: None,
         };
@@ -3229,6 +3319,7 @@ mod combined_gate_tests {
             action: Action::Deny,
             reason: None,
             floor: false,
+            except_rebuilt: false,
             case_sensitive: false,
             match_path: Some("*/.env".into()),
         };
@@ -3262,6 +3353,7 @@ mod combined_gate_tests {
             action: Action::Deny,
             reason: None,
             floor: false,
+            except_rebuilt: false,
             case_sensitive: false,
             match_path: Some("*/.ssh/id_*".into()),
         };
@@ -3751,5 +3843,130 @@ mod segment_directory_tests {
         // What `timeout` runs is still judged: no rule, no allow.
         let d = p.evaluate_command("timeout 60 npm run build", &ctx);
         assert_eq!(d.action, Action::Ask, "{}", d.reason);
+    }
+
+    /// Enforce mode lets a build directory go, as observe mode has since
+    /// v0.21.3 (decision #128 left this one open; taken Nov 13, 2026). The
+    /// starter's recursive-delete denies say `except_rebuilt`, and a delete
+    /// of nothing but such directories, inside the project, is allowed by
+    /// the gate and by no rule. Measured the same day on 0.21.8: `rm -rf
+    /// node_modules` and `rm -rf dist` were refused in enforce mode, and two
+    /// of them in a session tripped the breaker for the next delete that
+    /// would only have asked.
+    #[test]
+    fn a_rule_that_says_except_rebuilt_spares_a_build_directory() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for line in [
+            "rm -rf node_modules",
+            "rm -rf dist build .next",
+            "rm -rf ./node_modules/",
+            "rm -fr node_modules",
+            "rm -r -f dist",
+            "rm -rf wt/target",
+            "sudo rm -rf node_modules",
+            "Remove-Item -Recurse -Force node_modules",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Allow, "{line}: {}", d.reason);
+            assert_eq!(d.source, DecisionSource::Rebuilt, "{line}");
+            assert_eq!(
+                d.matched_rule, None,
+                "{line}: allowed by the gate, by no rule"
+            );
+            assert!(d.reason.contains("is rebuilt by"), "{line}: {}", d.reason);
+        }
+        for (line, why) in [
+            ("rm -rf wt", "not a directory a build rebuilds"),
+            ("rm -rf node_modules wt", "one target of two is not"),
+            ("rm -rf ../node_modules", "outside the project"),
+            (
+                "rm -rf \"$X/node_modules\"",
+                "a variable where its place is",
+            ),
+            ("rm -rf node_modules > log.txt", "something else is written"),
+            (
+                "cd \"$X\" && rm -rf node_modules",
+                "nobody knows where it runs",
+            ),
+            ("rm -rf /", "the root"),
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line} ({why}): {}", d.reason);
+        }
+        // Behind it, a floor command still names the line.
+        let d = p.evaluate_command("rm -rf dist; kubectl delete ns prod", &ctx);
+        assert_eq!(
+            d.matched_rule.as_deref(),
+            Some("kubectl delete*"),
+            "{}",
+            d.reason
+        );
+        // And what follows it is still judged: no rule for `npm install`.
+        let d = p.evaluate_command("rm -rf node_modules dist && npm install", &ctx);
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
+    }
+
+    /// What the policy file says is what the gate does. A policy written
+    /// before the field denies `rm -rf node_modules` as it did; the field
+    /// spares it; and a rule below that names the command still decides.
+    #[test]
+    fn except_rebuilt_is_the_policys_to_say() {
+        let (_tmp, ctx) = project();
+        let before = policy_from(
+            "version: 1\ndefault: ask\nrules:\n  - match: \"*rm -rf*\"\n    action: deny\n",
+        );
+        let d = before.evaluate_command("rm -rf node_modules", &ctx);
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        let with = policy_from(concat!(
+            "version: 1\ndefault: ask\nrules:\n",
+            "  - match: \"*rm -rf*\"\n    action: deny\n    except_rebuilt: true\n",
+        ));
+        let d = with.evaluate_command("rm -rf node_modules", &ctx);
+        assert_eq!(
+            (d.action, d.source),
+            (Action::Allow, DecisionSource::Rebuilt)
+        );
+        assert_eq!(
+            with.evaluate_command("rm -rf wt", &ctx).action,
+            Action::Deny
+        );
+        let named = policy_from(concat!(
+            "version: 1\ndefault: allow\nrules:\n",
+            "  - match: \"*rm -rf*\"\n    action: deny\n    except_rebuilt: true\n",
+            "  - match: \"rm *\"\n    action: ask\n",
+        ));
+        let d = named.evaluate_command("rm -rf node_modules", &ctx);
+        assert_eq!(d.matched_rule.as_deref(), Some("rm *"), "{}", d.reason);
+        assert_eq!(d.action, Action::Ask);
+        // With no rule that says it, nothing is spared: the default is the
+        // default (a policy with no rules asked about `rm -rf ./build`, and
+        // still does).
+        let bare = policy_from("version: 1\ndefault: ask\nrules: []\n");
+        let d = bare.evaluate_command("rm -rf ./build", &ctx);
+        assert_eq!((d.action, d.source), (Action::Ask, DecisionSource::Default));
+        // On an allow or an ask the field says nothing.
+        let odd = policy_from(concat!(
+            "version: 1\ndefault: deny\nrules:\n",
+            "  - match: \"*rm -rf*\"\n    action: ask\n    except_rebuilt: true\n",
+        ));
+        assert_eq!(
+            odd.evaluate_command("rm -rf node_modules", &ctx).action,
+            Action::Ask
+        );
+    }
+
+    /// `rm -rf dist/` empties whatever `dist` points at. A link in a build
+    /// directory's place is not one.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_named_like_a_build_directory_is_not_spared() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (tmp, ctx) = project();
+        std::os::unix::fs::symlink(tmp.path().join("wt"), tmp.path().join("dist")).unwrap();
+        let d = p.evaluate_command("rm -rf dist", &ctx);
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        let d = p.evaluate_command("rm -rf dist/", &ctx);
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
     }
 }

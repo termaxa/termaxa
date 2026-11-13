@@ -308,27 +308,40 @@ rules:
   # Broad recursive-force deletes (any target), Unix + PowerShell + cmd
   # forms. DENY by default: with auto-approving agent UIs, `ask` silently
   # degrades to `allow`. Relax deliberately, per project, if you need to.
+  # A directory a build or an install rebuilds, inside the project, is the
+  # exception (`except_rebuilt`): `rm -rf node_modules`, `.next`, `dist`,
+  # `build`, `target`, `.venv` and their kind run, copied aside first when
+  # they are under the budget, as observe mode has let them since v0.21.3.
+  # Nothing in one is the only copy of anything. The same command with any
+  # other target on it, or one outside the project, is denied as before.
   - match: "*rm -rf*"
     action: deny
     reason: "Recursive force delete blocked by default policy."
+    except_rebuilt: true
   - match: "*rm -fr*"
     action: deny
     reason: "Recursive force delete blocked by default policy."
+    except_rebuilt: true
   - match: "*Remove-Item*-Recurse*"
     action: deny
     reason: "Recursive delete (PowerShell) blocked by default policy."
+    except_rebuilt: true
   - match: "*Remove-Item*-Force*"
     action: deny
     reason: "Forced delete (PowerShell) blocked by default policy."
+    except_rebuilt: true
   - match: "*del /s*"
     action: deny
     reason: "Recursive delete (cmd) blocked by default policy."
+    except_rebuilt: true
   - match: "*rmdir /s*"
     action: deny
     reason: "Recursive delete (cmd) blocked by default policy."
+    except_rebuilt: true
   - match: "*rd /s*"
     action: deny
     reason: "Recursive delete (cmd) blocked by default policy."
+    except_rebuilt: true
   # A recovery point is the one delete with nothing behind it. Field report,
   # Sep 2026: an agent wiped a drive, and the parent agent sent to recover it
   # deleted the day-old shadow copy it was trying to restore. vssadmin and

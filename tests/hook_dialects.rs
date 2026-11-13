@@ -1376,3 +1376,81 @@ fn observe_mode_holds_a_floor_command_however_the_line_spells_it() {
         );
     }
 }
+
+/// Enforce mode lets a build directory go (decision of Nov 13, 2026). The
+/// gate says nothing, so Claude Code's own prompt is what it was; the copy
+/// aside is taken first when the directory is under the budget; and two of
+/// them in a session no longer count as attempts, so the delete after them
+/// that would only have asked still asks. On 0.21.8 the third line here was
+/// refused by the breaker, for the project, until a recorded resume.
+#[cfg(unix)]
+#[test]
+fn enforce_mode_lets_a_build_directory_go_and_the_breaker_does_not_count_it() {
+    use serde_json::json;
+    let tmp = scratch("enforce-rebuilt");
+    let home = tmp.join("home");
+    let starter = include_str!("../examples/policy.yaml").replace("\r\n", "\n");
+    assert!(starter.contains("\nmode: enforce\n"));
+    let proj = project(&tmp, &starter);
+    for file in ["node_modules/a/index.js", "dist/a.js", "sc/f"] {
+        let f = proj.join(file);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, "x").unwrap();
+    }
+    let p = proj.to_string_lossy().to_string();
+    let ask = |cmd: &str| {
+        hook(
+            &home,
+            &proj,
+            &json!({"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd},
+                    "session_id":"one-session","cwd":p}),
+            &[],
+        )
+    };
+    for cmd in ["rm -rf node_modules", "rm -rf dist"] {
+        let out = ask(cmd);
+        assert_eq!(
+            (out.stdout.trim(), out.code),
+            ("", 0),
+            "{cmd}: the gate says nothing"
+        );
+    }
+    let log = project_logs(&home);
+    let lines: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| {
+            e["command"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("rm -rf "))
+        })
+        .collect();
+    assert_eq!(lines.len(), 2, "{log}");
+    for e in &lines {
+        assert_eq!(e["decision"], "allow", "{e}");
+        assert_eq!(e["decided_by"], "context", "{e}");
+        assert!(e["matched_rule"].is_null(), "{e}");
+    }
+    assert!(
+        lines[1]["backup"].is_string(),
+        "`dist` was copied first: {}",
+        lines[1]
+    );
+
+    // Not attempts: the next delete that would ask, asks.
+    let out = ask("rm -r sc");
+    assert!(
+        out.stdout.contains("\"permissionDecision\":\"ask\"") && out.code == 0,
+        "{:?} exit {}",
+        out.stdout,
+        out.code
+    );
+    // And a directory nothing rebuilds is refused as it was.
+    let out = ask("rm -rf sc");
+    assert!(
+        out.stdout.contains("\"permissionDecision\":\"deny\"") && out.code == 2,
+        "{:?} exit {}",
+        out.stdout,
+        out.code
+    );
+}
