@@ -2,6 +2,50 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.21.9 — a substitution hides no command, and enforce mode lets a build directory go
+
+**In plain words:** the shell runs a command out of another command's words, `cat <(...)` or `echo $(...)`, and the gate read that command as part of the words around it, or not at all. With the starter, `cat <(kubectl delete pod web-1)` was allowed by `cat *`, though `kubectl delete*` is a hard stop, and `cat <(git push origin main)` ran without the ask a push gets. A hard stop behind `timeout 60`, in a `{ ...; }` group or in a function's body was asked about where it should be denied. In observe mode, where an ask is not enforced and the floor is the one thing held, all of these ran, and so did a floor command that followed an ordinary deny on the same line (`rm -rf dist; kubectl delete ns prod`). A command is now read where the shell runs it: the first command of a substitution is a command, a deny rule finds its command behind `timeout` and its kind, the floor's deny is the line's verdict wherever it sits on the line, and a line nested deeper than the gate reads is refused. Apart from that, enforce mode now lets a build directory go, as observe mode has since v0.21.3: under the new starter `rm -rf node_modules` and `rm -rf dist` are no longer refused.
+
+Security release for [GHSA-84qh-xh6v-3qhr](https://github.com/termaxa/termaxa/security/advisories/GHSA-84qh-xh6v-3qhr) (High), found on Nov 13, 2026 while measuring observe mode's floor before building on it, and measured on each release's own starter back to v0.6.1. Three code PRs (#166, #167, #168). The advisory lists when each form started.
+
+### Security
+
+- Between two denies on one line, the one on the floor is the line's verdict, and the reason names its segment. A line's verdict carries one rule, and observe mode holds a line only when that rule is on the floor, so `rm -rf dist; kubectl delete ns prod` was a deny by `*rm -rf*` and ran in observe mode, `dist` copied aside (#166).
+- The first command of a `$( ... )`, a backtick substitution, a `<( ... )` or a `>( ... )` is a segment of its own, read through any wrapper in it, where it runs: it is previewed, insured and classified like any other, and a `cd` that opens a substitution moves the rest of it and nothing after it, so `x=$(cd .termaxa; echo "default: allow" > policy.yaml)` is a write to the gate's policy. A deny on such a segment denies the line. A quoted heredoc (`git commit -m "$(cat <<'EOF' ... EOF)"`) is data, as before (#166).
+- A command read this way that no rule allows makes an allowed line an ask, with the command named in the reason: the rule a `$( ... )` has had since v0.19.3, now for a process substitution, which was read for nothing, and for a substitution beside a wrapper's string (`sh -c "ls" $(git push origin main)`), which was lost with the wrapper (#168).
+- Substitutions are read eight levels deep and a hundred to a line; a `-c` string four deep, as before. A line that goes past one of these is refused in every mode, observe included, with no rule named: nothing read the command left over, so nothing can say the floor is not in it. Until now the reading stopped at four levels without a word, and five deep a hard stop was judged by the command around it (#168).
+- Every deny rule, the classifier, the preview and the copy aside find the command past `timeout` (which owns its duration), `time`, `exec`, `setsid`, `stdbuf`, `watch`, `!`, `{` and a function's header. An allow rule reads through `timeout` only: `timeout 60 npm test` is allowed by `npm test*`, and `time npm test` asks as before (#166).
+
+### Changed
+
+- Enforce mode lets a build directory go. A deny can say `except_rebuilt: true`: it then does not apply to a delete whose every target is, or sits inside, one of the eighteen directories a build or an install rebuilds (`node_modules`, `.next`, `dist`, `build`, `target`, `.venv` and their kind), inside the project root. With no other rule naming the command it is allowed, by the gate and by no rule, the copy aside taken first when the directory is under the budget, and the harness's own prompt is what it was. With any other target on the command (`rm -rf node_modules src`), a link, a variable or a target outside the project, the rule applies as written. The starter's seven recursive-delete denies carry the field; it still has 229 rules (#167).
+- Two such deletes in a session are no longer two attempts to the circuit breaker, so the delete after them that would only have asked (`rm -r src/old`) asks, where 0.21.8 refused it until a recorded resume (#167).
+- `diff <(sort a.txt) <(sort b.txt)` asks, where it was allowed by `diff *`: `sort` has no rule, because `sort -o` writes a file with no redirect for the gate to see, and it asks typed plain. `diff <(git show HEAD:a) <(cat a)` is the allow it was (#168).
+
+### Measured and documented
+
+- Through the hook with the starter, 0.21.8 against this release. Each of the 38 floor rules by a command that names it, in seven spellings (plain, behind `rm -rf dist;`, in `x=$( )`, behind `timeout 60`, two substitutions deep, in `{ ; }`, in a function's body), 266 lines: observe mode held 191 and holds 266; enforce mode denied 236, asked about 25 and allowed 5, and denies 266. In seven deeper spellings (five to twelve substitutions deep, and beside a wrapper's string), 266 lines: enforce mode denied 224, asked about 6 and allowed 36, and denies 266; observe mode held 210 and holds 266.
+- Fifteen commands the starter asks about (its fourteen ask rules and one command with no rule) in ten spellings, 150 lines in enforce mode: 0.21.8 asked about 32 and allowed 118; this release asks about 135, refuses the 15 that are nine deep and allows none.
+- Ninety-one ways to run `kubectl delete pod web-1`: 0.21.8 denied 35, asked about 52 (which ran in observe mode) and allowed 4; this release denies 55, asks about 36 and allows none. The 36 are what is still not read: a runner the gate does not know (`strace`, `flock`, `ionice`, `chroot`, `docker exec`, `ssh` and their kind), a pipe into a shell, `coproc`, `trap`, an alias, a command named by a variable set elsewhere or by a substitution, an interpreter's inline code, a script. In enforce mode they ask; in observe mode they run. SECURITY.md and docs/observe-mode.md say so.
+- Ordinary work, each release with its own starter. Of the 95 calls of an ordinary Claude Code session, four verdicts move in enforce mode: `timeout 60 npm test` from an ask to an allow, `rm -rf dist` and `rm -rf node_modules` from refused to no answer, and the two together followed by `npm install` from refused to an ask on the install. In observe mode the hook's answer moves on one, the `timeout` line. Of 51 ordinary lines with a substitution in them, three move: `timeout 60 git log $(git describe --tags --abbrev=0)..HEAD --oneline` from an ask to an allow, and the two `diff <( ) <( )` lines over `sort` and `jq` from an allow to an ask.
+- The limit of a hundred substitutions to a line is there for time: each command read is judged by every rule, and a 118 KB line of 6,561 substitutions nested eight deep took the hook 9.8 s before the limit (0.34 s on 0.21.8); it is refused in 0.26 s.
+- The conformance test against bash still holds on 1,500 generated command lines per run.
+- SECURITY.md says how a substitution and a runner are read and what is still not read; docs/observe-mode.md says what the floor reads on a line; the README's modes, policy and limitations sections follow. A dated correction under v0.21.8: with the eleven project rules the record measures 59 allow, 63 ask, 1 deny.
+- 625 tests on Linux (23 new), 535 on Windows.
+
+### Upgrade note — a policy from before v0.21.9
+
+`init` never rewrites a policy. The security fixes are in the reading and need nothing from the policy: a hard stop written `kubectl delete*` is found inside a substitution and behind `timeout` as it stands, and the floor is whichever rules already say `floor: true`. Letting a build directory go in enforce mode is the policy's to say, so an existing policy denies `rm -rf node_modules` as before until the line is added to its recursive-delete denies (`*rm -rf*`, `*rm -fr*`, `*Remove-Item*-Recurse*`, `*Remove-Item*-Force*`, `*del /s*`, `*rmdir /s*`, `*rd /s*`):
+
+```yaml
+  - match: "*rm -rf*"
+    action: deny
+    reason: "Recursive force delete blocked by default policy."
+    except_rebuilt: true
+```
+
+`termaxa check "rm -rf node_modules"` should then say `allow`, and `termaxa check "rm -rf src"` should say `deny`.
+
 ## v0.21.8 — a line of a file is not a command, and the demo runs on a project the gate can see
 
 **In plain words:** an agent that writes a file through a heredoc and builds, tests or commits in the same call was asked about the first line of the file that matched no rule, and once refused on a JavaScript line for looking like a path. The file's contents are now data: a hard stop spelled in them still denies, nothing else in them is a verdict, and the build or the commit after them is what gets judged. `termaxa demo` had been denying its own three checks since v0.21.3, because its scratch project sat under `~/.termaxa`, which the floor protects; it now builds in the temp directory. Five heads an unattended agent ran this week join the starter as allows.
@@ -26,6 +70,10 @@ Measured on the SynCircles record: an agent (Claude Code, headless) building a r
 ### Docs
 
 - README.ja.md, a Japanese translation of the README as of v0.21.7, by Lesstep (#162), reviewed line by line against the English before merge; the English is authoritative and the translation says so.
+
+### Correction, Nov 14, 2026
+
+The entry above says that with the eleven project rules the record measures 58 allow, 64 ask, 1 deny. The released binary gives 59 allow, 63 ask, 1 deny: replayed twice on Nov 11, 2026 in a fresh state directory, the same per command as the Nov 5 run's own record. The figures without the rules (36 / 86 / 1) and the hook's own verdicts (34 / 88 / 1) reproduce.
 
 ## v0.21.7 — a comment hides no command, and a file written through a heredoc is judged by its path
 

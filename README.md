@@ -289,9 +289,9 @@ Each harness speaks its own dialect, and dialects change: Cursor 3.11 renamed it
 
 ## Modes
 
-**Enforce** is the default: asks ask, denies deny, insurance before execution.
+**Enforce** is the default: asks ask, denies deny, insurance before execution. One deny steps aside since v0.21.9: a recursive delete of nothing but a directory a build rebuilds (`node_modules`, `.next`, `dist`, `target`, `.venv` and their kind, inside the project) runs, copied first when it is under the budget, because the starter's delete denies say `except_rebuilt: true`.
 
-**Observe** (`mode: observe`, `termaxa init --observe`, or `TERMAXA_MODE=observe` on one machine) runs everything and records what enforcement would have done, insurance included. The hook stays silent, so the agent's own prompts are unchanged. The exception is the floor: 38 starter rules marked `floor: true` are enforced in both modes, and so is any command whose insurance cannot be taken. They cover the gate's own configuration and state (held by the path a write lands on since v0.21.3, and after a `cd` too since v0.21.4; reading those files is ordinary work), the machine and its recovery points, and commands with no recovery path: `rm -rf /`, `mkfs`, `dd` to a device, shadow-copy deletion, `drop database`, database resets, `kubectl delete`, `terraform destroy`, `docker system prune`, `find -delete`. A delete past the copy budget is uninsurable, and so held, unless the directory is one a build rebuilds (`node_modules`, `.next`, `dist`, `target`, `.venv` and their kind, inside the project): those run in observe mode with nothing copied, because nothing in them is the only copy of anything. Policies written before v0.20 have no floor markers; add `floor: true` to the rules you would never relax, or take the 38 from [`examples/policy.yaml`](examples/policy.yaml). Design and measurements: [docs/observe-mode.md](docs/observe-mode.md).
+**Observe** (`mode: observe`, `termaxa init --observe`, or `TERMAXA_MODE=observe` on one machine) runs everything and records what enforcement would have done, insurance included. The hook stays silent, so the agent's own prompts are unchanged. The exception is the floor: 38 starter rules marked `floor: true` are enforced in both modes, and so is any command whose insurance cannot be taken. They cover the gate's own configuration and state (held by the path a write lands on since v0.21.3, and after a `cd` too since v0.21.4; reading those files is ordinary work), the machine and its recovery points, and commands with no recovery path: `rm -rf /`, `mkfs`, `dd` to a device, shadow-copy deletion, `drop database`, database resets, `kubectl delete`, `terraform destroy`, `docker system prune`, `find -delete`. Since v0.21.9 the floor holds such a command wherever the gate reads it on the line: after another deny, as the first command of a `$(…)` or a `<(…)`, behind `timeout` and its kind, in a group or in a function's body; and a line nested deeper than the gate reads is refused in both modes. A delete past the copy budget is uninsurable, and so held, unless the directory is one a build rebuilds (`node_modules`, `.next`, `dist`, `target`, `.venv` and their kind, inside the project): those run in observe mode with nothing copied, because nothing in them is the only copy of anything. Policies written before v0.20 have no floor markers; add `floor: true` to the rules you would never relax, or take the 38 from [`examples/policy.yaml`](examples/policy.yaml). Design and measurements: [docs/observe-mode.md](docs/observe-mode.md).
 
 **Supervised** (Unix) moves the authority. A daemon running as you makes every decision; the agent runs as a second account that cannot read the audit log, edit the backups, change the policy or stop the supervisor, because the operating system refuses, not the code.
 
@@ -335,6 +335,10 @@ rules:
   - match: "git push*--force*"
     action: deny
     reason: "Force pushes are blocked by policy. Open a PR instead."
+  - match: "*rm -rf*"
+    action: deny
+    reason: "Recursive force delete blocked by default policy."
+    except_rebuilt: true         # not for node_modules, dist, target: a build rebuilds them
   - match: "*find* -delete*"
     action: deny
     reason: "find -delete removes everything it matches and nothing is copied first. Delete named paths with rm instead."
@@ -410,7 +414,7 @@ Termaxa is pre-1.0. It's real and tested, and it is not magic.
 - **Cooperative, not a sandbox.** Termaxa governs commands that flow through a hook, `termaxa run` or a wrapped shell. Raw, unhooked shell access is not contained.
 - **Native tools are judged by their target only.** A `Write` to `.env` is denied; a `Write` whose content is a script that deletes things is a write. What the agent then runs is judged when it runs it.
 - **The gate fails open on a payload it doesn't recognise, by design.** `doctor` and the liveness probe are how you find out; `unrecognised: deny` is the switch for runs where a stopped agent is cheaper than an ungated one.
-- **Shell parsing is good, not perfect.** Compound commands, `-c` strings, `eval`, same-line variables and the global options of git, kubectl, terraform, tofu and docker are read as what they run, and a program named by its path is read by its name for deny rules; `$(…)` is flagged unless the policy would allow what's inside. Subshells and deep quoting are judged conservatively. A path built from the caller's environment (`rm -rf ~/x/$SID`) is carried as *unresolved*, not guessed.
+- **Shell parsing is good, not perfect.** Compound commands, `-c` strings, `eval`, same-line variables and the global options of git, kubectl, terraform, tofu and docker are read as what they run, and a program named by its path is read by its name for deny rules; the first command of a `$(…)` or a `<(…)` is read as a command where it runs, denied if a rule denies it and flagged unless the policy would allow it, and a deny rule finds its command behind `timeout`, `time` and their kind. A line nested more than eight substitutions deep is refused, a runner the gate does not know (`strace`, `flock`, `docker exec`) is not read through, and subshells and deep quoting are judged conservatively. A path built from the caller's environment (`rm -rf ~/x/$SID`) is carried as *unresolved*, not guessed.
 - **Previews are best-effort.** No database connection means static analysis only; Terraform previews shell out to `terraform plan`.
 - **Backups have edges.** A delete expressed through a script or a language runtime is not insured; a glob target (`rm -rf build/*`) is previewed as what it expands to and is not insured, because the shell expands it after the gate has looked; a target over the budget is refused rather than silently uninsured, unless it is a directory a build rebuilds (`node_modules`, `.next`, `dist`, `target`, `.venv`, inside the project), which is left out of the copy and said so; a link is copied as a link, never followed into the tree behind it, which is the mechanism of the Sep 20, 2026 incident that deleted 48,218 live files through directory junctions.
 - **The format may still change.** Pin a release.
@@ -420,7 +424,7 @@ Every bug found in real use, with how it was found and where it was fixed, is in
 
 ## Contributing
 
-Rust 2021, ~19,300 lines of production code and ~20,100 of tests, 602 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
+Rust 2021, ~20,000 lines of production code and ~21,400 of tests, 625 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
 
 ## Security
 

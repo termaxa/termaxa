@@ -30,7 +30,7 @@ own prompt. Fixed in v0.20.1.) Observed verdicts send no notifications.
 
 ## The floor
 
-Two things are enforced in both modes:
+Three things are enforced in both modes:
 
 1. Every rule marked `floor: true`. The starter marks 38 of its denies, in
    three groups: the gate's own configuration and state (hook configs,
@@ -53,8 +53,33 @@ Two things are enforced in both modes:
    past the budget and not a loss, so they run, recorded as
    `known-uninsured`, with nothing copied. The same directory under any
    other name, or outside the project, is held as before.
+3. A line that holds a command the gate did not read to the end (v0.21.9):
+   substitutions nested more than eight deep, more than a hundred of them
+   on one line, or a `-c` string past the fourth. Nothing judged the
+   command left over, so nothing can say the floor is not in it, and the
+   line is refused with no rule named.
 
-Observe mode cannot relax either. Lowering the floor means editing the
+Since v0.21.9 the floor holds a floor command wherever the gate reads it on
+the line: after another deny, as the first command of a substitution,
+behind `timeout`, `time`, `exec`, `setsid`, `stdbuf`, `watch` or `!`, in a
+`{ ...; }` group and in a function's body. Until then `rm -rf dist; kubectl
+delete ns prod` carried the `*rm -rf*` deny, which is not on the floor, and
+ran with `dist` copied aside, as 35 of the 38 floor rules did behind `rm
+-rf dist;`. And the eight floor rules anchored on a command's first word
+(`rm -rf /`, `kubectl delete*`, `terraform destroy*`, `mkfs*` and their
+kind) did not see `x=$(rm -rf /)`, `cat <(kubectl delete ns prod)` or
+`timeout 60 kubectl delete ns prod`, which ran
+([GHSA-84qh-xh6v-3qhr](https://github.com/termaxa/termaxa/security/advisories/GHSA-84qh-xh6v-3qhr)).
+
+What the gate does not read it cannot hold. A command behind a runner it
+does not know (`strace`, `flock`, `chroot`, `docker exec`, `ssh`), piped
+into a shell, in an interpreter's inline code or in a script is not read:
+the line gets the verdict of its own words, which under the starter is an
+ask for all of these but a `node <file>` script, and in observe mode it
+runs, unless a floor rule spelled with a leading `*` matches the line as
+typed; the anchored ones do not. SECURITY.md has the list.
+
+Observe mode cannot relax any of them. Lowering the floor means editing the
 policy, which the fingerprint records. A policy that asks for observe but
 has no `floor: true` rule at all is enforced instead; `termaxa doctor`
 says why. Policies written before v0.20 have no markers: add `floor: true`
