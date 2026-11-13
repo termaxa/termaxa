@@ -990,11 +990,40 @@ fn expand_into(
     let mut cds: Vec<Option<CdEffect>> = Vec::new();
     let mut parens: Vec<Parens> = Vec::new();
     let mut prev: Option<Joiner> = None;
+    // Inside a backtick substitution that began in an earlier segment.
+    let mut tick_open = false;
     for mut seg in segments {
         if let Some(v) = via {
             seg.via = Some(v.to_string());
         }
-        let pp = strip_subshell_parens(&mut seg);
+        let mut pp = strip_subshell_parens(&mut seg);
+        // A backtick substitution the split cut at a `;` or `&&` inside it
+        // is a subshell the same way when it opens with a `cd`: it opens
+        // in that segment and closes in the next one with an odd backtick,
+        // whose closing backtick comes off the words its targets are read
+        // from, as a closing `)` does (`` x=`cd .claude && echo {} >
+        // settings.json` `` wrote to ``settings.json` ``, which no path
+        // rule names). Any other odd backtick is left alone: to PowerShell
+        // it is an escape (``"done`n"``), and nothing opens there. A
+        // segment read on its own (`resolve::command_targets` splits one
+        // segment's text again) has lost the one that opened it; there a
+        // lone backtick at the very end comes off the same words, and
+        // closes nothing.
+        if unquoted_backticks(&seg.text) % 2 == 1 {
+            if tick_open {
+                strip_closing_backtick(&mut seg);
+                pp.closes += 1;
+                tick_open = false;
+            } else if seg.text.trim_end().ends_with('`') {
+                strip_closing_backtick(&mut seg);
+            } else if inner_commands(&seg.text)
+                .last()
+                .is_some_and(|c| !c.closed && cd_effect(&c.text).is_some())
+            {
+                pp.opens += 1;
+                tick_open = true;
+            }
+        }
         for _ in 0..pp.opens {
             binding_scopes.push(bindings.clone());
         }
@@ -1101,7 +1130,16 @@ fn expand_into(
         // stays where the line's goes (`output_stays`). The line as a whole
         // is checked once it is read (`split_segments_deep`).
         let string_bodies = bodies && !conditional[i] && subshells.is_empty() && output_stays(&seg);
+        // The commands the shell runs out of this segment's own words. A
+        // line of a body it never runs has none, and past the depth limit
+        // the reading stops as it does for a `-c` string.
+        let inner_words = if seg.body_line || depth >= MAX_WRAP_DEPTH {
+            Vec::new()
+        } else {
+            inner_commands(&seg.text)
+        };
         out.push(seg);
+        let mut script_read: Option<String> = None;
         if let Some((shell, script)) = wrapped {
             let label = if shell == "eval" {
                 "eval".to_string()
@@ -1118,6 +1156,46 @@ fn expand_into(
             );
             // An `eval` runs in this shell, so a `cd` inside it moves it.
             if shell == "eval" && own_shell && after != here {
+                moves_to = Some(after);
+            }
+            script_read = Some(script);
+        }
+        for inner_cmd in inner_words {
+            // A quoted heredoc is data (`is_literal_heredoc`), and a
+            // substitution inside a wrapper's string was read with the
+            // string, just above.
+            if inner_cmd.text.trim().is_empty()
+                || is_literal_heredoc(&inner_cmd.text)
+                || script_read
+                    .as_deref()
+                    .is_some_and(|s| s.contains(inner_cmd.text.as_str()))
+            {
+                continue;
+            }
+            let from = out.len();
+            let after = expand_into(
+                out,
+                split_with(&inner_cmd.text, false),
+                Some(INSIDE),
+                depth + 1,
+                here.clone(),
+                false,
+            );
+            for s in &mut out[from..] {
+                s.inside = true;
+            }
+            // A substitution the split cut at a `;`, `&&` or newline inside
+            // it carries on in the segments after this one, in the same
+            // subshell: `x=$(cd .claude && echo {} > settings.json)` writes
+            // `.claude/settings.json`. Where it opened is on the stack
+            // already (`Parens::opens` counts it), and comes back when it
+            // closes; with nothing counted as open there is nowhere to come
+            // back from, and the move is not made.
+            if !inner_cmd.closed
+                && pp.opens > 0
+                && after != here
+                && !matches!(joiner, Joiner::Pipe | Joiner::Background)
+            {
                 moves_to = Some(after);
             }
         }
@@ -1395,6 +1473,47 @@ fn cd_effect(command: &str) -> Option<CdEffect> {
 struct Parens {
     opens: usize,
     closes: usize,
+}
+
+/// How many backticks in `text` the shell reads as opening or closing a
+/// substitution: every one outside single quotes that no backslash takes.
+fn unquoted_backticks(text: &str) -> usize {
+    let mut n = 0;
+    let mut single = false;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !single => {
+                chars.next();
+            }
+            '\'' => single = !single,
+            '`' if !single => n += 1,
+            _ => {}
+        }
+    }
+    n
+}
+
+/// Takes the backtick that closes a substitution opened in an earlier
+/// segment off the words this segment's targets are read from: the last
+/// redirect target that ends with one, or else the command's last word. The
+/// text the string rules match stays as typed.
+fn strip_closing_backtick(seg: &mut Segment) {
+    if let Some(r) = seg
+        .redirects
+        .iter_mut()
+        .rev()
+        .find(|r| r.target.ends_with('`'))
+    {
+        r.target.pop();
+        return;
+    }
+    let trimmed = seg.command.trim_end();
+    if let Some(rest) = trimmed.strip_suffix('`') {
+        seg.command = rest.trim_end().to_string();
+    } else if let Some(at) = seg.command.find('`') {
+        seg.command.remove(at);
+    }
 }
 
 /// Takes a `( … )` subshell's own parentheses off the words a segment's
@@ -2099,6 +2218,22 @@ pub struct Segment {
     /// template literal in a `python3 -` body was refused as an unresolved
     /// path (`${new URL(…)}`).
     pub body_line: bool,
+    /// True when this segment was read out of another segment's words: the
+    /// first command of a command substitution (`$( … )`, backticks) or of
+    /// a process substitution (`<( … )`, `>( … )`), and whatever a wrapper
+    /// in it runs. The shell runs it; until Nov 2026 nothing read it. The
+    /// commands after a `;`, `&&` or `|` inside a substitution were already
+    /// segments (the split cuts there), so `echo $(true; kubectl delete ns
+    /// prod)` was denied while `echo $(kubectl delete ns prod; true)` was
+    /// an ask, `x=$(rm -rf /)` matched the `*rm -rf*` rule and not the
+    /// anchored `rm -rf /` one, and `x=$(cd .termaxa; echo x > policy.yaml)`
+    /// wrote to `./policy.yaml` as far as the path rules could tell. In
+    /// observe mode, where only the floor is held, each of those ran
+    /// (measured Nov 13, 2026, on 0.21.8). Such a segment is previewed,
+    /// insured and classified like any other, and its `cd` moves the rest
+    /// of its substitution. The policy takes one thing from it, a deny:
+    /// what the line asked or allowed before, it asks or allows now.
+    pub inside: bool,
     /// The operator that ended this segment, which decides whether a `cd`
     /// in it carries over to the next one: through `&&`, `;` and a newline
     /// it does; through `|` and `&` it ran in a subshell and does not.
@@ -2346,6 +2481,7 @@ fn flush(
             keyword: t.starts_with('#'),
             literal_body: false,
             body_line: false,
+            inside: false,
             joiner,
             dir: RunDir::Start,
         });
@@ -2357,6 +2493,108 @@ fn flush(
     }
     spans.clear();
     cur.clear();
+}
+
+/// How a segment read out of another's words is labelled where a reason
+/// names it: "segment 2/2 `rm -rf /` (inside a substitution)".
+const INSIDE: &str = "a substitution";
+
+/// A command the shell runs out of another command's words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InnerCommand {
+    text: String,
+    /// False when the `$(`, `<(`, `>(` or backtick that opens it has no
+    /// close in this segment: the split cut the substitution at a `;`, `&&`,
+    /// `|` or newline inside it, so this is its first command and the
+    /// segments after this one are the rest of it.
+    closed: bool,
+}
+
+/// Every command the shell runs out of `s` before or beside the command
+/// `s` itself names: command substitutions (`$( … )` and backticks, which
+/// double quotes do not hide) and process substitutions (`<( … )`, `>( … )`,
+/// which they do). Outermost only: one nested inside another is found when
+/// that one is read in its turn. Single quotes hide all of them, a
+/// backslash takes a quote after it, and inside a `$( … )` a quoted
+/// parenthesis closes nothing. An opening with no close yields the rest of
+/// `s`, marked as not closed.
+fn inner_commands(s: &str) -> Vec<InnerCommand> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let (mut single, mut double) = (false, false);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            // A backslash takes the quote or the backslash after it and
+            // hides nothing else: before a `$(` it is a path separator on
+            // Windows (`C:\tmp\$(…)` is a subexpression to PowerShell),
+            // and reading one the POSIX shell would not run costs nothing.
+            '\\' if !single => {
+                i += if matches!(chars.get(i + 1), Some('\'' | '"' | '\\')) {
+                    2
+                } else {
+                    1
+                };
+            }
+            '\'' if !double => {
+                single = !single;
+                i += 1;
+            }
+            '"' if !single => {
+                double = !double;
+                i += 1;
+            }
+            '`' if !single => {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != '`' {
+                    if chars[j] == '\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                let end = j.min(chars.len());
+                out.push(InnerCommand {
+                    text: chars[start..end].iter().collect(),
+                    closed: j < chars.len(),
+                });
+                i = j + 1;
+            }
+            '$' | '<' | '>'
+                if !single && (c == '$' || !double) && chars.get(i + 1) == Some(&'(') =>
+            {
+                let start = i + 2;
+                let mut depth = 1usize;
+                let (mut in_single, mut in_double) = (false, false);
+                let mut j = start;
+                while j < chars.len() {
+                    match chars[j] {
+                        '\\' if !in_single => j += 1,
+                        '\'' if !in_double => in_single = !in_single,
+                        '"' if !in_single => in_double = !in_double,
+                        '(' if !in_single && !in_double => depth += 1,
+                        ')' if !in_single && !in_double => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let end = j.min(chars.len());
+                out.push(InnerCommand {
+                    text: chars[start..end].iter().collect(),
+                    closed: j < chars.len(),
+                });
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
 }
 
 /// Does the command contain command substitution we cannot see inside?
@@ -4251,6 +4489,171 @@ mod tests {
                 1,
                 "{real} is an ordinary file"
             );
+        }
+    }
+    /// The commands the shell runs out of a segment's words, and whether
+    /// each one closes there. Double quotes hide a process substitution and
+    /// not a command substitution; single quotes hide both; a backslash
+    /// takes the quote after it, so `\'` opens nothing.
+    #[test]
+    fn inner_commands_are_found_where_the_shell_finds_them() {
+        let got = |s: &str| -> Vec<(String, bool)> {
+            inner_commands(s)
+                .into_iter()
+                .map(|c| (c.text, c.closed))
+                .collect()
+        };
+        let one = |t: &str| vec![(t.to_string(), true)];
+        assert_eq!(got("x=$(rm -rf /)"), one("rm -rf /"));
+        assert_eq!(
+            got("echo \"$(kubectl delete ns prod)\""),
+            one("kubectl delete ns prod")
+        );
+        assert_eq!(got("echo `rm -rf /`"), one("rm -rf /"));
+        assert_eq!(got("cat <(rm -rf /)"), one("rm -rf /"));
+        assert_eq!(got("tee >(rm -rf /)"), one("rm -rf /"));
+        assert_eq!(got("echo \\' $(rm -rf /)"), one("rm -rf /"));
+        // A backslash hides nothing but a quote: on Windows it is a path.
+        assert_eq!(got("dir C:\\tmp\\$(rm -rf /)"), one("rm -rf /"));
+        assert_eq!(got("x=${y:-$(rm -rf /)}"), one("rm -rf /"));
+        // Outermost only; the nested one is found when this one is read.
+        assert_eq!(
+            got("echo $(echo $(mkfs /dev/sda1))"),
+            one("echo $(mkfs /dev/sda1)")
+        );
+        // A quoted parenthesis closes nothing.
+        assert_eq!(
+            got("echo $(echo \")\" && rm -rf /)"),
+            one("echo \")\" && rm -rf /")
+        );
+        // Hidden: single quotes, and a process substitution in double quotes.
+        assert!(got("echo '$(rm -rf /)'").is_empty());
+        assert!(got("echo \"<(rm -rf /)\"").is_empty());
+        assert!(got("echo a > b").is_empty());
+        // Cut by the split at a `;` inside it: the rest of the segment.
+        assert_eq!(
+            got("x=$(cd .claude"),
+            vec![("cd .claude".to_string(), false)]
+        );
+        // Every one `substitutions` finds is found here too.
+        for s in [
+            "git log origin/$(git branch --show-current) -1",
+            "echo $(dirname $(pwd)) `whoami`",
+            "echo $(unbalanced",
+        ] {
+            let mine: Vec<String> = inner_commands(s).into_iter().map(|c| c.text).collect();
+            assert_eq!(mine, substitutions(s), "{s}");
+        }
+    }
+
+    /// The first command of a substitution is a segment of its own, marked,
+    /// after the segment it was read out of; a quoted heredoc is data and
+    /// adds none; a line of a body the shell never runs adds none.
+    #[test]
+    fn a_substitutions_first_command_is_a_segment_of_its_own() {
+        let cmds = |line: &str| -> Vec<(String, bool)> {
+            split_segments_deep(line)
+                .iter()
+                .map(|s| (s.command().to_string(), s.inside))
+                .collect()
+        };
+        assert_eq!(
+            cmds("x=$(rm -rf /)"),
+            [
+                ("x=$(rm -rf /)".to_string(), false),
+                ("rm -rf /".to_string(), true)
+            ]
+        );
+        let nested = cmds("git log $(echo $(terraform destroy -auto-approve))");
+        assert_eq!(nested.len(), 3, "{nested:?}");
+        assert_eq!(
+            nested[2],
+            ("terraform destroy -auto-approve".to_string(), true)
+        );
+        // Through a wrapper inside it, and marked all the way down.
+        let wrapped = split_segments_deep("echo $(sh -c 'kubectl delete ns prod')");
+        assert!(
+            wrapped
+                .iter()
+                .any(|s| s.inside && s.command() == "kubectl delete ns prod"),
+            "{wrapped:?}"
+        );
+        // A wrapper's own string is read once, not twice.
+        let once = split_segments_deep("sh -c \"x=$(rm -rf /)\"");
+        assert_eq!(
+            once.iter().filter(|s| s.command() == "rm -rf /").count(),
+            1,
+            "{once:?}"
+        );
+        // Claude Code's commit message: data.
+        let commit = "git commit -m \"$(cat <<'EOF'\nfix: remove rm -rf / from the docs\nEOF\n)\"";
+        assert!(split_segments_deep(commit).iter().all(|s| !s.inside));
+        // A file's contents: data, whatever they spell.
+        let file = "cat > notes.md <<'EOF'\nrun $(rm -rf /) never\nEOF\nnpm run build";
+        assert!(
+            split_segments_deep(file).iter().all(|s| !s.inside),
+            "{:?}",
+            split_segments_deep(file)
+        );
+    }
+
+    /// An odd backtick that opens no `cd` opens nothing. PowerShell's
+    /// escape is a backtick (``"done`n"``), Codex on Windows sends
+    /// PowerShell, and read as the start of a substitution the first one
+    /// would have put the line's later `Set-Location` inside it, undone at
+    /// the next.
+    #[test]
+    fn an_odd_backtick_that_opens_no_cd_moves_nothing() {
+        let line = "Write-Host \"a`n\"; Set-Location sub; Write-Host \"b`n\"; Remove-Item x";
+        let segs = split_segments_deep(line);
+        let last = segs
+            .iter()
+            .find(|s| s.command() == "Remove-Item x")
+            .unwrap();
+        assert_eq!(
+            last.dir,
+            RunDir::Moved(vec![CdStep {
+                path: "sub".to_string(),
+                sure: false,
+                glob: false
+            }]),
+            "{segs:?}"
+        );
+        // And a line continuation's backtick comes off the target it ends.
+        let cont = split_segments_deep("echo x > out.txt`");
+        assert_eq!(cont[0].redirects[0].target, "out.txt", "{cont:?}");
+    }
+
+    /// A `cd` that opens a substitution moves the rest of that substitution
+    /// and nothing after it: `x=$(cd .claude && echo {} > settings.json)`
+    /// writes `.claude/settings.json`, and the `ls` after it runs where the
+    /// line started. Inside double quotes the split does not cut the
+    /// substitution, so the write is read out of the segment with the rest
+    /// (`Segment::inside`), in the same directory.
+    #[test]
+    fn a_cd_that_opens_a_substitution_moves_the_rest_of_it() {
+        let in_claude = RunDir::Moved(vec![CdStep {
+            path: ".claude".to_string(),
+            sure: true,
+            glob: false,
+        }]);
+        for line in [
+            "x=$(cd .claude && echo {} > settings.json); ls",
+            "echo \"$(cd .claude && echo {} > settings.json)\"; ls",
+            "x=`cd .claude && echo {} > settings.json`; ls",
+        ] {
+            let segs = split_segments_deep(line);
+            let write = segs
+                .iter()
+                .find(|s| !s.redirects.is_empty() && s.command().starts_with("echo {}"))
+                .unwrap_or_else(|| panic!("{line}: {segs:?}"));
+            assert_eq!(write.dir, in_claude, "{line}: {segs:?}");
+            assert_eq!(
+                write.redirects[0].target, "settings.json",
+                "{line}: {segs:?}"
+            );
+            let ls = segs.iter().find(|s| s.command() == "ls").unwrap();
+            assert_eq!(ls.dir, RunDir::Start, "{line}: {segs:?}");
         }
     }
 }

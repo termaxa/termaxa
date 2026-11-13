@@ -1234,3 +1234,145 @@ fn observe_mode_is_silent_to_cursor_and_copilot_and_the_floor_still_answers() {
         assert_eq!(e["enforced"], false);
     }
 }
+
+/// The floor holds a floor command however the line spells it (Nov 2026).
+/// Measured Nov 13, 2026, on 0.21.8, with the starter in observe mode: each
+/// held line below ran. A line's verdict carried one rule, the first deny
+/// on it; the first command of a substitution was read as the words of the
+/// command around it; and a rule anchored on `kubectl` does not match a
+/// line that starts with `timeout`. In observe mode nothing but the floor
+/// stands between such a line and the shell.
+#[cfg(unix)]
+#[test]
+fn observe_mode_holds_a_floor_command_however_the_line_spells_it() {
+    use serde_json::json;
+    let tmp = scratch("observe-floor-spellings");
+    let home = tmp.join("home");
+    let starter = include_str!("../examples/policy.yaml").replace("\r\n", "\n");
+    assert_eq!(starter.matches("\nmode: enforce\n").count(), 1);
+    let proj = project(
+        &tmp,
+        &starter.replace("\nmode: enforce\n", "\nmode: observe\n"),
+    );
+    for (file, body) in [
+        ("dist/a.js", "x"),
+        ("sc/f", "x"),
+        ("src/app.ts", "x"),
+        (".claude/settings.json", "{}"),
+        ("a.txt", "b\na\n"),
+        ("b.txt", "a\nb\n"),
+    ] {
+        let f = proj.join(file);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, body).unwrap();
+    }
+    let p = proj.to_string_lossy().to_string();
+    let n = std::cell::Cell::new(0);
+    let ask = |cmd: &str| {
+        n.set(n.get() + 1);
+        hook(
+            &home,
+            &proj,
+            &json!({"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd},
+                    "session_id":format!("floor-{}", n.get()),"cwd":p}),
+            &[],
+        )
+    };
+    let record = |cmd: &str| -> serde_json::Value {
+        project_logs(&home)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .rfind(|e| e["command"] == cmd)
+            .unwrap_or_else(|| panic!("no record line for {cmd}"))
+    };
+
+    let held = [
+        // Behind an ordinary deny on the same line.
+        "rm -rf dist; kubectl delete ns prod",
+        "git push --force origin main; terraform destroy -auto-approve",
+        // Inside a substitution: its only command, its first, two deep.
+        "x=$(rm -rf /)",
+        "out=$(kubectl delete ns prod 2>&1); echo \"$out\"",
+        "echo \"$(terraform destroy -auto-approve)\"",
+        "echo `rm -rf /`",
+        "cat <(rm -rf /)",
+        "echo $(kubectl delete ns prod; true)",
+        "git log $(echo $(terraform destroy -auto-approve))",
+        // The gate's own files, after a `cd` the substitution opens with.
+        "x=$(cd .termaxa; echo \"default: allow\" > policy.yaml)",
+        "x=$(cd .claude && echo \"{}\" > settings.json)",
+        "x=`cd .claude && echo \"{}\" > settings.json`",
+        "cat <(cd .claude && echo \"{}\" > settings.json)",
+        // Behind a runner, a `!`, a group, a function's header.
+        "timeout 60 kubectl delete ns prod",
+        "time kubectl delete ns prod",
+        "exec kubectl delete ns prod",
+        "! kubectl delete ns prod",
+        "{ kubectl delete ns prod; }",
+        "f() { kubectl delete ns prod; }; f",
+        "f() { rm -rf /; }; f",
+    ];
+    for cmd in held {
+        let out = ask(cmd);
+        assert!(
+            out.stdout.contains("\"permissionDecision\":\"deny\"") && out.code == 2,
+            "{cmd}: held in observe mode: {:?} exit {}",
+            out.stdout,
+            out.code
+        );
+        let line = record(cmd);
+        assert_eq!(line["decision"], "deny", "{cmd}: {line}");
+        assert_eq!(line["floor"], true, "{cmd}: {line}");
+        assert_eq!(line["enforced"], true, "{cmd}: {line}");
+    }
+
+    // What observe mode let through before, it lets through now, and what
+    // it reads inside a substitution it insures: `sc` is copied before
+    // `x=$(rm -rf sc)` runs, where 0.21.8 recorded `known-uninsured`.
+    // One copy is one `b-…` directory beside the manifest.
+    let copies = || -> usize {
+        std::fs::read_dir(home.join("projects"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|p| std::fs::read_dir(p.path().join("backups")).ok())
+            .flat_map(|d| d.flatten())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("b-"))
+            .count()
+    };
+    let before = copies();
+    let out = ask("x=$(rm -rf sc)");
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 0),
+        "an observed deny is silence"
+    );
+    let line = record("x=$(rm -rf sc)");
+    assert_eq!(line["decision"], "deny", "{line}");
+    assert_eq!(line["enforced"], false, "{line}");
+    assert_eq!(line["coverage"], "insured", "{line}");
+    assert_eq!((before, copies()), (0, 1), "one copy, taken first");
+
+    for cmd in ["echo $(basename src/app.ts)", "time npm test"] {
+        let out = ask(cmd);
+        assert_eq!(
+            (out.stdout.trim(), out.code),
+            ("", 0),
+            "{cmd}: an observed ask is silence"
+        );
+        assert_eq!(record(cmd)["enforced"], false, "{cmd}");
+    }
+    for cmd in [
+        "echo $(git branch --show-current)",
+        "diff <(sort a.txt) <(sort b.txt)",
+        "timeout 60 git status",
+    ] {
+        let out = ask(cmd);
+        assert!(
+            out.stdout.contains("\"permissionDecision\":\"allow\"") && out.code == 0,
+            "{cmd}: an allow is an allow: {:?} exit {}",
+            out.stdout,
+            out.code
+        );
+    }
+}
