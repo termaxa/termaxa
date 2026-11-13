@@ -35,6 +35,7 @@ pub fn gather(command: &str) -> Vec<Signal> {
 /// substitution that is not readable, and for an unbalanced one.
 pub fn gather_with(command: &str, readable: &dyn Fn(&str) -> bool) -> Vec<Signal> {
     let mut signals = Vec::new();
+    let line = command;
     let command = crate::shell::context_text(command);
     let command = command.as_str();
     let cmd_lc = command.to_lowercase();
@@ -102,13 +103,41 @@ pub fn gather_with(command: &str, readable: &dyn Fn(&str) -> bool) -> Vec<Signal
     // Command substitution: contents the gate cannot read are a reason to
     // put a human in the loop. Contents it can read and would allow are
     // not; a quoted heredoc is data and needs no reading at all.
+    let mut asked = false;
     if crate::shell::has_substitution(command) {
         let unreadable = crate::shell::substitutions(command)
             .into_iter()
             .any(|inner| !(crate::shell::is_literal_heredoc(&inner) || readable(&inner)));
         if unreadable {
+            asked = true;
             signals.push(Signal {
                 label: "command substitution ($(...) or ``) — contents not analyzable".into(),
+                escalate: true,
+            });
+        }
+    }
+
+    // The same rule for every command the shell runs out of another's
+    // words, as the reading found them (`shell::commands_inside`): a
+    // process substitution, which the scan above does not look for, and a
+    // substitution in the words of a wrapper whose string was read, which
+    // the text above leaves out with the wrapper. `cat <(git push origin
+    // main)` was allowed by `cat *` under a policy that asks about a push,
+    // and `sh -c "ls" $(npm publish)` by `ls` (measured Nov 13, 2026).
+    let opens = ["$(", "`", "<(", ">("].iter().any(|o| line.contains(o));
+    if !asked && opens {
+        if let Some(inner) = crate::shell::commands_inside(line)
+            .into_iter()
+            .find(|inner| !readable(inner))
+        {
+            let shown: String = inner.chars().take(60).collect();
+            let more = if inner.chars().count() > 60 {
+                "…"
+            } else {
+                ""
+            };
+            signals.push(Signal {
+                label: format!("runs inside a substitution and no rule allows it: `{shown}{more}`"),
                 escalate: true,
             });
         }
@@ -755,6 +784,66 @@ mod tests {
         assert!(signals
             .iter()
             .any(|s| s.label.contains("command substitution") && s.escalate));
+    }
+
+    /// The rule a `$( … )` has had since v0.19.3, for every command the
+    /// reading finds in another's words: one the caller cannot read is a
+    /// reason to ask, a process substitution and a substitution beside a
+    /// wrapper's string among them. One signal to a line.
+    #[test]
+    fn a_command_inside_any_substitution_is_a_signal_unless_it_is_readable() {
+        let readable = |inner: &str| {
+            ["git status", "ls", "cat ", "echo "]
+                .iter()
+                .any(|p| inner.starts_with(p))
+        };
+        let flagged = |cmd: &str| -> Vec<String> {
+            gather_with(cmd, &readable)
+                .into_iter()
+                .filter(|s| s.escalate)
+                .map(|s| s.label)
+                .collect()
+        };
+        let inside = |what: &str| {
+            vec![format!(
+                "runs inside a substitution and no rule allows it: `{what}`"
+            )]
+        };
+        assert_eq!(flagged("cat <(npm publish)"), inside("npm publish"));
+        assert_eq!(
+            flagged("tee >(npm publish) < notes.md"),
+            inside("npm publish")
+        );
+        assert_eq!(flagged("cat <(cat <(npm publish))"), inside("npm publish"));
+        assert_eq!(
+            flagged("sh -c \"ls\" $(npm publish)"),
+            inside("npm publish")
+        );
+        assert_eq!(
+            flagged("diff <(git status) <(sort a.txt)"),
+            inside("sort a.txt")
+        );
+        for cmd in [
+            "diff <(git status) <(cat notes.md)",
+            "sh -c \"ls\" $(git status)",
+            "cat <(echo '<(npm publish)')",
+            "echo \"<(npm publish)\"",
+        ] {
+            assert_eq!(flagged(cmd), Vec::<String>::new(), "{cmd}");
+        }
+        // A `$( … )` the scan of the text already asks about keeps its label
+        // and gets no second one.
+        assert_eq!(
+            flagged("echo $(npm publish)"),
+            ["command substitution ($(...) or ``) — contents not analyzable"]
+        );
+        // Shown short.
+        let long = format!("cat <(npm publish {})", "x".repeat(80));
+        let label = flagged(&long).remove(0);
+        assert!(
+            label.ends_with("…`") && label.chars().count() < 120,
+            "{label}"
+        );
     }
 
     fn decision(action: Action) -> Decision {

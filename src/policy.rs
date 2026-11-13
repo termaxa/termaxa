@@ -384,6 +384,25 @@ pub struct Decision {
     pub source: DecisionSource,
 }
 
+impl Decision {
+    /// A deny that no mode lets through for a reason no rule states: the
+    /// line holds a command the gate did not read (`DecisionSource::Unread`).
+    /// Observe mode holds it as it holds a rule on the floor.
+    pub fn held_in_every_mode(&self) -> bool {
+        self.action == Action::Deny && self.source == DecisionSource::Unread
+    }
+}
+
+/// `text`, cut to `max` characters with an ellipsis, for a reason a person
+/// reads on one line.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max).collect();
+    format!("{cut}…")
+}
+
 /// Where a verdict came from.
 ///
 /// Carried rather than collapsed, for the same reason `ResolvedTarget` keeps
@@ -406,6 +425,13 @@ pub enum DecisionSource {
     /// read the delete and found no loss in it, so the recursive and force
     /// flags it carries are not a reason to ask (`context::apply`).
     Rebuilt,
+    /// The line holds a command the reading stopped short of
+    /// (`Segment::unread`): nested deeper than it goes, or one of more
+    /// substitutions than it takes from a line. Nothing judged that
+    /// command. Always a deny, and one observe mode holds: the floor's
+    /// promise is about every command on the line, and this one was not
+    /// read.
+    Unread,
 }
 
 impl DecisionSource {
@@ -418,7 +444,7 @@ impl DecisionSource {
             DecisionSource::ExplicitRule => "rule",
             // On the record a reading of the command is `context`, as the
             // startup snapshot's allow is; the reason says which.
-            DecisionSource::Context | DecisionSource::Rebuilt => "context",
+            DecisionSource::Context | DecisionSource::Rebuilt | DecisionSource::Unread => "context",
         }
     }
 }
@@ -552,12 +578,17 @@ impl Policy {
     /// Is this substitution's inner text something the policy explicitly
     /// allows? The predicate `context::gather_with` takes. Explicit only:
     /// a default allow would let an unmatched inner command through the
-    /// escalation it exists for.
+    /// escalation it exists for. The text is judged by its own words, not
+    /// by what its own substitutions run: each of those is a command the
+    /// reading of the line found (`shell::commands_inside`) and is asked
+    /// about here in its turn, and a deny among them is the line's verdict
+    /// already (`evaluate_command`). Judging them again under every level
+    /// that holds them cost a nested line the square of its depth.
     pub fn allows_explicitly(&self, inner: &str, ctx: &crate::resolve::EvalContext) -> bool {
         if inner.trim().is_empty() {
             return false;
         }
-        let d = self.evaluate_command(inner, ctx);
+        let d = self.judge(inner, ctx, false);
         d.action == Action::Allow && d.source == DecisionSource::ExplicitRule
     }
 
@@ -699,7 +730,37 @@ impl Policy {
     }
 
     pub fn evaluate_command(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
-        let segments = crate::shell::split_segments_deep(command);
+        self.judge(command, ctx, true)
+    }
+
+    /// `evaluate_command`; with `inside` false, without the commands the
+    /// line runs out of its own words (`allows_explicitly`).
+    fn judge(&self, command: &str, ctx: &crate::resolve::EvalContext, inside: bool) -> Decision {
+        let mut segments = crate::shell::split_segments_deep(command);
+        // A command the reading stopped short of was judged by nothing:
+        // not by a rule, not by the floor. The line is refused whatever the
+        // rest of it earned, in observe mode too
+        // (`Decision::held_in_every_mode`).
+        if let Some((i, seg)) = segments.iter().enumerate().find(|(_, s)| s.unread) {
+            return Decision {
+                action: Action::Deny,
+                source: DecisionSource::Unread,
+                matched_rule: None,
+                reason: format!(
+                    "segment {}/{} `{}` holds a command Termaxa did not read: it is \
+                     nested too deep (past 8 substitutions or 4 `sh -c` strings) or \
+                     the line has more than 100 substitutions. Nothing judged that \
+                     command, so the line is refused. Run the inner commands on \
+                     lines of their own.",
+                    i + 1,
+                    segments.len(),
+                    clip(seg, 80)
+                ),
+            };
+        }
+        if !inside {
+            segments.retain(|s| !s.inside);
+        }
         // A segment read out of another's words (`Segment::inside`) is not
         // one of the line's own: a line that is one command with a `$(git
         // branch --show-current)` in it is still judged as that one command,
@@ -3750,7 +3811,8 @@ mod segment_directory_tests {
             (Action::Allow, "matched rule `git log*`")
         );
         // `sort` has no rule, and a process substitution was never read:
-        // it is read for a deny now, and for nothing else.
+        // the policy reads it for a deny, and the context check asks about
+        // it (`what_no_rule_allows_is_asked_about_wherever_a_substitution_runs_it`).
         let d = p.evaluate_command("diff <(sort a.txt) <(sort b.txt)", &ctx);
         assert_eq!(
             (d.action, d.reason.as_str()),
@@ -3767,6 +3829,135 @@ mod segment_directory_tests {
         // not: the verdict is the line's, as it was.
         let commit = "git commit -m \"$(cat <<'EOF'\nfix: typo\nEOF\n)\"";
         assert_eq!(p.evaluate_command(commit, &ctx).action, Action::Allow);
+    }
+
+    /// A command the policy asks about, or has no rule for, is asked about
+    /// inside a process substitution and beside a wrapper's string as it
+    /// has been inside a `$( … )` since v0.19.3. Measured Nov 13, 2026, with
+    /// the starter: `cat <(git push origin main)` and `cat <(npm publish)`
+    /// were allowed by `cat *`, on 0.21.8 and on the first fix of that day,
+    /// which read a process substitution for a deny and nothing else, and
+    /// `sh -c "ls" $(git push origin main)` by `ls`. The verdict here is
+    /// the policy's with the context check applied, as the hook, `check`
+    /// and `run` apply it.
+    #[test]
+    fn what_no_rule_allows_is_asked_about_wherever_a_substitution_runs_it() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        let verdict = |cmd: &str| {
+            let base = p.evaluate_command(cmd, &ctx);
+            let signals =
+                crate::context::gather_with(cmd, &|inner| p.allows_explicitly(inner, &ctx));
+            crate::context::apply(base, &signals).0
+        };
+        for line in [
+            "cat <(git push origin main)",
+            "cat <(npm publish)",
+            "cat <(terraform apply -auto-approve)",
+            "cat <(some-tool --wipe)",
+            "diff <(sort a.txt) <(sort b.txt)",
+            "diff <(git status) <(sort b.txt)",
+            "tee >(some-tool --wipe) < notes.md",
+            "cat <(cat <(git push origin main))",
+            "echo $(cat <(git push origin main))",
+            "cat <(echo $(git push origin main))",
+            "sh -c \"ls\" $(git push origin main)",
+            "sh -c \"ls\" <(git push origin main)",
+            "bash -c 'echo hi' x $(npm publish)",
+            "echo $(echo $(git push origin main))",
+        ] {
+            let d = verdict(line);
+            assert_eq!(d.action, Action::Ask, "{line}: {}", d.reason);
+            assert_eq!(d.source, DecisionSource::Context, "{line}");
+        }
+        for line in [
+            "diff <(git show HEAD:README.md) <(cat README.md)",
+            "cat <(git status)",
+            "wc -l <(git ls-files)",
+            "cat <(cat <(git status))",
+            "sh -c \"ls\" $(git status)",
+            "echo $(git branch --show-current)",
+            "git commit -m \"$(cat <<'EOF'\nfix: typo\nEOF\n)\"",
+        ] {
+            let d = verdict(line);
+            assert_eq!(d.action, Action::Allow, "{line}: {}", d.reason);
+        }
+        // A deny inside one is the line's verdict, as before.
+        let d = verdict("cat <(kubectl delete pod web-1)");
+        assert_eq!(
+            (d.action, d.matched_rule.as_deref()),
+            (Action::Deny, Some("kubectl delete*"))
+        );
+        // An inner text is judged by its own words: what it runs out of
+        // them is asked about in its turn, not under every level above it.
+        assert!(p.allows_explicitly("echo $(some-tool --wipe)", &ctx));
+        assert!(!p.allows_explicitly("some-tool --wipe", &ctx));
+        assert!(!p.allows_explicitly("echo $(rm -rf wt)", &ctx));
+    }
+
+    /// A hard stop is read at every depth the reading goes, and a line that
+    /// goes deeper is refused in every mode: nothing judged the command
+    /// past the last level read, so nothing can say the floor is not in it.
+    /// Measured Nov 13, 2026: the reading stopped at four levels without a
+    /// word, and `cat <(cat <(cat <(cat <(cat <(kubectl delete pod
+    /// web-1)))))` was allowed by `cat *`, on 0.21.8 and on the first fix
+    /// of that day; ten `$( … )` deep the same.
+    #[test]
+    fn a_line_nested_deeper_than_the_reading_goes_is_refused() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        let nest = |open: &str, inner: &str, n: usize| {
+            (0..n).fold(inner.to_string(), |s, _| format!("{open}{s})"))
+        };
+        for open in ["echo $(", "cat <("] {
+            for n in 1..=8 {
+                let line = nest(open, "kubectl delete pod web-1", n);
+                let d = p.evaluate_command(&line, &ctx);
+                assert_eq!(
+                    (d.action, d.matched_rule.as_deref()),
+                    (Action::Deny, Some("kubectl delete*")),
+                    "{line}: {}",
+                    d.reason
+                );
+                assert!(!d.held_in_every_mode(), "{line}: held by its rule");
+            }
+            let line = nest(open, "ls", 8);
+            let d = p.evaluate_command(&line, &ctx);
+            assert_eq!(d.action, Action::Allow, "{line}: {}", d.reason);
+            for inner in ["kubectl delete pod web-1", "ls"] {
+                for n in [9, 10, 40] {
+                    let line = nest(open, inner, n);
+                    let d = p.evaluate_command(&line, &ctx);
+                    assert_eq!(
+                        (d.action, d.source, d.matched_rule.as_deref()),
+                        (Action::Deny, DecisionSource::Unread, None),
+                        "{line}: {}",
+                        d.reason
+                    );
+                    assert!(d.held_in_every_mode(), "{line}");
+                    assert!(
+                        !p.allows_explicitly(&line, &ctx),
+                        "{line}: and not something to allow inside another"
+                    );
+                }
+            }
+        }
+        // `sh -c` strings past their own limit, and more substitutions on
+        // one line than are read.
+        let mut deep = "ls".to_string();
+        for n in 1..=6 {
+            deep = format!(
+                "sh -c \"{}\"",
+                deep.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+            let d = p.evaluate_command(&deep, &ctx);
+            assert_eq!(d.held_in_every_mode(), n > 4, "{deep}: {}", d.reason);
+        }
+        let wide = |n: usize| format!("echo {}", vec!["$(pwd)"; n].join(" "));
+        assert_eq!(p.evaluate_command(&wide(100), &ctx).action, Action::Allow);
+        assert!(p.evaluate_command(&wide(101), &ctx).held_in_every_mode());
+        // The record's name for it does not move.
+        assert_eq!(DecisionSource::Unread.as_str(), "context");
     }
 
     /// Between two denies on one line, the one on the floor is the line's

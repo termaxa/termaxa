@@ -1520,8 +1520,10 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // observed `rm -rf /*` (the non-floor `*rm -rf*`, over the copy budget)
     // ran, while `run` held it and the doc said it would be held (found
     // while fixing the `rm -r -f /` ask, Max Petrusenko's field report).
+    // And a line that nests a command deeper than the gate reads: no rule
+    // was asked about that command, the floor's among them.
     let floor_holds = matches!(decision.action, Action::Deny)
-        && (floor_rule || uninsured_escalation || uninsurable);
+        && (floor_rule || uninsured_escalation || uninsurable || decision.held_in_every_mode());
     let observed: Option<Action> = if mode == crate::policy::Mode::Observe
         && !is_probe
         && matches!(decision.action, Action::Ask | Action::Deny)

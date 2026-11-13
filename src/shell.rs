@@ -905,6 +905,24 @@ const POSIX_SHELLS: [&str; 4] = ["sh", "bash", "dash", "zsh"];
 /// four is more than any harness produces and bounds a pathological input.
 const MAX_WRAP_DEPTH: usize = 4;
 
+/// How many levels deep the reading goes in all, a `$( … )`, a `<( … )` or a
+/// `-c` string each counting one. Eight is more than a person or an agent
+/// nests by hand (`"$(basename "$(dirname "$(dirname "$(readlink -f "$(which
+/// node)")")")")"` is five) and bounds a pathological input. A segment the
+/// reading stops at with a command still inside it is marked
+/// (`Segment::unread`), and the policy refuses the line: until Nov 2026 the
+/// reading stopped at four for substitutions too and said nothing, so a
+/// hard stop five substitutions deep was judged by the command around it.
+const MAX_INNER_DEPTH: usize = 8;
+
+/// How many commands the reading takes out of the words of others on one
+/// line, at every depth together. Each is judged as a command of its own,
+/// so the number bounds what a line can make the gate do before it answers;
+/// a hundred is several times the substitutions of the longest line an
+/// agent has been seen to write. The one past it is not read, and the line
+/// is refused the same way (`Segment::unread`).
+const MAX_INNER_COMMANDS: usize = 100;
+
 /// `split_segments`, and then through every POSIX shell `-c` string found.
 ///
 /// #62. `sh -c "cat /dev/null > src/main.rs"` was a segment whose head is
@@ -948,7 +966,16 @@ fn expand_line(s: &str, bodies: bool) -> Vec<Segment> {
         split_with(s, false)
     };
     let mut out = Vec::new();
-    expand_into(&mut out, segments, None, 0, RunDir::Start, bodies);
+    let mut read = 0;
+    expand_into(
+        &mut out,
+        segments,
+        None,
+        0,
+        RunDir::Start,
+        bodies,
+        &mut read,
+    );
     out
 }
 
@@ -966,6 +993,7 @@ fn expand_into(
     depth: usize,
     start: RunDir,
     bodies: bool,
+    read: &mut usize,
 ) -> RunDir {
     // A variable assigned earlier in the same command line, in the clear, is
     // not unknown: `SNAPSHOT_FILE=/home/dev/.claude/…` on line one and
@@ -1111,9 +1139,13 @@ fn expand_into(
         let own_shell = !piped_in && !matches!(seg.joiner, Joiner::Pipe | Joiner::Background);
         let gated_and = prev_joiner == Some(Joiner::And);
         let gated_or = prev_joiner == Some(Joiner::Or);
+        // Past the depth limit a `-c` string is not read, and the segment
+        // says so: a command is still inside it.
+        let wrapped = wrapped_command(&seg).or_else(|| wrapped_eval(&seg));
         let wrapped = if depth < MAX_WRAP_DEPTH {
-            wrapped_command(&seg).or_else(|| wrapped_eval(&seg))
+            wrapped
         } else {
+            seg.unread |= wrapped.is_some();
             None
         };
         seg.wraps = wrapped.is_some();
@@ -1131,13 +1163,26 @@ fn expand_into(
         // is checked once it is read (`split_segments_deep`).
         let string_bodies = bodies && !conditional[i] && subshells.is_empty() && output_stays(&seg);
         // The commands the shell runs out of this segment's own words. A
-        // line of a body it never runs has none, and past the depth limit
-        // the reading stops as it does for a `-c` string.
-        let inner_words = if seg.body_line || depth >= MAX_WRAP_DEPTH {
+        // line of a body it never runs has none. Past the depth limit the
+        // reading stops, and a segment that still holds a command there is
+        // marked as not read to the end.
+        let inner_words = if seg.body_line {
             Vec::new()
         } else {
             inner_commands(&seg.text)
         };
+        let inner_words = if depth < MAX_INNER_DEPTH {
+            inner_words
+        } else {
+            seg.unread |= inner_words
+                .iter()
+                .any(|c| !c.text.trim().is_empty() && !is_literal_heredoc(&c.text));
+            Vec::new()
+        };
+        // What a harness's own scaffolding runs out of its words is
+        // scaffolding too: transparent unless a rule names it.
+        let scaffolding = seg.scaffold;
+        let at = out.len();
         out.push(seg);
         let mut script_read: Option<String> = None;
         if let Some((shell, script)) = wrapped {
@@ -1153,6 +1198,7 @@ fn expand_into(
                 depth + 1,
                 here.clone(),
                 string_bodies,
+                read,
             );
             // An `eval` runs in this shell, so a `cd` inside it moves it.
             if shell == "eval" && own_shell && after != here {
@@ -1172,6 +1218,14 @@ fn expand_into(
             {
                 continue;
             }
+            // No more than `MAX_INNER_COMMANDS` to a line: the one that
+            // would be next is left unread, and the segment it sits in says
+            // so.
+            if *read >= MAX_INNER_COMMANDS {
+                out[at].unread = true;
+                break;
+            }
+            *read += 1;
             let from = out.len();
             let after = expand_into(
                 out,
@@ -1180,9 +1234,11 @@ fn expand_into(
                 depth + 1,
                 here.clone(),
                 false,
+                read,
             );
             for s in &mut out[from..] {
                 s.inside = true;
+                s.scaffold |= scaffolding;
             }
             // A substitution the split cut at a `;`, `&&` or newline inside
             // it carries on in the segments after this one, in the same
@@ -2231,9 +2287,20 @@ pub struct Segment {
     /// observe mode, where only the floor is held, each of those ran
     /// (measured Nov 13, 2026, on 0.21.8). Such a segment is previewed,
     /// insured and classified like any other, and its `cd` moves the rest
-    /// of its substitution. The policy takes one thing from it, a deny:
-    /// what the line asked or allowed before, it asks or allows now.
+    /// of its substitution. The policy takes one thing from it, a deny;
+    /// one no rule allows makes an allowed line an ask, as a `$( … )` the
+    /// policy could not read always did (`commands_inside`).
     pub inside: bool,
+    /// True when the reading stopped at this segment with a command still
+    /// inside it: a substitution past `MAX_INNER_DEPTH` levels, a `-c`
+    /// string past `MAX_WRAP_DEPTH`, or one substitution more than
+    /// `MAX_INNER_COMMANDS` on the line. Nothing read what that command
+    /// is, so no verdict on the segment's own words covers it, and the
+    /// policy refuses the line in every mode (`Policy::evaluate_command`).
+    /// Until Nov 2026 the reading stopped without a word: `cat <(cat <(cat
+    /// <(cat <(cat <(kubectl delete pod web-1)))))` was allowed by `cat *`
+    /// (measured Nov 13, 2026).
+    pub unread: bool,
     /// The operator that ended this segment, which decides whether a `cd`
     /// in it carries over to the next one: through `&&`, `;` and a newline
     /// it does; through `|` and `&` it ran in a subshell and does not.
@@ -2482,6 +2549,7 @@ fn flush(
             literal_body: false,
             body_line: false,
             inside: false,
+            unread: false,
             joiner,
             dir: RunDir::Start,
         });
@@ -2595,6 +2663,27 @@ fn inner_commands(s: &str) -> Vec<InnerCommand> {
         }
     }
     out
+}
+
+/// Every command the shell runs out of another command's words on this
+/// line, as the reading found it: the first command of each `$( … )`,
+/// backtick substitution, `<( … )` and `>( … )` at every depth read, and
+/// what a wrapper in one runs. An unnamed wrapper, an assignment, a keyword
+/// and a harness's scaffolding are left out, as the policy leaves them out.
+///
+/// The context check asks the policy about each: one no rule allows makes
+/// an allowed line an ask. That was the rule for a `$( … )` from v0.19.3,
+/// read off the line's text; a process substitution was not looked for, and
+/// a substitution in a wrapper's own words (`sh -c "ls" $(git push)`) was
+/// lost with the wrapper, so `cat <(git push origin main)` and `cat <(npm
+/// publish)` ran unasked under a policy that asks about both (measured Nov
+/// 13, 2026, on 0.21.8 and on the first fix of the same day).
+pub fn commands_inside(command: &str) -> Vec<String> {
+    split_segments_deep(command)
+        .into_iter()
+        .filter(|s| s.inside && !(s.wraps || s.scaffold || s.binds || s.keyword || s.body_line))
+        .map(|s| s.text)
+        .collect()
 }
 
 /// Does the command contain command substitution we cannot see inside?
@@ -4654,6 +4743,110 @@ mod tests {
             );
             let ls = segs.iter().find(|s| s.command() == "ls").unwrap();
             assert_eq!(ls.dir, RunDir::Start, "{line}: {segs:?}");
+        }
+    }
+
+    /// The reading goes eight levels deep and takes a hundred commands out
+    /// of one line's words. The segment it stops at with a command still
+    /// inside says so (`Segment::unread`), and nothing short of the limit
+    /// does. Until Nov 2026 the reading stopped at four levels and said
+    /// nothing: the fifth was the words of the fourth to every reader.
+    #[test]
+    fn the_segment_the_reading_stops_at_is_marked_unread() {
+        let nest =
+            |open: &str, n: usize| (0..n).fold("ls".to_string(), |s, _| format!("{open}{s})"));
+        for open in ["echo $(", "cat <(", "tee >("] {
+            let segs = split_segments_deep(&nest(open, MAX_INNER_DEPTH));
+            assert!(segs.iter().all(|s| !s.unread), "{open}: eight are read");
+            assert_eq!(segs.len(), MAX_INNER_DEPTH + 1, "{open}");
+            assert_eq!(&*segs[MAX_INNER_DEPTH], "ls", "{open}: to the innermost");
+            let segs = split_segments_deep(&nest(open, MAX_INNER_DEPTH + 1));
+            assert_eq!(segs.len(), MAX_INNER_DEPTH + 1, "{open}: and no further");
+            let unread: Vec<bool> = segs.iter().map(|s| s.unread).collect();
+            assert_eq!(
+                unread.iter().filter(|u| **u).count(),
+                1,
+                "{open}: one segment holds what was not read"
+            );
+            assert!(unread[MAX_INNER_DEPTH], "{open}: the one it stopped at");
+            assert!(
+                segs.iter().all(|s| &**s != "ls"),
+                "{open}: the innermost was not reached"
+            );
+        }
+        // A `-c` string past its own limit, the same way.
+        let mut deep = "ls".to_string();
+        for _ in 0..MAX_WRAP_DEPTH + 1 {
+            deep = format!(
+                "sh -c \"{}\"",
+                deep.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+        }
+        let segs = split_segments_deep(&deep);
+        assert_eq!(segs.len(), MAX_WRAP_DEPTH + 1);
+        assert!(segs[..MAX_WRAP_DEPTH].iter().all(|s| s.wraps && !s.unread));
+        assert!(segs[MAX_WRAP_DEPTH].unread && !segs[MAX_WRAP_DEPTH].wraps);
+        // A hundred to a line, and the one past it is left where it is.
+        let wide = |n: usize| format!("echo {}", vec!["$(pwd)"; n].join(" "));
+        let segs = split_segments_deep(&wide(MAX_INNER_COMMANDS));
+        assert!(segs.iter().all(|s| !s.unread));
+        assert_eq!(segs.iter().filter(|s| s.inside).count(), MAX_INNER_COMMANDS);
+        let segs = split_segments_deep(&wide(MAX_INNER_COMMANDS + 1));
+        assert!(segs[0].unread, "the segment that holds the one left unread");
+        assert_eq!(segs.iter().filter(|s| s.inside).count(), MAX_INNER_COMMANDS);
+        // Counted over the whole line, not per segment.
+        let line = format!("{}; {}", wide(MAX_INNER_COMMANDS), wide(1));
+        let segs = split_segments_deep(&line);
+        assert_eq!(segs.iter().filter(|s| s.unread).count(), 1);
+        assert!(segs.last().is_some_and(|s| s.unread));
+        // Data is not a command left unread, and a line with nothing
+        // inside it has nothing to leave.
+        for line in [
+            "git commit -m \"$(cat <<'EOF'\nfix: typo\nEOF\n)\"",
+            "echo '$(a $(b $(c $(d $(e $(f $(g $(h $(i)))))))))'",
+            "git status && ls",
+        ] {
+            assert!(
+                split_segments_deep(line).iter().all(|s| !s.unread),
+                "{line}"
+            );
+        }
+    }
+
+    /// The commands a line runs out of its own words, as the context check
+    /// asks the policy about them (`commands_inside`).
+    #[test]
+    fn commands_inside_are_what_the_shell_runs_out_of_a_lines_words() {
+        let inside = commands_inside;
+        assert_eq!(
+            inside("cat <(git push origin main)"),
+            ["git push origin main"]
+        );
+        assert_eq!(
+            inside("diff <(sort a.txt) <(sort b.txt)"),
+            ["sort a.txt", "sort b.txt"]
+        );
+        assert_eq!(inside("tee >(wc -l) < notes.md"), ["wc -l"]);
+        assert_eq!(
+            inside("echo $(echo `date`) <(cat <(id))"),
+            ["echo `date`", "date", "cat <(id)", "id"]
+        );
+        // In the words of a wrapper whose string was read, beside the string.
+        assert_eq!(inside("sh -c \"ls\" $(npm publish)"), ["npm publish"]);
+        // In the string itself: read with the string, once.
+        assert_eq!(inside("sh -c 'echo $(date)'"), ["date"]);
+        assert_eq!(inside("sh -c \"echo $(date)\""), ["date"]);
+        // What a wrapper inside one runs, not the wrapper; not an
+        // assignment, which runs nothing.
+        assert_eq!(inside("echo $(sh -c 'git status')"), ["git status"]);
+        assert_eq!(inside("echo $(D=/tmp/x; ls)"), Vec::<String>::new());
+        // Data, quoted text, and a line with nothing inside it.
+        for line in [
+            "git commit -m \"$(cat <<'EOF'\nfix: typo\nEOF\n)\"",
+            "echo '<(not one)' \"<(nor this)\" '$(nor this)'",
+            "git status && ls",
+        ] {
+            assert_eq!(inside(line), Vec::<String>::new(), "{line}");
         }
     }
 }

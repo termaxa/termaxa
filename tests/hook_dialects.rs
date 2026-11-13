@@ -1298,6 +1298,9 @@ fn observe_mode_holds_a_floor_command_however_the_line_spells_it() {
         "cat <(rm -rf /)",
         "echo $(kubectl delete ns prod; true)",
         "git log $(echo $(terraform destroy -auto-approve))",
+        // Five deep, where the reading used to stop without a word.
+        "cat <(cat <(cat <(cat <(cat <(kubectl delete ns prod)))))",
+        "echo $(echo $(echo $(echo $(echo $(terraform destroy -auto-approve)))))",
         // The gate's own files, after a `cd` the substitution opens with.
         "x=$(cd .termaxa; echo \"default: allow\" > policy.yaml)",
         "x=$(cd .claude && echo \"{}\" > settings.json)",
@@ -1324,6 +1327,25 @@ fn observe_mode_holds_a_floor_command_however_the_line_spells_it() {
         assert_eq!(line["decision"], "deny", "{cmd}: {line}");
         assert_eq!(line["floor"], true, "{cmd}: {line}");
         assert_eq!(line["enforced"], true, "{cmd}: {line}");
+    }
+
+    // Deeper than the reading goes (eight levels), a line is refused,
+    // floor command or not: nothing read what the ninth level runs, so
+    // nothing can say the floor is not in it.
+    let nine = |inner: &str| (0..9).fold(inner.to_string(), |s, _| format!("cat <({s})"));
+    for cmd in [nine("kubectl delete ns prod"), nine("ls")] {
+        let out = ask(&cmd);
+        assert!(
+            out.stdout.contains("\"permissionDecision\":\"deny\"") && out.code == 2,
+            "{cmd}: refused in observe mode: {:?} exit {}",
+            out.stdout,
+            out.code
+        );
+        let line = record(&cmd);
+        assert_eq!(line["decision"], "deny", "{cmd}: {line}");
+        assert_eq!(line["floor"], true, "{cmd}: {line}");
+        assert_eq!(line["enforced"], true, "{cmd}: {line}");
+        assert!(line["matched_rule"].is_null(), "{cmd}: {line}");
     }
 
     // What observe mode let through before, it lets through now, and what
@@ -1353,18 +1375,26 @@ fn observe_mode_holds_a_floor_command_however_the_line_spells_it() {
     assert_eq!(line["coverage"], "insured", "{line}");
     assert_eq!((before, copies()), (0, 1), "one copy, taken first");
 
-    for cmd in ["echo $(basename src/app.ts)", "time npm test"] {
+    // `sort` has no rule: inside a process substitution it is asked about
+    // as it is inside a `$( … )`, and an observed ask is silence.
+    for cmd in [
+        "echo $(basename src/app.ts)",
+        "diff <(sort a.txt) <(sort b.txt)",
+        "time npm test",
+    ] {
         let out = ask(cmd);
         assert_eq!(
             (out.stdout.trim(), out.code),
             ("", 0),
             "{cmd}: an observed ask is silence"
         );
-        assert_eq!(record(cmd)["enforced"], false, "{cmd}");
+        let line = record(cmd);
+        assert_eq!(line["decision"], "ask", "{cmd}: {line}");
+        assert_eq!(line["enforced"], false, "{cmd}: {line}");
     }
     for cmd in [
         "echo $(git branch --show-current)",
-        "diff <(sort a.txt) <(sort b.txt)",
+        "diff <(cat a.txt) <(cat b.txt)",
         "timeout 60 git status",
     ] {
         let out = ask(cmd);
@@ -1453,4 +1483,71 @@ fn enforce_mode_lets_a_build_directory_go_and_the_breaker_does_not_count_it() {
         out.stdout,
         out.code
     );
+}
+
+/// Enforce mode asks about a command inside a process substitution unless
+/// a rule allows it, as it has asked about one inside a `$( … )` since
+/// v0.19.3, and refuses a line nested deeper than it reads. Measured Nov
+/// 13, 2026, with the starter: `cat <(git push origin main)` and `cat
+/// <(npm publish)` were allowed by `cat *` on 0.21.8 and on the first fix
+/// of that day, which read a process substitution for a deny and nothing
+/// else; `sh -c "ls" $(git push origin main)` by `ls`; and five levels
+/// down a hard stop was allowed by the command around it.
+#[cfg(unix)]
+#[test]
+fn enforce_mode_asks_about_what_a_process_substitution_runs() {
+    use serde_json::json;
+    let tmp = scratch("enforce-inside");
+    let home = tmp.join("home");
+    let starter = include_str!("../examples/policy.yaml").replace("\r\n", "\n");
+    assert!(starter.contains("\nmode: enforce\n"));
+    let proj = project(&tmp, &starter);
+    for (file, body) in [
+        ("a.txt", "b\na\n"),
+        ("b.txt", "a\nb\n"),
+        ("notes.md", "n\n"),
+    ] {
+        std::fs::write(proj.join(file), body).unwrap();
+    }
+    let p = proj.to_string_lossy().to_string();
+    let n = std::cell::Cell::new(0);
+    let ask = |cmd: &str| {
+        n.set(n.get() + 1);
+        hook(
+            &home,
+            &proj,
+            &json!({"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd},
+                    "session_id":format!("inside-{}", n.get()),"cwd":p}),
+            &[],
+        )
+    };
+    let nest = |inner: &str, n: usize| (0..n).fold(inner.to_string(), |s, _| format!("cat <({s})"));
+    let cases: Vec<(String, &str, i32)> = vec![
+        ("cat <(git push origin main)".into(), "ask", 0),
+        ("cat <(npm publish)".into(), "ask", 0),
+        ("cat <(some-tool --wipe)".into(), "ask", 0),
+        ("diff <(sort a.txt) <(sort b.txt)".into(), "ask", 0),
+        ("tee >(some-tool --wipe) < notes.md".into(), "ask", 0),
+        ("cat <(cat <(git push origin main))".into(), "ask", 0),
+        ("sh -c \"ls\" $(git push origin main)".into(), "ask", 0),
+        ("diff <(cat a.txt) <(cat b.txt)".into(), "allow", 0),
+        ("sh -c \"ls\" $(git status)".into(), "allow", 0),
+        (nest("ls", 8), "allow", 0),
+        ("cat <(kubectl delete pod web-1)".into(), "deny", 2),
+        (nest("kubectl delete pod web-1", 5), "deny", 2),
+        (nest("kubectl delete pod web-1", 8), "deny", 2),
+        (nest("kubectl delete pod web-1", 9), "deny", 2),
+        (nest("ls", 9), "deny", 2),
+    ];
+    for (cmd, decision, code) in cases {
+        let out = ask(&cmd);
+        assert!(
+            out.stdout
+                .contains(&format!("\"permissionDecision\":\"{decision}\""))
+                && out.code == code,
+            "{cmd}: expected {decision}: {:?} exit {}",
+            out.stdout,
+            out.code
+        );
+    }
 }
