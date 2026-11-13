@@ -1,6 +1,10 @@
 use crate::policy::{Action, Decision, DecisionSource};
 use std::process::Command;
 
+/// How the signal for a force or recursive flag begins (`gather_with`), and
+/// how `apply` knows it from the others.
+const DESTRUCTIVE_FLAG: &str = "destructive flag detected";
+
 /// A signal the context engine noticed about the environment or the command.
 #[derive(Debug, Clone)]
 pub struct Signal {
@@ -53,7 +57,7 @@ pub fn gather_with(command: &str, readable: &dyn Fn(&str) -> bool) -> Vec<Signal
     for flag in ["--force", "-f ", "--hard", "--no-verify", "-rf"] {
         if cmd_lc.contains(flag) {
             signals.push(Signal {
-                label: format!("destructive flag detected: {}", flag.trim()),
+                label: format!("{DESTRUCTIVE_FLAG}: {}", flag.trim()),
                 escalate: true,
             });
         }
@@ -272,11 +276,18 @@ pub fn apply_insurance(decision: Decision, uninsurable: bool) -> (Decision, bool
 }
 
 pub fn apply(decision: Decision, signals: &[Signal]) -> (Decision, bool) {
-    let should_escalate = signals.iter().any(|s| s.escalate);
+    // A delete the policy read and found no loss in (`rm -rf node_modules`
+    // under a rule that says `except_rebuilt`) is not asked about for the
+    // `-rf` it is spelled with: that flag is what was just judged. Every
+    // other signal still counts, a production marker or a substitution the
+    // gate cannot read among them.
+    let judged = decision.source == DecisionSource::Rebuilt;
+    let counts = |s: &&Signal| s.escalate && !(judged && s.label.starts_with(DESTRUCTIVE_FLAG));
+    let should_escalate = signals.iter().any(|s| counts(&s));
     if should_escalate && decision.action == Action::Allow {
         let labels: Vec<&str> = signals
             .iter()
-            .filter(|s| s.escalate)
+            .filter(counts)
             .map(|s| s.label.as_str())
             .collect();
         return (
@@ -801,5 +812,46 @@ mod tests {
         assert_eq!(out.action, Action::Allow);
         assert!(!escalated);
         assert_eq!(out.reason, "base", "an untouched decision keeps its reason");
+    }
+
+    /// A delete the policy found no loss in is not asked about for the
+    /// flags it is spelled with; anything else about the line still asks.
+    #[test]
+    fn a_spared_delete_is_not_asked_about_for_its_own_flags() {
+        let spared = || Decision {
+            action: Action::Allow,
+            source: DecisionSource::Rebuilt,
+            matched_rule: None,
+            reason: "`node_modules` is rebuilt by an install: not a loss".into(),
+        };
+        let (d, escalated) = apply(spared(), &gather("rm -rf node_modules"));
+        assert_eq!(
+            (d.action, escalated),
+            (Action::Allow, false),
+            "{}",
+            d.reason
+        );
+        let (d, escalated) = apply(spared(), &gather("rm -r --force dist"));
+        assert_eq!(
+            (d.action, escalated),
+            (Action::Allow, false),
+            "{}",
+            d.reason
+        );
+        // A production marker, and a substitution nobody read, still count.
+        let (d, escalated) = apply(spared(), &gather("rm -rf prod-site/node_modules"));
+        assert_eq!((d.action, escalated), (Action::Ask, true), "{}", d.reason);
+        assert!(!d.reason.contains("destructive flag"), "{}", d.reason);
+        let (d, _) = apply(spared(), &gather("rm -rf node_modules $(cat list)"));
+        assert_eq!(d.action, Action::Ask, "{}", d.reason);
+        // An allow a rule gave is asked about for the flag, as before.
+        let by_rule = Decision {
+            action: Action::Allow,
+            source: DecisionSource::ExplicitRule,
+            matched_rule: Some("rm *".into()),
+            reason: "matched rule `rm *`".into(),
+        };
+        let (d, escalated) = apply(by_rule, &gather("rm -rf node_modules"));
+        assert_eq!((d.action, escalated), (Action::Ask, true));
     }
 }
