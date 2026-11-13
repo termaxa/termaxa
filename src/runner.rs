@@ -104,7 +104,8 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         .as_deref()
         .is_some_and(|m| policy.is_floor_rule(m));
     let uninsurable = preview.as_ref().is_some_and(|p| p.uninsurable);
-    let floor_holds = decision.action == Action::Deny && (floor_rule || uninsurable);
+    let floor_holds = decision.action == Action::Deny
+        && (floor_rule || uninsurable || decision.held_in_every_mode());
     let observed = mode == crate::policy::Mode::Observe
         && matches!(decision.action, Action::Ask | Action::Deny)
         && !floor_holds;
