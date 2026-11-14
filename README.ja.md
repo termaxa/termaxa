@@ -418,11 +418,11 @@ Termaxa は 1.0 より前の版です。実際に動き、テストされてい�
 - **フォーマットはまだ変わるかもしれません。** リリースを固定してください。
 - **Windows PowerShell 5.1 は、リダイレクトした Unicode を壊します。** `termaxa report > out.txt` は UTF-16 で書き出し、罫線の文字を文字化けさせます。PowerShell 7 を使うか、`termaxa report --md | Out-File -Encoding utf8 report.md` を使ってください。
 
-実際の利用で見つかったバグは、どう見つかったか、どこで直したかとともに、すべて [docs/found-in-the-wild.md](docs/found-in-the-wild.md) にあります。現時点で 50 件です。脅威モデルと公開済みのアドバイザリは [SECURITY.md](SECURITY.md) にあります。
+実際の利用で見つかったバグは、どう見つかったか、どこで直したかとともに、すべて [docs/found-in-the-wild.md](docs/found-in-the-wild.md) にあります。現時点で 51 件です。脅威モデルと公開済みのアドバイザリは [SECURITY.md](SECURITY.md) にあります。
 
 ## コントリビュート
 
-Rust 2021、本番コードは約 20,000 行、テストは約 21,400 行、Linux 上のテストは 625 件、CI は Linux、macOS、Windows で動きます。`cargo fmt`、`cargo clippy -- -D warnings`、`cargo test` が関門で、門番のルールは門番自身にも適用されます。ここでは意見より計測が勝ちます。判定を変える変更には、それを示すフィクスチャを付けてください。
+Rust 2021、本番コードは約 21,300 行、テストは約 22,900 行、Linux 上のテストは 644 件、CI は Linux、macOS、Windows で動きます。`cargo fmt`、`cargo clippy -- -D warnings`、`cargo test` が関門で、門番のルールは門番自身にも適用されます。ここでは意見より計測が勝ちます。判定を変える変更には、それを示すフィクスチャを付けてください。
 
 ## セキュリティ
 

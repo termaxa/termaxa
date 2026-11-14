@@ -14,7 +14,7 @@ wording of each entry kept close to the changelog's own.
 Entries are dated by the day the changelog gives for the finding; where it
 gives none, by the release that fixed it.
 
-**50 bugs, in 27 episodes, as of v0.21.8.**
+**51 bugs, in 28 episodes, as of v0.21.10.**
 
 ## 2026
 
@@ -280,6 +280,23 @@ line is judged, previewed and copied in the directory it runs in, after `cd`,
 `pushd`, a subshell or git's `-C`. Fixing it found, by reading, that the path
 rules shared the blind spot, published as
 [GHSA-3hg6-x893-mfr4](https://github.com/termaxa/termaxa/security/advisories/GHSA-3hg6-x893-mfr4);
+that one is the changelog's and SECURITY.md's. 1 bug.
+
+### October 9 – November 14 — the field report's `git clean`: the policy removed by a command that names no file
+
+In the field report a `git clean -fdx` removed an untracked
+`.termaxa/policy.yaml`. The command names no file, nothing listed what it
+would remove and no path rule was asked: under the starter it was the
+default ask, which observe mode does not enforce.
+[v0.21.3](https://github.com/termaxa/termaxa/releases/tag/v0.21.3) made a
+delete of `.termaxa` a floor rule in answer and left `git clean` itself
+unread. Fixed in
+[v0.21.10](https://github.com/termaxa/termaxa/releases/tag/v0.21.10)
+([#172](https://github.com/termaxa/termaxa/pull/172)): git is asked what a
+clean would remove, and the path rules judge each file. Reading the code for
+that release found the rest of the class, a guarded file changed through its
+directory or put back by a git discard or a stash, published as
+[GHSA-7g97-4pmr-2vrq](https://github.com/termaxa/termaxa/security/advisories/GHSA-7g97-4pmr-2vrq);
 that one is the changelog's and SECURITY.md's. 1 bug.
 
 ### October 17 — winget's validation: the Windows exe needed the VC++ runtime
