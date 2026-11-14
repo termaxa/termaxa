@@ -114,6 +114,12 @@ fn overwrite_preview(
         if t.role != crate::resolve::TargetRole::Destination {
             continue;
         }
+        // An append adds to the file and what it held stays: nothing is
+        // lost, so there is nothing to report and nothing to insure
+        // (`ResolvedTarget::appends`).
+        if t.appends {
+            continue;
+        }
         let Some(path) = &t.resolved else {
             // An unresolved destination is already reported by the shape
             // machinery in policy; repeating it here would say the same thing
@@ -1424,6 +1430,60 @@ mod live_gate_tests {
             "an insured overwrite must not read as uninsured: {body}"
         );
         assert!(!pv.uninsurable, "this write IS insured");
+    }
+
+    /// An append is not a loss. `>>` and `tee -a` add to a file and what
+    /// it held stays, so the copy planner has always left them alone; the
+    /// preview read the same line as an overwrite of everything in the file
+    /// with no way back ("loses 6 B of existing content", "NOT
+    /// recoverable"), and that verdict on the preview made an ask a refusal
+    /// and put an ordinary append on observe mode's floor (measured Nov 13,
+    /// 2026, on 0.21.8: `echo "more" >> notes.md`, `curl -s … >> notes.md`
+    /// refused in enforce mode, `echo KEY=2 >> .env` held in observe mode).
+    #[test]
+    fn an_append_loses_nothing_and_is_not_previewed_as_a_loss() {
+        let t = crate::testutil::TempTree::new("append-preview");
+        let dir = t.path();
+        std::fs::write(dir.join("notes.md"), "notes\n").unwrap();
+        for line in [
+            "echo \"more\" >> notes.md",
+            "curl -s http://localhost:3000/health >> notes.md",
+            "printf x | tee -a notes.md",
+            "printf x | tee --append notes.md",
+            "cat >> notes.md <<'EOF'\nline\nEOF",
+        ] {
+            let pv = generate(line, None, dir, false);
+            assert!(
+                pv.is_none(),
+                "{line}: nothing is lost, so nothing is previewed: {:?}",
+                pv.map(|p| p.lines)
+            );
+        }
+        // The truncating spellings lose what the file held, as before, and
+        // so does a line that appends to a file and overwrites it too.
+        for line in [
+            "echo new > notes.md",
+            "printf x | tee notes.md",
+            "echo a >> notes.md; echo b > notes.md",
+        ] {
+            let pv = generate(line, None, dir, false)
+                .unwrap_or_else(|| panic!("{line}: an overwrite has a preview"));
+            assert!(
+                pv.lines.join("\n").contains("loses"),
+                "{line}: {:?}",
+                pv.lines
+            );
+        }
+        // An append is still a write to that path: a path rule judges it.
+        let targets = crate::resolve::command_targets(
+            "echo x >> notes.md",
+            &crate::resolve::EvalContext::at(dir),
+        );
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert!(
+            targets[0].appends && targets[0].role == crate::resolve::TargetRole::Destination,
+            "{targets:?}"
+        );
     }
 
     /// Tim Schipper's write-up (Sep 27, 2026): for each option that writes,

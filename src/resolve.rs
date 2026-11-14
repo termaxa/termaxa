@@ -275,6 +275,16 @@ pub struct ResolvedTarget {
     pub end: Option<Vec<String>>,
     /// Everything notable about this target, in a stable order.
     pub shapes: Vec<SensitiveShape>,
+    /// The command only ADDS to this file: a `>>`, or `tee -a`, and nothing
+    /// else on the line writes it. It is still a destination, and a path
+    /// rule still judges the write; but what the file holds stays, so there
+    /// is nothing to lose, nothing to copy first and nothing for the preview
+    /// to report. Until v0.21.10 the preview read an append as an overwrite
+    /// with no way back ("loses 6 B of existing content", "NOT
+    /// recoverable"), which made an ask on such a line a refusal and held
+    /// `echo KEY=2 >> .env` in observe mode, where the truncating spelling
+    /// runs after its copy (measured Nov 13, 2026).
+    pub appends: bool,
 }
 
 impl ResolvedTarget {
@@ -333,15 +343,16 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
     // a git command's after its `-C`. Read against the line's first
     // directory, `cd .termaxa && echo x > policy.yaml` was a write to
     // `./policy.yaml` that no path rule named, and was allowed.
-    // (as written, role, which segment, operand or redirect). Sorted on the
-    // first two as before, so a reason names the same target it always did.
-    let mut out: Vec<(String, TargetRole, usize, bool)> = Vec::new();
+    // (as written, role, which segment, operand or redirect, only appended
+    // to). Sorted on the first two as before, so a reason names the same
+    // target it always did.
+    let mut out: Vec<(String, TargetRole, usize, bool, bool)> = Vec::new();
     let mut contexts: Vec<(EvalContext, EvalContext)> = Vec::new();
     for seg in crate::shell::split_segments_deep(segment) {
         let k = contexts.len();
         contexts.push((ctx.for_segment(&seg), ctx.for_operands(&seg)));
-        let mut add = |raw: String, role: TargetRole, operand: bool| {
-            out.push((raw, role, k, operand));
+        let mut add = |raw: String, role: TargetRole, operand: bool, appends: bool| {
+            out.push((raw, role, k, operand, appends));
         };
 
         // Redirects: the unified scanner already extracted them, with
@@ -349,12 +360,17 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
         // it does not truncate, but the path is still one the command
         // writes.
         for o in &seg.redirects {
-            add(o.target.clone(), TargetRole::Destination, false);
+            add(
+                o.target.clone(),
+                TargetRole::Destination,
+                false,
+                !o.truncates,
+            );
         }
 
         // Deletes: destroyed in place, which is what Removed means.
         for t in crate::delete::segment_targets(&seg) {
-            add(t.text, TargetRole::Removed, true);
+            add(t.text, TargetRole::Removed, true, false);
         }
 
         // Per-command grammars, over the segment's own words: a redirect's
@@ -371,35 +387,35 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
             "dd" => dd_targets(args),
             _ => Vec::new(),
         };
+        // `tee -a` adds to its files, as `>>` does.
+        let adds = head == "tee" && tee_appends(args);
         for (raw, role) in grammar {
-            add(raw, role, true);
+            add(raw, role, true, adds);
         }
         for p in option_write_targets(&head, args) {
-            add(p, TargetRole::Destination, true);
+            add(p, TargetRole::Destination, true, false);
         }
     }
 
     out.sort();
     out.dedup();
-    let mut resolved: Vec<ResolvedTarget> = out
-        .into_iter()
-        .map(|(raw, role, k, operand)| {
-            let (shell, operands) = &contexts[k];
-            target(&raw, role, if operand { operands } else { shell })
-        })
-        .collect();
     // The same path named by two segments, or as an operand and a
-    // redirect, is one target: the dedup above saw two keys.
-    let mut seen: Vec<(TargetRole, String, Option<PathBuf>)> = Vec::new();
-    resolved.retain(|t| {
-        let key = (t.role, t.as_written.clone(), t.resolved.clone());
-        if seen.contains(&key) {
-            false
-        } else {
-            seen.push(key);
-            true
+    // redirect, is one target: the dedup above saw two keys. It is only
+    // appended to if every write of it appends (`echo a >> f; echo b > f`
+    // loses what `f` held).
+    let mut resolved: Vec<ResolvedTarget> = Vec::new();
+    for (raw, role, k, operand, appends) in out {
+        let (shell, operands) = &contexts[k];
+        let mut t = target(&raw, role, if operand { operands } else { shell });
+        t.appends = appends;
+        match resolved
+            .iter_mut()
+            .find(|m| m.role == t.role && m.as_written == t.as_written && m.resolved == t.resolved)
+        {
+            Some(m) => m.appends &= t.appends,
+            None => resolved.push(t),
         }
-    });
+    }
     resolved
 }
 
@@ -548,6 +564,15 @@ fn tee_targets(args: &[String]) -> Vec<(String, TargetRole)> {
         .collect()
 }
 
+/// Does this `tee` add to its files rather than replace them: `-a`,
+/// `--append`, or the letter in a cluster of short flags (`-ia`)?
+fn tee_appends(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "--append"
+            || (a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a[1..].contains('a'))
+    })
+}
+
 /// `dd` grammar: `key=value` operands, so the roles are named rather than
 /// positional. `of=` is written, `if=` is read. Everything else (`bs=`,
 /// `count=`, `status=`) is not a path.
@@ -588,6 +613,7 @@ pub fn target(raw: &str, role: TargetRole, ctx: &EvalContext) -> ResolvedTarget 
             resolved: None,
             end,
             shapes,
+            appends: false,
         };
     }
 
@@ -609,6 +635,7 @@ pub fn target(raw: &str, role: TargetRole, ctx: &EvalContext) -> ResolvedTarget 
             resolved: None,
             end,
             shapes,
+            appends: false,
         };
     }
 
@@ -635,6 +662,7 @@ pub fn target(raw: &str, role: TargetRole, ctx: &EvalContext) -> ResolvedTarget 
         resolved: Some(resolved),
         end: None,
         shapes,
+        appends: false,
     }
 }
 

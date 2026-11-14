@@ -929,8 +929,10 @@ fn the_hook_leaves_a_witness_first_and_records_the_call_id() {
 
 /// Observe mode (decision #108): outside the floor an ask or deny runs,
 /// insured, and is recorded as not-enforced with its coverage; a floor rule
-/// and an uninsurable command are enforced even in observe mode; allows are
-/// unchanged. This is the record the first run produced, pinned.
+/// and an uninsurable command are enforced even in observe mode; an allow is
+/// recorded as before and, since v0.21.10, answered with nothing, like every
+/// verdict outside the floor. This is the record the first run produced,
+/// pinned.
 #[cfg(unix)]
 #[test]
 fn observe_mode_records_what_enforcement_would_have_done() {
@@ -971,8 +973,14 @@ fn observe_mode_records_what_enforcement_would_have_done() {
         0,
         "observed ask runs"
     );
-    // An allow is unchanged.
-    assert_eq!(hook(&home, &proj, &mk("ls -la"), &[]).code, 0);
+    // An allow: on the record, and nothing said to the harness. Until
+    // v0.21.10 this answered `allow`, and Claude Code skipped its own prompt.
+    let allowed = hook(&home, &proj, &mk("ls -la"), &[]);
+    assert_eq!(
+        (allowed.stdout.trim(), allowed.code),
+        ("", 0),
+        "observe mode answers nothing for an allow"
+    );
 
     let log = project_logs(&home);
     let line = |cmd: &str| -> serde_json::Value {
@@ -990,6 +998,11 @@ fn observe_mode_records_what_enforcement_would_have_done() {
     assert_eq!(root["enforced"], true, "the floor is enforced");
     assert_eq!(root["floor"], true);
     assert_eq!(root["coverage"], "floor");
+    let listed = line("ls -la");
+    assert_eq!(listed["decision"], "allow");
+    assert_eq!(listed["matched_rule"], "ls*");
+    assert_eq!(listed["mode"], "observe");
+    assert_eq!(listed["enforced"], true, "an allow overrode nothing");
     let script = line("python rebuild.py");
     assert_eq!(script["enforced"], false);
     assert_eq!(
@@ -1166,7 +1179,9 @@ fn observe_mode_lets_a_build_directory_go_and_a_floor_path_rule_holds() {
 /// 2026: Copilot CLI treats a hook's `allow` as an approval and skips its
 /// own prompt, so v0.20.0's `allow` for an observed verdict widened what
 /// Copilot ran; silence leaves Cursor's and Copilot's own decision in place.
-/// The floor still answers, in each harness's own shape.
+/// The same for an allow since v0.21.10: a rule's allow was the one verdict
+/// the mode still answered. The floor still answers, in each harness's own
+/// shape.
 #[cfg(unix)]
 #[test]
 fn observe_mode_is_silent_to_cursor_and_copilot_and_the_floor_still_answers() {
@@ -1177,6 +1192,7 @@ fn observe_mode_is_silent_to_cursor_and_copilot_and_the_floor_still_answers() {
         "version: 1\nmode: observe\ndefault: ask\nrules:\n",
         "  - match: \"rm -rf /\"\n    action: deny\n    floor: true\n",
         "  - match: \"*rm -rf*\"\n    action: deny\n",
+        "  - match: \"git status*\"\n    action: allow\n",
     );
     let proj = project(&tmp, policy);
     std::fs::create_dir_all(proj.join("sc")).unwrap();
@@ -1201,6 +1217,20 @@ fn observe_mode_is_silent_to_cursor_and_copilot_and_the_floor_still_answers() {
         ("", 0),
         "Copilot gets silence: an allow would skip its prompt"
     );
+
+    // An allow: nothing either (v0.21.10). In enforce mode both harnesses
+    // are answered `allow` for this rule, and Copilot then runs the command
+    // without its own prompt.
+    for (who, out) in [
+        ("Cursor", hook(&home, &proj, &cursor("git status"), &[])),
+        ("Copilot", hook(&home, &proj, &copilot("git status"), &[])),
+    ] {
+        assert_eq!(
+            (out.stdout.trim(), out.code),
+            ("", 0),
+            "{who} gets silence for an allow in observe mode"
+        );
+    }
 
     // The floor answers in each harness's shape.
     let cf = hook(&home, &proj, &cursor("rm -rf /"), &[]);
@@ -1397,13 +1427,17 @@ fn observe_mode_holds_a_floor_command_however_the_line_spells_it() {
         "diff <(cat a.txt) <(cat b.txt)",
         "timeout 60 git status",
     ] {
+        // An allow, and since v0.21.10 the mode answers nothing for one:
+        // the record carries the verdict.
         let out = ask(cmd);
-        assert!(
-            out.stdout.contains("\"permissionDecision\":\"allow\"") && out.code == 0,
-            "{cmd}: an allow is an allow: {:?} exit {}",
-            out.stdout,
-            out.code
+        assert_eq!(
+            (out.stdout.trim(), out.code),
+            ("", 0),
+            "{cmd}: an allow is silence in observe mode"
         );
+        let line = record(cmd);
+        assert_eq!(line["decision"], "allow", "{cmd}: {line}");
+        assert_eq!(line["enforced"], true, "{cmd}: {line}");
     }
 }
 
@@ -1550,4 +1584,248 @@ fn enforce_mode_asks_about_what_a_process_substitution_runs() {
             out.code
         );
     }
+}
+
+/// Observe mode observes a native write (v0.21.10). Until then the write
+/// tools had no mode: a path rule's deny on `Write` or `Edit` was enforced
+/// in observe mode, so `Write .env` was refused where the shell's `echo
+/// KEY=2 > .env` ran after its copy, and the record line carried none of the
+/// mode's fields (measured Nov 13, 2026, on 0.21.8). Now a verdict outside
+/// the floor is recorded with its coverage, the file copied aside first, and
+/// nothing is said to the harness; an allow is not answered either; a floor
+/// rule and the gate's own files are refused as before.
+#[test]
+fn observe_mode_observes_a_native_write_and_the_floor_still_holds() {
+    use serde_json::json;
+    let policy_in = |mode: &str| {
+        format!(
+            concat!(
+                "version: 1\nmode: {}\ndefault: ask\nrules:\n",
+                "  - match_path: \"*/.github/workflows/*\"\n    action: deny\n    floor: true\n",
+                "  - match_path: \"*/.env\"\n    action: deny\n",
+                "  - match_path: \"*/docs/*\"\n    action: ask\n",
+                "  - match_path: \"*/notes.md\"\n    action: allow\n",
+            ),
+            mode
+        )
+    };
+    let tmp = scratch("observe-write");
+    let home = tmp.join("home");
+    let proj = project(&tmp, &policy_in("observe"));
+    for file in [
+        ".env",
+        "docs/a.md",
+        "notes.md",
+        ".github/workflows/ci.yml",
+        "src/x.ts",
+    ] {
+        let path = proj.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "before\n").unwrap();
+    }
+    let write = |proj: &Path, file: &str| {
+        json!({"session_id":"W","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+               "hook_event_name":"PreToolUse","tool_name":"Write",
+               "tool_input":{"file_path":proj.join(file).to_string_lossy(),"content":"after\n"}})
+    };
+    let record = |home: &Path, file: &str| -> serde_json::Value {
+        let log = project_logs(home);
+        log.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| {
+                e["command"]
+                    .as_str()
+                    .is_some_and(|c| c.replace('\\', "/").ends_with(file))
+            })
+            .unwrap_or_else(|| panic!("no record line for {file}: {log}"))
+    };
+
+    // A deny that is not on the floor: observed.
+    assert_eq!(backup_count(&home), 0);
+    let out = hook(&home, &proj, &write(&proj, ".env"), &[]);
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 0),
+        "an observed deny says nothing and the write goes ahead"
+    );
+    let line = record(&home, ".env");
+    assert_eq!(line["decision"], "deny", "{line}");
+    assert_eq!(line["mode"], "observe", "{line}");
+    assert_eq!(line["enforced"], false, "{line}");
+    assert_eq!(line["floor"], false, "{line}");
+    assert_eq!(line["coverage"], "insured", "{line}");
+    assert!(backup_count(&home) > 0, "the file was copied aside first");
+
+    // An ask: observed the same way.
+    let out = hook(&home, &proj, &write(&proj, "docs/a.md"), &[]);
+    assert_eq!((out.stdout.trim(), out.code), ("", 0), "an observed ask");
+    let line = record(&home, "docs/a.md");
+    assert_eq!(
+        (&line["decision"], &line["enforced"], &line["coverage"]),
+        (&json!("ask"), &json!(false), &json!("insured")),
+        "{line}"
+    );
+
+    // An allow: on the record, and not answered.
+    let out = hook(&home, &proj, &write(&proj, "notes.md"), &[]);
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 0),
+        "observe mode answers nothing for an allow"
+    );
+    let line = record(&home, "notes.md");
+    assert_eq!(
+        (&line["decision"], &line["mode"], &line["enforced"]),
+        (&json!("allow"), &json!("observe"), &json!(true)),
+        "{line}"
+    );
+    assert!(line.get("coverage").is_none_or(|c| c.is_null()), "{line}");
+
+    // A floor rule, and the gate's own files: refused in observe mode.
+    for file in [".github/workflows/ci.yml", ".claude/settings.json"] {
+        let out = hook(&home, &proj, &write(&proj, file), &[]);
+        assert_eq!(out.code, 2, "{file}: the floor holds: {}", out.stdout);
+        assert!(is_claude_shape(&out.stdout), "{}", out.stdout);
+        let line = record(&home, file);
+        assert_eq!(
+            (
+                &line["decision"],
+                &line["mode"],
+                &line["enforced"],
+                &line["floor"],
+                &line["coverage"]
+            ),
+            (
+                &json!("deny"),
+                &json!("observe"),
+                &json!(true),
+                &json!(true),
+                &json!("floor")
+            ),
+            "{line}"
+        );
+    }
+
+    // A file no rule names: nothing said, nothing recorded, as before.
+    let out = hook(&home, &proj, &write(&proj, "src/x.ts"), &[]);
+    assert_eq!((out.stdout.trim(), out.code), ("", 0));
+    assert!(!project_logs(&home).replace('\\', "/").contains("src/x.ts"));
+
+    // Enforce mode is what it was, and its lines carry the mode too.
+    let tmp2 = scratch("enforce-write");
+    let home2 = tmp2.join("home");
+    let proj2 = project(&tmp2, &policy_in("enforce"));
+    std::fs::write(proj2.join(".env"), "before\n").unwrap();
+    let out = hook(&home2, &proj2, &write(&proj2, ".env"), &[]);
+    assert_eq!(out.code, 2, "enforce mode refuses: {}", out.stdout);
+    let line = record(&home2, ".env");
+    assert_eq!(
+        (
+            &line["decision"],
+            &line["mode"],
+            &line["enforced"],
+            &line["floor"],
+            &line["coverage"]
+        ),
+        (
+            &json!("deny"),
+            &json!("enforce"),
+            &json!(true),
+            &json!(false),
+            &json!("known-uninsured")
+        ),
+        "{line}"
+    );
+}
+
+/// An append is not a loss, so it is not refused for having no way back
+/// (v0.21.10). Measured Nov 13, 2026, on 0.21.8: the preview called `>>` an
+/// overwrite nothing could recover, so in enforce mode a command an ask rule
+/// matches that appends (`curl … >> notes.md`) was refused where it should
+/// ask, and in observe mode `echo KEY=2 >> .env` was held by the floor where
+/// the truncating spelling runs after its copy. A path rule still judges an
+/// append, and a floor rule still holds one.
+#[cfg(unix)]
+#[test]
+fn an_append_is_asked_about_and_observed_like_any_other_write() {
+    use serde_json::json;
+    let rules = concat!(
+        "  - match_path: \"*/.claude/settings*.json\"\n    action: deny\n    floor: true\n",
+        "  - match_path: \"*/.env\"\n    action: deny\n",
+        "  - match: \"curl*\"\n    action: ask\n",
+        "  - match: \"echo *\"\n    action: allow\n",
+    );
+    let fixture = |tag: &str, mode: &str| {
+        let tmp = scratch(tag);
+        let proj = project(
+            &tmp,
+            &format!("version: 1\nmode: {mode}\ndefault: ask\nrules:\n{rules}"),
+        );
+        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+        for (file, text) in [
+            ("notes.md", "notes\n"),
+            (".env", "KEY=1\n"),
+            (".claude/settings.json", "{}\n"),
+        ] {
+            std::fs::write(proj.join(file), text).unwrap();
+        }
+        (tmp.join("home"), proj)
+    };
+    let mk = |proj: &Path, cmd: &str| {
+        json!({"session_id":"A","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+               "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+    };
+
+    // Enforce mode: the ask is an ask, and says nothing about a loss.
+    let (home, proj) = fixture("append-enforce", "enforce");
+    let out = hook(
+        &home,
+        &proj,
+        &mk(&proj, "curl -s http://localhost:3000/health >> notes.md"),
+        &[],
+    );
+    assert!(
+        out.stdout.contains("\"permissionDecision\":\"ask\"") && out.code == 0,
+        "an append under an ask rule asks: {} exit {}",
+        out.stdout,
+        out.code
+    );
+    assert!(!out.stdout.contains("loses"), "{}", out.stdout);
+    // The path rules still judge the write.
+    let out = hook(&home, &proj, &mk(&proj, "echo KEY=2 >> .env"), &[]);
+    assert_eq!(out.code, 2, "the .env rule: {}", out.stdout);
+    let out = hook(
+        &home,
+        &proj,
+        &mk(&proj, "echo x >> .claude/settings.json"),
+        &[],
+    );
+    assert_eq!(out.code, 2, "the floor: {}", out.stdout);
+
+    // Observe mode: the `.env` append is observed, the floor still holds.
+    let (home, proj) = fixture("append-observe", "observe");
+    let out = hook(&home, &proj, &mk(&proj, "echo KEY=2 >> .env"), &[]);
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 0),
+        "an append to .env is observed, not held"
+    );
+    let log = project_logs(&home);
+    let line = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["command"] == "echo KEY=2 >> .env")
+        .expect("the append is on the record");
+    assert_eq!(
+        (&line["decision"], &line["enforced"], &line["floor"]),
+        (&json!("deny"), &json!(false), &json!(false)),
+        "{line}"
+    );
+    let out = hook(
+        &home,
+        &proj,
+        &mk(&proj, "echo x >> .claude/settings.json"),
+        &[],
+    );
+    assert_eq!(out.code, 2, "a floor rule holds an append: {}", out.stdout);
 }

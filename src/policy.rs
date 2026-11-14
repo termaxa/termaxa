@@ -77,6 +77,26 @@ pub struct Rule {
     /// field existed denies `rm -rf node_modules` until the line is added.
     #[serde(default, skip_serializing_if = "is_false")]
     pub except_rebuilt: bool,
+    /// On a deny: the rule does not apply to a command that cannot write a
+    /// file, which is one of a short list of programs that only read or
+    /// print, named plainly as the line's first word (`only_reads`).
+    ///
+    /// For a string rule that guards a FILE by its spelling. The starter's
+    /// belt over the hook configs, `*.claude*settings*` and its three
+    /// siblings, is there for the writers a path rule cannot see (`sed -i`
+    /// before it was read, an editor, `python -c`), and a string cannot tell
+    /// a write from a mention: it refused `grep -n hooks
+    /// .claude/settings.json`, `git commit -m "update .claude settings"` and
+    /// every reader but `cat` (known since Oct 23, 2026; two of 95 everyday
+    /// calls on Nov 13). A program on the list writes nothing except through
+    /// a redirect, and a redirect's target is judged by the path rules,
+    /// which come first, so for those commands the string has nothing left
+    /// to guard. Every other command meets the rule as written.
+    ///
+    /// Written on the rule, like `except_rebuilt`: a policy written before
+    /// this field existed refuses those reads until the line is added.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub except_reads: bool,
     /// Match this rule against the command's RESOLVED targets rather than
     /// against the command string.
     ///
@@ -970,7 +990,12 @@ impl Policy {
         // A delete of nothing but directories a build rebuilds: a deny that
         // says `except_rebuilt` does not apply to it (`Rule::except_rebuilt`).
         let rebuilt = rebuilt_only(&targets, ctx);
-        let excepted = |r: &Rule| rebuilt.is_some() && r.except_rebuilt && r.action == Action::Deny;
+        let spared = |r: &Rule| rebuilt.is_some() && r.except_rebuilt && r.action == Action::Deny;
+        // A command that only reads or prints: a deny that says
+        // `except_reads` does not apply to it (`Rule::except_reads`).
+        let reads = only_reads(command);
+        let excepted =
+            |r: &Rule| spared(r) || (reads && r.except_reads && r.action == Action::Deny);
         // A privilege wrapper is transparent to a DENY only: `sudo gh repo
         // delete …` must hit a `gh repo delete*` deny, while an allow written
         // for `apt-get install*` must not admit `sudo apt-get install`. The
@@ -1108,7 +1133,7 @@ impl Policy {
                 && views
                     .iter()
                     .chain(deny_only_readings(command).iter())
-                    .any(|v| self.rules.iter().any(|r| excepted(r) && r.matches(v))) =>
+                    .any(|v| self.rules.iter().any(|r| spared(r) && r.matches(v))) =>
             {
                 let (name, by) = rebuilt.unwrap_or_default();
                 Decision {
@@ -1126,6 +1151,74 @@ impl Policy {
             },
         }
     }
+}
+
+/// Programs that write no file of their own accord: they read their
+/// operands, or print their arguments. Whatever one of them writes, it writes
+/// through a redirect, which is a target the path rules judge.
+///
+/// HAND-WALKED LIST (decision #56). On it only if the program has no option
+/// that names an output file and none that runs another program: `sort`
+/// (`-o`), `less` (`-o`), `sdiff` (`-o`), `rg` (`--pre`), `find`, `awk`,
+/// `sed`, `tee`, `cp`, `mv`, `file` (`-C`) and every interpreter are off it,
+/// and stay under the rule as written. Lowercase: the first word is compared
+/// lowercased, as rules are.
+const READ_ONLY: [&str; 22] = [
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "egrep",
+    "fgrep",
+    "stat",
+    "ls",
+    "du",
+    "diff",
+    "cmp",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "jq",
+    "echo",
+    "printf",
+    "type",
+    "get-content",
+    "gc",
+    "select-string",
+];
+
+/// The git subcommands that read the working tree, and the two that stage
+/// and record what is already on disk. `checkout`, `restore`, `reset`,
+/// `stash`, `clean`, `apply` and `config` change files and are off it; so is
+/// `grep`, for `-O`, which opens matches in a program.
+const GIT_READ_ONLY: [&str; 8] = [
+    "diff", "show", "log", "status", "blame", "ls-files", "add", "commit",
+];
+
+/// Does this command only read or print: is its first word, spelled plainly,
+/// a program on `READ_ONLY`, or `git` followed at once by a subcommand on
+/// `GIT_READ_ONLY`?
+///
+/// Plainly, because the exception relaxes a deny: a program named by a path
+/// (`./cat`) is whatever file sits there, a wrapper in front (`sudo cat`,
+/// `timeout 5 cat`, `X=1 cat`) is another program's line, and `git -c
+/// diff.external=… diff` runs what the option names. Each of those meets the
+/// rule as written, as it did before. One command only: the caller hands
+/// over a segment, and a line that is more than one is judged segment by
+/// segment, so the write in `cat x | python3 -c …` is the second segment's.
+fn only_reads(command: &str) -> bool {
+    let tokens = crate::delete::tokenize_public(command);
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let head = first.to_ascii_lowercase();
+    if head == "git" {
+        return tokens
+            .get(1)
+            .is_some_and(|sub| GIT_READ_ONLY.contains(&sub.to_ascii_lowercase().as_str()));
+    }
+    READ_ONLY.contains(&head.as_str())
 }
 
 /// The forms of a command a rule is matched against.
@@ -1412,6 +1505,7 @@ mod schema_and_severity_tests {
             reason: None,
             floor: false,
             except_rebuilt: false,
+            except_reads: false,
             case_sensitive: false,
             match_path: None,
         };
@@ -1427,6 +1521,7 @@ mod schema_and_severity_tests {
             reason: None,
             floor: false,
             except_rebuilt: false,
+            except_reads: false,
             case_sensitive: true,
             match_path: None,
         };
@@ -1597,6 +1692,7 @@ mod tests {
             reason: None,
             floor: false,
             except_rebuilt: false,
+            except_reads: false,
             case_sensitive: true,
             match_path: None,
         };
@@ -3381,6 +3477,7 @@ mod combined_gate_tests {
             reason: None,
             floor: false,
             except_rebuilt: false,
+            except_reads: false,
             case_sensitive: false,
             match_path: Some("*/.env".into()),
         };
@@ -3415,6 +3512,7 @@ mod combined_gate_tests {
             reason: None,
             floor: false,
             except_rebuilt: false,
+            except_reads: false,
             case_sensitive: false,
             match_path: Some("*/.ssh/id_*".into()),
         };
@@ -4159,5 +4257,150 @@ mod segment_directory_tests {
         assert_eq!(d.action, Action::Deny, "{}", d.reason);
         let d = p.evaluate_command("rm -rf dist/", &ctx);
         assert_eq!(d.action, Action::Deny, "{}", d.reason);
+    }
+}
+
+#[cfg(test)]
+mod except_reads_tests {
+    use super::*;
+
+    fn here() -> crate::resolve::EvalContext {
+        crate::resolve::EvalContext::at(std::path::Path::new("."))
+    }
+
+    /// The string belt over the hook configs no longer refuses a command
+    /// that cannot write a file. Known since Oct 23, 2026, and two of 95
+    /// everyday calls on Nov 13: `*.claude*settings*` matched a read and a
+    /// commit message, in both modes, because it is on the floor.
+    #[test]
+    fn a_read_or_a_mention_of_a_hook_config_is_ordinary_work() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        for line in [
+            "grep -n hooks .claude/settings.json",
+            "git commit -m \"update .claude settings\"",
+            "echo \"see .claude/settings.json\" >> TODO.md",
+            "cat .github/workflows/hooks.yml",
+            "git add .github/workflows/hooks.yml",
+            "head -5 .claude/settings.json",
+            "tail -3 .claude/settings.json",
+            "wc -l .claude/settings.json",
+            "stat .claude/settings.json",
+            "diff .claude/settings.json /tmp/x.json",
+            "jq . .claude/settings.json",
+            "ls -la .claude/settings.json",
+            "git log -p .claude/settings.json",
+            "git status .claude",
+            "Get-Content .claude\\settings.json",
+            "grep hook .codex/hooks.json",
+            "wc -l .cursor/hooks.json",
+        ] {
+            let d = p.evaluate_command(line, &here());
+            assert_ne!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+    }
+
+    /// Everything else still meets the rule: a write the path rules see, a
+    /// write only the string can see, a program that is not on the list or
+    /// is not named plainly, and a second command on the line.
+    #[test]
+    fn a_write_to_a_hook_config_is_still_refused_however_it_is_spelled() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        for line in [
+            "sed -i 's/a/b/' .claude/settings.json",
+            "python3 -c \"open('.claude/settings.json','w')\"",
+            "python3 -c \"import os; open(os.path.join('.claude','settings.json'),'w')\"",
+            "vim .claude/settings.json",
+            "git checkout -- .claude/settings.json",
+            "git restore .claude/settings.json",
+            "truncate -s 0 .claude/settings.json",
+            "cat .claude/settings.json > .claude/settings.json",
+            "grep x .claude/settings.json > .claude/settings.json",
+            "echo '{}' > .claude/settings.json",
+            "echo x | tee .claude/settings.json",
+            // not named plainly
+            "./cat .claude/settings.json",
+            "sudo cat .claude/settings.json",
+            "timeout 5 cat .claude/settings.json",
+            "X=1 cat .claude/settings.json",
+            "git -c diff.external=x diff .claude/settings.json",
+            // a reader with a door: not on the list
+            "rg --pre ./x pattern .claude/settings.json",
+            "less .claude/settings.json",
+            "sort -o .claude/settings.json .claude/settings.json",
+            "git grep -Ovi hooks .claude/settings.json",
+            "git diff --output=.claude/settings.json",
+            "git log --output .claude/settings.json",
+            // a second command on the line
+            "cat .claude/settings.json | python3 -c \"open('.claude/settings.json','w')\"",
+            "cat .claude/settings.json & python3 -c \"open('.claude/settings.json','w')\"",
+            "cat .claude/settings.json; python3 -c \"open('.claude/settings.json','w')\"",
+            "cat .claude/settings.json\npython3 -c \"open('.claude/settings.json','w')\"",
+            "cat \"$(python3 -c \"open('.claude/settings.json','w')\")\"",
+            "cat <(python3 -c \"open('.claude/settings.json','w')\")",
+            // the other hook configs
+            "python3 -c \"open('.cursor/hooks.json','w')\"",
+            "vim .codex/hooks.json",
+            "truncate -s 0 .github/hooks/hooks.json",
+            // the gate's own files keep their rule as written
+            "grep x .termaxa/policy.yaml",
+            "head .termaxa/policy.yaml",
+        ] {
+            let d = p.evaluate_command(line, &here());
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+    }
+
+    /// The exception is the policy's to make: a rule that does not say it
+    /// refuses a read as before, and on anything but a deny it means nothing.
+    #[test]
+    fn except_reads_is_the_policys_to_say() {
+        let belt = |extra: &str| -> Policy {
+            serde_yaml::from_str(&format!(
+                "version: 1\ndefault: ask\nrules:\n  - match: \"*.claude*settings*\"\n    action: deny\n{extra}  - match: \"grep *\"\n    action: allow\n"
+            ))
+            .expect("policy parses")
+        };
+        let read = "grep -n hooks .claude/settings.json";
+        assert_eq!(
+            belt("").evaluate_command(read, &here()).action,
+            Action::Deny
+        );
+        assert_eq!(
+            belt("    except_reads: true\n")
+                .evaluate_command(read, &here())
+                .action,
+            Action::Allow
+        );
+        let ask: Policy = serde_yaml::from_str(
+            "version: 1\ndefault: allow\nrules:\n  - match: \"*.claude*settings*\"\n    action: ask\n    except_reads: true\n",
+        )
+        .expect("policy parses");
+        assert_eq!(ask.evaluate_command(read, &here()).action, Action::Ask);
+    }
+
+    /// The starter says it on the four hook-config belts and nowhere else.
+    #[test]
+    fn the_starter_says_except_reads_on_the_hook_config_belts_only() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let said: Vec<String> = p
+            .rules
+            .iter()
+            .filter(|r| r.except_reads)
+            .map(|r| r.label())
+            .collect();
+        assert_eq!(
+            said,
+            vec![
+                "*.claude*settings*",
+                "*.cursor*hooks*",
+                "*.codex*hooks*",
+                "*.github*hooks*"
+            ]
+        );
+        assert!(p
+            .rules
+            .iter()
+            .filter(|r| r.except_reads)
+            .all(|r| r.floor && r.action == Action::Deny));
     }
 }

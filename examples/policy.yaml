@@ -208,16 +208,28 @@ rules:
   - match: "git add *.github/hooks*"
     action: allow
   # A belt over the path rules for commands whose grammar the gate does not
-  # model (`sed -i`, an editor, `python -c`): the gate's own files, then the
-  # hook configs. Reads are denied by these too, except for the reads listed
-  # above, because separating reads from writes in general would mean
-  # enumerating every read command. To add one, put it in that group — NOT
-  # at the top of the file. Named by what they hold, because a plain
-  # `*.termaxa*` also matched the PATH line `wrap` itself injects into every
-  # shell it starts - `export PATH=~/.termaxa/shims:...` - and refused Claude
-  # Code's own startup snapshot (Sep 10, 2026). The matcher knows only `*`,
-  # so the separator is spanned by it; `shims/` with the slash is a file
-  # inside the shim directory, while `shims:` in a PATH is not.
+  # model (an editor, `python -c`, `truncate`): the gate's own files, then
+  # the hook configs. A string cannot tell a write from a mention, so these
+  # match a read too. For the gate's own files, reads are denied except for
+  # the ones listed above; to add one, put it in that group — NOT at the top
+  # of the file. For the hook configs the four rules say `except_reads`
+  # (v0.21.10): they do not apply to a command that cannot write a file, one
+  # of a short list of programs that only read or print (`cat`, `head`,
+  # `tail`, `wc`, `grep`, `stat`, `ls`, `diff`, `jq`, `echo` and their kind,
+  # and git's `diff`, `show`, `log`, `status`, `add` and `commit`), named
+  # plainly as the first word. What such a command writes through a redirect
+  # is judged by the path rules at the top, which come first. Until then
+  # `grep -n hooks .claude/settings.json` and `git commit -m "update .claude
+  # settings"` were refused by a rule written to stop an agent EDITING the
+  # file.
+  #
+  # The rules for the gate's own files are named by what they hold, because
+  # a plain `*.termaxa*` also matched the PATH line `wrap` itself injects
+  # into every shell it starts - `export PATH=~/.termaxa/shims:...` - and
+  # refused Claude Code's own startup snapshot (Sep 10, 2026). The matcher
+  # knows only `*`, so the separator is spanned by it; `shims/` with the
+  # slash is a file inside the shim directory, while `shims:` in a PATH is
+  # not.
   - match: "*.termaxa*policy*"
     action: deny
     reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
@@ -242,18 +254,22 @@ rules:
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
+    except_reads: true
   - match: "*.cursor*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
+    except_reads: true
   - match: "*.codex*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
+    except_reads: true
   - match: "*.github*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
+    except_reads: true
   # Pointing git's hook directory anywhere runs whatever is there on the
   # next commit. It used to be caught only when the target was inside
   # `.termaxa`; the hazard is the redirection itself.
