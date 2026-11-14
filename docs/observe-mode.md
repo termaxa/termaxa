@@ -9,7 +9,14 @@ interrupting execution, except for a floor it cannot lower. The default is
 
 Outside the floor, every command runs:
 
-- An **allow** behaves as in enforce mode.
+- An **allow** is recorded as in enforce mode and, since v0.21.10, not
+  answered: the harness decides as it would alone. Until then the hook said
+  `allow` wherever a rule allowed the command; Claude Code and Copilot CLI
+  take a hook's `allow` as the approval, so switching the mode on skipped
+  prompts they would have shown. A run that leaned on that answer, an
+  unattended session that must prompt for nothing, gets its approvals from
+  the harness's own settings, or from enforce mode, where an allow is an
+  allow.
 - An **ask** or **deny** runs after its insurance is taken (the same copy,
   pin or dump enforce mode takes before an allowed destructive command),
   and is recorded as the verdict enforcement would have given. The record
@@ -20,13 +27,23 @@ Outside the floor, every command runs:
   - `unknown`: the gate could not read what the command changes (a script
     file, inline code, an unresolvable substitution).
 
-The hook says nothing: no output, exit 0, in every harness. Measured on
-Claude Code, Codex, Cursor 3.21.16 and Copilot CLI 1.0.83, silence leaves
-the harness's own decision in place, so its prompts are exactly what they
-were without Termaxa and observe mode grants nothing the harness would not
-have granted by itself. (v0.20.0 answered Cursor and Copilot `allow`
-instead, and Copilot treats a hook's `allow` as an approval: it skipped its
-own prompt. Fixed in v0.20.1.) Observed verdicts send no notifications.
+A native write (`Write`, `Edit`, `Delete`, a patch's files) is observed the
+same way since v0.21.10: a path rule's ask or deny outside the floor is
+recorded with the mode's fields, the file is copied aside first, and nothing
+is said to the harness; the floor below holds for it as for a command. Until
+then a path rule's deny on a native write was enforced in observe mode, and
+`Write .env` was refused where the shell's `echo KEY=2 > .env` ran after its
+copy.
+
+The hook says nothing: no output, exit 0, in every harness, whatever the
+verdict outside the floor. Measured on Claude Code, Codex, Cursor 3.21.16
+and Copilot CLI 1.0.83, silence leaves the harness's own decision in place,
+so its prompts are exactly what they were without Termaxa and observe mode
+grants nothing the harness would not have granted by itself. (v0.20.0
+answered Cursor and Copilot `allow` for an observed verdict, and Copilot
+treats a hook's `allow` as an approval: it skipped its own prompt. Fixed in
+v0.20.1. A rule's allow was still answered until v0.21.10, above.) Observed
+verdicts send no notifications.
 
 ## The floor
 
@@ -71,13 +88,37 @@ kind) did not see `x=$(rm -rf /)`, `cat <(kubectl delete ns prod)` or
 `timeout 60 kubectl delete ns prod`, which ran
 ([GHSA-84qh-xh6v-3qhr](https://github.com/termaxa/termaxa/security/advisories/GHSA-84qh-xh6v-3qhr)).
 
+Since v0.21.10 the floor's path rules hold a file the command does not
+name: a file copied or moved into its directory (`cp x/settings.json
+.claude/`), a tree landed over it (`cp -r template/. .`), its directory
+removed or moved away (`rm -r .claude`, `mv .claude .claude.bak`), and what
+a git discard, a stash or a clean would undo. Until then the first three
+were asks, or the `*rm -rf*` deny, which is not on the floor, and ran. And
+in a project as `init` leaves it, where the policy is an untracked
+directory and the hook registration an uncommitted change to a settings
+file git already tracks, `git stash`, `git reset --hard` and `git checkout
+-- .` put the settings file back without the hook and `git clean -fd`
+deleted the policy: all four ran
+([GHSA-7g97-4pmr-2vrq](https://github.com/termaxa/termaxa/security/advisories/GHSA-7g97-4pmr-2vrq)).
+Until the policy and the hook config are committed, which `init` now says
+to do, the git commands that would undo them are held in that project;
+after that they are observed as before.
+Of 57 ways to copy, move, rename or delete a guarded file without naming it,
+observe mode held 6 on 0.21.9 and holds 47 now; the ten left are a `.env`,
+whose rule is not on the floor, two lines that touch nothing guarded, and
+seven the gate does not read.
+
 What the gate does not read it cannot hold. A command behind a runner it
 does not know (`strace`, `flock`, `chroot`, `docker exec`, `ssh`), piped
 into a shell, in an interpreter's inline code or in a script is not read:
 the line gets the verdict of its own words, which under the starter is an
 ask for all of these but a `node <file>` script, and in observe mode it
 runs, unless a floor rule spelled with a leading `*` matches the line as
-typed; the anchored ones do not. SECURITY.md has the list.
+typed; the anchored ones do not. The same goes for a guarded file changed
+by `install`, `rsync`, `ln`, `find -exec` or an archive unpacked over the
+project, and for one that git brings in from another commit: a branch
+switch, a merge, a pull or `git stash pop` can replace a hook config, and
+the floor does not see it. SECURITY.md has both lists.
 
 Observe mode cannot relax any of them. Lowering the floor means editing the
 policy, which the fingerprint records. A policy that asks for observe but
