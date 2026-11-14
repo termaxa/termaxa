@@ -71,7 +71,7 @@ Measured on the SynCircles record: an agent (Claude Code, headless) building a r
 
 - README.ja.md, a Japanese translation of the README as of v0.21.7, by Lesstep (#162), reviewed line by line against the English before merge; the English is authoritative and the translation says so.
 
-### Correction, Nov 14, 2026
+### Correction, Nov 13, 2026
 
 The entry above says that with the eleven project rules the record measures 58 allow, 64 ask, 1 deny. The released binary gives 59 allow, 63 ask, 1 deny: replayed twice on Nov 11, 2026 in a fresh state directory, the same per command as the Nov 5 run's own record. The figures without the rules (36 / 86 / 1) and the hook's own verdicts (34 / 88 / 1) reproduce.
 
