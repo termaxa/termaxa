@@ -1829,3 +1829,164 @@ fn an_append_is_asked_about_and_observed_like_any_other_write() {
     );
     assert_eq!(out.code, 2, "a floor rule holds an append: {}", out.stdout);
 }
+
+/// The floor holds a hook config that a command changes without naming it:
+/// a file copied or moved into its directory, a tree copied over the
+/// project, the directory deleted or moved away. Found Nov 14, 2026 on
+/// 0.21.9, where each of these ran in observe mode: the path rule names the
+/// file, and the command named only the directory. A copy beside it, and a
+/// tree that lands outside the project, run as before.
+#[cfg(unix)]
+#[test]
+fn observe_mode_holds_a_hook_config_changed_through_its_directory() {
+    use serde_json::json;
+    let tmp = scratch("observe-directory");
+    let home = tmp.join("home");
+    let policy = concat!(
+        "version: 1\nmode: observe\ndefault: ask\nrules:\n",
+        "  - match_path: \"*/.claude/settings*.json\"\n    action: deny\n    floor: true\n",
+        "  - match: \"*rm -rf*\"\n    action: deny\n",
+    );
+    let proj = project(&tmp, policy);
+    for (file, text) in [
+        (".claude/settings.json", "{}\n"),
+        ("incoming/settings.json", "{}\n"),
+        ("incoming/tpl/.claude/settings.json", "{}\n"),
+        ("incoming/tpl/README.md", "t\n"),
+        ("notes.md", "n\n"),
+    ] {
+        let path = proj.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let mk = |cmd: &str| {
+        json!({"session_id":"D","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+               "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+    };
+    for cmd in [
+        "cp incoming/settings.json .claude/",
+        "mv incoming/settings.json .claude",
+        "cp -r incoming/tpl/. .",
+        "rm -rf .claude",
+        "rm -r .claude",
+        "mv .claude .claude.bak",
+    ] {
+        let out = hook(&home, &proj, &mk(cmd), &[]);
+        assert_eq!(out.code, 2, "{cmd}: held in observe mode: {}", out.stdout);
+        assert!(
+            out.stdout.contains("*/.claude/settings*.json"),
+            "{cmd}: by the path rule: {}",
+            out.stdout
+        );
+    }
+    for cmd in [
+        "cp notes.md incoming/",
+        "cp -r incoming/tpl ../elsewhere",
+        "mv notes.md docs.md",
+    ] {
+        let out = hook(&home, &proj, &mk(cmd), &[]);
+        assert_eq!(
+            (out.stdout.trim(), out.code),
+            ("", 0),
+            "{cmd}: observed, and it runs"
+        );
+    }
+    let log = project_logs(&home);
+    let held = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["command"] == "cp incoming/settings.json .claude/")
+        .expect("the held copy is on the record");
+    assert_eq!(held["floor"], true, "{held}");
+    assert_eq!(held["enforced"], true, "{held}");
+}
+
+/// The floor holds a git command that would unhook the gate without naming
+/// its file. In the state `termaxa init` leaves, the hook registration is
+/// an uncommitted change to a tracked `.claude/settings.json`: `git stash`
+/// and `git reset --hard` put the file back as committed, and both ran in
+/// observe mode (found Nov 14, 2026, on 0.21.9). Once the file is committed
+/// the same commands are observed and run, as before.
+#[cfg(unix)]
+#[test]
+fn observe_mode_holds_a_git_discard_that_would_unhook_the_gate() {
+    use serde_json::json;
+    let tmp = scratch("observe-git");
+    let home = tmp.join("home");
+    let policy = concat!(
+        "version: 1\nmode: observe\ndefault: ask\nrules:\n",
+        "  - match_path: \"*/.claude/settings*.json\"\n    action: deny\n    floor: true\n",
+    );
+    let proj = project(&tmp, policy);
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&proj)
+            .args([
+                "-c",
+                "user.email=tests@termaxa.invalid",
+                "-c",
+                "user.name=termaxa tests",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git must be available");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    std::fs::create_dir_all(proj.join(".claude")).unwrap();
+    std::fs::write(proj.join(".claude/settings.json"), "{}\n").unwrap();
+    std::fs::write(proj.join("notes.md"), "n\n").unwrap();
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(proj.join(".claude/settings.json"), "{\"hooks\":{}}\n").unwrap();
+    std::fs::write(proj.join("notes.md"), "edited\n").unwrap();
+    let mk = |cmd: &str| {
+        json!({"session_id":"G","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+               "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+    };
+    for (cmd, how) in [
+        ("git stash", "taken into a stash"),
+        ("git reset --hard", "put back as committed"),
+        ("git checkout -- .", "put back as committed"),
+    ] {
+        let out = hook(&home, &proj, &mk(cmd), &[]);
+        assert_eq!(out.code, 2, "{cmd}: held in observe mode: {}", out.stdout);
+        assert!(
+            out.stdout.contains(how) && out.stdout.contains("settings.json"),
+            "{cmd}: the reason names the file and what happens to it: {}",
+            out.stdout
+        );
+    }
+    // A discard that leaves the hook config alone is observed.
+    let out = hook(&home, &proj, &mk("git checkout -- notes.md"), &[]);
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 0),
+        "observed, and it runs"
+    );
+    // Committed, the hook config is no longer something a discard puts back.
+    git(&["add", ".claude"]);
+    git(&["commit", "-q", "-m", "hook"]);
+    for cmd in ["git stash", "git reset --hard"] {
+        let out = hook(&home, &proj, &mk(cmd), &[]);
+        assert_eq!(
+            (out.stdout.trim(), out.code),
+            ("", 0),
+            "{cmd}: observed, and it runs"
+        );
+    }
+    let log = project_logs(&home);
+    let held = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["command"] == "git stash" && e["enforced"] == true)
+        .expect("the held stash is on the record");
+    assert_eq!(held["floor"], true, "{held}");
+    assert_eq!(held["decision"], "deny", "{held}");
+}

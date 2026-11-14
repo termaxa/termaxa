@@ -415,8 +415,9 @@ fn git_subcommand(tokens: &[String]) -> Option<usize> {
 }
 
 /// `git reset --hard`, `git checkout -- <paths>` and `git restore <paths>`
-/// discard uncommitted changes to tracked files, and git's reflog does not
-/// hold those: it records commits, and uncommitted work never was one. The
+/// discard uncommitted changes to tracked files (as do `git checkout -f`
+/// and `git switch --discard-changes`, read since v0.21.10), and git's
+/// reflog does not hold those: it records commits, and uncommitted work never was one. The
 /// starter policy leaves these at the default ask, and until now the ask came
 /// with no way back. Measured Oct 5-6, 2026 (the Destructive Reach benchmark):
 /// asked to "undo my last commit" with an unrelated edit uncommitted in the
@@ -431,10 +432,14 @@ pub fn git_discard_target(tokens: &[String], cwd: &Path) -> Option<Discard> {
             .any(|t| t == "--hard")
             .then_some(Discard::WholeTree),
         "checkout" => {
+            // `-f` throws the tree's changes away whatever else the command
+            // does: `git checkout -f`, `git checkout -f main`.
+            let forced = args.iter().any(|t| t == "-f" || t == "--force");
             // Creating or switching a branch keeps the tree's changes.
-            if args
-                .iter()
-                .any(|t| matches!(t.as_str(), "-b" | "-B" | "--orphan" | "--detach"))
+            if !forced
+                && args
+                    .iter()
+                    .any(|t| matches!(t.as_str(), "-b" | "-B" | "--orphan" | "--detach"))
             {
                 return None;
             }
@@ -449,8 +454,17 @@ pub fn git_discard_target(tokens: &[String], cwd: &Path) -> Option<Discard> {
                     .cloned()
                     .collect(),
             };
-            (!paths.is_empty()).then_some(Discard::Paths(paths))
+            if paths.is_empty() {
+                forced.then_some(Discard::WholeTree)
+            } else {
+                Some(Discard::Paths(paths))
+            }
         }
+        // A switch keeps the tree's changes unless it is told to drop them.
+        "switch" => args
+            .iter()
+            .any(|t| matches!(t.as_str(), "-f" | "--force" | "--discard-changes"))
+            .then_some(Discard::WholeTree),
         "restore" => {
             let staged = args.iter().any(|t| t == "--staged" || t == "-S");
             let worktree = args.iter().any(|t| t == "--worktree" || t == "-W");
@@ -2525,6 +2539,32 @@ mod tests {
             git_discard_target(&tokens("git -C . reset --hard"), &work),
             Some(Discard::WholeTree)
         );
+        // A forced checkout and a forced switch throw the same changes
+        // away (v0.21.10); the unforced ones keep them.
+        for line in [
+            "git checkout -f",
+            "git checkout --force main",
+            "git checkout -f -b fresh",
+            "git switch --discard-changes main",
+            "git switch -f main",
+        ] {
+            assert_eq!(
+                git_discard_target(&tokens(line), &work),
+                Some(Discard::WholeTree),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            git_discard_target(&tokens("git checkout -f -- app.py"), &work),
+            Some(Discard::Paths(vec!["app.py".to_string()]))
+        );
+        for line in [
+            "git switch main",
+            "git checkout main",
+            "git checkout -b fresh",
+        ] {
+            assert_eq!(git_discard_target(&tokens(line), &work), None, "{line}");
+        }
         assert_eq!(
             plan("git reset --hard HEAD~1", &work).as_deref(),
             Some("snapshot the uncommitted changes in 2 file(s) with git stash before they are discarded")
