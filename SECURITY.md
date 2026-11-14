@@ -193,6 +193,7 @@ The affected range and publication date are on each advisory's page.
 | [GHSA-3hg6-x893-mfr4](https://github.com/termaxa/termaxa/security/advisories/GHSA-3hg6-x893-mfr4) | High | Path rules, previews and backups did not follow a `cd` earlier on the command line | v0.7.0, 2026-07-02 | v0.21.4, 2026-10-13 | 2026-10-13 | 103 |
 | [GHSA-4mqm-4c42-2xxc](https://github.com/termaxa/termaxa/security/advisories/GHSA-4mqm-4c42-2xxc) | High | A path read only at its end, after a `cd` or behind a variable, was not matched by the path rules and an explicit allow let the write through | v0.15.0, 2026-08-13 | v0.21.6, 2026-10-23 | 2026-10-23 | 71 |
 | [GHSA-rp8h-f4h4-w4j3](https://github.com/termaxa/termaxa/security/advisories/GHSA-rp8h-f4h4-w4j3) | High | A quote in a comment or a heredoc's body joined the lines after it to the command before, under its verdict | v0.7.0, 2026-07-02 | v0.21.7, 2026-10-27 | 2026-10-27 | 117 |
+| [GHSA-84qh-xh6v-3qhr](https://github.com/termaxa/termaxa/security/advisories/GHSA-84qh-xh6v-3qhr) | High | A command inside a substitution was not read as a command, and observe mode's floor did not hold a floor command behind a runner or another deny | v0.6.1, 2026-07-02 | v0.21.9, 2026-11-13 | 2026-11-14 | 135 |
 
 "Days exposed" is the window a user of the first affected release was
 exposed without knowing it: from that release to the public advisory. It
