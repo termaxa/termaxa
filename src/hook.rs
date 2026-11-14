@@ -600,6 +600,7 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
             after,
             None,
             Some(true),
+            ModeFields::default(),
         );
         return silent;
     }
@@ -631,8 +632,107 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
         None => format!("[termaxa] {}", decision.reason),
     };
 
-    match decision.action {
-        Action::Deny => {
+    // OBSERVE MODE, for a native write as for a shell command (v0.21.10).
+    // Until then this path had no mode at all: a path rule's deny on
+    // `Write`, `Edit` or a delete was enforced in observe mode, and its
+    // record line carried none of the mode's fields, so `Write .env` was
+    // refused where the shell's `echo KEY=2 > .env` ran after its copy, and
+    // the report never counted either (measured Nov 13, 2026, on 0.21.8).
+    // Now the same three cases as the shell path: a floor rule holds; so
+    // does a delete of a tree past the copy budget, which nothing could
+    // bring back; anything else is recorded with its coverage, copied aside
+    // first, and left to the harness, to which the hook says nothing. The
+    // gate's own files never get this far (`protected_write`, above).
+    let (mode, _) = policy.effective_mode();
+    let floor_rule = decision
+        .matched_rule
+        .as_deref()
+        .is_some_and(|m| policy.is_floor_rule(m));
+    let uninsurable = resolved.iter().zip(&w.targets).any(|(t, wt)| {
+        matches!(wt.kind, WriteKind::Delete)
+            && t.resolved
+                .as_ref()
+                .is_some_and(|p| p.is_dir() && crate::delete::scan_budgeted(p).capped)
+    });
+    let floor_holds = decision.action == Action::Deny && (floor_rule || uninsurable);
+    let observed = mode == crate::policy::Mode::Observe
+        && matches!(decision.action, Action::Ask | Action::Deny)
+        && !floor_holds;
+    let fields = |enforced: bool, copied: bool| ModeFields {
+        mode: Some(mode.as_str().to_string()),
+        enforced: Some(enforced),
+        floor: Some(floor_holds),
+        coverage: match decision.action {
+            Action::Allow => None,
+            _ if floor_holds => Some("floor".to_string()),
+            _ if copied => Some("insured".to_string()),
+            _ => Some("known-uninsured".to_string()),
+        },
+    };
+    let exit_for_deny = if matches!(w.dialect, Dialect::Copilot | Dialect::CopilotRepoSettings) {
+        0
+    } else {
+        2
+    };
+
+    if !observed && decision.action == Action::Deny {
+        append_write_entry(
+            w,
+            &paths,
+            "hook",
+            "deny",
+            decision.matched_rule.clone(),
+            &subject,
+            &decision.reason,
+            cost,
+            None,
+            None,
+            fields(true, false),
+        );
+        crate::notify::maybe_send(&policy, "deny", &subject, &decision.reason, "hook");
+        return Outcome {
+            rendered: Some(render_response(w.dialect, "deny", &reason_shown)),
+            exit_code: exit_for_deny,
+            audit_seq: None,
+        };
+    }
+    if !observed && decision.action == Action::Ask {
+        append_write_entry(
+            w,
+            &paths,
+            "hook",
+            "ask",
+            decision.matched_rule.clone(),
+            &subject,
+            &decision.reason,
+            cost,
+            None,
+            None,
+            fields(true, false),
+        );
+        crate::notify::maybe_send(&policy, "ask", &subject, &decision.reason, "hook");
+        return Outcome {
+            rendered: Some(render_response(w.dialect, "ask", &reason_shown)),
+            exit_code: 0,
+            audit_seq: None,
+        };
+    }
+
+    // The write goes ahead: an allow, or a verdict observe mode records and
+    // lets through. Insurance before the harness writes: the existing file
+    // or tree, copied aside under the same store `rollback` reads, under
+    // the same budget as a shell delete. A failed copy is reported in the
+    // record and, under `backup_failure: deny`, refuses the write.
+    let (backup, insurance_failed) =
+        match crate::backup::take_target(&paths.state_dir, &subject, &existing) {
+            Ok(rec) => (rec.map(|r| r.id), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+    if let Some(e) = insurance_failed {
+        if policy.backup_failure == crate::policy::BackupFailure::Deny {
+            let reason = format!(
+                "insurance failed ({e}) and the policy sets `backup_failure: deny` — an uninsured write does not run"
+            );
             append_write_entry(
                 w,
                 &paths,
@@ -640,119 +740,63 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
                 "deny",
                 decision.matched_rule.clone(),
                 &subject,
-                &decision.reason,
+                &reason,
                 cost,
                 None,
                 None,
-            );
-            crate::notify::maybe_send(&policy, "deny", &subject, &decision.reason, "hook");
-            Outcome {
-                rendered: Some(render_response(w.dialect, "deny", &reason_shown)),
-                exit_code: if matches!(w.dialect, Dialect::Copilot | Dialect::CopilotRepoSettings) {
-                    0
-                } else {
-                    2
+                ModeFields {
+                    mode: Some(mode.as_str().to_string()),
+                    enforced: Some(true),
+                    floor: Some(false),
+                    coverage: Some("known-uninsured".to_string()),
                 },
-                audit_seq: None,
-            }
-        }
-        Action::Ask => {
-            append_write_entry(
-                w,
-                &paths,
-                "hook",
-                "ask",
-                decision.matched_rule.clone(),
-                &subject,
-                &decision.reason,
-                cost,
-                None,
-                None,
             );
-            crate::notify::maybe_send(&policy, "ask", &subject, &decision.reason, "hook");
-            Outcome {
-                rendered: Some(render_response(w.dialect, "ask", &reason_shown)),
-                exit_code: 0,
+            return Outcome {
+                rendered: Some(render_response(
+                    w.dialect,
+                    "deny",
+                    &format!("[termaxa] {reason}"),
+                )),
+                exit_code: exit_for_deny,
                 audit_seq: None,
-            }
-        }
-        Action::Allow => {
-            // Insurance before the harness writes: the existing file or tree,
-            // copied aside under the same store `rollback` reads, under the
-            // same budget as a shell delete. A failed copy is reported in the
-            // record and, under `backup_failure: deny`, refuses the write.
-            let (backup, insurance_failed) =
-                match crate::backup::take_target(&paths.state_dir, &subject, &existing) {
-                    Ok(rec) => (rec.map(|r| r.id), None),
-                    Err(e) => (None, Some(e.to_string())),
-                };
-            if let Some(e) = insurance_failed {
-                if policy.backup_failure == crate::policy::BackupFailure::Deny {
-                    let reason = format!(
-                        "insurance failed ({e}) and the policy sets `backup_failure: deny` — an uninsured write does not run"
-                    );
-                    append_write_entry(
-                        w,
-                        &paths,
-                        "hook",
-                        "deny",
-                        decision.matched_rule.clone(),
-                        &subject,
-                        &reason,
-                        cost,
-                        None,
-                        None,
-                    );
-                    return Outcome {
-                        rendered: Some(render_response(
-                            w.dialect,
-                            "deny",
-                            &format!("[termaxa] {reason}"),
-                        )),
-                        exit_code: if matches!(
-                            w.dialect,
-                            Dialect::Copilot | Dialect::CopilotRepoSettings
-                        ) {
-                            0
-                        } else {
-                            2
-                        },
-                        audit_seq: None,
-                    };
-                }
-            }
-            let before = existing
-                .first()
-                .filter(|p| p.is_file())
-                .and_then(|p| crate::fingerprint::of_file(p))
-                .map(|h| format!("sha256 before {h}"));
-            let preview = match (&cost, before) {
-                (Some(c), Some(b)) => Some(format!("{c}; {b}")),
-                (Some(c), None) => Some(c.clone()),
-                (None, b) => b,
             };
-            append_write_entry(
-                w,
-                &paths,
-                "hook",
-                "allow",
-                decision.matched_rule.clone(),
-                &subject,
-                &decision.reason,
-                preview,
-                backup,
-                None,
-            );
-            Outcome {
-                rendered: if is_silent(w.dialect, &decision) {
-                    None
-                } else {
-                    Some(render_response(w.dialect, "allow", &reason_shown))
-                },
-                exit_code: 0,
-                audit_seq: None,
-            }
         }
+    }
+    let before = existing
+        .first()
+        .filter(|p| p.is_file())
+        .and_then(|p| crate::fingerprint::of_file(p))
+        .map(|h| format!("sha256 before {h}"));
+    let preview = match (&cost, before) {
+        (Some(c), Some(b)) => Some(format!("{c}; {b}")),
+        (Some(c), None) => Some(c.clone()),
+        (None, b) => b,
+    };
+    let copied = backup.is_some();
+    append_write_entry(
+        w,
+        &paths,
+        "hook",
+        &decision.action.to_string(),
+        decision.matched_rule.clone(),
+        &subject,
+        &decision.reason,
+        preview,
+        backup,
+        None,
+        fields(!observed, copied),
+    );
+    // Observe mode answers nothing outside the floor: not for a verdict it
+    // let through, and not for an allow, here as on the shell path.
+    let quiet = observed || mode == crate::policy::Mode::Observe || is_silent(w.dialect, &decision);
+    Outcome {
+        rendered: if quiet {
+            None
+        } else {
+            Some(render_response(w.dialect, "allow", &reason_shown))
+        },
+        exit_code: 0,
+        audit_seq: None,
     }
 }
 
@@ -762,6 +806,18 @@ fn start_dir_of(cwd: &str) -> std::path::PathBuf {
     } else {
         std::env::current_dir().unwrap_or_default()
     }
+}
+
+/// The mode a native write was judged in and what the mode did with the
+/// verdict: the four fields the shell path's record lines have carried since
+/// v0.20.0, which the report's observe section is built from. All empty for
+/// a receipt, which is no verdict.
+#[derive(Default)]
+struct ModeFields {
+    mode: Option<String>,
+    enforced: Option<bool>,
+    floor: Option<bool>,
+    coverage: Option<String>,
 }
 
 /// One audit line for a native write, in the shape the shell path's lines
@@ -778,6 +834,7 @@ fn append_write_entry(
     preview: Option<String>,
     backup: Option<String>,
     approved: Option<bool>,
+    fields: ModeFields,
 ) {
     let Ok(log) = AuditLog::new(&paths.state_dir) else {
         return;
@@ -785,10 +842,10 @@ fn append_write_entry(
     let (ts_ms, ts) = now();
     let _ = log.append(&AuditEntry {
         call_id: None,
-        mode: None,
-        enforced: None,
-        floor: None,
-        coverage: None,
+        mode: fields.mode,
+        enforced: fields.enforced,
+        floor: fields.floor,
+        coverage: fields.coverage,
         ts_ms,
         ts,
         source: source.into(),
@@ -831,14 +888,19 @@ fn protected_write(w: &FileWrite, path: &str, protected: crate::protect::Protect
     // went unrecorded is still a deny.
     let start_dir = start_dir_of(&w.cwd);
     if let Ok(paths) = crate::paths::resolve_from(&start_dir) {
+        // The mode, when there is a policy to read it from: this refusal
+        // does not depend on one, and is the floor in either mode.
+        let policy = Policy::load(&paths.policy_file()).ok();
         if let Ok(log) = AuditLog::new(&paths.state_dir) {
             let (ts_ms, ts) = now();
             let _ = log.append(&AuditEntry {
                 call_id: None,
-                mode: None,
-                enforced: None,
-                floor: None,
-                coverage: None,
+                mode: policy
+                    .as_ref()
+                    .map(|p| p.effective_mode().0.as_str().to_string()),
+                enforced: Some(true),
+                floor: Some(true),
+                coverage: Some("floor".to_string()),
                 ts_ms,
                 ts,
                 source: "hook".into(),
@@ -869,8 +931,8 @@ fn protected_write(w: &FileWrite, path: &str, protected: crate::protect::Protect
                 hash: None,
             });
         }
-        if let Ok(policy) = Policy::load(&paths.policy_file()) {
-            crate::notify::maybe_send(&policy, "deny", &subject, protected.reason, "hook");
+        if let Some(policy) = &policy {
+            crate::notify::maybe_send(policy, "deny", &subject, protected.reason, "hook");
         }
     }
 
@@ -1660,7 +1722,20 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // CLI 1.0.83 still prompts), while an explicit `allow` makes Copilot
     // skip its own prompt and run. v0.20.0 answered Cursor and Copilot
     // `allow` here, so turning observe mode on widened what Copilot ran.
-    let silent = is_silent(input.dialect, &decision) || observed.is_some();
+    //
+    // An allow is silence in observe mode too, in every dialect (Manoj's
+    // call, Nov 14, 2026). Until v0.21.10 a rule's allow was still answered
+    // `allow`, which makes Claude Code skip its own prompt: on the starter,
+    // 28 of 95 everyday tool calls were approved by a mode whose rule, and
+    // whose README, say the hook says nothing (measured Nov 13, 2026). The
+    // record is unchanged: the allow and its rule are on it, and `enforced`
+    // stays true, since enforcement would have run it as well. A run that
+    // leaned on that answer (a locked-down `claude -p`) gets its approvals
+    // from the harness's own settings, or from enforce mode, where an allow
+    // is an allow. A probe still sees the policy's verdict.
+    let observed_allow =
+        mode == crate::policy::Mode::Observe && !is_probe && decision.action == Action::Allow;
+    let silent = is_silent(input.dialect, &decision) || observed.is_some() || observed_allow;
 
     // Codex honours exactly one PreToolUse verdict: `deny`. An `ask` is
     // "unsupported permissionDecision:ask", which fails the hook and falls

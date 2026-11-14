@@ -62,7 +62,9 @@ Silence - no output, exit 0 - is the answer for an allow no rule named, and
 only where the harness documents that no output means no opinion (Claude
 Code; Codex for every allow). Cursor and Copilot always get an answer in
 enforce mode. An observed verdict (observe mode) is silence in every
-harness, measured below.
+harness, measured below, and since v0.21.10 so is an allow in observe mode:
+outside the floor the mode answers nothing, and each harness decides as it
+would without the hook.
 
 ## Silence, `allow` and `ask`, as measured (Oct 4, 2026, Windows)
 
