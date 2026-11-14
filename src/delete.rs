@@ -2094,6 +2094,137 @@ pub fn scan_budgeted(root: &Path) -> Scan {
     }
 }
 
+/// How much of the disk one command's reading may walk when it has to know
+/// what a tree HOLDS rather than how big it is (`files_under`): the delete
+/// preview's budget, counted across every tree the command names.
+///
+/// The time is time spent walking, not time since the reading began: a
+/// reading that asks git first (`resolve::undone_by_git`) waits on a
+/// process or three before it walks anything, on Windows for longer than
+/// the whole budget, and a clock started at the top would have stopped the
+/// walk before its first file.
+pub struct WalkBudget {
+    walked: std::time::Duration,
+    files: usize,
+    /// True once a walk stopped early: there are files nobody read.
+    pub capped: bool,
+}
+
+impl WalkBudget {
+    pub fn new() -> Self {
+        Self {
+            walked: std::time::Duration::ZERO,
+            files: 0,
+            capped: false,
+        }
+    }
+
+    /// Is the budget gone, `this_walk` into the walk that is asking?
+    fn spent(&self, this_walk: Instant) -> bool {
+        self.files >= MAX_FILES || self.walked + this_walk.elapsed() > MAX_TIME
+    }
+}
+
+impl Default for WalkBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The files under `root`, each as its path below `root` with `/` between
+/// the components: what `rm -r root` takes with it and what `cp -r root
+/// dest` lands (`resolve::command_contents`).
+///
+/// Breadth first, and in each directory the dot-named entries before the
+/// rest: the files a path rule names (`.claude/settings.json`, `.env`) sit
+/// near the top of a tree, and under a budget what is read first is what is
+/// read. A directory a build rebuilds and `.git` are not entered: what they
+/// hold is not the project's own (a dependency's `.env` is nobody's
+/// credentials), and they are where the budget would go. Nor is a checkout
+/// of its own below the root (`is_checkout`): a worktree under
+/// `.claude/worktrees`, a clone in `vendor/`. Its files are that checkout's,
+/// its `.claude/settings.json` gates sessions that run there, and it comes
+/// and goes whole. A link is an entry, never followed. When the budget runs
+/// out the walk stops and says so in `budget.capped`; the rest of the tree
+/// was not read.
+pub fn files_under(root: &Path, budget: &mut WalkBudget) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let started = Instant::now();
+    let mut queue: std::collections::VecDeque<(PathBuf, String)> =
+        std::collections::VecDeque::from([(root.to_path_buf(), String::new())]);
+    'walk: while let Some((dir, below)) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // (not dot-named, name, is a directory): dot-named first, then by
+        // name, so two runs read the same files under the same budget.
+        let mut found: Vec<(bool, String, bool)> = Vec::new();
+        for e in entries.flatten() {
+            if budget.spent(started) {
+                budget.capped = true;
+                break 'walk;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            let is_dir = e.path().symlink_metadata().is_ok_and(|m| m.is_dir());
+            found.push((!name.starts_with('.'), name, is_dir));
+        }
+        found.sort();
+        for (_, name, is_dir) in found {
+            let rel = if below.is_empty() {
+                name.clone()
+            } else {
+                format!("{below}/{name}")
+            };
+            if !is_dir {
+                if budget.spent(started) {
+                    budget.capped = true;
+                    break 'walk;
+                }
+                budget.files += 1;
+                out.push(rel);
+            } else if !is_rebuilt_name(&name)
+                && !name.eq_ignore_ascii_case(".git")
+                && !is_checkout(&dir.join(&name))
+            {
+                queue.push_back((dir.join(&name), rel));
+            }
+        }
+    }
+    budget.walked += started.elapsed();
+    out
+}
+
+/// Is `dir` a checkout of its own: does it hold a `.git`, which is a
+/// directory in a clone and a file in a worktree or a submodule?
+pub fn is_checkout(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(".git")).is_ok()
+}
+
+/// Is `name` one of the directories a build or an install rebuilds, by name
+/// alone? Only for deciding what a walk enters; `reproducible_within` is the
+/// reading a verdict rests on.
+pub fn is_rebuilt_name(name: &str) -> bool {
+    REPRODUCIBLE
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(name))
+}
+
+/// The directories under the user's home that hold an agent's own
+/// configuration, the hook registration among it: `~/.claude`, `~/.cursor`,
+/// `~/.codex`. A tree that is removed or copied over is read for what it
+/// changes in the project and in these, and nowhere else
+/// (`resolve::command_contents`).
+pub fn user_config_dirs() -> Vec<PathBuf> {
+    home_dir()
+        .map(|h| {
+            [".claude", ".cursor", ".codex"]
+                .iter()
+                .map(|d| h.join(d))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // formatting
 // ---------------------------------------------------------------------------
@@ -3467,5 +3598,65 @@ mod segment_directory_tests {
             "#73's re-check must see the tree it will delete"
         );
         assert!(target_signature("rm -r data", &main).is_none());
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use crate::testutil::TempTree;
+
+    /// Shallow before deep, dot-named before the rest, and neither a
+    /// directory a build rebuilds, nor `.git`, nor a checkout of its own
+    /// below the root entered: a clone has a `.git` directory, a worktree a
+    /// `.git` file.
+    #[test]
+    fn a_tree_is_read_from_the_top_and_dot_names_first() {
+        let tmp = TempTree::new("walk");
+        tmp.file("z.txt", "z");
+        tmp.file(".env", "k");
+        tmp.file("a/b.txt", "b");
+        tmp.file(".claude/settings.json", "{}");
+        tmp.file("node_modules/pkg/.env", "x");
+        tmp.file(".git/config", "c");
+        tmp.file("vendor/clone/.git/config", "c");
+        tmp.file("vendor/clone/.claude/settings.json", "{}");
+        tmp.file(".claude/worktrees/wt/.git", "gitdir: elsewhere");
+        tmp.file(".claude/worktrees/wt/.termaxa/policy.yaml", "p");
+        assert!(is_checkout(tmp.path()) && is_checkout(&tmp.path().join("vendor/clone")));
+        assert!(is_checkout(&tmp.path().join(".claude/worktrees/wt")));
+        assert!(!is_checkout(&tmp.path().join("a")));
+        let mut budget = WalkBudget::new();
+        let found = files_under(tmp.path(), &mut budget);
+        assert_eq!(
+            found,
+            vec![".env", "z.txt", ".claude/settings.json", "a/b.txt"]
+        );
+        assert!(!budget.capped);
+    }
+
+    /// Past the budget the walk stops and says so. The time that counts is
+    /// time spent walking: a reading that waited on git before its first
+    /// walk has its whole budget left, and one that has walked for the whole
+    /// budget has none.
+    #[test]
+    fn a_walk_past_the_budget_says_it_stopped() {
+        let tmp = TempTree::new("walk-capped");
+        tmp.file("d/f0", "x");
+        let mut budget = WalkBudget::new();
+        budget.files = MAX_FILES;
+        let found = files_under(tmp.path(), &mut budget);
+        assert!(found.is_empty() && budget.capped, "{found:?}");
+
+        let mut waited = WalkBudget::new();
+        std::thread::sleep(MAX_TIME + std::time::Duration::from_millis(50));
+        let found = files_under(tmp.path(), &mut waited);
+        assert_eq!(found, vec!["d/f0"], "waiting is not walking");
+        assert!(!waited.capped);
+
+        let mut walked = WalkBudget::new();
+        walked.walked = MAX_TIME + std::time::Duration::from_millis(1);
+        let found = files_under(tmp.path(), &mut walked);
+        assert!(found.is_empty() && walked.capped, "{found:?}");
     }
 }

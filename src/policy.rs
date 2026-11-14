@@ -543,6 +543,13 @@ impl Policy {
                 if !t.role.is_destructive() {
                     continue;
                 }
+                // A stash keeps what it takes, so a rule that guards a
+                // file's contents is not asked; a rule on the floor is,
+                // because the tree a stash leaves has the hook config as
+                // committed (`TargetRole::Stashed`).
+                if t.role == crate::resolve::TargetRole::Stashed && !rule.floor {
+                    continue;
+                }
                 // A resolved target by its path; one in a directory the
                 // gate could read only the end of, by the end of its path,
                 // which only a rule matching at any depth can name.
@@ -1043,7 +1050,18 @@ impl Policy {
         // A `match_path` rule fires if ANY target matches, and the reason
         // names which one: a command with several targets is one command, and
         // the human approving it needs to know which path tripped the gate.
-        let path_hit = self.path_rule_for(&targets);
+        // A command also changes a file by naming only the directory it is
+        // in (`cp x/settings.json .claude/`, `rm -rf .claude`): what it
+        // lands there and what it takes with it are targets for the path
+        // rules too (`resolve::command_contents`).
+        let contents = crate::resolve::command_contents(command, ctx);
+        let path_hit = if contents.is_empty() {
+            self.path_rule_for(&targets)
+        } else {
+            let mut all = targets.clone();
+            all.extend(contents);
+            self.path_rule_for(&all)
+        };
 
         // An unresolved target carrying a sensitive shape fails closed. NOT a
         // short-circuit: it enters the same most-severe-wins tournament as
@@ -2257,9 +2275,24 @@ rules:
         );
         // The starter has no `reset --hard` rule (an ask either way); the
         // reading's guarantee is that the verdict is the plain form's.
+        // Judged in a directory that is nobody's repository: since v0.21.10
+        // a hard reset is read for the files it would put back
+        // (`resolve::undone_by_git`), and in `.` that is whatever the
+        // developer's own checkout holds uncommitted at the moment, the
+        // repository's policy among it.
+        let nowhere = crate::testutil::TempTree::new("policy-no-repo");
+        nowhere.file(".git", "gitdir: /nonexistent/termaxa-test\n");
+        let outside = crate::resolve::EvalContext::at(nowhere.path());
         assert_eq!(
-            v("git --git-dir=/x/.git --work-tree=/x reset --hard HEAD~3").action,
-            v("git reset --hard HEAD~3").action
+            starter
+                .evaluate_command(
+                    "git --git-dir=/x/.git --work-tree=/x reset --hard HEAD~3",
+                    &outside
+                )
+                .action,
+            starter
+                .evaluate_command("git reset --hard HEAD~3", &outside)
+                .action
         );
         assert_eq!(
             v("git -c core.pager=cat -C /x push -f origin main").action,
@@ -4402,5 +4435,504 @@ mod except_reads_tests {
             .iter()
             .filter(|r| r.except_reads)
             .all(|r| r.floor && r.action == Action::Deny));
+    }
+}
+
+#[cfg(test)]
+mod directory_contents_tests {
+    use super::*;
+
+    /// A project beside the things an agent might copy into it: `proj` is
+    /// the root, `other` is outside it.
+    fn project() -> (crate::testutil::TempTree, crate::resolve::EvalContext) {
+        let tmp = crate::testutil::TempTree::new("policy-dir");
+        tmp.file("proj/.termaxa/policy.yaml", "default: ask\nrules: []\n");
+        tmp.file("proj/.claude/settings.json", "{}\n");
+        tmp.file("proj/.cursor/hooks.json", "{}\n");
+        tmp.file("proj/.env", "K=0\n");
+        tmp.file("proj/src/a.ts", "a\n");
+        tmp.file("proj/node_modules/pkg/.env", "X=1\n");
+        tmp.file("other/settings.json", "{}\n");
+        tmp.file("other/hooks.json", "{}\n");
+        tmp.file("other/.env", "K=1\n");
+        tmp.file("other/tpl/.claude/settings.json", "{}\n");
+        tmp.file("other/tpl/README.md", "t\n");
+        tmp.file("other/dot/.claude/settings.local.json", "{}\n");
+        tmp.file("other/checkout/.claude/settings.json", "{}\n");
+        // Checkouts of their own: a clone outside the project, and inside
+        // it a clone and a worktree, whose `.git` is a file.
+        tmp.file("other/checkout/.git/config", "c\n");
+        tmp.file("proj/vendor/clone/.git/config", "c\n");
+        tmp.file("proj/vendor/clone/.claude/settings.json", "{}\n");
+        tmp.file("proj/.claude/worktrees/wt/.git", "gitdir: elsewhere\n");
+        tmp.file("proj/.claude/worktrees/wt/.claude/settings.json", "{}\n");
+        tmp.file("proj/.claude/worktrees/wt/.termaxa/policy.yaml", "p\n");
+        let ctx = crate::resolve::EvalContext::at(tmp.path().join("proj"));
+        (tmp, ctx)
+    }
+
+    /// A path rule names a file, and a command can change that file by
+    /// naming only the directory it is in. Found Nov 14, 2026 on 0.21.9: `cp
+    /// x/settings.json .claude/` was an ask where `cp x/settings.json
+    /// .claude/settings.json` is a floor deny, so it ran in observe mode,
+    /// and under a policy that allows `cp *` it was allowed outright; `rm
+    /// -rf .claude` was an ordinary deny, copied aside and run in observe
+    /// mode, and `mv .claude x` an ask. The files a copy or a move lands in
+    /// a directory, and the files a delete or a move takes with one, are
+    /// targets for the path rules (`resolve::command_contents`).
+    #[test]
+    fn a_path_rule_sees_a_file_changed_by_naming_its_directory() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for line in [
+            // a file into the directory, the name left out
+            "cp ../other/settings.json .claude/",
+            "cp ../other/settings.json .claude",
+            "mv ../other/settings.json .claude/",
+            "cp -t .claude ../other/settings.json",
+            "cp ../other/hooks.json ../other/settings.json .claude",
+            "cp ../other/hooks.json .cursor/",
+            "cd .claude && cp ../../other/settings.json .",
+            "cp ../other/*.json .claude/",
+            "cp \"$T/settings.json\" .claude/",
+            "sudo cp ../other/settings.json .claude/",
+            // a tree onto the project
+            "cp -r ../other/tpl/. .",
+            "cp -r ../other/dot/.claude .",
+            "mv ../other/dot/.claude .",
+            "cp -rT ../other/tpl .",
+            "cp -a ../other/tpl/.claude .claude/",
+            // the same through a bracket glob, a brace list, git and
+            // PowerShell
+            "cp -r ../other/tpl/.[!.]* .",
+            "cp ../other/{hooks.json,settings.json} .claude/",
+            "git mv ../other/settings.json .claude/",
+            "Copy-Item ..\\other\\settings.json .claude\\",
+            "Copy-Item -Destination .claude -Path ../other/settings.json",
+            "Copy-Item -Recurse ../other/tpl/.claude .",
+            "Copy-Item ../other/settings.json .claude -ErrorAction SilentlyContinue",
+            "cp ../other/settings.json .claude -Force",
+            "cd .claude; Copy-Item ../../other/settings.json",
+            "Move-Item .claude .claude.bak",
+            "Rename-Item .claude .claude.bak",
+            "ren .claude old",
+            "cd .claude; ren settings.bak settings.json",
+            "mv .claude{,.bak}",
+            "git rm -r .claude",
+            "Remove-Item -Recurse -Force .claude",
+            // the directory itself
+            "rm -rf .claude",
+            "rm -r .claude",
+            "rm -rf .cursor",
+            "mv .claude .claude.bak",
+            "mv .claude ../other/gone",
+            "rm .claude/*",
+            "mv .claude/* ../other/",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert!(
+                d.matched_rule
+                    .as_deref()
+                    .is_some_and(|m| m.starts_with("path:") && p.is_floor_rule(m)),
+                "{line}: held by a path rule on the floor, not {:?}",
+                d.matched_rule
+            );
+        }
+        // `.env` the same way, by its own rule, which is not on the floor.
+        for line in ["cp ../other/.env .", "cp -r ../other/. ."] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+        let d = p.evaluate_command("cp ../other/.env .", &ctx);
+        assert_eq!(
+            d.matched_rule.as_deref(),
+            Some("path:*/.env"),
+            "{}",
+            d.reason
+        );
+    }
+
+    /// The same reading leaves ordinary copies and deletes where they were.
+    /// A tree is read only for what it changes in the project and in the
+    /// agent configuration under the user's home: every checkout holds a
+    /// `.claude/settings.json`, and one that is copied or deleted somewhere
+    /// else is not this session's. A directory a build rebuilds is not
+    /// entered, so a dependency that ships a `.env` does not bring `rm -rf
+    /// node_modules` back under the `.env` rule.
+    #[test]
+    fn ordinary_copies_and_deletes_are_judged_as_before() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for line in [
+            "cp src/a.ts src/b.ts",
+            "cp src/a.ts ../other/",
+            "cp -r src ../other/src-copy",
+            "cp -r . ../backup",
+            "cp -r ../other/tpl ../elsewhere",
+            "cp -r ../other/checkout ../other/checkout2",
+            "mv src lib",
+            "mv ../other/checkout ../other/renamed",
+            "Copy-Item src/a.ts src/b.ts -ErrorAction SilentlyContinue",
+            "Copy-Item -Recurse src ../other/src-copy",
+            "Rename-Item src lib",
+            "ren src\\a.ts b.ts",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Ask, "{line}: {}", d.reason);
+            assert_eq!(d.matched_rule, None, "{line}: {}", d.reason);
+        }
+        for line in ["rm -rf src", "rm -rf ../other/checkout", "rm -rf ../other"] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert_eq!(d.matched_rule.as_deref(), Some("*rm -rf*"), "{line}");
+        }
+        // A checkout of its own inside the project comes and goes whole: a
+        // worktree under `.claude/worktrees`, a clone in `vendor/`. Its hook
+        // config and its policy are that checkout's. And the project itself
+        // goes with everything in it, as something above it does.
+        for line in [
+            "rm -rf .claude/worktrees/wt",
+            "rm -rf vendor/clone",
+            "rm -rf vendor",
+            "cd .. && rm -rf proj",
+            "rm -rf ../proj",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert_eq!(d.matched_rule.as_deref(), Some("*rm -rf*"), "{line}");
+        }
+        for line in [
+            "mv vendor/clone vendor/old",
+            "mv .claude/worktrees/wt .claude/worktrees/done",
+            "cp -r ../other/checkout vendor/copy",
+            "cp -r vendor/clone vendor/second",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Ask, "{line}: {}", d.reason);
+            assert_eq!(d.matched_rule, None, "{line}: {}", d.reason);
+        }
+        // What a checkout lands ON the project is the project's.
+        let d = p.evaluate_command("cp -r ../other/checkout/. .", &ctx);
+        assert_eq!(
+            d.matched_rule.as_deref(),
+            Some("path:*/.claude/settings*.json"),
+            "{}",
+            d.reason
+        );
+        let d = p.evaluate_command("rm -rf node_modules", &ctx);
+        assert_eq!(
+            (d.action, d.source),
+            (Action::Allow, DecisionSource::Rebuilt),
+            "{}",
+            d.reason
+        );
+    }
+
+    /// The hole was widest under a project's own allow rule: `cp *` is the
+    /// first rule a team adds, and it allowed the copy that the path rule
+    /// refuses when the file is named.
+    #[test]
+    fn an_allow_for_cp_does_not_admit_a_copy_over_a_hook_config() {
+        let (_tmp, ctx) = project();
+        let p: Policy = serde_yaml::from_str(concat!(
+            "version: 1\ndefault: ask\nrules:\n",
+            "  - match_path: \"*/.claude/settings*.json\"\n    action: deny\n    floor: true\n",
+            "  - match: \"cp *\"\n    action: allow\n",
+            "  - match: \"mv *\"\n    action: allow\n",
+        ))
+        .expect("policy parses");
+        for line in [
+            "cp ../other/settings.json .claude/",
+            "mv ../other/settings.json .claude",
+            "cp -r ../other/tpl/. .",
+            "mv .claude ../other/gone",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+        let d = p.evaluate_command("cp src/a.ts src/b.ts", &ctx);
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+    }
+}
+
+#[cfg(test)]
+mod git_undo_tests {
+    use super::*;
+    use crate::testutil::TestEnv;
+    use std::path::{Path, PathBuf};
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.email=tests@termaxa.invalid",
+                "-c",
+                "user.name=termaxa tests",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git must be available");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn put(dir: &Path, name: &str, text: &str) {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().expect("a file has a parent"))
+            .expect("dir must be creatable");
+        std::fs::write(path, text).expect("writable");
+    }
+
+    /// A repository in the state `termaxa init` leaves: the hook registered
+    /// in a tracked `.claude/settings.json`, the policy written, and neither
+    /// committed. Beside them, ordinary work: an edit, an untracked folder,
+    /// an ignored `.env`.
+    ///
+    /// Under `TestEnv`, for its lock and not for its `TERMAXA_HOME`: these
+    /// tests find `git` on `PATH`, here and inside the reading they test,
+    /// a few hundred times, and `TestEnv::isolate_path` takes `PATH` away
+    /// from the whole process while another test holds that lock. The first
+    /// Windows run of this test met exactly that ("program not found", Nov
+    /// 14, 2026): a test that leans on a process-global holds the guard that
+    /// has a word for it (#102).
+    fn fresh_install() -> (TestEnv, PathBuf, crate::resolve::EvalContext) {
+        let env = TestEnv::new("policy-git");
+        let proj = env.root().join("proj");
+        put(&proj, ".claude/settings.json", "{}\n");
+        put(&proj, "README.md", "# app\n");
+        put(&proj, "src/app.ts", "a\n");
+        put(&proj, ".gitignore", "node_modules/\n.env\n");
+        git(&proj, &["init", "-q"]);
+        // Git for Windows checks files out with CRLF by default; the
+        // fixture keeps the bytes it was given.
+        git(&proj, &["config", "core.autocrlf", "false"]);
+        git(&proj, &["add", "-A"]);
+        git(&proj, &["commit", "-q", "-m", "seed"]);
+        put(&proj, ".claude/settings.json", "{\"hooks\":{}}\n");
+        put(&proj, ".termaxa/policy.yaml", "default: ask\nrules: []\n");
+        put(&proj, ".env", "K=1\n");
+        put(&proj, "src/app.ts", "b\n");
+        put(&proj, "scratch/notes.txt", "n\n");
+        let ctx = crate::resolve::EvalContext::at(&proj);
+        (env, proj, ctx)
+    }
+
+    fn held_on_the_floor(p: &Policy, line: &str, ctx: &crate::resolve::EvalContext) -> Decision {
+        let d = p.evaluate_command(line, ctx);
+        assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+        assert!(
+            d.matched_rule
+                .as_deref()
+                .is_some_and(|m| m.starts_with("path:") && p.is_floor_rule(m)),
+            "{line}: held by a path rule on the floor, not {:?}",
+            d.matched_rule
+        );
+        d
+    }
+
+    fn no_path_rule(p: &Policy, line: &str, ctx: &crate::resolve::EvalContext) {
+        let d = p.evaluate_command(line, ctx);
+        assert!(
+            !d.matched_rule
+                .as_deref()
+                .is_some_and(|m| m.starts_with("path:")),
+            "{line}: no path rule names it: {:?} {}",
+            d.matched_rule,
+            d.reason
+        );
+    }
+
+    /// Git changes files that the command never names. Found Nov 14, 2026,
+    /// on 0.21.9, in a project as `termaxa init` leaves it: `git stash` put
+    /// `.claude/settings.json` back as committed, without the hook, and `git
+    /// clean -fd` deleted the untracked `.termaxa/`; each was an ask, ran
+    /// in observe mode, and the discard preview listed the hook config among
+    /// the files it would lose. The path rules now see what a discard, a
+    /// stash or a clean would undo (`resolve::undone_by_git`).
+    #[test]
+    fn a_path_rule_sees_what_a_git_discard_a_stash_or_a_clean_would_undo() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_env, proj, ctx) = fresh_install();
+
+        // The hook config has an uncommitted change, the policy is untracked.
+        for line in [
+            "git stash",
+            "git stash save wip",
+            "git stash -u",
+            "git reset --hard",
+            "git checkout -- .",
+            "git checkout .",
+            "git checkout -f",
+            "git restore .",
+            "git restore .claude",
+            "git checkout -- .claude",
+            "git checkout HEAD -- .claude",
+            "git switch --discard-changes main",
+            "git -C . stash",
+            "cd src && git stash",
+            // A directory the gate cannot read: the project's own
+            // repository is the one that is read.
+            "cd \"$(git rev-parse --show-toplevel)\" && git stash",
+            "cd \"$ROOT\" && git reset --hard",
+            "cd \"$ROOT\" && git checkout -- .",
+            "cd \"$ROOT\" && git clean -fd",
+            "git clean -fd",
+            "git clean -fdx",
+            "sudo git clean -fd",
+        ] {
+            held_on_the_floor(&p, line, &ctx);
+        }
+        let d = held_on_the_floor(&p, "git stash", &ctx);
+        assert!(
+            d.reason.contains("taken into a stash") && d.reason.contains("settings.json"),
+            "{}",
+            d.reason
+        );
+        let d = held_on_the_floor(&p, "git reset --hard", &ctx);
+        assert!(
+            d.reason.contains("put back as committed") && d.reason.contains("settings.json"),
+            "{}",
+            d.reason
+        );
+        // The commands that take nothing out of the tree, a dry run, and a
+        // discard or a clean somewhere else in it.
+        for line in [
+            "git stash list",
+            "git stash pop",
+            "git stash apply",
+            "git clean -n -fd",
+            "git clean -fdn",
+            "git reset --soft HEAD",
+            "git checkout -b fresh",
+            "git restore --staged .",
+            "git restore src",
+            "git checkout -- src/app.ts",
+            "git stash push -- src",
+            "git clean -fd scratch",
+            "cd \"$ROOT\" && git restore src",
+            "cd \"$ROOT\" && git clean -fd scratch",
+            "cd \"$ROOT\" && git stash push -- src",
+            "git --git-dir=../elsewhere/.git --work-tree=../elsewhere stash",
+            "git status",
+            "git add -A",
+        ] {
+            no_path_rule(&p, line, &ctx);
+        }
+
+        // The hook config committed, the policy still untracked: a discard
+        // has nothing of the gate's to put back, and a clean still takes the
+        // policy. A clean works below the directory it runs in; a stash
+        // takes the whole tree's untracked files from anywhere.
+        git(&proj, &["add", ".claude"]);
+        git(&proj, &["commit", "-q", "-m", "hook"]);
+        for line in [
+            "git stash",
+            "git reset --hard",
+            "git checkout -- .",
+            "git restore .",
+        ] {
+            no_path_rule(&p, line, &ctx);
+        }
+        for (line, how) in [
+            ("git clean -fd", "(removed)"),
+            ("git stash -u", "(taken into a stash)"),
+            ("git stash --include-untracked", "(taken into a stash)"),
+            ("cd src && git stash -u", "(taken into a stash)"),
+        ] {
+            let d = held_on_the_floor(&p, line, &ctx);
+            assert_eq!(
+                d.matched_rule.as_deref(),
+                Some("path:*/.termaxa/*"),
+                "{line}"
+            );
+            assert!(d.reason.contains(how), "{line}: {}", d.reason);
+        }
+        for line in [
+            "git clean -f",
+            "cd src && git clean -fd",
+            "git clean -fd -e .termaxa",
+            "git clean -fd --exclude=.termaxa",
+            "git clean -fd scratch",
+            "git stash push -u -- scratch",
+        ] {
+            no_path_rule(&p, line, &ctx);
+        }
+
+        // Both committed: nothing of the gate's is in play, and what is left
+        // is the ignored `.env`, which only `-x` and `-a` reach. Its rule is
+        // not on the floor.
+        git(&proj, &["add", ".termaxa"]);
+        git(&proj, &["commit", "-q", "-m", "policy"]);
+        for line in [
+            "git stash",
+            "git stash -u",
+            "git reset --hard",
+            "git checkout -- .",
+            "git clean -fd",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Ask, "{line}: {}", d.reason);
+            assert_eq!(d.matched_rule, None, "{line}: {}", d.reason);
+        }
+        assert!(!p.is_floor_rule("path:*/.env"));
+        for line in ["git clean -fdx", "git clean -fX"] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert_eq!(d.matched_rule.as_deref(), Some("path:*/.env"), "{line}");
+        }
+        // A stash keeps what it takes: the `.env` rule guards the file's
+        // contents and has nothing to say about one.
+        no_path_rule(&p, "git stash -a", &ctx);
+
+        // A tracked `.env` with local edits: a discard loses them, by a
+        // command that names no file, and a stash keeps them.
+        git(&proj, &["add", "-f", ".env"]);
+        git(&proj, &["commit", "-q", "-m", "env"]);
+        put(&proj, ".env", "K=2\n");
+        for line in [
+            "git reset --hard",
+            "git checkout -- .",
+            "git restore .",
+            "git checkout -f",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert_eq!(d.matched_rule.as_deref(), Some("path:*/.env"), "{line}");
+            assert!(d.reason.contains("put back as committed"), "{}", d.reason);
+        }
+        for line in ["git stash", "git stash -u", "git checkout -- src"] {
+            no_path_rule(&p, line, &ctx);
+        }
+    }
+
+    /// Outside a repository git has nothing to say, and the commands are
+    /// judged as they were.
+    #[test]
+    fn outside_a_repository_git_is_judged_as_before() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let env = TestEnv::new("policy-nogit");
+        let proj = env.root().join("proj");
+        put(&proj, ".claude/settings.json", "{}\n");
+        put(&proj, ".termaxa/policy.yaml", "default: ask\nrules: []\n");
+        // A directory that is nobody's repository, whatever is above it.
+        put(&proj, ".git", "gitdir: /nonexistent/termaxa-test\n");
+        let ctx = crate::resolve::EvalContext::at(&proj);
+        for line in [
+            "git stash",
+            "git stash -u",
+            "git reset --hard",
+            "git clean -fd",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Ask, "{line}: {}", d.reason);
+            assert_eq!(d.matched_rule, None, "{line}: {}", d.reason);
+        }
     }
 }

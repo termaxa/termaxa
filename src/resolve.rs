@@ -231,6 +231,17 @@ pub enum TargetRole {
     /// of its source, which is the case that would go missing if `mv` only
     /// reported where the file lands.
     Removed,
+    /// Put back as git has it committed, by a discard that names no file:
+    /// `git reset --hard`, `git checkout -- .`. What the file held since its
+    /// last commit is gone (`command_contents`).
+    Reverted,
+    /// Taken out of the tree into a stash: `git stash`, and with `-u` the
+    /// untracked files too. A stash keeps what it takes, so this is not a
+    /// loss, and a rule that guards a file's contents has nothing to say.
+    /// What a stash cannot keep is the gate being hooked: the tree it leaves
+    /// has the hook config as committed and no untracked policy. So only a
+    /// rule on the floor is asked about a stashed file (`path_rule_for`).
+    Stashed,
 }
 
 impl TargetRole {
@@ -246,11 +257,19 @@ impl TargetRole {
             TargetRole::Source => "read",
             TargetRole::Destination => "written",
             TargetRole::Removed => "removed",
+            TargetRole::Reverted => "put back as committed",
+            TargetRole::Stashed => "taken into a stash",
         }
     }
 
     pub fn is_destructive(self) -> bool {
-        matches!(self, TargetRole::Destination | TargetRole::Removed)
+        matches!(
+            self,
+            TargetRole::Destination
+                | TargetRole::Removed
+                | TargetRole::Reverted
+                | TargetRole::Stashed
+        )
     }
 }
 
@@ -417,6 +436,967 @@ pub fn command_targets(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> 
         }
     }
     resolved
+}
+
+/// What a command changes INSIDE a directory it names, as targets of their
+/// own: the files a `cp` or a `mv` lands in a directory, and the files a
+/// delete or a move takes with one.
+///
+/// A path rule names a file, and until v0.21.10 it saw that file only when
+/// the command named it too. `cp x/settings.json .claude/` writes
+/// `.claude/settings.json` and reported one destination, the directory; `rm
+/// -rf .claude` removes it and reported one removal, the directory. So the
+/// spelling that leaves the file name out was an ask where the spelling with
+/// it is a deny, it ran in observe mode, where that rule is on the floor,
+/// and the copy was allowed outright under a policy that allows `cp *`
+/// (found Nov 14, 2026, reading the code for another change). A copied tree
+/// is the same write many times over: `cp -r template/. .` lands the
+/// template's `.claude/settings.json` on the project's.
+///
+/// Two readings, and they differ in how far they go:
+///
+/// - **A file into a directory** is exact: the name that lands is the
+///   source's own, wherever the directory is. `cp a b dir/` lands `dir/a`
+///   and `dir/b`; a glob is what it matches on disk; a name held in a
+///   variable is not known and is left out.
+/// - **A tree** is read off the disk (`delete::files_under`, under the
+///   delete preview's budget), and only for what it changes in the project
+///   and in the agent configuration under the user's home. A tree copied or
+///   deleted anywhere else holds `.claude/settings.json` files too, every
+///   checkout does, and those are not this session's: `cp -r . /tmp/backup`
+///   and `rm -rf ../old-worktree` are judged as before.
+///
+/// And a third, for git, which changes files by asking git what it would
+/// do (`undone_by_git`): the tracked files whose uncommitted changes a
+/// discard or a stash puts back as committed, and the untracked files a
+/// clean or a stash takes away. In the state `termaxa init` leaves, the hook
+/// registration is an uncommitted change to `.claude/settings.json` and the
+/// policy an untracked directory, so `git stash` unhooked the gate and `git
+/// clean -fd` deleted its policy, each an ask that ran in observe mode
+/// (found the same day, on the fixtures of the first measurement).
+///
+/// Not in `command_targets`: only the path rules read these, so the
+/// preview, the copy aside and the classifier see the command as they did.
+pub fn command_contents(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget> {
+    let mut out: Vec<ResolvedTarget> = Vec::new();
+    let mut budget = delete::WalkBudget::new();
+    for seg in crate::shell::split_segments_deep(segment) {
+        let ctx = ctx.for_operands(&seg);
+        for t in delete::segment_targets(&seg) {
+            removed_with(&t.text, &ctx, &mut budget, &mut out);
+        }
+        let tokens = brace_expanded(delete::tokenize_public(seg.command()));
+        let Some((head, at)) = delete::resolve_head(&tokens) else {
+            continue;
+        };
+        // The commands that copy or move: `cp` and `mv` and their cmd
+        // names, PowerShell's by their own parameter names (`cp` and `mv`
+        // are its aliases too, and are read that way when a word of the
+        // line is one of its parameters), a rename, and `git mv`, which is
+        // a move.
+        let rest = &tokens[at + 1..];
+        let (source_role, args): (TargetRole, Vec<String>) = match head.as_str() {
+            "rename-item" | "rni" | "ren" => {
+                renamed(rest, &ctx, &mut budget, &mut out);
+                continue;
+            }
+            "cp" | "copy" if says_powershell(rest) => {
+                (TargetRole::Source, powershell_operands(rest))
+            }
+            "mv" | "move" if says_powershell(rest) => {
+                (TargetRole::Removed, powershell_operands(rest))
+            }
+            "cp" | "copy" => (TargetRole::Source, rest.to_vec()),
+            "mv" | "move" => (TargetRole::Removed, rest.to_vec()),
+            "copy-item" | "cpi" => (TargetRole::Source, powershell_operands(rest)),
+            "move-item" | "mi" => (TargetRole::Removed, powershell_operands(rest)),
+            "git" => {
+                let full = tokens[at..].to_vec();
+                let g = delete::git_without_global_options(&full).unwrap_or(full);
+                if g.get(1).is_some_and(|sub| sub.eq_ignore_ascii_case("mv")) {
+                    (TargetRole::Removed, g[2..].to_vec())
+                } else {
+                    undone_by_git(&tokens[at..], &ctx, &mut budget, &mut out);
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        let head = match source_role {
+            TargetRole::Removed => "mv",
+            _ => "cp",
+        };
+        let args = &args[..];
+        let grammar = copy_move_targets(head, args, source_role);
+        let Some(dest) = grammar
+            .iter()
+            .find(|(_, role)| *role == TargetRole::Destination)
+            .map(|(d, _)| unquoted(d))
+        else {
+            continue;
+        };
+        let sources: Vec<String> = grammar
+            .iter()
+            .filter(|(_, role)| *role != TargetRole::Destination)
+            .map(|(s, _)| unquoted(s))
+            .collect();
+        if source_role == TargetRole::Removed {
+            for s in &sources {
+                removed_with(s, &ctx, &mut budget, &mut out);
+            }
+        }
+        landed(
+            args,
+            source_role,
+            &dest,
+            &sources,
+            &ctx,
+            &mut budget,
+            &mut out,
+        );
+    }
+    out
+}
+
+fn unquoted(s: &str) -> String {
+    s.trim().trim_matches('"').trim_matches('\'').to_string()
+}
+
+/// `mv .claude{,.bak}` is `mv .claude .claude.bak`: one brace list in a
+/// word, the simple form, opened the way the shell opens it. A nested list,
+/// a range (`{1..3}`) and a variable (`${X}`) are left as written, and a
+/// name the reading cannot open is one it does not know.
+fn brace_expanded(tokens: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        match (t.find('{'), t.rfind('}')) {
+            (Some(a), Some(b))
+                if a < b
+                    && t[a + 1..b].contains(',')
+                    && !t[a + 1..b].contains('{')
+                    && !t[..a].ends_with('$') =>
+            {
+                for part in t[a + 1..b].split(',') {
+                    out.push(format!("{}{}{}", &t[..a], part, &t[b + 1..]));
+                }
+            }
+            _ => out.push(t),
+        }
+    }
+    out
+}
+
+/// A glob with a bracket in it, as one this reading can expand: each `[…]`
+/// becomes `?`, which matches whatever the bracket would and more. `cp -r
+/// template/.[!.]* .` is how dot-named entries are copied, and what it is
+/// read as landing may be more than it lands, never less.
+fn without_brackets(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(a) = rest.find('[') {
+        match rest[a..].find(']') {
+            Some(b) if b > 1 => {
+                out.push_str(&rest[..a]);
+                out.push('?');
+                rest = &rest[a + b + 1..];
+            }
+            _ => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What a parameter of `Copy-Item`, `Move-Item` or `Rename-Item` is to this
+/// reading.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PsParameter {
+    /// `-Path`, `-LiteralPath`: what is copied, moved or renamed.
+    Source,
+    /// `-Destination`, and `-NewName` for a rename.
+    Destination,
+    /// `-Recurse`: a directory goes with what it holds.
+    Recurse,
+    /// Takes a value, and the value is not a path this reading uses.
+    Value,
+    /// Takes nothing.
+    Switch,
+}
+
+/// The parameters of `Copy-Item`, `Move-Item` and `Rename-Item`, with the
+/// common parameters every cmdlet takes.
+///
+/// HAND-WALKED (#56): the list sizes a decision. A parameter read as a
+/// switch when it takes a value leaves that value standing as a path, and
+/// `Copy-Item x .claude\ -ErrorAction SilentlyContinue` would be read as a
+/// copy into `SilentlyContinue`. PowerShell accepts any prefix that names
+/// one parameter (`-Dest`, `-Rec`), so the switches are listed as well: a
+/// prefix is resolved against all of them, as PowerShell resolves it.
+const POWERSHELL_PARAMETERS: [(&str, PsParameter); 29] = [
+    ("path", PsParameter::Source),
+    ("literalpath", PsParameter::Source),
+    ("destination", PsParameter::Destination),
+    ("newname", PsParameter::Destination),
+    ("recurse", PsParameter::Recurse),
+    ("filter", PsParameter::Value),
+    ("include", PsParameter::Value),
+    ("exclude", PsParameter::Value),
+    ("credential", PsParameter::Value),
+    ("fromsession", PsParameter::Value),
+    ("tosession", PsParameter::Value),
+    ("erroraction", PsParameter::Value),
+    ("warningaction", PsParameter::Value),
+    ("informationaction", PsParameter::Value),
+    ("progressaction", PsParameter::Value),
+    ("errorvariable", PsParameter::Value),
+    ("warningvariable", PsParameter::Value),
+    ("informationvariable", PsParameter::Value),
+    ("outvariable", PsParameter::Value),
+    ("outbuffer", PsParameter::Value),
+    ("pipelinevariable", PsParameter::Value),
+    ("container", PsParameter::Switch),
+    ("force", PsParameter::Switch),
+    ("passthru", PsParameter::Switch),
+    ("whatif", PsParameter::Switch),
+    ("confirm", PsParameter::Switch),
+    ("verbose", PsParameter::Switch),
+    ("debug", PsParameter::Switch),
+    ("usetransaction", PsParameter::Switch),
+];
+
+/// The short names PowerShell gives some of them.
+const POWERSHELL_ALIASES: [(&str, &str); 17] = [
+    ("pspath", "literalpath"),
+    ("lp", "literalpath"),
+    ("ea", "erroraction"),
+    ("wa", "warningaction"),
+    ("infa", "informationaction"),
+    ("proga", "progressaction"),
+    ("ev", "errorvariable"),
+    ("wv", "warningvariable"),
+    ("iv", "informationvariable"),
+    ("ov", "outvariable"),
+    ("ob", "outbuffer"),
+    ("pv", "pipelinevariable"),
+    ("vb", "verbose"),
+    ("db", "debug"),
+    ("wi", "whatif"),
+    ("cf", "confirm"),
+    ("usetx", "usetransaction"),
+];
+
+/// Which parameter `-Word` names: its full name, an alias, or a prefix only
+/// one parameter starts with. A prefix two parameters share names neither,
+/// and PowerShell refuses the command.
+fn powershell_parameter(word: &str) -> Option<PsParameter> {
+    let name = word.strip_prefix('-')?.to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    let name = POWERSHELL_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map_or(name.as_str(), |(_, full)| *full);
+    if let Some((_, kind)) = POWERSHELL_PARAMETERS.iter().find(|(n, _)| *n == name) {
+        return Some(*kind);
+    }
+    let mut starting = POWERSHELL_PARAMETERS
+        .iter()
+        .filter(|(n, _)| n.starts_with(name));
+    match (starting.next(), starting.next()) {
+        (Some((_, kind)), None) => Some(*kind),
+        _ => None,
+    }
+}
+
+/// Is a word of these arguments one of PowerShell's parameters, by its full
+/// name? `cp` and `mv` are aliases there, and `cp x y -Recurse -Force` is
+/// `Copy-Item`. A full name is never a cluster of `cp`'s own switches.
+fn says_powershell(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        let word = a.split(':').next().unwrap_or(a);
+        word.len() > 3
+            && word.starts_with('-')
+            && POWERSHELL_PARAMETERS
+                .iter()
+                .any(|(n, _)| word[1..].eq_ignore_ascii_case(n))
+    })
+}
+
+/// What a PowerShell copy, move or rename names: whether it recurses, its
+/// sources, and its destination when the line gives one.
+///
+/// `-Destination X` (or `-Destination:X`) names the destination wherever it
+/// stands; `-Path` and `-LiteralPath` name the sources; a comma makes a
+/// list of them, with or without a space after it. Words with no parameter
+/// in front bind in PowerShell's order: the sources first, unless they
+/// were named, then the destination.
+fn powershell_words(args: &[String]) -> (bool, Vec<String>, Option<String>) {
+    let list = |v: &str| -> Vec<String> {
+        v.split(',')
+            .map(unquoted)
+            .filter(|p| !p.is_empty())
+            .collect()
+    };
+    let mut recurse = false;
+    let mut named_sources: Option<Vec<String>> = None;
+    let mut named_dest: Option<String> = None;
+    // Each positional argument, a comma list being one argument.
+    let mut positional: Vec<Vec<String>> = Vec::new();
+    let mut list_open = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        i += 1;
+        if !a.starts_with('-') || a.len() < 2 {
+            let continues = list_open || a.starts_with(',');
+            list_open = a.ends_with(',');
+            match positional.last_mut() {
+                Some(last) if continues => last.extend(list(a)),
+                _ => positional.push(list(a)),
+            }
+            continue;
+        }
+        list_open = false;
+        let (word, inline) = match a.split_once(':') {
+            Some((w, v)) => (w, Some(v.to_string())),
+            None => (a.as_str(), None),
+        };
+        let kind = powershell_parameter(word);
+        let value = match kind {
+            Some(PsParameter::Source | PsParameter::Destination | PsParameter::Value) => {
+                inline.or_else(|| {
+                    let mut v = args.get(i).cloned();
+                    i += 1;
+                    // A list after the parameter: `-Path a, b`.
+                    while v.as_ref().is_some_and(|x| x.ends_with(','))
+                        || args.get(i).is_some_and(|x| x.starts_with(','))
+                    {
+                        match (v.as_mut(), args.get(i)) {
+                            (Some(x), Some(more)) => x.push_str(more),
+                            _ => break,
+                        }
+                        i += 1;
+                    }
+                    v
+                })
+            }
+            _ => None,
+        };
+        match kind {
+            Some(PsParameter::Source) => {
+                named_sources
+                    .get_or_insert_with(Vec::new)
+                    .extend(value.as_deref().map(list).unwrap_or_default());
+            }
+            Some(PsParameter::Destination) => {
+                named_dest = value.as_deref().and_then(|v| list(v).into_iter().next());
+            }
+            Some(PsParameter::Recurse) => recurse = true,
+            _ => {}
+        }
+    }
+    let mut positional = positional.into_iter();
+    let sources = named_sources.unwrap_or_else(|| positional.next().unwrap_or_default());
+    let dest = named_dest.or_else(|| positional.next().and_then(|d| d.into_iter().next()));
+    (recurse, sources, dest)
+}
+
+/// `Copy-Item` and `Move-Item`, as `cp` would be written: `-r` when it
+/// recurses, the sources, then the destination. With no destination
+/// PowerShell copies into the directory it is in.
+fn powershell_operands(args: &[String]) -> Vec<String> {
+    let (recurse, sources, dest) = powershell_words(args);
+    let mut out: Vec<String> = Vec::new();
+    if recurse {
+        out.push("-r".to_string());
+    }
+    if sources.is_empty() {
+        return out;
+    }
+    out.extend(sources);
+    out.push(dest.unwrap_or_else(|| ".".to_string()));
+    out
+}
+
+/// `Rename-Item a b` and `ren a b`: `a` is gone, with what it holds, and
+/// `b` is there instead, beside where `a` was. The new name is a name and
+/// not a path, in PowerShell and in cmd alike.
+fn renamed(
+    args: &[String],
+    ctx: &EvalContext,
+    budget: &mut delete::WalkBudget,
+    out: &mut Vec<ResolvedTarget>,
+) {
+    let (_, sources, new_name) = powershell_words(args);
+    let (Some(source), Some(new_name)) = (sources.first(), new_name) else {
+        return;
+    };
+    let was = source.trim_end_matches(['/', '\\']);
+    let beside = match was.rfind(['/', '\\']) {
+        Some(0) => joined("/", &new_name),
+        Some(i) => joined(&was[..i], &new_name),
+        None => new_name,
+    };
+    removed_with(source, ctx, budget, out);
+    // A renamed file is a write of its new name; a renamed directory puts
+    // what it held under the new one.
+    match on_disk(source, ctx).filter(|p| p.is_dir()) {
+        Some(tree) => {
+            if not_read(&tree, ctx) {
+                return;
+            }
+            if let Some(place) = on_disk(&beside, ctx) {
+                for p in guarded_files(&tree, &place, ctx, budget) {
+                    out.push(inside(p, TargetRole::Destination));
+                }
+            }
+        }
+        None => out.push(target(&beside, TargetRole::Destination, ctx)),
+    }
+}
+
+/// What a git command undoes or removes without naming it: the tracked
+/// files whose uncommitted changes a discard puts back as committed
+/// (`Reverted`), the untracked files a clean deletes (`Removed`), and both
+/// kinds as a stash takes them (`Stashed`, which only a rule on the floor
+/// is asked about: a stash keeps what it takes).
+///
+/// Asked of git, in the directory the command runs in: which files have
+/// uncommitted changes is `backup::git_discard_losses`, the answer the
+/// discard preview and the stash snapshot already take (#37), and which
+/// untracked files would go is `git clean -n`, a dry run. Nothing is read
+/// when the command points git somewhere else (`--git-dir`, `--work-tree`)
+/// or is not in a repository.
+///
+/// When the directory is not known (`cd "$(git rev-parse --show-toplevel)"
+/// && git stash`, how an agent goes to the top of a repository), a command
+/// that names no path, or only `.`, is read in the project's own
+/// repository, whole: wherever the `cd` went, that is most often where, and
+/// a hold too many is the loud side (#44). One that names a path there is
+/// not read; the path is relative to a directory nobody knows.
+///
+/// Which commands:
+/// - `git reset --hard`, `git checkout [--] <paths>`, `git restore <paths>`,
+///   `git checkout -f`, `git switch --discard-changes`: the scope
+///   `backup::git_discard_target` reads.
+/// - `git stash`, `git stash push`, `git stash save`: the same files, and
+///   with `-u` or `-a` the untracked ones too. `list`, `show`, `pop`,
+///   `apply`, `drop` and the rest put nothing back.
+/// - `git clean` that is not a dry run: what it would remove.
+///
+/// Not read: what a command brings in from ANOTHER commit. A branch switch,
+/// a merge, a pull, a rebase, a revert, `git reset --hard <commit>` and
+/// `git checkout <commit> -- <paths>` write what the repository's history
+/// holds, and are read only for the uncommitted changes they discard on the
+/// way.
+fn undone_by_git(
+    tokens: &[String],
+    ctx: &EvalContext,
+    budget: &mut delete::WalkBudget,
+    out: &mut Vec<ResolvedTarget>,
+) {
+    if tokens
+        .iter()
+        .any(|t| t.starts_with("--git-dir") || t.starts_with("--work-tree"))
+    {
+        return;
+    }
+    let cwd = if ctx.cwd_known {
+        ctx.cwd.as_path()
+    } else {
+        ctx.root.as_path()
+    };
+    let plain = delete::git_without_global_options(tokens).unwrap_or_else(|| tokens.to_vec());
+    let args = plain.get(2..).unwrap_or(&[]);
+    let verb = plain.get(1).map(|s| s.to_ascii_lowercase());
+    let (scope, untracked) = match verb.as_deref() {
+        Some("stash") => match stash_takes(args) {
+            Some(taken) => taken,
+            None => return,
+        },
+        Some("clean") => (None, clean_takes(args)),
+        _ => (crate::backup::git_discard_target(tokens, cwd), None),
+    };
+    let (scope, untracked) = if ctx.cwd_known {
+        (scope, untracked)
+    } else {
+        let here = |paths: &[String]| paths.iter().all(|p| p == "." || p == "./");
+        (
+            match scope {
+                Some(crate::backup::Discard::Paths(p)) => {
+                    here(&p).then_some(crate::backup::Discard::WholeTree)
+                }
+                whole => whole,
+            },
+            untracked.filter(|u| here(&u.paths)).map(|u| Untracked {
+                paths: Vec::new(),
+                whole_tree: true,
+                ..u
+            }),
+        )
+    };
+    let (put_back, taken) = if verb.as_deref() == Some("stash") {
+        (TargetRole::Stashed, TargetRole::Stashed)
+    } else {
+        (TargetRole::Reverted, TargetRole::Removed)
+    };
+    if scope.is_none() && untracked.is_none() {
+        return;
+    }
+    // Git names a tracked file from the top of the repository.
+    let Some(top) = git_line(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from) else {
+        return;
+    };
+    if let Some(scope) = &scope {
+        for name in crate::backup::git_discard_losses(cwd, scope).unwrap_or_default() {
+            out.push(inside(below(&top, &name), put_back));
+        }
+    }
+    if let Some(untracked) = &untracked {
+        // A clean works below the directory it runs in; a stash with no
+        // paths takes the whole tree's.
+        let from = if untracked.whole_tree { &top } else { cwd };
+        for path in git_would_remove(from, untracked) {
+            if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                out.push(inside(path, taken));
+            } else if !not_read(&path, ctx) && !delete::is_checkout(&path) {
+                for rel in delete::files_under(&path, budget) {
+                    out.push(inside(below(&path, &rel), taken));
+                }
+            }
+        }
+    }
+}
+
+/// The untracked files a command would take away, as `git clean` is asked
+/// for them.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Untracked {
+    /// `-d`: untracked directories too.
+    dirs: bool,
+    /// `-x`: ignored files as well.
+    ignored_too: bool,
+    /// `-X`: ignored files only.
+    ignored_only: bool,
+    /// `-e <pattern>`: left alone.
+    except: Vec<String>,
+    /// The paths the command names; none is the directory it runs in.
+    paths: Vec<String>,
+    /// From the top of the repository, wherever the command runs (a stash).
+    whole_tree: bool,
+}
+
+/// What `git clean <args>` would remove, or `None` when it removes nothing:
+/// a dry run, or `-i`, which asks at a terminal an agent does not have.
+///
+/// HAND-WALKED (#56): `-n`, `-i`, `-h`, `-d`, `-x`, `-X`, `-e` and their
+/// long names, alone or in a cluster (`-fdx`); `-f` and `-q` change nothing
+/// about what is removed. Every other word is a path.
+fn clean_takes(args: &[String]) -> Option<Untracked> {
+    let mut u = Untracked::default();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        match a {
+            "--" => {
+                u.paths.extend(args[i..].iter().cloned());
+                break;
+            }
+            "--dry-run" | "--interactive" => return None,
+            "--force" | "--quiet" => {}
+            "--exclude" => {
+                u.except.extend(args.get(i).cloned());
+                i += 1;
+            }
+            _ if a.starts_with("--exclude=") => u.except.push(a["--exclude=".len()..].to_string()),
+            _ if a.starts_with("--") => {}
+            _ if a.starts_with('-') && a.len() > 1 => {
+                for (at, c) in a.char_indices().skip(1) {
+                    match c {
+                        'n' | 'i' | 'h' => return None,
+                        'd' => u.dirs = true,
+                        'x' => u.ignored_too = true,
+                        'X' => u.ignored_only = true,
+                        'e' => {
+                            // `-e<pattern>` or `-e <pattern>`.
+                            let rest = &a[at + 1..];
+                            if rest.is_empty() {
+                                u.except.extend(args.get(i).cloned());
+                                i += 1;
+                            } else {
+                                u.except.push(rest.to_string());
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => u.paths.push(a.to_string()),
+        }
+    }
+    Some(u)
+}
+
+/// What `git stash <args>` takes out of the tree: the scope of the tracked
+/// changes it puts back as committed and, with `-u` or `-a`, the untracked
+/// files it removes. `None` for the stash commands that take nothing:
+/// `list`, `show`, `pop`, `apply`, `drop`, `clear`, `branch`, `create`,
+/// `store`.
+///
+/// HAND-WALKED (#56): a bare `git stash` is `push`; `-u` and
+/// `--include-untracked`, `-a` and `--all`, alone or in a cluster; `-m`
+/// takes the next word; after `push` every other word is a path; after
+/// `save` every other word is the message.
+fn stash_takes(args: &[String]) -> Option<(Option<crate::backup::Discard>, Option<Untracked>)> {
+    let mut untracked = false;
+    let mut ignored = false;
+    let mut verb: Option<&str> = None;
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        match a {
+            "--" => {
+                words.extend(args[i..].iter().cloned());
+                break;
+            }
+            "--include-untracked" => untracked = true,
+            "--all" => {
+                untracked = true;
+                ignored = true;
+            }
+            "-m" | "--message" | "--pathspec-from-file" => i += 1,
+            _ if a.starts_with("--") => {}
+            _ if a.starts_with('-') && a.len() > 1 => {
+                untracked |= a[1..].contains('u') || a[1..].contains('a');
+                ignored |= a[1..].contains('a');
+                // `-um wip`: the message follows the cluster.
+                if a.ends_with('m') {
+                    i += 1;
+                }
+            }
+            _ if verb.is_none() && words.is_empty() => verb = Some(a),
+            _ => words.push(a.to_string()),
+        }
+    }
+    let paths = match verb {
+        None | Some("push") => words,
+        Some("save") => Vec::new(),
+        // A bare `git stash` with options and no verb put its first word
+        // here; anything else is a verb that takes nothing from the tree.
+        Some(_) => return None,
+    };
+    let scope = if paths.is_empty() {
+        crate::backup::Discard::WholeTree
+    } else {
+        crate::backup::Discard::Paths(paths.clone())
+    };
+    let taken = untracked.then(|| Untracked {
+        dirs: true,
+        ignored_too: ignored,
+        whole_tree: paths.is_empty(),
+        paths,
+        ..Untracked::default()
+    });
+    Some((Some(scope), taken))
+}
+
+/// What a clean would remove, asked of git as a dry run in `dir`. The
+/// command is built here from what was read of the agent's, never passed
+/// through (#41): `-n` first, the switches this reading knows, each
+/// exclusion behind its own `-e`, and the paths behind `--`, where git takes
+/// no option.
+fn git_would_remove(dir: &std::path::Path, what: &Untracked) -> Vec<PathBuf> {
+    let mut args: Vec<String> = ["-c", "core.quotePath=false", "clean", "-n"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if what.dirs {
+        args.push("-d".into());
+    }
+    if what.ignored_only {
+        args.push("-X".into());
+    } else if what.ignored_too {
+        args.push("-x".into());
+    }
+    for pattern in &what.except {
+        args.push("-e".into());
+        args.push(pattern.clone());
+    }
+    if !what.paths.is_empty() {
+        args.push("--".into());
+        args.extend(what.paths.iter().cloned());
+    }
+    let Ok(done) = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(&args)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !done.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&done.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("Would remove "))
+        .map(|name| below(dir, name.trim_matches('"')))
+        .collect()
+}
+
+/// One line of git's answer, run in `dir`: `None` when git is not there,
+/// fails (not a repository) or says nothing.
+fn git_line(dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    let done = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    let line = String::from_utf8_lossy(&done.stdout).trim().to_string();
+    (done.status.success() && !line.is_empty()).then_some(line)
+}
+
+/// A path git names with `/`, below `base`: `../x` is beside it.
+fn below(base: &std::path::Path, name: &str) -> PathBuf {
+    let mut path = base.to_path_buf();
+    for part in name.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                path.pop();
+            }
+            _ => path.push(part),
+        }
+    }
+    path
+}
+
+/// The last component of a path as written, trailing separators aside.
+fn last_component(s: &str) -> &str {
+    s.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+}
+
+/// `a/b`, whichever separator `a` ends in.
+fn joined(a: &str, b: &str) -> String {
+    format!("{}/{}", a.trim_end_matches(['/', '\\']), b)
+}
+
+/// Where `raw` is on disk, when the gate can say: not through a variable,
+/// and not relative to a directory it could not follow.
+fn on_disk(raw: &str, ctx: &EvalContext) -> Option<PathBuf> {
+    if has_unexpanded_var(raw) || (!ctx.cwd_known && !delete::is_dir_independent(raw)) {
+        return None;
+    }
+    Some(delete::resolve_path_in(raw, &ctx.cwd))
+}
+
+/// A file read out of a tree: already a path, with nothing left to resolve.
+fn inside(path: PathBuf, role: TargetRole) -> ResolvedTarget {
+    ResolvedTarget {
+        role,
+        as_written: path.display().to_string(),
+        resolved: Some(path),
+        end: None,
+        shapes: Vec::new(),
+        appends: false,
+    }
+}
+
+/// The files a tree puts at, or takes from, `place`, for the parts of
+/// `place` a tree is read for: the project, and the agent configuration
+/// under the user's home. `tree` is where the tree is on disk now: `place`
+/// itself for a delete, the source for a copy or a move.
+///
+/// Only a tree that lands or lies INSIDE one of those. A delete of the
+/// project or of something above it (`rm -rf ..`, `rm -rf ~`, `rm -rf /`)
+/// takes the project with it and is judged as it always was, by the rules
+/// that name it and by what can be copied first: the root rules explain
+/// themselves better than the first protected file a walk happens to meet
+/// (`removed_with`).
+///
+/// And not a checkout of its own that is not the project's: a worktree
+/// under `.claude/worktrees`, a clone in `vendor/`, which hold a `.git` of
+/// their own. Every checkout has a `.claude/settings.json` and, once the
+/// policy is committed, a `.termaxa/policy.yaml`; they gate sessions that
+/// run there, and `rm -rf .claude/worktrees/done` removes that checkout
+/// whole. Only what lands ON the project, or on an agent's configuration,
+/// is read (`cp -r ../other-checkout/. .`).
+fn guarded_files(
+    tree: &std::path::Path,
+    place: &std::path::Path,
+    ctx: &EvalContext,
+    budget: &mut delete::WalkBudget,
+) -> Vec<PathBuf> {
+    let mut guarded = vec![ctx.root.clone()];
+    guarded.extend(delete::user_config_dirs());
+    let mut out = Vec::new();
+    let another_checkout =
+        delete::is_checkout(tree) && !guarded.iter().any(|g| delete::is_inside(g, place));
+    if guarded.iter().any(|g| delete::is_inside(place, g))
+        && !another_checkout
+        && std::fs::symlink_metadata(tree).is_ok_and(|m| m.is_dir())
+    {
+        for rel in delete::files_under(tree, budget) {
+            out.push(place.join(rel));
+        }
+    }
+    out
+}
+
+/// Is this tree one the reading does not enter: a directory a build
+/// rebuilds, inside the project, or git's own?
+fn not_read(tree: &std::path::Path, ctx: &EvalContext) -> bool {
+    tree.file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case(".git"))
+        || delete::reproducible_within(tree, Some(&ctx.root)).is_some()
+}
+
+/// What a delete, or the source side of a move, takes with a directory. A
+/// glob is what it matches: each file by its own name, each directory by
+/// what it holds. A link is removed as a link, and what it points at stays.
+fn removed_with(
+    raw: &str,
+    ctx: &EvalContext,
+    budget: &mut delete::WalkBudget,
+    out: &mut Vec<ResolvedTarget>,
+) {
+    let Some(path) = on_disk(&without_brackets(&unquoted(raw)), ctx) else {
+        return;
+    };
+    let (roots, globbed) = match delete::expand_glob(&path) {
+        Some(found) => (found, true),
+        None => (vec![path], false),
+    };
+    for root in roots {
+        let Ok(meta) = std::fs::symlink_metadata(&root) else {
+            continue;
+        };
+        // The project itself, or something above it, goes with everything
+        // in it: there is nothing left for its hook config to gate, and the
+        // rules that name the delete judge it (`guarded_files`).
+        if not_read(&root, ctx) || delete::is_inside(&ctx.root, &root) {
+            continue;
+        }
+        if !meta.is_dir() {
+            if globbed {
+                out.push(inside(root, TargetRole::Removed));
+            }
+            continue;
+        }
+        for p in guarded_files(&root, &root, ctx, budget) {
+            out.push(inside(p, TargetRole::Removed));
+        }
+    }
+}
+
+/// What a `cp` or a `mv` lands: `dest/<name>` for a file that goes INTO a
+/// directory, and for a tree, its files where they will be.
+///
+/// The destination is a directory to copy into when the command says so
+/// (`-t`, more than one source, a trailing separator, `.`), or when it is
+/// one on disk. One the gate cannot look at (a variable, a directory it
+/// could not follow) may be a directory and is read as one: a deny too many
+/// is loud, and a write nobody judged is not (#44). `-T` makes the
+/// destination the copy itself.
+fn landed(
+    args: &[String],
+    source_role: TargetRole,
+    dest: &str,
+    sources: &[String],
+    ctx: &EvalContext,
+    budget: &mut delete::WalkBudget,
+    out: &mut Vec<ResolvedTarget>,
+) {
+    let long = |name: &str| args.iter().any(|a| a == name);
+    let short = |c: char| {
+        args.iter().any(|a| {
+            a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a[1..].contains(c)
+        })
+    };
+    let explicit = args
+        .iter()
+        .any(|a| a == "-t" || a == "--target-directory" || a.starts_with("--target-directory="));
+    let as_itself = long("--no-target-directory") || short('T');
+    // A move takes a directory whole; a copy only when asked to.
+    let whole_trees = source_role == TargetRole::Removed
+        || long("--recursive")
+        || long("--archive")
+        || short('r')
+        || short('R')
+        || short('a');
+    let named_a_directory = explicit
+        || sources.len() > 1
+        || dest.ends_with('/')
+        || dest.ends_with('\\')
+        || matches!(last_component(dest), "." | ".." | "~");
+    let into = !as_itself
+        && (named_a_directory
+            || match on_disk(dest, ctx) {
+                Some(p) => p.is_dir(),
+                None => true,
+            });
+
+    for s in sources {
+        let name = last_component(s);
+        // `tree/.` is the tree's contents; `..` and nothing name no file.
+        let contents = name == ".";
+        if name.is_empty() || name == ".." {
+            continue;
+        }
+        // The names that land: a glob's are what it matches on disk, and a
+        // name held in a variable or a brace list is not known.
+        let items: Vec<(String, Option<PathBuf>)> = if name.contains(['*', '?', '[']) {
+            on_disk(&without_brackets(s), ctx)
+                .and_then(|p| delete::expand_glob(&p))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| Some((p.file_name()?.to_string_lossy().to_string(), Some(p))))
+                .collect()
+        } else if has_unexpanded_var(name) || name.contains('{') {
+            Vec::new()
+        } else {
+            vec![(name.to_string(), on_disk(s, ctx))]
+        };
+        for (name, src) in items {
+            match src.filter(|p| p.is_dir()) {
+                Some(tree) => {
+                    // `cp dir dest` without `-r` copies nothing.
+                    if !whole_trees || not_read(&tree, ctx) {
+                        continue;
+                    }
+                    // Where the tree's root lands: inside the directory
+                    // under its own name, unless it is the contents
+                    // (`tree/.`) or the destination is the tree's new name.
+                    let place = if into && !contents {
+                        joined(dest, &name)
+                    } else {
+                        dest.to_string()
+                    };
+                    let Some(place) = on_disk(&place, ctx) else {
+                        continue;
+                    };
+                    for p in guarded_files(&tree, &place, ctx, budget) {
+                        out.push(inside(p, TargetRole::Destination));
+                    }
+                }
+                None => {
+                    if into && !contents {
+                        let t = target(&joined(dest, &name), TargetRole::Destination, ctx);
+                        if !out.contains(&t) {
+                            out.push(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Files a command writes through its own options rather than through a
@@ -1187,5 +2167,330 @@ mod tests {
                 "{l}: labels continue a sentence, they do not start one"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod contents_tests {
+    use super::*;
+    use crate::testutil::TempTree;
+
+    fn landed_as(line: &str, ctx: &EvalContext) -> Vec<String> {
+        command_contents(line, ctx)
+            .into_iter()
+            .map(|t| t.as_written)
+            .collect()
+    }
+
+    /// A file that goes INTO a directory lands under its own name, and that
+    /// is read off the command alone: the directory need not exist.
+    #[test]
+    fn a_file_copied_into_a_directory_lands_under_its_own_name() {
+        let tmp = TempTree::new("contents-file");
+        tmp.dir("isdir");
+        tmp.file("isfile", "x");
+        let ctx = EvalContext::at(tmp.path());
+        assert_eq!(landed_as("cp a b dir/", &ctx), vec!["dir/a", "dir/b"]);
+        assert_eq!(landed_as("mv a dir/", &ctx), vec!["dir/a"]);
+        assert_eq!(landed_as("cp sub/a .", &ctx), vec!["./a"]);
+        assert_eq!(landed_as("cp -t dir a", &ctx), vec!["dir/a"]);
+        assert_eq!(
+            landed_as("cp --target-directory=dir a b", &ctx),
+            vec!["dir/a", "dir/b"]
+        );
+        // A directory on disk is one without the trailing separator.
+        assert_eq!(landed_as("cp a isdir", &ctx), vec!["isdir/a"]);
+        // A file, and a name nothing has yet, are the copy itself.
+        assert!(landed_as("cp a isfile", &ctx).is_empty());
+        assert!(landed_as("cp a newname", &ctx).is_empty());
+        assert!(landed_as("cp -T a isdir", &ctx).is_empty());
+        // A destination the gate cannot look at may be a directory.
+        assert_eq!(landed_as("cp a \"$D\"", &ctx), vec!["$D/a"]);
+        // The name that lands is the source's last word, whatever comes
+        // before it; one held in a variable is not known.
+        assert_eq!(
+            landed_as("cp \"$T/settings.json\" dir/", &ctx),
+            vec!["dir/settings.json"]
+        );
+        assert!(landed_as("cp \"$F\" dir/", &ctx).is_empty());
+        // Neither a copy nor a move: nothing lands.
+        assert!(landed_as("cat a dir/", &ctx).is_empty());
+        // The same grammar under its other names.
+        assert_eq!(landed_as("git mv a dir/", &ctx), vec!["dir/a"]);
+        assert_eq!(landed_as("Copy-Item a dir\\", &ctx), vec!["dir/a"]);
+        assert_eq!(
+            landed_as("Copy-Item -Destination isdir -Path a,b -Force", &ctx),
+            vec!["isdir/a", "isdir/b"]
+        );
+        assert_eq!(
+            landed_as("Move-Item -Path a -Destination dir/", &ctx),
+            vec!["dir/a"]
+        );
+        assert!(landed_as("Copy-Item a newname", &ctx).is_empty());
+        // PowerShell's parameters, hand-walked (#56): one that takes a
+        // value takes it; a prefix names the one parameter it starts; a
+        // colon joins a value; a comma makes a list, spaced or not; `cp`
+        // is `Copy-Item` when the line speaks PowerShell; and with no
+        // destination the copy lands where the command runs.
+        for (line, lands) in [
+            (
+                "Copy-Item a dir\\ -ErrorAction SilentlyContinue",
+                vec!["dir/a"],
+            ),
+            ("Copy-Item a -ea 0 dir/", vec!["dir/a"]),
+            ("Copy-Item -Filter *.json a dir/", vec!["dir/a"]),
+            ("Copy-Item a -Dest isdir", vec!["isdir/a"]),
+            ("Copy-Item -Destination:isdir a", vec!["isdir/a"]),
+            (
+                "Copy-Item -LiteralPath a -Destination isdir",
+                vec!["isdir/a"],
+            ),
+            ("Copy-Item a, b isdir", vec!["isdir/a", "isdir/b"]),
+            (
+                "Copy-Item -Path a, b -Destination isdir",
+                vec!["isdir/a", "isdir/b"],
+            ),
+            ("cpi a isdir", vec!["isdir/a"]),
+            ("mi a isdir", vec!["isdir/a"]),
+            ("cp a isdir -Force -PassThru", vec!["isdir/a"]),
+            ("mv -Path a -Destination isdir", vec!["isdir/a"]),
+            ("Copy-Item sub/a", vec!["./a"]),
+        ] {
+            assert_eq!(landed_as(line, &ctx), lands, "{line}");
+        }
+        for (word, kind) in [
+            ("-Destination", Some(PsParameter::Destination)),
+            ("-des", Some(PsParameter::Destination)),
+            ("-NewName", Some(PsParameter::Destination)),
+            ("-Path", Some(PsParameter::Source)),
+            ("-pat", Some(PsParameter::Source)),
+            ("-PSPath", Some(PsParameter::Source)),
+            ("-l", Some(PsParameter::Source)),
+            ("-Recurse", Some(PsParameter::Recurse)),
+            ("-r", Some(PsParameter::Recurse)),
+            ("-ErrorAction", Some(PsParameter::Value)),
+            ("-ea", Some(PsParameter::Value)),
+            ("-Filter", Some(PsParameter::Value)),
+            ("-Force", Some(PsParameter::Switch)),
+            ("-WhatIf", Some(PsParameter::Switch)),
+            // `-p`, `-de`, `-f` and `-c` each start more than one.
+            ("-p", None),
+            ("-de", None),
+            ("-f", None),
+            ("-c", None),
+            ("-nosuch", None),
+        ] {
+            assert_eq!(powershell_parameter(word), kind, "{word}");
+        }
+        // A rename: the new name stands beside the old one.
+        assert_eq!(landed_as("Rename-Item a b", &ctx), vec!["b"]);
+        assert_eq!(landed_as("ren sub\\a b", &ctx), vec!["sub/b"]);
+        assert_eq!(
+            landed_as("Rename-Item -NewName b -Path sub/a", &ctx),
+            vec!["sub/b"]
+        );
+        assert!(landed_as("Rename-Item a", &ctx).is_empty());
+        // A brace list is the words it opens into.
+        assert_eq!(landed_as("cp x/{a,b} dir/", &ctx), vec!["dir/a", "dir/b"]);
+        assert!(landed_as("cp a{,.bak}", &ctx).is_empty());
+        assert_eq!(without_brackets(".[!.]*"), ".?*");
+        assert_eq!(without_brackets("a[0-9]b[xy]"), "a?b?");
+        assert_eq!(without_brackets("plain"), "plain");
+    }
+
+    /// What a stash and a clean take out of the tree, read off their words
+    /// (hand-walked, #56).
+    #[test]
+    fn a_stash_and_a_clean_are_read_for_what_they_take() {
+        use crate::backup::Discard;
+        let w = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+        let paths = |p: &[&str]| Discard::Paths(p.iter().map(|s| s.to_string()).collect());
+        let everything = || Untracked {
+            dirs: true,
+            whole_tree: true,
+            ..Untracked::default()
+        };
+        // A stash: bare is `push`; `save` takes a message, `push` paths.
+        for line in [
+            "",
+            "push",
+            "save wip on the form",
+            "-m wip",
+            "push -m wip",
+            "-k",
+        ] {
+            assert_eq!(
+                stash_takes(&w(line)),
+                Some((Some(Discard::WholeTree), None)),
+                "git stash {line}"
+            );
+        }
+        for line in ["push src docs", "push -m wip -- src docs", "-- src docs"] {
+            assert_eq!(
+                stash_takes(&w(line)),
+                Some((Some(paths(&["src", "docs"])), None)),
+                "git stash {line}"
+            );
+        }
+        for line in ["-u", "--include-untracked", "push -u", "-ku", "-um wip"] {
+            assert_eq!(
+                stash_takes(&w(line)),
+                Some((Some(Discard::WholeTree), Some(everything()))),
+                "git stash {line}"
+            );
+        }
+        for line in ["-a", "--all", "push --all"] {
+            assert_eq!(
+                stash_takes(&w(line)),
+                Some((
+                    Some(Discard::WholeTree),
+                    Some(Untracked {
+                        ignored_too: true,
+                        ..everything()
+                    })
+                )),
+                "git stash {line}"
+            );
+        }
+        assert_eq!(
+            stash_takes(&w("push -u -- src")),
+            Some((
+                Some(paths(&["src"])),
+                Some(Untracked {
+                    dirs: true,
+                    paths: vec!["src".to_string()],
+                    ..Untracked::default()
+                })
+            ))
+        );
+        // The verbs that put nothing back.
+        for verb in [
+            "list", "show", "pop", "apply", "drop", "clear", "branch b", "create", "store x",
+        ] {
+            assert_eq!(stash_takes(&w(verb)), None, "git stash {verb}");
+        }
+
+        // A clean: what `-d`, `-x`, `-X`, `-e` and the paths say.
+        assert_eq!(clean_takes(&w("-f")), Some(Untracked::default()));
+        for line in ["-fd", "-f -d", "-df", "--force -d", "-ffd", "-qfd"] {
+            assert_eq!(
+                clean_takes(&w(line)),
+                Some(Untracked {
+                    dirs: true,
+                    ..Untracked::default()
+                }),
+                "git clean {line}"
+            );
+        }
+        assert_eq!(
+            clean_takes(&w("-fdx")),
+            Some(Untracked {
+                dirs: true,
+                ignored_too: true,
+                ..Untracked::default()
+            })
+        );
+        assert_eq!(
+            clean_takes(&w("-fX")),
+            Some(Untracked {
+                ignored_only: true,
+                ..Untracked::default()
+            })
+        );
+        for line in [
+            "-fd -e .termaxa -e *.log",
+            "-fd --exclude=.termaxa --exclude *.log",
+            "-fde.termaxa -e*.log",
+        ] {
+            assert_eq!(
+                clean_takes(&w(line)),
+                Some(Untracked {
+                    dirs: true,
+                    except: vec![".termaxa".to_string(), "*.log".to_string()],
+                    ..Untracked::default()
+                }),
+                "git clean {line}"
+            );
+        }
+        for line in ["-fd build out", "-fd -- build out"] {
+            assert_eq!(
+                clean_takes(&w(line)),
+                Some(Untracked {
+                    dirs: true,
+                    paths: vec!["build".to_string(), "out".to_string()],
+                    ..Untracked::default()
+                }),
+                "git clean {line}"
+            );
+        }
+        // A dry run, a prompt and the help remove nothing.
+        for line in [
+            "-n",
+            "-fdn",
+            "-n -fd",
+            "--dry-run -fd",
+            "-i",
+            "--interactive",
+            "-h",
+        ] {
+            assert_eq!(clean_takes(&w(line)), None, "git clean {line}");
+        }
+        // Git names a path with `/`, from where it was asked.
+        let base = std::path::Path::new("/repo/sub");
+        assert_eq!(
+            below(base, ".termaxa/"),
+            PathBuf::from("/repo/sub/.termaxa")
+        );
+        assert_eq!(below(base, "../.env"), PathBuf::from("/repo/.env"));
+        assert_eq!(below(base, "./a/b.txt"), PathBuf::from("/repo/sub/a/b.txt"));
+    }
+
+    /// A tree is read off the disk, for the project only: its files where
+    /// they will be, or where they were.
+    #[test]
+    fn a_tree_is_read_for_what_it_changes_in_the_project() {
+        let tmp = TempTree::new("contents-tree");
+        tmp.file("proj/.claude/settings.json", "{}");
+        tmp.file("proj/src/a.ts", "a");
+        tmp.file("tpl/.claude/settings.json", "{}");
+        tmp.file("tpl/README.md", "t");
+        let proj = tmp.path().join("proj");
+        let ctx = EvalContext::at(&proj);
+        let paths = |line: &str| -> Vec<(TargetRole, PathBuf)> {
+            command_contents(line, &ctx)
+                .into_iter()
+                .filter_map(|t| Some((t.role, t.resolved?)))
+                .collect()
+        };
+        // The template's files, where they land in the project.
+        let landed = paths("cp -r ../tpl/. .");
+        assert!(
+            landed.contains(&(TargetRole::Destination, proj.join(".claude/settings.json")))
+                && landed.contains(&(TargetRole::Destination, proj.join("README.md"))),
+            "{landed:?}"
+        );
+        // Under its own name when it is the directory that is copied.
+        let landed = paths("cp -r ../tpl .");
+        assert!(
+            landed.contains(&(
+                TargetRole::Destination,
+                proj.join("tpl/.claude/settings.json")
+            )),
+            "{landed:?}"
+        );
+        // Without `-r` a directory is not copied at all.
+        assert!(paths("cp ../tpl .").is_empty());
+        // What a delete and a move take with a directory.
+        assert_eq!(
+            paths("rm -rf .claude"),
+            vec![(TargetRole::Removed, proj.join(".claude/settings.json"))]
+        );
+        assert_eq!(
+            paths("mv .claude ../gone"),
+            vec![(TargetRole::Removed, proj.join(".claude/settings.json"))]
+        );
+        // The project copied or a tree deleted somewhere else: not read.
+        assert!(paths("cp -r . ../backup").is_empty());
+        assert!(paths("rm -rf ../tpl").is_empty());
     }
 }

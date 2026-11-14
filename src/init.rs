@@ -1159,6 +1159,19 @@ pub fn run(
 
         println!("\nRuntime state (logs, backups) lives OUTSIDE the repo:");
         println!("  {}", p.state_dir.display());
+
+        // The policy and the hook registration are files in the working
+        // tree, and until they are committed git can take them back: a
+        // stash or a hard reset puts the old settings file back, a clean
+        // deletes the untracked policy. The starter refuses those commands
+        // while that is so (`resolve::undone_by_git`, v0.21.10), and a
+        // refusal is better explained before it happens than after.
+        if dir.ancestors().any(crate::delete::is_checkout) {
+            println!("\nCommit `.termaxa/policy.yaml` and the hook config. Until then the");
+            println!("starter refuses a `git stash`, `git reset --hard`, `git checkout --`");
+            println!("or `git clean` that would put them back or delete them. A new hook");
+            println!("config kept to this clone can go in `.git/info/exclude` instead.");
+        }
     }
 
     if verified_dead {
