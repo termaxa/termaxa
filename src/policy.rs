@@ -89,9 +89,17 @@ pub struct Rule {
     /// .claude/settings.json`, `git commit -m "update .claude settings"` and
     /// every reader but `cat` (known since Oct 23, 2026; two of 95 everyday
     /// calls on Nov 13). A program on the list writes nothing except through
-    /// a redirect, and a redirect's target is judged by the path rules,
-    /// which come first, so for those commands the string has nothing left
-    /// to guard. Every other command meets the rule as written.
+    /// a redirect, so the exception covers the command and what it reads,
+    /// and stops at its first redirection: the rule still reads the line
+    /// from there on (`redirection_readings`), and a redirect's target is
+    /// judged by the path rules as well, which come first. Every other
+    /// command meets the rule as written.
+    ///
+    /// v0.21.10 excepted the whole line and left the redirect to the path
+    /// rules alone. They did not see `&>`, `>&` or `<>`, and read a target
+    /// with a quote inside it as another name, so `echo x &>
+    /// .claude/settings.json` and `echo x > ".claude"/settings.json` were
+    /// allowed (v0.22.0).
     ///
     /// Written on the rule, like `except_rebuilt`: a policy written before
     /// this field existed refuses those reads until the line is added.
@@ -1038,10 +1046,23 @@ impl Policy {
         let rebuilt = rebuilt_only(&targets, ctx);
         let spared = |r: &Rule| rebuilt.is_some() && r.except_rebuilt && r.action == Action::Deny;
         // A command that only reads or prints: a deny that says
-        // `except_reads` does not apply to it (`Rule::except_reads`).
+        // `except_reads` does not apply to it (`Rule::except_reads`). To
+        // the command and what it reads, that is: where its output goes is
+        // the line from its first redirection on, and a rule that matches
+        // there applies as written (`redirection_readings`).
         let reads = only_reads(command);
-        let excepted =
-            |r: &Rule| spared(r) || (reads && r.except_reads && r.action == Action::Deny);
+        let redirected = if reads {
+            redirection_readings(command)
+        } else {
+            Vec::new()
+        };
+        let excepted = |r: &Rule| {
+            spared(r)
+                || (reads
+                    && r.except_reads
+                    && r.action == Action::Deny
+                    && !redirected.iter().any(|v| r.matches(v)))
+        };
         // A privilege wrapper is transparent to a DENY only: `sudo gh repo
         // delete …` must hit a `gh repo delete*` deny, while an allow written
         // for `apt-get install*` must not admit `sudo apt-get install`. The
@@ -1276,6 +1297,72 @@ fn only_reads(command: &str) -> bool {
             .is_some_and(|sub| GIT_READ_ONLY.contains(&sub.to_ascii_lowercase().as_str()));
     }
     READ_ONLY.contains(&head.as_str())
+}
+
+/// The readings of a command from its first redirection on: everything
+/// after the first `>` that stands outside quotes, the `>` included. Empty
+/// for a command that redirects nothing.
+///
+/// `except_reads` takes a string rule off a program that only reads or
+/// prints, because such a program writes nothing of its own accord. What it
+/// does write goes through a redirection, and v0.21.10 left that to the path
+/// rules alone, on the word of a reader that did not see every redirection
+/// (`&>`, `>&`, `<>`) and misread a target with a quote inside it
+/// (`".claude"/settings.json`): `echo x &> .claude/settings.json` was
+/// allowed by `echo *`. The reader is corrected (`shell::target_word`), and
+/// the exception no longer rests on it: a rule that matches this part of the
+/// line applies, read program or not, as it did before the exception
+/// existed. So `cat .claude/settings.json` and `echo "see
+/// .claude/settings.json" >> TODO.md` are still excepted, and a `>` followed
+/// by the guarded name is not, however it is spelled.
+///
+/// Found by text and nothing else, so that it holds where the redirection
+/// reader is wrong again: the cost of a `>` that was not a redirection (an
+/// unquoted one in a heredoc's body) is the rule applying as written.
+fn redirection_readings(command: &str) -> Vec<String> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut first: Option<usize> = None;
+    for (at, c) in command.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some(q) => {
+                if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\\' => escaped = true,
+                '\'' | '"' => quote = Some(c),
+                '>' => {
+                    first = Some(at);
+                    break;
+                }
+                _ => {}
+            },
+        }
+    }
+    let Some(at) = first else {
+        return Vec::new();
+    };
+    let rest = &command[at..];
+    let mut out = readings(rest);
+    for r in deny_only_readings(rest) {
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 /// The forms of a command a rule is matched against.
@@ -4419,6 +4506,125 @@ mod except_reads_tests {
         ] {
             let d = p.evaluate_command(line, &here());
             assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+    }
+
+    /// The exception covers the program and what it reads, and stops at the
+    /// line's first redirection. v0.21.10 excepted the whole line and left
+    /// the redirection to the path rules, which did not see `&>`, `>&` or
+    /// `<>` and read a target with a quote inside it as another name: every
+    /// line here was allowed by `echo *` or `cat *`, in a release whose
+    /// predecessor refused all of them (found Nov 15, 2026).
+    #[test]
+    fn a_program_that_only_reads_is_still_refused_where_it_redirects() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        for config in [
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".cursor/hooks.json",
+            ".codex/hooks.json",
+            ".github/hooks/hooks.json",
+        ] {
+            let (dir, file) = config.rsplit_once('/').expect("a directory and a file");
+            let (half, rest) = dir.split_at(dir.len() - 3);
+            for line in [
+                format!("echo x > \"{dir}\"/{file}"),
+                format!("echo x > {dir}/\"{file}\""),
+                format!("echo x > '{dir}'/{file}"),
+                format!("echo x > {dir}/'{file}'"),
+                format!("echo x > \"{dir}\"/\"{file}\""),
+                format!("echo x > {half}\"{rest}\"/{file}"),
+                format!("echo x >> \"{dir}\"/{file}"),
+                format!("echo x >| \"{dir}\"/{file}"),
+                format!("echo x >\"{dir}\"/{file}"),
+                format!("echo x 1> \"{dir}\"/{file}"),
+                format!("echo x &> {config}"),
+                format!("echo x &>> {config}"),
+                format!("echo x >& {config}"),
+                format!("echo x 1<> {config}"),
+                format!("echo x > \"$PWD/{dir}\"/{file}"),
+                format!("echo x > $'{config}'"),
+                format!("echo x > ${{NOPE:-{dir}}}/{file}"),
+                format!("cat /tmp/s.json > \"{dir}\"/{file}"),
+                format!("printf '{{}}' > '{dir}'/{file}"),
+                format!("grep -c . /tmp/s.json > \"{dir}\"/{file}"),
+                format!("jq . /tmp/s.json > {dir}/\"{file}\""),
+                format!("head -1 /tmp/s.json > \"{dir}\"/{file}"),
+                format!("ls > \"{dir}\"/{file}"),
+                format!("Get-Content /tmp/s.json > \"{dir}\"/{file}"),
+                format!("cat > \"{dir}\"/{file} <<'EOF'\n{{}}\nEOF"),
+                format!("cat <<'EOF' > \"{dir}\"/{file}\n{{}}\nEOF"),
+                format!("echo x > \"{dir}\"/{file} 2>&1"),
+                format!("echo x > \"{dir}\"/{file} || true"),
+                format!("if true; then echo x > \"{dir}\"/{file}; fi"),
+                format!("for f in 1; do echo x > \"{dir}\"/{file}; done"),
+                format!("echo x | cat > \"{dir}\"/{file}"),
+                format!("echo x > \"{dir}\"/{file} &"),
+            ] {
+                let d = p.evaluate_command(&line, &here());
+                assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+                assert!(p.held_by_floor(&d), "{line}: held in observe mode too");
+            }
+        }
+        // What the program reads, and what it prints somewhere else, is
+        // still ordinary work: a `>` inside quotes is no redirection, and a
+        // redirection that names no guarded file matches no rule.
+        for line in [
+            "cat \".claude\"/settings.json",
+            "echo \"see .claude/settings.json\" >> TODO.md",
+            "cat .claude/settings.json > /tmp/copy.json",
+            "grep -c hooks .claude/settings.json > count.txt",
+            "grep -n \">\" .claude/settings.json",
+            "grep -n '=>' .cursor/hooks.json",
+            "jq '.hooks | length > 0' .claude/settings.json",
+            "git commit -m \"settings -> .claude/settings.json\"",
+            "ls -la .claude > listing.txt",
+            "wc -l .codex/hooks.json 2>&1",
+        ] {
+            let d = p.evaluate_command(line, &here());
+            assert_ne!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+    }
+
+    /// The same redirections under a policy with a path rule and nothing
+    /// else: no string names `.env`, so these were allowed by any allow
+    /// that covered the command, in every release since the path rules
+    /// began (`echo x &> .env`, `echo x > sub/".env"`).
+    #[test]
+    fn a_path_rule_sees_every_redirection_and_a_target_with_a_quote_in_it() {
+        let p: Policy = serde_yaml::from_str(
+            "version: 1\ndefault: allow\nrules:\n  - match_path: \"*/.env\"\n    action: deny\n",
+        )
+        .expect("policy parses");
+        for line in [
+            "echo x > sub/\".env\"",
+            "echo x > sub/'.env'",
+            "echo x > \"sub\"/\".env\"",
+            "echo x > \"sub\"/.env",
+            "echo x > .e\"nv\"",
+            "echo x &> sub/.env",
+            "echo x &>> sub/.env",
+            "echo x >& sub/.env",
+            "echo x >&.env",
+            "echo x 1<> sub/.env",
+            "wc -l notes.md >> sub/\".env\"",
+            "echo x > $'sub/.env'",
+            "npm run build &> .env",
+        ] {
+            let d = p.evaluate_command(line, &here());
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+        for line in [
+            "echo x > sub/.env.example",
+            "echo x &> sub/env.txt",
+            "cat sub/\".env\"",
+            "echo x >&2",
+            "echo x >& 2",
+            "echo x 2>&1",
+            "echo x &> /dev/null",
+        ] {
+            let d = p.evaluate_command(line, &here());
+            assert_eq!(d.action, Action::Allow, "{line}: {}", d.reason);
         }
     }
 
