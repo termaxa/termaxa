@@ -131,8 +131,7 @@ fn split_with(s: &str, bodies_as_data: bool) -> Vec<Segment> {
             // A redirect: consume the operator and its target in THIS walk,
             // recording the Overwrite the segment will carry. Deliberately
             // NOT treated as redirects, because they do not create or
-            // truncate a file: `2>&1`, `>&2` (descriptor duplication), `&>`
-            // and `&>>` (stream combination), `<>` (read-write open),
+            // truncate a file: `2>&1`, `>&2` (descriptor duplication),
             // `>(...)` (process substitution — an operator, not a filename),
             // `\>` (a literal, consumed by the escape arm above), anything
             // inside quotes, and sinks (`/dev/null` and friends — truncating
@@ -140,6 +139,13 @@ fn split_with(s: &str, bodies_as_data: bool) -> Vec<Segment> {
             // truncation of the named file, and one operator: splitting at
             // its `|` cut the target into its own segment, hiding the
             // truncation from every engine that splits first.
+            //
+            // `&> file`, `&>> file` and `>& file` send both streams to a
+            // file, and are that file's `>` or `>>`. Until v0.22.0 they were
+            // taken for descriptor plumbing and no engine saw the write: no
+            // copy first, and no path rule (`echo x &> .env`). `<> file`
+            // opens a file for reading and writing without truncating it,
+            // and is recorded by the `<` arm the way `>>` is.
             '>' => {
                 let prev_is_amp = i > 0 && chars[i - 1] == '&';
                 let prev_is_lt = i > 0 && chars[i - 1] == '<';
@@ -169,7 +175,55 @@ fn split_with(s: &str, bodies_as_data: bool) -> Vec<Segment> {
                     // classified it, and leave the whole of `2>&1` out of
                     // the command text: it names no file.
                     cur.push('&');
-                    let end = descriptor(&chars, &mut cur, j + 1);
+                    // `>& word` where the word is not a descriptor is the
+                    // older spelling of `&> word`: a file, written over.
+                    // A descriptor is digits, `-`, or digits and a `-`
+                    // (`>&3-` moves it); the shell allows blanks before it.
+                    let mut k = j + 1;
+                    while k < chars.len() && matches!(chars[k], ' ' | '\t') {
+                        k += 1;
+                    }
+                    let word: String = chars[k..]
+                        .iter()
+                        .take_while(|d| {
+                            !(d.is_whitespace()
+                                || matches!(d, ';' | '|' | '&' | '(' | ')' | '<' | '>'))
+                        })
+                        .collect();
+                    let digits = word.trim_end_matches('-');
+                    // A variable alone (`>&$fd`, `>&"${fd}"`) may hold
+                    // either, and is left as it was read before: a
+                    // descriptor. One with a path after it is a file.
+                    let bare = word.trim_matches('"');
+                    let held = bare
+                        .strip_prefix('$')
+                        .map(|v| v.trim_start_matches('{').trim_end_matches('}'))
+                        .is_some_and(|v| {
+                            !v.is_empty()
+                                && v.chars().all(|d| d.is_ascii_alphanumeric() || d == '_')
+                        });
+                    let is_descriptor = word == "-"
+                        || held
+                        || (!digits.is_empty()
+                            && digits.chars().all(|d| d.is_ascii_digit())
+                            && word.len() - digits.len() <= 1);
+                    if !word.is_empty() && !is_descriptor && !prev_is_amp && !prev_is_lt {
+                        cur.extend(&chars[j + 1..k]);
+                        let (target, end) = target_word(&chars, &mut cur, k, in_comment);
+                        if !target.is_empty() && !is_sink(&target) {
+                            cur_redirects.push(Overwrite { target, truncates });
+                        }
+                        cur_spans.push((start, end));
+                        i = end;
+                        continue;
+                    }
+                    let from = if is_descriptor && !held {
+                        cur.extend(&chars[j + 1..k]);
+                        k
+                    } else {
+                        j + 1
+                    };
+                    let end = descriptor(&chars, &mut cur, from);
                     cur_spans.push((start, end));
                     i = end;
                     continue;
@@ -185,7 +239,7 @@ fn split_with(s: &str, bodies_as_data: bool) -> Vec<Segment> {
                     continue;
                 }
                 let (target, end) = target_word(&chars, &mut cur, j, in_comment);
-                if !target.is_empty() && !prev_is_amp && !prev_is_lt && !is_sink(&target) {
+                if !target.is_empty() && !prev_is_lt && !is_sink(&target) {
                     cur_redirects.push(Overwrite { target, truncates });
                 }
                 // A sink or a duplication still occupies the command line;
@@ -291,9 +345,11 @@ fn split_with(s: &str, bodies_as_data: bool) -> Vec<Segment> {
                 let start = span_start(&chars, seg_start, i);
                 cur.push(c);
                 let mut j = i + 1;
-                // `<<` and `<<-` open a heredoc; `<<<` is a here-string.
+                // `<<` and `<<-` open a heredoc; `<<<` is a here-string;
+                // `<>` opens a file for reading and writing.
                 let mut heredoc = false;
                 let mut strip_tabs = false;
+                let mut read_write = false;
                 if chars.get(j) == Some(&'<') {
                     cur.push('<');
                     j += 1;
@@ -311,6 +367,7 @@ fn split_with(s: &str, bodies_as_data: bool) -> Vec<Segment> {
                 } else if chars.get(j) == Some(&'>') {
                     cur.push('>');
                     j += 1;
+                    read_write = true;
                 }
                 if chars.get(j) == Some(&'&') {
                     cur.push('&');
@@ -347,7 +404,16 @@ fn split_with(s: &str, bodies_as_data: bool) -> Vec<Segment> {
                     });
                     end
                 } else {
-                    target_word(&chars, &mut cur, j, in_comment).1
+                    let (target, end) = target_word(&chars, &mut cur, j, in_comment);
+                    // `echo x 1<> f` writes into `f` where it stands: not a
+                    // truncation, and a write all the same.
+                    if read_write && !target.is_empty() && !is_sink(&target) {
+                        cur_redirects.push(Overwrite {
+                            target,
+                            truncates: false,
+                        });
+                    }
+                    end
                 };
                 cur_spans.push((start, end));
                 i = end;
@@ -865,18 +931,47 @@ fn descriptor(chars: &[char], cur: &mut String, mut j: usize) -> usize {
 /// unquoted separator, escapes honored as everywhere else in the walk.
 /// Backslashes are RETAINED in the target string, as they always were for
 /// non-boundary characters. Every character is pushed to the segment text;
-/// returns the target with its surrounding quotes stripped, and the index
-/// after it. In a comment (`literal`) nothing quotes or escapes, so the
-/// target ends at the line's end at the latest, as the comment does.
+/// returns the target as the shell names it, with the quotes that delimit
+/// its parts left out, and the index after it. In a comment (`literal`)
+/// nothing quotes or escapes, so the target ends at the line's end at the
+/// latest, as the comment does.
+///
+/// Until v0.22.0 only the quotes around the whole word were left out, so
+/// `".claude"/settings.json` was the name `.claude"/settings.json`, which no
+/// path rule matches. The quotes are the shell's, wherever in the word they
+/// stand; so is the `$` of `$'…'` and `$"…"`.
 fn target_word(chars: &[char], cur: &mut String, mut j: usize, literal: bool) -> (String, usize) {
     let mut target = String::new();
     let mut quote: Option<char> = None;
     while j < chars.len() {
         let d = chars[j];
         match quote {
-            Some(q) if d == q => quote = None,
+            // The quote that closes: the line's, not the name's.
+            Some(q) if d == q => {
+                quote = None;
+                cur.push(d);
+                j += 1;
+                continue;
+            }
+            // Inside double quotes a backslash still escapes what follows
+            // it, so `"a\"b"` does not end at its second quote.
+            Some('"') if d == '\\' && j + 1 < chars.len() => {
+                cur.push(d);
+                target.push(d);
+                j += 1;
+            }
             Some(_) => {}
-            None if !literal && (d == '\'' || d == '"') => quote = Some(d),
+            None if !literal && (d == '\'' || d == '"') => {
+                quote = Some(d);
+                cur.push(d);
+                j += 1;
+                continue;
+            }
+            None if !literal && d == '$' && matches!(chars.get(j + 1), Some('\'') | Some('"')) => {
+                cur.push(d);
+                j += 1;
+                continue;
+            }
             None if !literal && d == '\\' && j + 1 < chars.len() => {
                 cur.push(d);
                 target.push(d);
@@ -891,7 +986,6 @@ fn target_word(chars: &[char], cur: &mut String, mut j: usize, literal: bool) ->
         target.push(chars[j]);
         j += 1;
     }
-    let target: String = target.trim_matches(|c| c == '\'' || c == '"').to_string();
     (target, j)
 }
 
@@ -2840,9 +2934,10 @@ mod tests {
         for cmd in [
             "make 2>&1",
             "cmd >&2",
+            "cmd >& 2",
+            "cmd >&-",
             "cmd <&-",
-            "cmd &> log",
-            "cmd &>> log",
+            "cmd 2>&1 1>&2",
             "make 2>&1 | tee out",
         ] {
             assert!(
@@ -2850,6 +2945,130 @@ mod tests {
                 "{cmd} redirects a descriptor, it does not truncate a file"
             );
         }
+    }
+
+    /// `&> file` and `>& file` send both streams to a file and truncate it;
+    /// `&>> file` appends; `<> file` opens it for reading and writing. Until
+    /// v0.22.0 all four were taken for descriptor plumbing: no engine saw
+    /// the write, so nothing was copied first and no path rule matched
+    /// (`echo x &> .env` was allowed by `echo *`).
+    #[test]
+    fn both_streams_into_a_file_is_a_write_to_that_file() {
+        for (cmd, target, truncates) in [
+            ("cmd &> log", "log", true),
+            ("cmd &>log", "log", true),
+            ("cmd &>> log", "log", false),
+            ("cmd >& log", "log", true),
+            ("cmd >&log", "log", true),
+            ("cmd >& \"my log\"", "my log", true),
+            (
+                "echo x &> .claude/settings.json",
+                ".claude/settings.json",
+                true,
+            ),
+            ("echo x >& .env", ".env", true),
+            ("cmd <> rw.txt", "rw.txt", false),
+            ("echo x 1<> .env", ".env", false),
+            ("exec 3<> /tmp/f", "/tmp/f", false),
+        ] {
+            let r = redirects(cmd);
+            assert_eq!(r.len(), 1, "{cmd}: {r:?}");
+            assert_eq!(r[0].target, target, "{cmd}");
+            assert_eq!(r[0].truncates, truncates, "{cmd}");
+        }
+        // A sink is a sink behind any operator, and the command is the same
+        // command with the redirection left out.
+        for cmd in ["cmd &> /dev/null", "cmd &>/dev/null", "cmd >& /dev/null"] {
+            assert!(redirects(cmd).is_empty(), "{cmd}");
+            assert_eq!(split_segments(cmd)[0].command(), "cmd", "{cmd}");
+        }
+        assert_eq!(split_segments("cmd >& log")[0].command(), "cmd");
+        assert_eq!(split_segments("cmd >& 2")[0].command(), "cmd");
+        // A variable alone after `>&` may be a descriptor: read as before.
+        for cmd in ["cmd >&$fd", "cmd >&\"${fd}\"", "exec 3>&$fd"] {
+            assert!(redirects(cmd).is_empty(), "{cmd}");
+        }
+        assert_eq!(redirects("cmd >& $OUT/log")[0].target, "$OUT/log");
+        // Still one segment: the `&` is the operator's.
+        assert_eq!(split_segments("cmd >& log; next"), ["cmd >& log", "next"]);
+    }
+
+    /// A target is the name the shell gives the file, and the shell takes
+    /// the quotes out wherever they stand. Until v0.22.0 only the quotes
+    /// around the whole word were taken out, so `".claude"/settings.json`
+    /// was read as `.claude"/settings.json`: a name no path rule matches,
+    /// and no file on disk to copy first.
+    #[test]
+    fn a_target_is_read_without_the_quotes_inside_it() {
+        for (cmd, target) in [
+            (
+                r#"echo x > ".claude"/settings.json"#,
+                ".claude/settings.json",
+            ),
+            (
+                r#"echo x > .claude/"settings.json""#,
+                ".claude/settings.json",
+            ),
+            (
+                r#"echo x > '.claude'/settings.json"#,
+                ".claude/settings.json",
+            ),
+            (
+                r#"echo x > .claude/'settings.json'"#,
+                ".claude/settings.json",
+            ),
+            (
+                r#"echo x > ".claude"/"settings.json""#,
+                ".claude/settings.json",
+            ),
+            (
+                r#"echo x > .cl"aude"/settings.json"#,
+                ".claude/settings.json",
+            ),
+            (
+                r#"echo x >".claude"/settings.json"#,
+                ".claude/settings.json",
+            ),
+            (r#"echo x >> sub/".env""#, "sub/.env"),
+            (
+                r#"echo x > "$PWD/.claude"/settings.json"#,
+                "$PWD/.claude/settings.json",
+            ),
+            (
+                r#"echo x > "$PWD"/.claude/settings.json"#,
+                "$PWD/.claude/settings.json",
+            ),
+            (
+                r#"echo x > $'.claude/settings.json'"#,
+                ".claude/settings.json",
+            ),
+            (
+                r#"echo x > $".claude"/settings.json"#,
+                ".claude/settings.json",
+            ),
+            // As before: the whole word in quotes, a space kept, and a quote
+            // of the other kind inside is part of the name.
+            (r#"echo x > "my file.txt""#, "my file.txt"),
+            (r#"echo x > 'my file.txt'"#, "my file.txt"),
+            (r#"echo x > "it's.txt""#, "it's.txt"),
+            (r#"echo x > "$OUT""#, "$OUT"),
+        ] {
+            let r = redirects(cmd);
+            assert_eq!(r.len(), 1, "{cmd}: {r:?}");
+            assert_eq!(r[0].target, target, "{cmd}");
+        }
+        // The text of the segment is the line as typed, quotes and all.
+        assert_eq!(
+            split_segments(r#"echo x > ".claude"/settings.json"#),
+            [r#"echo x > ".claude"/settings.json"#]
+        );
+        // An escaped quote inside double quotes does not close them: the
+        // target runs on, and the `;` inside it is not a separator.
+        let segs = split_segments("echo x > \"a\\\";b\" ; next");
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].redirects[0].target, "a\\\";b");
+        // Quotes that hold nothing name nothing.
+        assert!(redirects(r#"echo x > """#).is_empty());
     }
 
     /// A `>` inside quotes is text, not an operator — the same property the
@@ -3918,7 +4137,9 @@ mod tests {
     }
 
     /// `\>` outside quotes is a literal; `>|` clobbers — a truncation of the
-    /// named file; `<>` opens read-write and destroys nothing.
+    /// named file; `<>` opens read-write: it truncates nothing, and what the
+    /// command writes lands in the file all the same, so it is recorded the
+    /// way an append is (v0.22.0; until then it was not recorded at all).
     #[test]
     fn escapes_clobber_and_read_write_open() {
         assert!(redirects(r"echo a \> b").is_empty());
@@ -3926,7 +4147,10 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].target, "forced.txt");
         assert!(r[0].truncates);
-        assert!(redirects("cmd <> rw.txt").is_empty());
+        let r = redirects("cmd <> rw.txt");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].target, "rw.txt");
+        assert!(!r[0].truncates);
     }
 
     /// v0.16 §1.5, behavior CHANGE, pinned deliberately: an escape outside
@@ -4460,9 +4684,11 @@ mod tests {
         assert_eq!(targets[0].target, "out.txt");
         assert!(targets[0].truncates);
 
-        // A leading `&>` combines streams rather than truncating a file, and
-        // asking what precedes the `&` must not run off the front.
-        assert_eq!(redirects("&> log.txt").len(), 0);
+        // A leading `&>` sends both streams to the file, and asking what
+        // precedes the `&` must not run off the front.
+        let targets = redirects("&> log.txt");
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].target, "log.txt");
         assert_eq!(split_segments("&> log.txt"), ["&> log.txt"]);
     }
 

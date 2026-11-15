@@ -554,6 +554,13 @@ mod tests {
             // this at the `|`, so intent classified it None while backup
             // insured it — two engines disagreeing about one command.
             "cmd >| forced.txt",
+            // Both streams into a file is that file's `>`. Until v0.22.0
+            // `&>` and `>&` were read as descriptor plumbing, so `npm run
+            // build &> build.log` was nothing to this classifier while `npm
+            // run build > build.log 2>&1` was an overwrite.
+            "npm run build &> build.log",
+            "npm run build >& build.log",
+            r#"echo x > "sub"/"notes.txt""#,
         ] {
             assert_eq!(
                 classify_command(cmd),
@@ -680,7 +687,7 @@ mod tests {
             "echo entry >> app.log",
             "make 2>&1",
             "cmd >&2",
-            "npm run build &> build.log",
+            "npm run build &> /dev/null",
             "cargo test > /dev/null",
             "cmd 2> /dev/null",
             "make >/dev/null 2>&1",

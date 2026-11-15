@@ -1927,6 +1927,89 @@ fn observe_mode_holds_a_hook_config_changed_through_its_directory() {
     assert_eq!(held["enforced"], true, "{held}");
 }
 
+/// A program that only reads or prints cannot write a hook config through
+/// a redirection, however the redirection is spelled, in either mode.
+/// v0.21.10 took the string rule off such a program and left its redirect
+/// to the path rule, which did not see `&>`, `>&` or `<>` and read
+/// `".claude"/settings.json` as another name: each of these was allowed by
+/// `echo *` or `cat *` and ran in observe mode (found Nov 15, 2026, on the
+/// released 0.21.10; 0.21.9 refused them all). The file a `&>` writes over
+/// is copied first now, as the file behind a `>` always was.
+#[cfg(unix)]
+#[test]
+fn a_program_that_only_reads_cannot_redirect_into_a_hook_config() {
+    use serde_json::json;
+    for mode in ["enforce", "observe"] {
+        let tmp = scratch(&format!("redirect-{mode}"));
+        let home = tmp.join("home");
+        let policy = format!(
+            concat!(
+                "version: 1\nmode: {}\ndefault: ask\nrules:\n",
+                "  - match_path: \"*/.claude/settings*.json\"\n    action: deny\n    floor: true\n",
+                "  - match: \"*.claude*settings*\"\n    action: deny\n    floor: true\n    except_reads: true\n",
+                "  - match: \"echo *\"\n    action: allow\n",
+                "  - match: \"cat *\"\n    action: allow\n",
+            ),
+            mode
+        );
+        let proj = project(&tmp, &policy);
+        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+        std::fs::write(proj.join(".claude").join("settings.json"), "{}\n").unwrap();
+        std::fs::write(proj.join("notes.md"), "kept\n").unwrap();
+        let mk = |cmd: &str| {
+            json!({"session_id":"R","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+                   "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+        };
+        for cmd in [
+            "echo x > \".claude\"/settings.json",
+            "echo x > .claude/\"settings.json\"",
+            "echo x > '.claude'/settings.json",
+            "echo x > .cl\"aude\"/settings.json",
+            "echo x > \"$PWD/.claude\"/settings.json",
+            "echo x >> \".claude\"/settings.json",
+            "echo x &> .claude/settings.json",
+            "echo x &>> .claude/settings.json",
+            "echo x >& .claude/settings.json",
+            "echo x 1<> .claude/settings.json",
+            "echo x > $'.claude/settings.json'",
+            "echo x > ${NOPE:-.claude}/settings.json",
+            "cat notes.md > \".claude\"/settings.json",
+            "cat > \".claude\"/settings.json <<'EOF'\n{}\nEOF",
+            "echo x | cat > \".claude\"/settings.local.json",
+        ] {
+            let out = hook(&home, &proj, &mk(cmd), &[]);
+            assert_eq!(out.code, 2, "{mode}: {cmd}: {}", out.stdout);
+            assert!(
+                out.stdout.contains("\"permissionDecision\":\"deny\""),
+                "{mode}: {cmd}: {}",
+                out.stdout
+            );
+        }
+        // Reading the file, and writing somewhere else, is ordinary work.
+        for cmd in [
+            "cat \".claude\"/settings.json",
+            "cat .claude/settings.json > copy.json",
+            "echo \"see .claude/settings.json\" >> notes.md",
+        ] {
+            let out = hook(&home, &proj, &mk(cmd), &[]);
+            assert_eq!(out.code, 0, "{mode}: {cmd}: {}", out.stdout);
+            assert!(
+                !out.stdout.contains("\"permissionDecision\":\"deny\""),
+                "{mode}: {cmd}: {}",
+                out.stdout
+            );
+        }
+        // And a file written over through `&>` is copied first.
+        let before = backup_count(&home);
+        let out = hook(&home, &proj, &mk("echo x &> notes.md"), &[]);
+        assert_eq!(out.code, 0, "{mode}: {}", out.stdout);
+        assert!(
+            backup_count(&home) > before,
+            "{mode}: the file behind `&>` is copied before it is written over"
+        );
+    }
+}
+
 /// The floor holds a git command that would unhook the gate without naming
 /// its file. In the state `termaxa init` leaves, the hook registration is
 /// an uncommitted change to a tracked `.claude/settings.json`: `git stash`
