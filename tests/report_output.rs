@@ -346,3 +346,115 @@ fn a_home_with_no_log_reports_no_activity() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// One call of a plugin's hook (`termaxa hook --plugin`), with the user's
+/// settings directory pinned to an empty `.claude` beside `home`: the real
+/// one, on a machine whose user wires `termaxa hook`, would stand it down.
+fn plugin_hook(home: &Path, proj: &Path, session: &str, command: &str) {
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "cwd": proj.display().to_string(),
+        "session_id": session,
+        "tool_input": { "command": command }
+    })
+    .to_string();
+    let user = home.with_file_name("user").join(".claude");
+    std::fs::create_dir_all(&user).expect("the user's config dir must be creatable");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_termaxa"))
+        .args(["hook", "--plugin"])
+        .current_dir(proj)
+        .env("TERMAXA_HOME", home)
+        .env("CLAUDE_CONFIG_DIR", &user)
+        .env_remove("CLAUDE_PROJECT_DIR")
+        .env_remove("TERMAXA_MODE")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("the binary must be runnable");
+    let _ = child
+        .stdin
+        .take()
+        .expect("stdin must be piped")
+        .write_all(payload.as_bytes());
+    child.wait().expect("the hook must exit");
+}
+
+/// A project a plugin's hook watched has a record and no policy, and the
+/// commands that read a record read that one from inside the project: the
+/// report with its `Watched` line and no asks to count (nobody was asked),
+/// the log with each unenforced verdict marked as one, `paths`, `stats` and
+/// `backups`. A directory nobody watched still has nothing to read.
+#[test]
+fn a_watched_project_is_read_without_a_policy() {
+    let tmp = scratch("watched");
+    let home = tmp.join("home");
+    let proj = tmp.join("watched");
+    std::fs::create_dir_all(proj.join(".git")).expect("checkout must be creatable");
+    std::fs::create_dir_all(proj.join("sc")).expect("dir must be creatable");
+    std::fs::write(proj.join("sc").join("a.txt"), "kept\n").expect("file must be writable");
+
+    assert_eq!(
+        termaxa(&home, &proj, &["report"]),
+        "",
+        "no policy and no record: the error it always was, and nothing on stdout"
+    );
+
+    for command in [
+        "ls -la",
+        "python rebuild.py",
+        "rm -rf ./sc",
+        "kubectl delete ns prod",
+    ] {
+        plugin_hook(&home, &proj, "W", command);
+    }
+
+    let out = termaxa(&home, &proj, &["report", "--all"]);
+    assert!(out.contains("Watched             4"), "{out}");
+    assert!(
+        out.contains("enforcement would have asked 1 and denied 1"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("\nAsks "),
+        "an ask nobody was asked is not counted with the asks: {out}"
+    );
+    let md = termaxa(&home, &proj, &["report", "--all", "--md"]);
+    assert!(
+        md.contains("- **Watched:** 4 judged by the built-in starter"),
+        "{md}"
+    );
+    assert!(!md.contains("- **Asks:**"), "{md}");
+
+    let log = termaxa(&home, &proj, &["log"]);
+    assert_eq!(log.lines().count(), 4, "{log}");
+    assert_eq!(
+        log.matches("→ watched, not enforced").count(),
+        2,
+        "the ask and the deny that ran, and not the allow or the floor: {log}"
+    );
+    let paths = termaxa(&home, &proj, &["paths"]);
+    assert!(
+        paths.starts_with("policy : none (watched by the plugin's hook"),
+        "{paths}"
+    );
+    let stats = termaxa(&home, &proj, &["stats"]);
+    assert!(stats.contains("entries    : 4"), "{stats}");
+    let backups = termaxa(&home, &proj.join("sc"), &["backups"]);
+    assert!(
+        backups.contains("insures: rm -rf ./sc"),
+        "from a directory below the root as well: {backups}"
+    );
+
+    let elsewhere = tmp.join("elsewhere");
+    std::fs::create_dir_all(elsewhere.join(".git")).expect("checkout must be creatable");
+    assert_eq!(termaxa(&home, &elsewhere, &["report"]), "");
+    assert!(
+        !proj.join(".termaxa").exists(),
+        "reading a watched record writes nothing into the project"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

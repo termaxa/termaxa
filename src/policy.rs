@@ -305,6 +305,11 @@ pub struct Policy {
     /// all of them at once. Defaults: keep 50, days 30.
     #[serde(default, skip_serializing_if = "Retention::is_default")]
     pub retention: Retention,
+    /// True for the policy a plugin's hook judges by where the project has
+    /// none (`Policy::watching`, decision #147). Never read from a file: a
+    /// policy somebody wrote is that project's policy, in the mode it says.
+    #[serde(skip)]
+    pub watch: bool,
 }
 
 /// See `Policy::retention`.
@@ -385,6 +390,8 @@ pub enum ModeSource {
     Default,
     PolicyFile,
     Environment,
+    /// No policy in the project: a plugin's hook is watching it.
+    NoPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -674,6 +681,32 @@ impl Policy {
         Ok(policy)
     }
 
+    /// The policy a project with none is WATCHED by (decision #147, Nov 13,
+    /// 2026): the built-in starter, in observe mode whatever `TERMAXA_MODE`
+    /// says. A hook a plugin registered runs in every project, and with no
+    /// policy the hook's own answer is a refusal of every command (decision
+    /// #19: never an invisible policy). Watching is what #19 leaves room
+    /// for: nothing is asked and nothing is allowed, the record and the
+    /// copies are kept, and the one thing answered is the floor, said once
+    /// at the start of a session.
+    pub fn watching() -> Result<Self> {
+        let mut policy = Self::builtin()?;
+        policy.mode = Mode::Observe;
+        policy.watch = true;
+        Ok(policy)
+    }
+
+    /// The mode a record line names: `watch` for a project judged by
+    /// `Policy::watching`, so that `init` can tell what it watched from
+    /// what a policy of the project's own observed.
+    pub fn mode_label(&self, mode: Mode) -> &'static str {
+        if self.watch {
+            "watch"
+        } else {
+            mode.as_str()
+        }
+    }
+
     /// Walk up from `start` looking for `.termaxa/policy.yaml`.
     pub fn find_policy_file(start: &Path) -> Option<PathBuf> {
         let mut dir = Some(start.to_path_buf());
@@ -696,6 +729,12 @@ impl Policy {
     /// stand on: a policy with no `floor: true` rule (one written before
     /// v0.20, say) is enforced regardless, and `doctor` says why.
     pub fn effective_mode(&self) -> (Mode, ModeSource) {
+        // A watched project has no mode to choose: `TERMAXA_MODE=enforce`
+        // on the machine must not turn the starter nobody chose into the
+        // policy that asks and refuses.
+        if self.watch {
+            return (Mode::Observe, ModeSource::NoPolicy);
+        }
         let (mode, src) = match std::env::var("TERMAXA_MODE")
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
@@ -4934,5 +4973,48 @@ mod git_undo_tests {
             assert_eq!(d.action, Action::Ask, "{line}: {}", d.reason);
             assert_eq!(d.matched_rule, None, "{line}: {}", d.reason);
         }
+    }
+}
+
+#[cfg(test)]
+mod watching_tests {
+    use super::*;
+
+    /// The policy a watched project is judged by (decision #147): the
+    /// built-in starter with its floor, in observe mode, and not a mode the
+    /// machine can change. The early return is the point: `effective_mode`
+    /// does not consult `TERMAXA_MODE` for it at all.
+    #[test]
+    fn the_watching_policy_is_the_starter_observed_and_nothing_else() {
+        let watching = Policy::watching().expect("the starter parses");
+        let starter = Policy::builtin().unwrap();
+        assert!(watching.watch && !starter.watch);
+        assert_eq!(watching.rules.len(), starter.rules.len());
+        assert_eq!(watching.floor_rules(), starter.floor_rules());
+        assert!(
+            watching.floor_rules() > 0,
+            "watching without a floor would be enforcing"
+        );
+        assert!(matches!(
+            watching.effective_mode(),
+            (Mode::Observe, ModeSource::NoPolicy)
+        ));
+        assert_eq!(watching.mode_label(Mode::Observe), "watch");
+        assert_eq!(starter.mode_label(Mode::Observe), "observe");
+        assert_eq!(starter.mode_label(Mode::Enforce), "enforce");
+    }
+
+    /// `watch` is never read from a file: a policy somebody wrote is that
+    /// project's policy, whatever key it carries.
+    #[test]
+    fn a_policy_file_cannot_declare_itself_watched() {
+        let t = crate::testutil::TempTree::new("policy-watch-key");
+        let path = t.file(
+            "policy.yaml",
+            "version: 1\ndefault: ask\nwatch: true\nrules: []\n",
+        );
+        let policy = Policy::load(&path).expect("an unknown key is not an error");
+        assert!(!policy.watch);
+        assert_eq!(policy.mode_label(Mode::Observe), "observe");
     }
 }

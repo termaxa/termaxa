@@ -386,6 +386,7 @@ mod tests {
         crate::paths::Paths {
             project_dir,
             state_dir: tmp.dir("state"),
+            watched: false,
         }
     }
 

@@ -140,9 +140,7 @@ fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
 /// hook finds its policy. `None` outside any project, and then no directory
 /// is reproducible, so the budget refuses as it always has.
 fn project_root_of(cwd: &Path) -> Option<PathBuf> {
-    crate::paths::resolve_readonly(cwd)
-        .ok()
-        .and_then(|p| p.project_dir.parent().map(Path::to_path_buf))
+    crate::paths::project_root(cwd)
 }
 
 /// A delete operand the copy leaves out: a directory a build rebuilds, past

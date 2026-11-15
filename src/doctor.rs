@@ -60,6 +60,7 @@ pub fn run(dir: &Path) -> Result<i32> {
                         crate::policy::ModeSource::Default => "default",
                         crate::policy::ModeSource::PolicyFile => "policy.yaml",
                         crate::policy::ModeSource::Environment => "TERMAXA_MODE",
+                        crate::policy::ModeSource::NoPolicy => "no policy",
                     };
                     if mode == crate::policy::Mode::Observe {
                         println!(
@@ -100,6 +101,19 @@ pub fn run(dir: &Path) -> Result<i32> {
                 cyan("run"),
                 cyan("hook")
             );
+            // A plugin's hook is the exception (`termaxa hook --plugin`): it
+            // watches a project like this one, and its record says it has.
+            if let Some(watched) = paths::watched_record(dir) {
+                println!(
+                    "  {} watched: a plugin's hook keeps a record of this project by the built-in starter, and refuses only its floor",
+                    amber("◉")
+                );
+                println!("    {}", dim(&watched.log_file().display().to_string()));
+                println!(
+                    "    {} shows what a policy would have asked or refused.",
+                    cyan("termaxa report --all")
+                );
+            }
             problems.push("run `termaxa init` to create a policy".into());
         }
     }

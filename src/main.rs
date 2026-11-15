@@ -97,7 +97,14 @@ enum Cmd {
         command: Vec<String>,
     },
     /// Claude Code PreToolUse hook mode (reads hook JSON on stdin)
-    Hook,
+    Hook {
+        /// For a hook a plugin registers for every project: watch a project
+        /// that has no policy (the built-in starter, nothing asked, only the
+        /// floor refused), and leave a project that registers its own hook
+        /// to that hook
+        #[arg(long)]
+        plugin: bool,
+    },
     /// Execute a command through the policy gate: termaxa run -- git push
     Run {
         #[arg(last = true)]
@@ -218,6 +225,23 @@ fn release(
     state.trips = kept;
     breaker::save(&paths.state_dir, &state)?;
     Ok(())
+}
+
+/// What became of a record line, after its reason in `termaxa log`: the
+/// answer and exit code `run` recorded, and for a verdict that was recorded
+/// and not enforced (observe mode, or a project a plugin's hook watches)
+/// that it was not, since the mark beside it is the verdict's.
+fn log_outcome(e: &audit::AuditEntry) -> String {
+    match (e.approved, e.exit_code) {
+        (Some(true), Some(code)) => format!("  → approved, exit {}", code),
+        (Some(false), _) => "  → not run".to_string(),
+        (None, Some(code)) => format!("  → exit {}", code),
+        _ if e.enforced == Some(false) && e.mode.as_deref() == Some("watch") => {
+            "  → watched, not enforced".to_string()
+        }
+        _ if e.enforced == Some(false) => "  → observed, not enforced".to_string(),
+        _ => String::new(),
+    }
 }
 
 fn main() {
@@ -421,8 +445,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 policy::Action::Deny => 4,
             })
         }
-        Cmd::Hook => {
-            hook::run()?;
+        Cmd::Hook { plugin } => {
+            hook::run(plugin)?;
             Ok(0)
         }
         Cmd::Run { argv } => {
@@ -451,7 +475,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             source,
             json,
         } => {
-            let p = paths::resolve()?;
+            let p = paths::resolve_record()?;
             let log = audit::AuditLog::new(&p.state_dir)?;
             // A reader of the record says when the record does not verify,
             // as `doctor` does; until Oct 9, 2026 only `doctor` did, and
@@ -469,12 +493,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     return;
                 }
                 let mark = ui::mark(&e.decision, &e.source);
-                let outcome = match (e.approved, e.exit_code) {
-                    (Some(true), Some(code)) => format!("  → approved, exit {}", code),
-                    (Some(false), _) => "  → not run".to_string(),
-                    (None, Some(code)) => format!("  → exit {}", code),
-                    _ => String::new(),
-                };
+                let outcome = log_outcome(e);
                 let sess = e
                     .session
                     .as_deref()
@@ -549,12 +568,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 // success, not a denial (the v0.12 fix), and the colour comes
                 // from one place so every surface agrees.
                 let mark = ui::mark(&e.decision, &e.source);
-                let outcome = match (e.approved, e.exit_code) {
-                    (Some(true), Some(code)) => format!("  → approved, exit {}", code),
-                    (Some(false), _) => "  → not run".to_string(),
-                    (None, Some(code)) => format!("  → exit {}", code),
-                    _ => String::new(),
-                };
+                let outcome = log_outcome(&e);
                 let sess = e
                     .session
                     .as_deref()
@@ -589,7 +603,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Stats => {
-            let p = paths::resolve()?;
+            let p = paths::resolve_record()?;
             let log = audit::AuditLog::new(&p.state_dir)?;
             let entries = log.read_last(1_000_000)?;
             if entries.is_empty() {
@@ -715,9 +729,15 @@ Resume with: termaxa breaker resume --reason \"…\""
             Ok(0)
         }
         Cmd::Backups { prune } => {
-            let p = paths::resolve()?;
+            let p = paths::resolve_record()?;
             if prune {
-                let policy = Policy::load(&p.policy_file())?;
+                // A watched project keeps the starter's retention: there is
+                // no policy file to read another from.
+                let policy = if p.watched {
+                    Policy::watching()?
+                } else {
+                    Policy::load(&p.policy_file())?
+                };
                 let done = backup::prune(&p.state_dir, policy.retention, None)?;
                 if done.removed.is_empty() {
                     println!(
@@ -771,12 +791,19 @@ Resume with: termaxa breaker resume --reason \"…\""
             days,
             md,
         } => {
-            let p = paths::resolve()?;
+            let p = paths::resolve_record()?;
             report::run(&p, report::Scope { session, all, days }, md)
         }
         Cmd::Paths => {
-            let p = paths::resolve()?;
-            println!("policy : {}", p.policy_file().display());
+            let p = paths::resolve_record()?;
+            if p.watched {
+                println!(
+                    "policy : none (watched by the plugin's hook; `termaxa init` writes {})",
+                    p.policy_file().display()
+                );
+            } else {
+                println!("policy : {}", p.policy_file().display());
+            }
             println!("state  : {}", p.state_dir.display());
             println!(
                 "logs   : {}",
@@ -786,7 +813,7 @@ Resume with: termaxa breaker resume --reason \"…\""
             Ok(0)
         }
         Cmd::Rollback { id } => {
-            let p = paths::resolve()?;
+            let p = paths::resolve_record()?;
             let records = backup::list(&p.state_dir)?;
             let Some(rec) = records.iter().find(|r| r.id == id) else {
                 bail!("no backup with id `{}` — see `termaxa backups`", id);
