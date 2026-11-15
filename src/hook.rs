@@ -545,10 +545,10 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
     // like the shell path's, because it is the shell path's path-rule
     // tournament on the same resolved targets.
     let start_dir = start_dir_of(&w.cwd);
-    let Ok(paths) = crate::paths::resolve_from(&start_dir) else {
+    let Ok(paths) = locate(&start_dir) else {
         return silent;
     };
-    let Ok(policy) = Policy::load(&paths.policy_file()) else {
+    let Ok(policy) = policy_for(&paths) else {
         return silent;
     };
     let ctx = crate::resolve::EvalContext::from_paths(&start_dir, &paths);
@@ -627,10 +627,13 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
                 .map(|m| format!("{} B on disk", m.len())),
         }
     });
-    let reason_shown = match &cost {
+    let mut reason_shown = match &cost {
         Some(c) => format!("[termaxa] {} · {}", decision.reason, c),
         None => format!("[termaxa] {}", decision.reason),
     };
+    if policy.watch && decision.action == Action::Deny {
+        reason_shown.push_str(WATCH_SUFFIX);
+    }
 
     // OBSERVE MODE, for a native write as for a shell command (v0.21.10).
     // Until then this path had no mode at all: a path rule's deny on
@@ -659,7 +662,7 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
         && matches!(decision.action, Action::Ask | Action::Deny)
         && !floor_holds;
     let fields = |enforced: bool, copied: bool| ModeFields {
-        mode: Some(mode.as_str().to_string()),
+        mode: Some(policy.mode_label(mode).to_string()),
         enforced: Some(enforced),
         floor: Some(floor_holds),
         coverage: match decision.action {
@@ -745,7 +748,7 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
                 None,
                 None,
                 ModeFields {
-                    mode: Some(mode.as_str().to_string()),
+                    mode: Some(policy.mode_label(mode).to_string()),
                     enforced: Some(true),
                     floor: Some(false),
                     coverage: Some("known-uninsured".to_string()),
@@ -881,23 +884,26 @@ fn append_write_entry(
 /// the policy path and does not depend on it.
 fn protected_write(w: &FileWrite, path: &str, protected: crate::protect::Protected) -> Outcome {
     let subject = format!("{} {}", w.tool, path);
-    let reason = format!("[termaxa] {}", protected.reason);
+    let mut reason = format!("[termaxa] {}", protected.reason);
 
     // Audit best-effort, and never at the cost of the block: if the state dir
     // cannot be resolved there is nowhere to write the record, and a deny that
     // went unrecorded is still a deny.
     let start_dir = start_dir_of(&w.cwd);
-    if let Ok(paths) = crate::paths::resolve_from(&start_dir) {
+    if let Ok(paths) = locate(&start_dir) {
         // The mode, when there is a policy to read it from: this refusal
         // does not depend on one, and is the floor in either mode.
-        let policy = Policy::load(&paths.policy_file()).ok();
+        let policy = policy_for(&paths).ok();
+        if policy.as_ref().is_some_and(|p| p.watch) {
+            reason.push_str(WATCH_SUFFIX);
+        }
         if let Ok(log) = AuditLog::new(&paths.state_dir) {
             let (ts_ms, ts) = now();
             let _ = log.append(&AuditEntry {
                 call_id: None,
                 mode: policy
                     .as_ref()
-                    .map(|p| p.effective_mode().0.as_str().to_string()),
+                    .map(|p| p.mode_label(p.effective_mode().0).to_string()),
                 enforced: Some(true),
                 floor: Some(true),
                 coverage: Some("floor".to_string()),
@@ -1069,12 +1075,257 @@ pub struct Outcome {
     pub audit_seq: Option<u64>,
 }
 
-pub fn run() -> Result<()> {
+/// What a watched session is told, once, when it starts (#147: one line).
+const WATCH_NOTICE: &str = "Termaxa is watching this project, which has no policy: it asks \
+     nothing, approves nothing, and refuses only the built-in starter's floor. `termaxa report` \
+     shows what a policy would have asked or refused; `termaxa init` writes one.";
+
+/// What a refusal says after its reason in a watched project: whose rule
+/// this was, since nobody here wrote it.
+const WATCH_SUFFIX: &str = " Termaxa is watching this project by its built-in starter: there is \
+     no .termaxa/policy.yaml here, and `termaxa init` writes one.";
+
+/// Where this call's project keeps its policy and its record. For a
+/// plugin's hook a project with no policy is a watched one; for any other
+/// hook it is the error it always was (decision #19).
+pub(crate) fn locate(start_dir: &std::path::Path) -> Result<crate::paths::Paths> {
+    match crate::paths::resolve_from(start_dir) {
+        Ok(paths) => Ok(paths),
+        Err(_) if crate::paths::plugin_hook() => crate::paths::resolve_watched(start_dir),
+        Err(no_policy) => Err(no_policy),
+    }
+}
+
+/// The policy that judges a located project: its own, or the watching one.
+fn policy_for(paths: &crate::paths::Paths) -> Result<Policy> {
+    if paths.watched {
+        Policy::watching()
+    } else {
+        Policy::load(&paths.policy_file())
+    }
+}
+
+/// The directory a payload says it is about, before any dialect is read:
+/// `cwd`, or the first workspace root, or where this process was started.
+fn payload_dir(json: &serde_json::Value) -> std::path::PathBuf {
+    json.get("cwd")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty() && std::path::Path::new(c).is_dir())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            json.get("workspace_roots")
+                .and_then(|r| r.get(0))
+                .and_then(|r| r.as_str())
+                .filter(|r| std::path::Path::new(r).is_dir())
+                .map(std::path::PathBuf::from)
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
+/// Does a hook of the project's or the user's own already gate this
+/// session with `termaxa hook`? Claude Code runs a plugin's handler and a
+/// settings file's identical one as two (its hooks reference: only copies
+/// in settings files are merged into one), so without this a wired project
+/// would have every command judged, recorded and copied twice.
+///
+/// The files are the ones Claude Code reads: the project's
+/// `.claude/settings.json` and `settings.local.json`, in the directory it
+/// exports as `CLAUDE_PROJECT_DIR` (without it, every directory from the
+/// call's up to the project's root), and the user's `settings.json` under
+/// `CLAUDE_CONFIG_DIR` or `~/.claude`. A registration counts where it
+/// gates, under `PreToolUse`: that is what `init` writes and what a
+/// hand-wired gate needs, and a file that names the hook anywhere else does
+/// not make this one stand down.
+///
+/// The hook stands down only on the word of a file `protect::classify`
+/// names: a `settings*.json` in a `.claude` directory, refused to a file
+/// tool in every mode and on the starter's floor for a command, so a
+/// session cannot write itself the registration that would stand this hook
+/// down. A user directory that `CLAUDE_CONFIG_DIR` puts under another name
+/// is not read: both hooks run there, which costs a second record and takes
+/// nothing away.
+///
+/// The files are read at each call, and a registration counts once it has
+/// settled (`REGISTRATION_SETTLES`).
+fn registers_own_hook(start_dir: &std::path::Path) -> bool {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    match std::env::var("CLAUDE_PROJECT_DIR") {
+        Ok(p) if !p.trim().is_empty() && std::path::Path::new(&p).is_dir() => {
+            dirs.push(std::path::PathBuf::from(p).join(".claude"));
+        }
+        _ => {
+            let root = crate::paths::project_root(start_dir)
+                .unwrap_or_else(|| crate::paths::watch_root(start_dir));
+            for dir in start_dir.ancestors() {
+                dirs.push(dir.join(".claude"));
+                if dir == root {
+                    break;
+                }
+            }
+        }
+    }
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in dirs {
+        files.push(dir.join("settings.json"));
+        files.push(dir.join("settings.local.json"));
+    }
+    let user = match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(d) if !d.trim().is_empty() => Some(std::path::PathBuf::from(d)),
+        _ => std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .ok()
+            .map(|h| std::path::PathBuf::from(h).join(".claude")),
+    };
+    if let Some(user) = user {
+        files.push(user.join("settings.json"));
+    }
+    files.retain(|f| crate::protect::classify("", &f.to_string_lossy()).is_some());
+    files.iter().any(|f| {
+        std::fs::read_to_string(f)
+            .ok()
+            .and_then(|t| {
+                serde_json::from_str::<serde_json::Value>(t.trim_start_matches('\u{feff}')).ok()
+            })
+            .and_then(|v| v.get("hooks").and_then(|h| h.get("PreToolUse")).cloned())
+            .is_some_and(|pre| names_termaxa_hook(&pre))
+            && settled(f)
+    })
+}
+
+/// How long a registration has to have been in its file before a plugin's
+/// hook leaves the project to it.
+///
+/// Claude Code's file watcher picks a hook up from a settings file edited
+/// while a session runs. Its hooks guide says that is the normal case, and
+/// that a change which has not shown up within seconds was missed and needs
+/// a restart. So a registration written a moment ago, by `termaxa init` in
+/// another terminal say, is not yet a hook that runs. Standing down for it
+/// at once would leave the calls in between to nobody, in the minute a
+/// project is being given its gate. Until the file has been still this long
+/// both hooks judge, which costs a second record line for those calls and
+/// takes nothing away.
+const REGISTRATION_SETTLES: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn settled(file: &std::path::Path) -> bool {
+    let Ok(modified) = std::fs::metadata(file).and_then(|m| m.modified()) else {
+        return true;
+    };
+    match std::time::SystemTime::now().duration_since(modified) {
+        Ok(age) => age >= REGISTRATION_SETTLES,
+        // A time in the future is a clock that moved, not a file just
+        // written, and it would never settle.
+        Err(_) => true,
+    }
+}
+
+/// Is there a hook handler under `v` that runs `termaxa hook` and is not a
+/// plugin's (`--plugin`)? Read from the handler's `command`, and its `args`
+/// in the exec form: a word whose file name is `termaxa`, and `hook` as the
+/// word after it. So a bare name, an absolute path (quoted or not) and a
+/// launcher in front (`env X=1 termaxa hook`) all read as the hook, and a
+/// wrapper script that calls it from inside does not: both hooks run for
+/// that one, which costs a second record and takes nothing away.
+fn names_termaxa_hook(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Array(items) => items.iter().any(names_termaxa_hook),
+        serde_json::Value::Object(map) => {
+            if let Some(command) = map.get("command").and_then(|c| c.as_str()) {
+                let mut words: Vec<String> = command
+                    .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if let Some(args) = map.get("args").and_then(|a| a.as_array()) {
+                    words.extend(args.iter().filter_map(|a| a.as_str()).map(str::to_string));
+                }
+                let is_termaxa = |w: &String| {
+                    let name = w.rsplit(['/', '\\']).next().unwrap_or(w);
+                    name.eq_ignore_ascii_case("termaxa") || name.eq_ignore_ascii_case("termaxa.exe")
+                };
+                let own = words.windows(2).enumerate().any(|(at, pair)| {
+                    is_termaxa(&pair[0])
+                        && pair[1] == "hook"
+                        && words.get(at + 2).map(String::as_str) != Some("--plugin")
+                });
+                if own {
+                    return true;
+                }
+            }
+            map.values().any(names_termaxa_hook)
+        }
+        _ => false,
+    }
+}
+
+/// What a plugin's hook answers before anything is judged or recorded, if
+/// it answers there at all (`--plugin`):
+///
+///   * nothing, where the project or the user registers a hook of their own:
+///     that hook answers, records and copies, and this one leaves no trace,
+///     not even the witness;
+///   * the start of a session: nothing in a project that has a policy, and
+///     in one that has none the one line that says it is being watched, as
+///     a `systemMessage`. Claude Code's hooks reference describes that
+///     field as a warning shown to the user, and names it for a
+///     `SessionStart` hook with something to report; what the model is
+///     given at a session's start is `additionalContext` and plain output,
+///     and the hook prints neither, so the session's own course is what it
+///     was.
+///
+/// `None` for every other call, which is judged as any hook's is.
+pub(crate) fn plugin_answer(raw_payload: &str) -> Option<Outcome> {
+    if !crate::paths::plugin_hook() {
+        return None;
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(raw_payload.trim_start_matches('\u{feff}')).ok()?;
+    let dir = payload_dir(&json);
+    let nothing = Outcome {
+        rendered: None,
+        exit_code: 0,
+        audit_seq: None,
+    };
+    if registers_own_hook(&dir) {
+        return Some(nothing);
+    }
+    let event = json
+        .get("hook_event_name")
+        .and_then(|e| e.as_str())
+        .unwrap_or_default();
+    if !event.eq_ignore_ascii_case("SessionStart") {
+        return None;
+    }
+    // `clear` and `compact` restart a session the person is already in: it
+    // was said when that one started. And under a supervisor the hook has no
+    // authority of its own: it forwards, and the supervisor refuses a
+    // project that has no policy, so nothing here is being watched.
+    let source = json.get("source").and_then(|s| s.as_str()).unwrap_or("");
+    if matches!(source, "clear" | "compact")
+        || crate::paths::resolve_readonly(&dir).is_ok()
+        || crate::supervise::detect() == crate::supervise::Mode::Supervised
+    {
+        return Some(nothing);
+    }
+    Some(Outcome {
+        rendered: Some(json!({ "systemMessage": WATCH_NOTICE }).to_string()),
+        exit_code: 0,
+        audit_seq: None,
+    })
+}
+
+pub fn run(plugin: bool) -> Result<()> {
+    crate::paths::set_plugin_hook(plugin);
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
-    // The witness goes down before anything that can fail: see witness.rs.
-    crate::witness::leave(&buf);
-    let outcome = decide(&buf)?;
+    let outcome = match plugin_answer(&buf) {
+        Some(answer) => answer,
+        None => {
+            // The witness goes down before anything that can fail: see
+            // witness.rs.
+            crate::witness::leave(&buf);
+            decide(&buf)?
+        }
+    };
     if let Some(r) = &outcome.rendered {
         println!("{r}");
     }
@@ -1290,7 +1541,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         } else {
             std::env::current_dir().unwrap_or_default()
         };
-        if let Ok(paths) = crate::paths::resolve_from(&start_dir) {
+        if let Ok(paths) = locate(&start_dir) {
             if let Ok(log) = AuditLog::new(&paths.state_dir) {
                 let (ts_ms, ts) = now();
                 let _ = log.append(&AuditEntry {
@@ -1345,7 +1596,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     } else {
         std::env::current_dir().unwrap_or_default()
     };
-    let paths = crate::paths::resolve_from(&start_dir)?;
+    let paths = locate(&start_dir)?;
 
     // One-line resolution trace (reviewer request): set TERMAXA_HOOK_DEBUG to a
     // file path and this records exactly what got resolved, so future debugging
@@ -1420,7 +1671,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         }
     }
 
-    let policy = Policy::load(&paths.policy_file())?;
+    let policy = policy_for(&paths)?;
 
     // The payload's cwd is where the command runs; the project root comes
     // from the located policy. Never the process cwd - a hook runs wherever
@@ -1448,7 +1699,12 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
             crate::intent::classify_command(&command),
             Some(crate::intent::Intent::FileOverwrite)
         );
-    if decision.action == Action::Ask && !ungated_overwrite {
+    //
+    // Not while a project is watched. The breaker escalates asks, and there
+    // nothing is asked; and a trip is state that outlives the session, so
+    // one tripped by a week of watching would refuse the first ask of the
+    // policy `init` writes afterwards, in the same state directory.
+    if decision.action == Action::Ask && !ungated_overwrite && !policy.watch {
         let log_path = paths.state_dir.join("logs").join("audit.jsonl");
         let cwd_s = input.cwd.clone();
         let now_ms = crate::audit::now().0;
@@ -1655,7 +1911,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
             let (ts_ms, ts) = now();
             let _ = log.append(&AuditEntry {
                 call_id: input.call_id.clone(),
-                mode: Some(mode.as_str().to_string()),
+                mode: Some(policy.mode_label(mode).to_string()),
                 enforced: Some(observed.is_none()),
                 floor: Some(floor_holds),
                 coverage: if matches!(decision.action, Action::Ask | Action::Deny) {
@@ -1774,6 +2030,11 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     }
     if let Some(id) = &backup_id {
         reason.push_str(&format!(" | backup {}", id));
+    }
+    // Whose rule this was, in a project where nobody wrote one. Only in what
+    // is shown: the record has the mode.
+    if policy.watch && decision.action == Action::Deny {
+        reason.push_str(WATCH_SUFFIX);
     }
 
     // A probe must not page anyone: with `notify.on: [deny]` configured,
@@ -2629,5 +2890,429 @@ mod tests {
             crate::protect::classify(&w.cwd, &w.path).map(|p| p.what),
             Some("termaxa-state")
         );
+    }
+
+    // -----------------------------------------------------------------
+    // A plugin's hook (`termaxa hook --plugin`, decision #147)
+    // -----------------------------------------------------------------
+
+    fn bash_payload(dir: &std::path::Path, session: &str, command: &str) -> String {
+        json!({
+            "session_id": session,
+            "cwd": dir.display().to_string(),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command }
+        })
+        .to_string()
+    }
+
+    /// A checkout with no policy: a directory that holds a `.git`.
+    fn checkout(env: &crate::testutil::TestEnv, name: &str) -> std::path::PathBuf {
+        let dir = env.root().join(name);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        dir
+    }
+
+    /// Make a settings file one that has been there a while: a
+    /// registration counts once it has settled (`REGISTRATION_SETTLES`).
+    fn settle(file: &std::path::Path) {
+        std::fs::File::options()
+            .write(true)
+            .open(file)
+            .expect("the settings file")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("a file's time can be set");
+    }
+
+    /// What was recorded while `dir` was watched, oldest first.
+    fn watched_lines(dir: &std::path::Path) -> Vec<AuditEntry> {
+        let paths = crate::paths::watched_record(dir).expect("a watched project keeps a record");
+        assert!(paths.watched);
+        AuditLog::new(&paths.state_dir)
+            .unwrap()
+            .read_last(100)
+            .unwrap_or_default()
+    }
+
+    /// Decision #147. Any other hook refuses every command of a project
+    /// that has no policy (decision #19), and that stands. A plugin's hook
+    /// runs in every project on the machine, so there it watches: the
+    /// built-in starter judges, the record and the copy are kept, nothing
+    /// is said for an allow, an ask or a deny, and the floor is refused
+    /// with a sentence that says whose rule it was.
+    #[test]
+    fn a_plugins_hook_watches_a_project_that_has_no_policy() {
+        let mut env = crate::testutil::TestEnv::new("hook-watch");
+        let proj = checkout(&env, "proj");
+        std::fs::create_dir_all(proj.join("sc")).unwrap();
+        std::fs::write(proj.join("sc").join("a.txt"), "kept\n").unwrap();
+
+        assert!(
+            decide(&bash_payload(&proj, "w", "ls -la")).is_err(),
+            "without the flag, no policy is the refusal it always was"
+        );
+        assert!(
+            crate::paths::watched_record(&proj).is_none(),
+            "and that hook keeps nothing"
+        );
+
+        env.plugin_hook();
+        // An allow, an ask and a deny the floor does not hold: silence.
+        for cmd in ["ls -la", "python rebuild.py", "rm -rf ./sc"] {
+            let out = decide(&bash_payload(&proj, "w", cmd)).expect("a watched project is judged");
+            assert_eq!((out.rendered.as_deref(), out.exit_code), (None, 0), "{cmd}");
+        }
+        // The floor.
+        let out = decide(&bash_payload(&proj, "w", "kubectl delete ns prod")).unwrap();
+        assert_eq!(out.exit_code, 2);
+        let said = out.rendered.expect("the floor answers");
+        assert!(said.contains("\"permissionDecision\":\"deny\""), "{said}");
+        assert!(said.contains("kubectl delete is blocked"), "{said}");
+        assert!(said.contains("watching this project"), "{said}");
+        assert!(said.contains("termaxa init"), "{said}");
+
+        let lines = watched_lines(&proj);
+        let line = |cmd: &str| {
+            lines
+                .iter()
+                .find(|e| e.command == cmd)
+                .unwrap_or_else(|| panic!("no record line for {cmd}"))
+        };
+        let listed = line("ls -la");
+        assert_eq!(listed.decision, "allow");
+        assert_eq!(listed.mode.as_deref(), Some("watch"));
+        assert_eq!(listed.enforced, Some(true), "an allow overrode nothing");
+        let script = line("python rebuild.py");
+        assert_eq!(script.decision, "ask");
+        assert_eq!(script.mode.as_deref(), Some("watch"));
+        assert_eq!(script.enforced, Some(false), "nothing is asked");
+        let removed = line("rm -rf ./sc");
+        assert_eq!(removed.decision, "deny");
+        assert_eq!(removed.enforced, Some(false));
+        assert_eq!(removed.floor, Some(false));
+        assert_eq!(removed.coverage.as_deref(), Some("insured"));
+        assert!(removed.backup.is_some(), "the copy is taken first");
+        let held = line("kubectl delete ns prod");
+        assert_eq!(held.mode.as_deref(), Some("watch"));
+        assert_eq!(held.enforced, Some(true));
+        assert_eq!(held.floor, Some(true));
+        assert!(
+            !held.reason.contains("watching"),
+            "the record keeps the rule's own reason: {}",
+            held.reason
+        );
+        // The state is where `init` will look for it: a policy written at
+        // the checkout's root continues this record.
+        std::fs::create_dir_all(proj.join(".termaxa")).unwrap();
+        std::fs::write(
+            proj.join(".termaxa").join("policy.yaml"),
+            "version: 1\ndefault: ask\nrules: []\n",
+        )
+        .unwrap();
+        let owned = crate::paths::resolve_from(&proj.join("sc")).unwrap();
+        assert!(!owned.watched);
+        assert_eq!(
+            AuditLog::new(&owned.state_dir)
+                .unwrap()
+                .read_last(100)
+                .unwrap()
+                .len(),
+            lines.len(),
+            "the project's own policy continues the watched record"
+        );
+    }
+
+    /// The same for the tools that write files with no shell: a path rule's
+    /// deny is observed and the file copied aside, the gate's own files are
+    /// refused as everywhere, and a write nothing names is no line at all.
+    #[test]
+    fn a_watched_project_has_its_native_writes_observed_and_its_settings_held() {
+        let mut env = crate::testutil::TestEnv::new("hook-watch-write");
+        env.plugin_hook();
+        let proj = checkout(&env, "proj");
+        std::fs::write(proj.join(".env"), "SECRET=1\n").unwrap();
+        let write = |path: std::path::PathBuf| {
+            let raw = json!({
+                "cwd": proj.display().to_string(),
+                "hook_event_name": "PreToolUse",
+                "session_id": "w-native",
+                "tool_name": "Write",
+                "tool_input": { "file_path": path.display().to_string(), "content": "x" }
+            })
+            .to_string();
+            gate_file_write(&parse_file_write(&raw).expect("a write"))
+        };
+
+        let out = write(proj.join(".env"));
+        assert_eq!((out.rendered.as_deref(), out.exit_code), (None, 0));
+        let out = write(proj.join("src").join("main.rs"));
+        assert_eq!((out.rendered.as_deref(), out.exit_code), (None, 0));
+        for guarded in [
+            proj.join(".claude").join("settings.json"),
+            proj.join(".claude").join("settings.local.json"),
+            proj.join(".termaxa").join("policy.yaml"),
+        ] {
+            let out = write(guarded.clone());
+            assert_eq!(out.exit_code, 2, "{}", guarded.display());
+            let said = out.rendered.expect("a refusal is said");
+            assert!(said.contains("\"permissionDecision\":\"deny\""), "{said}");
+            assert!(said.contains("watching this project"), "{said}");
+        }
+
+        let lines = watched_lines(&proj);
+        assert_eq!(lines.len(), 4, "the ordinary write left no line");
+        let env_line = &lines[0];
+        assert!(env_line.command.ends_with(".env"), "{}", env_line.command);
+        assert_eq!(env_line.decision, "deny");
+        assert_eq!(env_line.mode.as_deref(), Some("watch"));
+        assert_eq!(env_line.enforced, Some(false));
+        assert!(env_line.backup.is_some(), "the file is copied aside first");
+        for held in &lines[1..] {
+            assert_eq!(held.mode.as_deref(), Some("watch"), "{}", held.command);
+            assert_eq!(held.floor, Some(true), "{}", held.command);
+            assert_eq!(held.enforced, Some(true), "{}", held.command);
+        }
+    }
+
+    /// A project that registers `termaxa hook` itself is left to that hook:
+    /// Claude Code runs a plugin's handler beside a settings file's, and
+    /// two would judge, record and copy every command twice. The plugin's
+    /// answers nothing and keeps nothing, whatever the command.
+    #[test]
+    fn a_plugins_hook_stands_down_where_a_hook_is_already_registered() {
+        let mut env = crate::testutil::TestEnv::new("hook-plugin-aside");
+        let user = env.plugin_hook();
+        let floor = "kubectl delete ns prod";
+        let wired = |command: serde_json::Value| {
+            json!({ "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [ command ] } ] } })
+                .to_string()
+        };
+        let plain = json!({ "type": "command", "command": "termaxa hook" });
+        let stands_down =
+            |dir: &std::path::Path| match plugin_answer(&bash_payload(dir, "a", floor)) {
+                Some(out) => {
+                    assert_eq!((out.rendered.as_deref(), out.exit_code), (None, 0));
+                    true
+                }
+                None => false,
+            };
+
+        // Nothing registered anywhere: the call goes on to be judged.
+        let bare = checkout(&env, "bare");
+        assert!(!stands_down(&bare));
+
+        // The project's settings.json, as `init` writes it. Written this
+        // second it is not yet a hook Claude Code has loaded, and both
+        // judge; once it has been there a while the plugin's stands down.
+        let proj = checkout(&env, "wired");
+        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+        let settings = proj.join(".claude").join("settings.json");
+        std::fs::write(&settings, wired(plain.clone())).unwrap();
+        assert!(
+            !stands_down(&proj),
+            "a registration written a moment ago has not settled"
+        );
+        settle(&settings);
+        assert!(stands_down(&proj));
+        assert!(
+            stands_down(&proj.join(".claude")),
+            "from a directory below the root as well"
+        );
+        assert!(
+            crate::paths::watched_record(&proj).is_none(),
+            "a hook that stood down kept nothing"
+        );
+
+        // settings.local.json, an absolute path with a space in it, and the
+        // exec form.
+        for (name, command) in [
+            (
+                "local",
+                json!({ "type": "command", "command": "\"C:\\Program Files\\Termaxa\\termaxa.exe\" hook" }),
+            ),
+            (
+                "launcher",
+                json!({ "type": "command", "command": "env TERMAXA_MODE=observe /usr/local/bin/termaxa hook" }),
+            ),
+            (
+                "exec",
+                json!({ "type": "command", "command": "termaxa", "args": ["hook"] }),
+            ),
+        ] {
+            let proj = checkout(&env, name);
+            std::fs::create_dir_all(proj.join(".claude")).unwrap();
+            let local = proj.join(".claude").join("settings.local.json");
+            std::fs::write(&local, wired(command)).unwrap();
+            settle(&local);
+            assert!(stands_down(&proj), "{name}");
+        }
+
+        // What does NOT stand it down: the plugin's own line copied into a
+        // settings file, a hook of another name, another subcommand, a
+        // registration under an event that gates nothing, and a file that
+        // does not parse.
+        for (name, text) in [
+            (
+                "copied",
+                wired(json!({ "type": "command", "command": "termaxa hook --plugin" })),
+            ),
+            (
+                "copied-exec",
+                wired(json!({ "type": "command", "command": "termaxa", "args": ["hook", "--plugin"] })),
+            ),
+            (
+                "other-name",
+                wired(json!({ "type": "command", "command": "not-termaxa hook" })),
+            ),
+            (
+                "other-command",
+                wired(json!({ "type": "command", "command": "termaxa doctor && echo hook" })),
+            ),
+            (
+                "other-event",
+                json!({ "hooks": { "PostToolUse": [ { "matcher": "Bash", "hooks": [ plain.clone() ] } ] } })
+                    .to_string(),
+            ),
+            ("broken", "{ \"hooks\": termaxa hook".to_string()),
+        ] {
+            let proj = checkout(&env, name);
+            std::fs::create_dir_all(proj.join(".claude")).unwrap();
+            let settings = proj.join(".claude").join("settings.json");
+            std::fs::write(&settings, text).unwrap();
+            settle(&settings);
+            assert!(!stands_down(&proj), "{name}");
+        }
+
+        // The directory Claude Code started in decides whose settings are
+        // read, not the directory a command happens to run in.
+        std::env::set_var("CLAUDE_PROJECT_DIR", &bare);
+        assert!(
+            !stands_down(&proj),
+            "a session started elsewhere never loaded this project's hook"
+        );
+        std::env::set_var("CLAUDE_PROJECT_DIR", &proj);
+        assert!(stands_down(&bare));
+        std::env::remove_var("CLAUDE_PROJECT_DIR");
+
+        // The user's own settings: a hook wired for every project.
+        std::fs::write(user.join("settings.json"), wired(plain.clone())).unwrap();
+        settle(&user.join("settings.json"));
+        assert!(stands_down(&bare));
+        std::fs::remove_file(user.join("settings.json")).unwrap();
+
+        // And only a `.claude` directory's settings count: a user directory
+        // under another name is not read.
+        let moved = env.root().join("claude-config");
+        std::fs::create_dir_all(&moved).unwrap();
+        std::fs::write(moved.join("settings.json"), wired(plain)).unwrap();
+        settle(&moved.join("settings.json"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", &moved);
+        assert!(!stands_down(&bare));
+    }
+
+    /// The one line a session is told (#147), at its start, to the person:
+    /// a `systemMessage` and no decision. Not when the session is one the
+    /// person is already in, not where the project has a policy or a hook
+    /// of its own, and never from a hook that is not a plugin's.
+    #[test]
+    fn a_watched_session_is_told_once_at_its_start() {
+        let mut env = crate::testutil::TestEnv::new("hook-watch-notice");
+        let proj = checkout(&env, "proj");
+        let start = |dir: &std::path::Path, source: &str| {
+            json!({
+                "session_id": "n",
+                "cwd": dir.display().to_string(),
+                "hook_event_name": "SessionStart",
+                "source": source
+            })
+            .to_string()
+        };
+        assert!(
+            plugin_answer(&start(&proj, "startup")).is_none(),
+            "not a plugin's hook: nothing changes"
+        );
+
+        env.plugin_hook();
+        for source in ["startup", "resume", "fork"] {
+            let out = plugin_answer(&start(&proj, source)).expect("a session start is answered");
+            assert_eq!(out.exit_code, 0);
+            let said: serde_json::Value =
+                serde_json::from_str(&out.rendered.expect("the notice")).unwrap();
+            assert_eq!(said["systemMessage"], WATCH_NOTICE, "{source}");
+            assert_eq!(
+                said.as_object().map(|o| o.len()),
+                Some(1),
+                "a message and nothing else: no decision, no context for the model"
+            );
+        }
+        for source in ["clear", "compact"] {
+            let out = plugin_answer(&start(&proj, source)).expect("answered with nothing");
+            assert_eq!(
+                (out.rendered.as_deref(), out.exit_code),
+                (None, 0),
+                "{source}"
+            );
+        }
+        assert!(
+            crate::paths::watched_record(&proj).is_none(),
+            "saying so writes nothing"
+        );
+
+        let owned = env.project("owned");
+        let out = plugin_answer(&start(&owned, "startup")).expect("answered with nothing");
+        assert_eq!((out.rendered.as_deref(), out.exit_code), (None, 0));
+    }
+
+    /// The witness is left where the record goes, so `replay
+    /// --against-record` reads a watched project as it reads any other.
+    #[test]
+    fn a_watched_call_leaves_its_witness_with_its_record() {
+        let mut env = crate::testutil::TestEnv::new("hook-watch-witness");
+        let proj = checkout(&env, "proj");
+        let payload = bash_payload(&proj, "wit", "ls -la");
+        crate::witness::leave(&payload);
+        assert!(
+            !env.home().join("projects").exists(),
+            "no policy and no plugin: no witness, and no state made for one"
+        );
+        env.plugin_hook();
+        crate::witness::leave(&payload);
+        let state = crate::paths::resolve_watched(&proj).unwrap().state_dir;
+        let seen = std::fs::read_to_string(state.join("logs").join("seen.jsonl"))
+            .expect("the witness of a watched call");
+        assert!(seen.contains("\"command\":\"ls -la\""), "{seen}");
+    }
+
+    #[test]
+    fn a_registered_hook_is_read_by_its_program_and_its_next_word() {
+        let named =
+            |handler: serde_json::Value| names_termaxa_hook(&json!([{ "hooks": [handler] }]));
+        for command in [
+            "termaxa hook",
+            "termaxa.exe hook",
+            "TERMAXA.EXE hook",
+            "/usr/local/bin/termaxa hook",
+            "C:\\Users\\User\\scoop\\shims\\termaxa.exe hook",
+            "\"C:\\Program Files\\Termaxa\\termaxa.exe\" hook",
+            "env TERMAXA_MODE=observe termaxa hook",
+            "sh -c 'termaxa hook'",
+        ] {
+            assert!(named(json!({ "command": command })), "{command}");
+        }
+        assert!(named(json!({ "command": "termaxa", "args": ["hook"] })));
+        for command in [
+            "termaxa hook --plugin",
+            "termaxa check hook",
+            "termaxa doctor && echo hook",
+            "termaxa-wrapper hook",
+            "echo termaxa",
+            "my-gate.sh",
+        ] {
+            assert!(!named(json!({ "command": command })), "{command}");
+        }
+        assert!(!named(
+            json!({ "command": "termaxa", "args": ["hook", "--plugin"] })
+        ));
     }
 }

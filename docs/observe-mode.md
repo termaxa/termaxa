@@ -127,6 +127,70 @@ says why. Policies written before v0.20 have no markers: add `floor: true`
 to the rules you would never want relaxed, or take the 38 from
 `examples/policy.yaml`.
 
+## Watching: a project that has no policy
+
+A hook that a plugin registers runs in every project on the machine, and
+most of them have no `.termaxa/policy.yaml`. Any other hook refuses every
+command there and says to run `termaxa init`; that has not changed. A
+plugin's hook is registered as `termaxa hook --plugin` (v0.22.0), and with
+that flag a project with no policy is watched:
+
+- The built-in starter judges each command and each native write, in
+  observe mode, whatever `TERMAXA_MODE` says. Nobody chose that policy, so
+  nothing on the machine turns it into one that asks and refuses.
+- The floor above is what is refused, all three parts of it, with the
+  starter's 38 rules as the first. A refusal ends by saying that the
+  project is watched by the built-in starter and that `termaxa init` writes
+  a policy. The gate's own files are on that floor, so a session cannot
+  write the policy, or the hook registration, that would end the watching.
+- The record, the witness and the copies are kept as for any project, in
+  the state directory of the checkout the command ran in; outside a
+  checkout, of the directory the session was started in. That is the state
+  directory a later `termaxa init` at the checkout's root resolves to, so
+  the project's own policy continues the record. Nothing is written into
+  the project.
+- Record lines carry `mode: watch`. `termaxa report`, `log`, `stats`,
+  `backups`, `rollback` and `paths` read a watched project's record from
+  inside it; `doctor` says the project is watched. `run`, `notify` and
+  `breaker` still need a policy.
+- A session is told once, when it starts: the hook answers `SessionStart`
+  with a `systemMessage`, the field Claude Code's hooks reference describes
+  as a warning shown to the user, and with no context for the model. Not
+  after `/clear` or a compaction, which restart a session the person is
+  already in.
+- The circuit breaker does not run. It escalates asks, and nothing is
+  asked; and a trip outlives its session in the state directory, where the
+  policy `init` writes later would inherit it.
+
+A project that has a policy is judged by it as written, in its own mode,
+whoever registered the hook.
+
+And a project that wires the hook itself is left to that hook. Claude Code
+runs a plugin's handler beside a settings file's identical one, so without
+this every command would be judged, recorded and copied twice. Where
+`.claude/settings.json` or `.claude/settings.local.json` in the directory
+the session started in, or the user's `settings.json`, registers `termaxa
+hook` under `PreToolUse`, the plugin's hook answers nothing and leaves no
+record, no witness and no copy, for any event. It reads only a
+`settings*.json` in a `.claude` directory, the files the floor holds
+against a session's own writes. A registration it does not recognise (a
+wrapper script that runs the hook from inside) leaves both hooks running:
+a second record, and nothing taken away.
+
+It reads those files at each call, and a registration counts once it has
+been in its file for ten seconds. Claude Code's file watcher picks up a
+hook edited into a settings file while a session runs, normally within a
+few seconds, so a registration `termaxa init` wrote a moment ago is not
+yet a hook that runs: for those seconds both hooks judge. If the hook has
+not appeared in `/hooks` after that, the watcher missed the change and
+the plugin's hook has stood down for a hook that is not running: restart
+the session, which is what Claude Code's hooks guide says of a missed
+change.
+
+Under a supervisor (`termaxa supervise`) a plugin's hook forwards as any
+hook does, and the supervisor refuses a project that has no policy:
+watching is the unsupervised hook's.
+
 ## What you read
 
 `termaxa report` adds a section:
@@ -143,9 +207,19 @@ ran with no copy: N
 
 "Ran with no copy" is the exposure: the commands observe mode let run that
 enforce mode would have interrupted and that nothing insured. `termaxa log`
-shows the lines themselves. `termaxa doctor` names the mode in force,
-where it came from (the policy file, `TERMAXA_MODE`, or the default) and
-the floor-rule count.
+shows the lines themselves, and since v0.22.0 marks a verdict that was not
+enforced (`→ observed, not enforced`, or `→ watched, not enforced`), since
+the mark beside it is the verdict's and the command ran. `termaxa doctor`
+names the mode in force, where it came from (the policy file,
+`TERMAXA_MODE`, or the default) and the floor-rule count.
+
+The report's `Asks` line counts the asks that were put to somebody. Until
+v0.22.0 it counted an observed ask as well, and took that command's own
+execution receipt for the answer: a session observed from end to end
+reported every ask approved, and the report called it a habit. An ask that
+was recorded and not enforced is in the section above and nowhere else. A
+watched project's report has one more line, `Watched`, with the number of
+lines the built-in starter judged while the project had no policy.
 
 ## Switching
 

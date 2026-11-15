@@ -92,6 +92,14 @@ struct Report {
     allow: usize,
     ask: usize,
     deny: usize,
+    /// The asks that were put to somebody: every ask but the ones a mode
+    /// recorded and did not enforce (observe, or a watched project). Those
+    /// were never asked, so they have no answer to count, and they are in
+    /// the observed section.
+    asked: usize,
+    /// Lines judged by the built-in starter while the project had no policy
+    /// and a plugin's hook was watching it (`mode: watch`).
+    watched: usize,
     escalated: usize,
     auto_flow: usize,
     blocked: Vec<String>,
@@ -133,7 +141,7 @@ const HABIT_MIN_ASKS: usize = 5;
 const HABIT_MIN_APPROVED_PERCENT: usize = 80;
 
 fn habit_fires(r: &Report) -> bool {
-    r.ask >= HABIT_MIN_ASKS && r.asks_approved * 100 >= r.ask * HABIT_MIN_APPROVED_PERCENT
+    r.asked >= HABIT_MIN_ASKS && r.asks_approved * 100 >= r.asked * HABIT_MIN_APPROVED_PERCENT
 }
 
 /// Map a decision (and source) to a terminal mark.
@@ -269,12 +277,19 @@ fn compute(entries: &[&AuditEntry], paths: &Paths) -> Result<Report> {
     // Asks and their outcomes. A `run` ask records the answer; a hook ask
     // does not, so a later execution receipt for the same command in the
     // same session stands in for a yes.
+    //
+    // An ask a mode recorded and did not enforce was put to nobody. Until
+    // v0.22.0 it was counted here all the same, and its own execution
+    // receipt read as the yes: an observed session's report said every ask
+    // had been approved and called it a habit.
     let (mut asks_approved, mut asks_declined, mut asks_unanswered) = (0, 0, 0);
+    let mut asked = 0;
     let mut habit_map: HashMap<String, usize> = HashMap::new();
     for (i, e) in entries.iter().enumerate() {
-        if e.decision != "ask" {
+        if e.decision != "ask" || e.enforced == Some(false) {
             continue;
         }
+        asked += 1;
         let approved = match e.approved {
             Some(v) => v,
             None => entries[i + 1..].iter().any(|later| {
@@ -321,6 +336,11 @@ fn compute(entries: &[&AuditEntry], paths: &Paths) -> Result<Report> {
         allow,
         ask,
         deny,
+        asked,
+        watched: entries
+            .iter()
+            .filter(|e| e.mode.as_deref() == Some("watch"))
+            .count(),
         escalated,
         auto_flow: allow,
         blocked,
@@ -486,10 +506,17 @@ fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
         red("✗"),
         r.deny
     );
-    if r.ask > 0 {
+    if r.asked > 0 {
         println!(
             "Asks                {}   approved {} · declined {} · unanswered {}",
-            r.ask, r.asks_approved, r.asks_declined, r.asks_unanswered
+            r.asked, r.asks_approved, r.asks_declined, r.asks_unanswered
+        );
+    }
+    if r.watched > 0 {
+        println!(
+            "Watched             {}   {}",
+            r.watched,
+            dim("no policy here: the built-in starter judged, only its floor was refused")
         );
     }
     println!("Escalated           {}", r.escalated);
@@ -555,8 +582,8 @@ fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
         println!(
             "{} of {} asks were approved ({}%). An ask that is always approved",
             r.asks_approved,
-            r.ask,
-            r.asks_approved * 100 / r.ask
+            r.asked,
+            r.asks_approved * 100 / r.asked
         );
         println!("is not a safety feature, it is a habit.");
         if !r.habit.is_empty() {
@@ -668,10 +695,16 @@ fn print_markdown(r: &Report, roll: &Rollup, session: Option<&str>) {
         "- **Commands:** {} — {} allow / {} ask / {} deny",
         r.total, r.allow, r.ask, r.deny
     );
-    if r.ask > 0 {
+    if r.asked > 0 {
         println!(
             "- **Asks:** {} — approved {}, declined {}, unanswered {}",
-            r.ask, r.asks_approved, r.asks_declined, r.asks_unanswered
+            r.asked, r.asks_approved, r.asks_declined, r.asks_unanswered
+        );
+    }
+    if r.watched > 0 {
+        println!(
+            "- **Watched:** {} judged by the built-in starter while the project had no policy; only its floor was refused",
+            r.watched
         );
     }
     println!("- **Escalated by context:** {}", r.escalated);
@@ -685,8 +718,8 @@ fn print_markdown(r: &Report, roll: &Rollup, session: Option<&str>) {
         println!(
             "{} of {} asks were approved ({}%). An ask that is always approved is not a safety feature, it is a habit.",
             r.asks_approved,
-            r.ask,
-            r.asks_approved * 100 / r.ask
+            r.asked,
+            r.asks_approved * 100 / r.asked
         );
         for (head, n) in &r.habit {
             println!(
@@ -803,6 +836,7 @@ mod tests {
         Paths {
             project_dir: tmp.dir("proj/.termaxa"),
             state_dir: tmp.dir("state"),
+            watched: false,
         }
     }
 
@@ -1296,5 +1330,49 @@ mod tests {
         // are normal work; three *blocked* attempts are a policy signal.
         // (Guards the constant against being re-pointed at `intents`.)
         assert_eq!(INSIGHT_THRESHOLD, 3);
+    }
+
+    /// An ask a mode recorded and did not enforce was put to nobody. Until
+    /// v0.22.0 it was counted with the asks, and its own execution receipt
+    /// read as the answer: an observed session's report said every ask had
+    /// been approved and called that a habit.
+    #[test]
+    fn an_ask_nobody_was_asked_has_no_answer_to_count() {
+        let mut entries = Vec::new();
+        for i in 0..6 {
+            let mut ask = entry("ask", &format!("python step{i}.py"));
+            ask.session = Some("s".into());
+            ask.mode = Some("watch".into());
+            ask.enforced = Some(false);
+            ask.coverage = Some("unknown".into());
+            entries.push(ask);
+            let mut ran = entry("executed", &format!("python step{i}.py"));
+            ran.session = Some("s".into());
+            ran.source = "post".into();
+            entries.push(ran);
+        }
+        let (r, _tree) = compute_for(&entries);
+        assert_eq!(r.ask, 6, "the verdicts are counted as verdicts");
+        assert_eq!(r.asked, 0);
+        assert_eq!(
+            (r.asks_approved, r.asks_declined, r.asks_unanswered),
+            (0, 0, 0)
+        );
+        assert!(!habit_fires(&r));
+        assert!(r.habit.is_empty());
+        assert_eq!(r.observed.would_ask, 6, "they are in the observed section");
+        assert_eq!(r.watched, 6, "the receipts are not watched lines");
+
+        // The same six, enforced and each followed by its receipt: asked,
+        // approved, and a habit, as before.
+        for e in entries.iter_mut().filter(|e| e.decision == "ask") {
+            e.mode = Some("enforce".into());
+            e.enforced = Some(true);
+            e.coverage = None;
+        }
+        let (r, _tree) = compute_for(&entries);
+        assert_eq!((r.asked, r.asks_approved), (6, 6));
+        assert!(habit_fires(&r));
+        assert_eq!(r.watched, 0);
     }
 }

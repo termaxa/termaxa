@@ -421,3 +421,66 @@ fn the_log_line_separates_hook_entries_from_the_rest() {
         out.stdout
     );
 }
+
+/// A project with no policy that a plugin's hook has watched (`termaxa hook
+/// --plugin`): `init` is still the thing to do, and doctor says the project
+/// is watched and where the record of that is, which a directory nobody
+/// watched does not get said about it.
+#[test]
+fn a_watched_project_is_said_to_be_watched() {
+    use std::io::Write as _;
+    let tmp = scratch("watched");
+    let bin = controlled_path(&tmp);
+    let home = tmp.join("home");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).expect("checkout must be creatable");
+
+    let before = doctor(&home, &proj, &bin);
+    assert_eq!(before.code, 1);
+    assert!(!before.stdout.contains("watched"), "{:?}", before.stdout);
+
+    let user = tmp.join("user").join(".claude");
+    std::fs::create_dir_all(&user).expect("the user's config dir must be creatable");
+    let mut hook = Command::new(env!("CARGO_BIN_EXE_termaxa"))
+        .args(["hook", "--plugin"])
+        .current_dir(&proj)
+        .env("TERMAXA_HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", &user)
+        .env_remove("CLAUDE_PROJECT_DIR")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("the binary must be runnable");
+    let _ = hook.stdin.take().expect("stdin must be piped").write_all(
+        serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": proj.display().to_string(),
+            "session_id": "D",
+            "tool_input": { "command": "ls -la" }
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    hook.wait().expect("the hook must exit");
+
+    let out = doctor(&home, &proj, &bin);
+    assert_eq!(out.code, 1, "no policy is still something to fix");
+    assert!(
+        out.stdout
+            .contains("watched: a plugin's hook keeps a record of this project"),
+        "{:?}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("audit.jsonl"), "{:?}", out.stdout);
+    assert!(
+        out.stdout.contains("termaxa report --all"),
+        "{:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("run `termaxa init`"),
+        "{:?}",
+        out.stdout
+    );
+}

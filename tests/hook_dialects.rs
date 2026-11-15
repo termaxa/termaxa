@@ -21,9 +21,35 @@ struct Out {
 }
 
 fn hook(home: &Path, cwd: &Path, payload: &serde_json::Value, env: &[(&str, &str)]) -> Out {
+    hook_as(&["hook"], home, cwd, payload, env)
+}
+
+/// `termaxa hook --plugin`, as a plugin's `hooks.json` runs it, with the two
+/// variables that hook reads pinned. The user's settings directory is an
+/// empty `.claude` beside `home`, never the machine's own: on a machine
+/// whose user wires `termaxa hook` for every project, the real one would
+/// stand every hook here down. And `CLAUDE_PROJECT_DIR` is absent unless a
+/// test passes one in `env`.
+fn plugin_hook(home: &Path, cwd: &Path, payload: &serde_json::Value, env: &[(&str, &str)]) -> Out {
+    let user = home.with_file_name("user").join(".claude");
+    std::fs::create_dir_all(&user).expect("the user's config dir must be creatable");
+    let user = user.to_string_lossy().into_owned();
+    let mut all: Vec<(&str, &str)> = vec![("CLAUDE_CONFIG_DIR", user.as_str())];
+    all.extend_from_slice(env);
+    hook_as(&["hook", "--plugin"], home, cwd, payload, &all)
+}
+
+fn hook_as(
+    args: &[&str],
+    home: &Path,
+    cwd: &Path,
+    payload: &serde_json::Value,
+    env: &[(&str, &str)],
+) -> Out {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_termaxa"));
-    cmd.arg("hook")
+    cmd.args(args)
         .current_dir(cwd)
+        .env_remove("CLAUDE_PROJECT_DIR")
         .env("TERMAXA_HOME", home)
         .env("NO_COLOR", "1")
         .env_remove("TERMAXA_HOOK_PROBE")
@@ -1989,4 +2015,360 @@ fn observe_mode_holds_a_git_discard_that_would_unhook_the_gate() {
         .expect("the held stash is on the record");
     assert_eq!(held["floor"], true, "{held}");
     assert_eq!(held["decision"], "deny", "{held}");
+}
+
+// ---------------------------------------------------------------------------
+// A plugin's hook (`termaxa hook --plugin`, decision #147)
+// ---------------------------------------------------------------------------
+
+/// A checkout with no policy in it: a directory that holds a `.git`.
+fn checkout(root: &Path, name: &str) -> PathBuf {
+    let dir = root.join(name);
+    std::fs::create_dir_all(dir.join(".git")).expect("checkout must be creatable");
+    dir
+}
+
+fn bash(dir: &Path, session: &str, command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session,
+        "transcript_path": "/tmp/t",
+        "cwd": dir.to_string_lossy(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command }
+    })
+}
+
+/// Every witness line left under any project in this home.
+fn witnesses(home: &Path) -> String {
+    let mut all = String::new();
+    if let Ok(projects) = std::fs::read_dir(home.join("projects")) {
+        for p in projects.flatten() {
+            if let Ok(text) = std::fs::read_to_string(p.path().join("logs").join("seen.jsonl")) {
+                all.push_str(&text);
+            }
+        }
+    }
+    all
+}
+
+/// Decision #147. A hook a plugin registers runs in every project on the
+/// machine, and most of them have no policy. Any other hook refuses every
+/// command there (decision #19, unchanged). The plugin's watches: the
+/// built-in starter judges, the record, the witness and the copy are kept,
+/// nothing is said for an allow, an ask or a deny, and the starter's floor
+/// is refused with a sentence that says whose rule it was. `TERMAXA_MODE`
+/// cannot turn the watching into enforcing: nobody chose that policy.
+#[test]
+fn a_plugins_hook_watches_a_project_that_has_no_policy() {
+    let tmp = scratch("plugin-watch");
+    let home = tmp.join("home");
+    let proj = checkout(&tmp, "proj");
+    for dir in ["sc", "sc2"] {
+        std::fs::create_dir_all(proj.join(dir)).unwrap();
+        std::fs::write(proj.join(dir).join("a.txt"), "kept\n").unwrap();
+    }
+
+    let out = hook(&home, &proj, &bash(&proj, "P", "ls -la"), &[]);
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 2),
+        "without the flag, no policy is the refusal it always was"
+    );
+    assert!(
+        !home.join("projects").exists(),
+        "and that hook keeps no state for the project"
+    );
+
+    for cmd in ["ls -la", "python rebuild.py", "rm -rf ./sc"] {
+        let out = plugin_hook(&home, &proj, &bash(&proj, "P", cmd), &[]);
+        assert_eq!((out.stdout.trim(), out.code), ("", 0), "{cmd}");
+    }
+    assert!(backup_count(&home) > 0, "the delete was copied aside first");
+    let out = plugin_hook(
+        &home,
+        &proj,
+        &bash(&proj, "P", "rm -rf ./sc2"),
+        &[("TERMAXA_MODE", "enforce")],
+    );
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 0),
+        "the machine's mode does not enforce a starter nobody chose"
+    );
+
+    let out = plugin_hook(
+        &home,
+        &proj,
+        &bash(&proj, "P", "kubectl delete ns prod"),
+        &[],
+    );
+    assert_eq!(out.code, 2, "the floor is refused: {}", out.stdout);
+    assert!(is_claude_shape(&out.stdout), "{}", out.stdout);
+    assert!(out.stdout.contains("\"permissionDecision\":\"deny\""));
+    assert!(
+        out.stdout.contains("watching this project"),
+        "the refusal says whose rule it was: {}",
+        out.stdout
+    );
+    // The gate's own files are the floor's too: a session cannot write the
+    // policy, or the registration, that would end the watching.
+    for cmd in [
+        "mkdir -p .termaxa && echo 'default: allow' > .termaxa/policy.yaml",
+        "echo '{}' > .claude/settings.local.json",
+    ] {
+        let out = plugin_hook(&home, &proj, &bash(&proj, "P", cmd), &[]);
+        assert_eq!(out.code, 2, "{cmd}: {}", out.stdout);
+    }
+
+    let log = project_logs(&home);
+    let line = |cmd: &str| -> serde_json::Value {
+        log.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["command"] == cmd)
+            .unwrap_or_else(|| panic!("no record line for {cmd}: {log}"))
+    };
+    assert_eq!(log.lines().count(), 7, "one line a call: {log}");
+    for cmd in ["ls -la", "python rebuild.py", "rm -rf ./sc", "rm -rf ./sc2"] {
+        assert_eq!(line(cmd)["mode"], "watch", "{cmd}");
+        assert_eq!(line(cmd)["floor"], false, "{cmd}");
+    }
+    assert_eq!(line("ls -la")["decision"], "allow");
+    assert_eq!(line("python rebuild.py")["decision"], "ask");
+    assert_eq!(line("python rebuild.py")["enforced"], false);
+    assert_eq!(line("rm -rf ./sc")["decision"], "deny");
+    assert_eq!(line("rm -rf ./sc")["enforced"], false);
+    assert_eq!(line("rm -rf ./sc")["coverage"], "insured");
+    assert_eq!(line("rm -rf ./sc2")["enforced"], false);
+    let held = line("kubectl delete ns prod");
+    assert_eq!(held["mode"], "watch");
+    assert_eq!(held["enforced"], true);
+    assert_eq!(held["coverage"], "floor");
+    assert_eq!(
+        witnesses(&home).lines().count(),
+        7,
+        "and one witness a call, where the record is"
+    );
+    assert!(
+        !proj.join(".termaxa").exists(),
+        "watching writes nothing into the project"
+    );
+}
+
+/// The floor's second leg in a watched project: a delete past the copy
+/// budget is held, and a directory a build rebuilds, inside the project, is
+/// not. The project here is the checkout, so `rm -rf node_modules`, the
+/// delete a web project runs every week, runs.
+#[test]
+fn a_watched_project_keeps_its_build_directories_out_of_the_floor() {
+    let tmp = scratch("plugin-watch-rebuilt");
+    let home = tmp.join("home");
+    let proj = checkout(&tmp, "proj");
+    let web = proj.join("web");
+    for dir in ["node_modules", "big"] {
+        let d = web.join(dir);
+        for i in 0..5_100 {
+            let sub = d.join(format!("p{}", i % 50));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join(format!("f{i}")), "x").unwrap();
+        }
+    }
+    let out = plugin_hook(&home, &web, &bash(&web, "B", "rm -rf node_modules"), &[]);
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 0),
+        "a directory an install rebuilds is not the floor"
+    );
+    assert_eq!(backup_count(&home), 0, "and nothing was copied aside");
+    let out = plugin_hook(&home, &web, &bash(&web, "B", "rm -rf big"), &[]);
+    assert_eq!(
+        out.code, 2,
+        "an unrecoverable delete is the floor: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("watching this project"),
+        "{}",
+        out.stdout
+    );
+}
+
+/// A project that has a policy is judged by it, as written, in the mode it
+/// says, whoever registered the hook. And one that also registers its own
+/// hook is left to that hook: Claude Code runs a plugin's handler beside a
+/// settings file's, and the plugin's leaves no line, no witness and no
+/// copy, so a command is judged once.
+#[test]
+fn a_plugins_hook_applies_a_policy_as_written_and_stands_down_for_a_projects_own_hook() {
+    let tmp = scratch("plugin-policy");
+    let home = tmp.join("home");
+    let proj = project(&tmp, DENIES_AN_ECHO);
+
+    let out = plugin_hook(&home, &proj, &bash(&proj, "Q", PROJECT_ONLY), &[]);
+    assert_eq!(out.code, 2, "the project's own deny: {}", out.stdout);
+    assert!(is_claude_shape(&out.stdout), "{}", out.stdout);
+    assert!(
+        !out.stdout.contains("watching"),
+        "a project with a policy is not watched: {}",
+        out.stdout
+    );
+    let out = plugin_hook(&home, &proj, &bash(&proj, "Q", "cargo build"), &[]);
+    assert!(
+        out.stdout.contains("\"permissionDecision\":\"ask\""),
+        "its default asks, enforced: {}",
+        out.stdout
+    );
+    let log = project_logs(&home);
+    assert_eq!(log.lines().count(), 2, "{log}");
+    assert!(!log.contains("\"mode\":\"watch\""), "{log}");
+
+    // The project wires the hook itself, as `init` does.
+    std::fs::create_dir_all(proj.join(".claude")).unwrap();
+    let settings = proj.join(".claude").join("settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"termaxa hook"}]}]}}"#,
+    )
+    .unwrap();
+    // Written this second, the registration is not yet a hook Claude Code
+    // has loaded: both judge, and the plugin's leaves its line.
+    let out = plugin_hook(&home, &proj, &bash(&proj, "Q", PROJECT_ONLY), &[]);
+    assert_eq!(out.code, 2, "not settled yet: {}", out.stdout);
+    assert_eq!(project_logs(&home).lines().count(), 3);
+    // Once it has been there a while, it is the project's hook that runs.
+    std::fs::File::options()
+        .write(true)
+        .open(&settings)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+        .unwrap();
+    let before = (project_logs(&home), witnesses(&home));
+    let out = plugin_hook(&home, &proj, &bash(&proj, "Q", PROJECT_ONLY), &[]);
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 0),
+        "the plugin's hook stands down"
+    );
+    assert_eq!(
+        (project_logs(&home), witnesses(&home)),
+        before,
+        "and leaves no line and no witness"
+    );
+    let out = hook(&home, &proj, &bash(&proj, "Q", PROJECT_ONLY), &[]);
+    assert_eq!(
+        out.code, 2,
+        "the project's own hook answers: {}",
+        out.stdout
+    );
+    assert_eq!(project_logs(&home).lines().count(), 4);
+
+    // The session's directory decides whose settings count. One started in
+    // a checkout that wires nothing never loaded this project's hook, so a
+    // command run here from that session is judged by the plugin's.
+    let other = checkout(&tmp, "other");
+    let other_dir = other.to_string_lossy().into_owned();
+    let out = plugin_hook(
+        &home,
+        &proj,
+        &bash(&proj, "Q", PROJECT_ONLY),
+        &[("CLAUDE_PROJECT_DIR", other_dir.as_str())],
+    );
+    assert_eq!(out.code, 2, "{}", out.stdout);
+    assert_eq!(project_logs(&home).lines().count(), 5);
+}
+
+/// The one line a watched session is told, at its start and to the person:
+/// a `systemMessage`, no decision and nothing for the model. A hook that is
+/// not a plugin's says nothing at a session's start, as before.
+#[test]
+fn a_watched_session_is_told_so_once_at_its_start() {
+    let tmp = scratch("plugin-notice");
+    let home = tmp.join("home");
+    let proj = checkout(&tmp, "proj");
+    let start = |dir: &Path, source: &str| {
+        serde_json::json!({
+            "session_id": "N",
+            "transcript_path": "/tmp/t",
+            "cwd": dir.to_string_lossy(),
+            "hook_event_name": "SessionStart",
+            "source": source
+        })
+    };
+    let out = hook(&home, &proj, &start(&proj, "startup"), &[]);
+    assert_eq!((out.stdout.trim(), out.code), ("", 0));
+
+    let out = plugin_hook(&home, &proj, &start(&proj, "startup"), &[]);
+    assert_eq!(out.code, 0);
+    let said: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON object");
+    let notice = said["systemMessage"].as_str().expect("a systemMessage");
+    assert!(notice.contains("watching this project"), "{notice}");
+    assert!(notice.contains("termaxa report"), "{notice}");
+    assert!(notice.contains("termaxa init"), "{notice}");
+    assert_eq!(said.as_object().map(|o| o.len()), Some(1), "{said}");
+
+    let out = plugin_hook(&home, &proj, &start(&proj, "compact"), &[]);
+    assert_eq!((out.stdout.trim(), out.code), ("", 0), "the same sitting");
+    let owned = project(&tmp, DENIES);
+    let out = plugin_hook(&home, &owned, &start(&owned, "startup"), &[]);
+    assert_eq!(
+        (out.stdout.trim(), out.code),
+        ("", 0),
+        "a policy of its own"
+    );
+    assert!(
+        !home.join("projects").exists(),
+        "a session's start writes nothing"
+    );
+}
+
+/// The breaker stays out of a watched project. It escalates asks, and there
+/// nothing is asked; and a trip is state that outlives the session, in the
+/// state directory the policy `init` writes later resolves to, so a week of
+/// watching would refuse that policy's first ask. The same three deletes
+/// under an observed policy of the project's own do trip it, which is what
+/// makes this a test.
+#[test]
+fn a_watched_project_never_trips_the_breaker() {
+    let tmp = scratch("plugin-breaker");
+    let home = tmp.join("home");
+    let watched = checkout(&tmp, "watched");
+    let observed = project(
+        &tmp,
+        concat!(
+            "version: 1\nmode: observe\ndefault: ask\nrules:\n",
+            "  - match: \"rm -rf /\"\n    action: deny\n    floor: true\n",
+        ),
+    );
+    for dir in [&watched, &observed] {
+        std::fs::create_dir_all(dir.join("sc")).unwrap();
+        std::fs::write(dir.join("sc").join("a.txt"), "kept\n").unwrap();
+    }
+    for _ in 0..3 {
+        let out = plugin_hook(&home, &watched, &bash(&watched, "K", "rm -r ./sc"), &[]);
+        assert_eq!((out.stdout.trim(), out.code), ("", 0));
+        let out = hook(&home, &observed, &bash(&observed, "K", "rm -r ./sc"), &[]);
+        assert_eq!((out.stdout.trim(), out.code), ("", 0));
+    }
+    let mut tripped = Vec::new();
+    for state in std::fs::read_dir(home.join("projects"))
+        .expect("both projects kept state")
+        .flatten()
+    {
+        let name = state.file_name().to_string_lossy().into_owned();
+        let log = std::fs::read_to_string(state.path().join("logs").join("audit.jsonl"))
+            .unwrap_or_default();
+        let by_breaker = log.contains("\"matched_rule\":\"circuit-breaker\"");
+        let kept_a_trip = state.path().join("breaker.json").exists();
+        if name.starts_with("watched") {
+            assert!(!by_breaker && !kept_a_trip, "{name}: {log}");
+            assert_eq!(log.matches("\"decision\":\"ask\"").count(), 3, "{log}");
+        }
+        tripped.push((name, by_breaker, kept_a_trip));
+    }
+    tripped.sort();
+    assert_eq!(tripped.len(), 2, "{tripped:?}");
+    assert!(
+        tripped[0].0.starts_with("proj") && tripped[0].1 && tripped[0].2,
+        "the observed project's third delete trips: {tripped:?}"
+    );
 }

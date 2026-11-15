@@ -18,6 +18,10 @@ pub struct Paths {
     pub project_dir: PathBuf,
     /// Home-directory state root for this project (holds logs/, backups/).
     pub state_dir: PathBuf,
+    /// True when the project has no policy and a plugin's hook is watching
+    /// it (`resolve_watched`): `project_dir` is then where `init` WOULD put
+    /// the policy, and `policy_file()` names a file that does not exist.
+    pub watched: bool,
 }
 
 impl Paths {
@@ -75,7 +79,139 @@ pub fn resolve_readonly(start: &std::path::Path) -> Result<Paths> {
     Ok(Paths {
         project_dir,
         state_dir,
+        watched: false,
     })
+}
+
+/// Set by `termaxa hook --plugin`: this hook was registered by a plugin, for
+/// every project on the machine, not by `termaxa init` for one. Two things
+/// follow from that and nothing else does (decision #147):
+///
+///   * a project with NO policy is watched (`Policy::watching`) where a
+///     project's own hook refuses every command (decision #19, which stands
+///     for every hook without the flag);
+///   * a project that registers a hook of its own is left to that hook, so a
+///     command is judged, recorded and copied once.
+///
+/// A flag of this process and not a parameter: its readers are several
+/// modules deep (the hook, the witness, the copy's project root). And not an
+/// environment variable: a variable something else exported (a `.envrc`, a
+/// launch script) would make a project's OWN hook step aside for itself,
+/// which is every command ungated. Only the command line sets it.
+///
+/// Under test the flag is the thread's and not the process's: cargo runs
+/// tests as threads of one process, and a flag one test raised would have
+/// every other test's hook watching the directory it happened to be in.
+#[cfg(not(test))]
+static PLUGIN_HOOK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+thread_local! {
+    static PLUGIN_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(not(test))]
+pub fn plugin_hook() -> bool {
+    PLUGIN_HOOK.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(test)]
+pub fn plugin_hook() -> bool {
+    PLUGIN_HOOK.with(|flag| flag.get())
+}
+
+/// `termaxa hook --plugin` calls this once, before it reads its input.
+#[cfg(not(test))]
+pub fn set_plugin_hook(on: bool) {
+    PLUGIN_HOOK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(test)]
+pub fn set_plugin_hook(on: bool) {
+    PLUGIN_HOOK.with(|flag| flag.set(on));
+}
+
+/// The directory a project with no policy is taken to be: the checkout
+/// `start` is in; outside any checkout, the directory the session was
+/// started in when `start` is inside it (Claude Code exports it to its
+/// hooks as `CLAUDE_PROJECT_DIR`, so a `cd build` does not start a second
+/// record); otherwise `start` itself. The checkout is where `termaxa init`
+/// is run, so the record kept while watching is the record the project's
+/// own policy continues (same root, same state directory).
+pub fn watch_root(start: &Path) -> PathBuf {
+    if let Some(checkout) = start.ancestors().find(|d| crate::delete::is_checkout(d)) {
+        return checkout.to_path_buf();
+    }
+    if let Ok(session) = std::env::var("CLAUDE_PROJECT_DIR") {
+        let session = PathBuf::from(session);
+        if session.is_dir() {
+            let inside = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+                (Ok(a), Ok(b)) => a.starts_with(b),
+                _ => a.starts_with(b),
+            };
+            if inside(start, &session) {
+                return session;
+            }
+        }
+    }
+    start.to_path_buf()
+}
+
+/// The root of the project `cwd` is in: the directory that holds
+/// `.termaxa/`, found the way the hook finds its policy, and for a plugin's
+/// hook in a project with no policy the root it is watched from. `None`
+/// outside any project.
+pub fn project_root(cwd: &Path) -> Option<PathBuf> {
+    match resolve_readonly(cwd) {
+        Ok(paths) => paths.project_dir.parent().map(Path::to_path_buf),
+        Err(_) if plugin_hook() => Some(watch_root(cwd)),
+        Err(_) => None,
+    }
+}
+
+/// Paths for a project with NO policy that a plugin's hook is watching
+/// (decision #147). Creates the state directories, as `resolve_from` does:
+/// the caller is about to write the record.
+pub fn resolve_watched(start: &Path) -> Result<Paths> {
+    let paths = watched_readonly(start)?;
+    for dir in ["logs", "backups"] {
+        let dir = paths.state_dir.join(dir);
+        fs::create_dir_all(&dir).with_context(|| {
+            format!(
+                "termaxa is watching this project (it has no .termaxa/policy.yaml) and cannot \
+                 create {} to keep the record in",
+                dir.display()
+            )
+        })?;
+    }
+    Ok(paths)
+}
+
+fn watched_readonly(start: &Path) -> Result<Paths> {
+    let root = watch_root(start);
+    Ok(Paths {
+        project_dir: root.join(".termaxa"),
+        state_dir: state_dir_for(&root)?,
+        watched: true,
+    })
+}
+
+/// Paths for the commands that READ a project's record (`log`, `report`,
+/// `stats`, `backups`, `rollback`, `paths`): the project's own when it has a
+/// policy, and otherwise the record a plugin's hook kept while watching it,
+/// if there is one. With neither, the error `resolve` gives. Nothing is
+/// created: a project nobody watched has no record to read.
+pub fn resolve_record() -> Result<Paths> {
+    let cwd = std::env::current_dir()?;
+    match resolve_from(&cwd) {
+        Ok(paths) => Ok(paths),
+        Err(no_policy) => watched_record(&cwd).ok_or(no_policy),
+    }
+}
+
+/// The record a plugin's hook kept of a project with no policy, if it kept
+/// one: the paths it wrote under, and nothing created.
+pub fn watched_record(start: &Path) -> Option<Paths> {
+    watched_readonly(start)
+        .ok()
+        .filter(|watched| watched.log_file().is_file())
 }
 
 /// `$TERMAXA_HOME` (tests, custom setups) or `~/.termaxa`.
@@ -548,5 +684,112 @@ mod tests {
         rewrite_strings(&mut v, "/old/backups", "/new/backups");
         assert_eq!(v["file"], "/new/backups/b-1-pg.sql");
         assert_eq!(v["items"][0]["saved_as"], "/new/backups/b-1/x.txt");
+    }
+
+    /// A project with no policy is rooted at its checkout, from any
+    /// directory inside it, and its state is the state a policy written at
+    /// that root resolves to: what was watched is what `init` continues.
+    #[test]
+    fn a_watched_project_is_rooted_where_init_would_root_it() {
+        let env = TestEnv::new("paths-watch-root");
+        let proj = env.root().join("proj");
+        let deep = proj.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+
+        assert_eq!(watch_root(&deep), proj);
+        assert_eq!(watch_root(&proj), proj);
+        let watched = resolve_watched(&deep).unwrap();
+        assert!(watched.watched);
+        assert_eq!(watched.project_dir, proj.join(".termaxa"));
+        assert!(
+            !watched.policy_file().exists(),
+            "nothing is written in the project"
+        );
+        assert!(watched.state_dir.starts_with(env.home()));
+        assert!(watched.state_dir.join("logs").is_dir());
+
+        std::fs::create_dir_all(proj.join(".termaxa")).unwrap();
+        std::fs::write(
+            proj.join(".termaxa").join("policy.yaml"),
+            "version: 1\ndefault: ask\nrules: []\n",
+        )
+        .unwrap();
+        let owned = resolve_from(&deep).unwrap();
+        assert!(!owned.watched);
+        assert_eq!(owned.state_dir, watched.state_dir);
+    }
+
+    /// Outside any checkout the session's own directory is the root, when
+    /// the call is inside it, so a `cd build` does not start a second
+    /// record; a call somewhere else is its own.
+    #[test]
+    fn outside_a_checkout_a_watched_project_is_the_sessions_directory() {
+        let mut env = TestEnv::new("paths-watch-session");
+        env.plugin_hook();
+        let session = env.root().join("scratch");
+        let build = session.join("build");
+        let elsewhere = env.root().join("elsewhere");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        if watch_root(&build) != build {
+            // The suite's own temp directory is inside somebody's checkout:
+            // every directory here has that root, and there is no
+            // "outside a checkout" on this machine to test.
+            return;
+        }
+        std::env::set_var("CLAUDE_PROJECT_DIR", &session);
+        assert_eq!(watch_root(&build), session);
+        assert_eq!(watch_root(&session), session);
+        assert_eq!(watch_root(&elsewhere), elsewhere);
+        assert_eq!(project_root(&build), Some(session.clone()));
+        std::env::remove_var("CLAUDE_PROJECT_DIR");
+        assert_eq!(watch_root(&build), build);
+    }
+
+    /// The root a copy is planned against (`project_root`): the policy's
+    /// directory, or under a plugin's hook the watched root, so a build
+    /// directory in a watched project is the build directory it is in any
+    /// other. Without the flag a project with no policy has no root, as
+    /// before.
+    #[test]
+    fn a_plugins_hook_gives_a_watched_project_a_root() {
+        let mut env = TestEnv::new("paths-watch-project-root");
+        let proj = env.root().join("proj");
+        let sub = proj.join("web");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        assert_eq!(project_root(&sub), None);
+        env.plugin_hook();
+        assert_eq!(project_root(&sub), Some(proj.clone()));
+        let owned = env.project("owned");
+        assert_eq!(project_root(&owned), Some(owned.clone()));
+    }
+
+    /// The commands that read a record find a watched one, and looking for
+    /// one makes nothing: a project nobody watched has no state afterwards.
+    #[test]
+    fn a_watched_record_is_found_only_once_it_exists() {
+        let mut env = TestEnv::new("paths-watch-record");
+        let proj = env.root().join("proj");
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        env.chdir(&proj);
+
+        assert!(watched_record(&proj).is_none());
+        assert!(resolve_record().is_err(), "no policy and no record");
+        assert!(
+            !env.home().join("projects").exists(),
+            "looking for a record created nothing"
+        );
+
+        let watched = resolve_watched(&proj).unwrap();
+        assert!(
+            watched_record(&proj).is_none(),
+            "a state directory with no line in it is not a record"
+        );
+        std::fs::write(watched.log_file(), "").unwrap();
+        let found = resolve_record().expect("the watched record");
+        assert!(found.watched);
+        assert_eq!(found.state_dir, watched.state_dir);
     }
 }

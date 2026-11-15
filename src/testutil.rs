@@ -19,7 +19,9 @@
 //!   the tree, and the cwd restored on the way out. Only tests that need the
 //!   environment redirected should pay for the serialisation.
 //!   [`TestEnv::isolate_path`] adds `PATH` to what it covers, for the tests
-//!   whose subject is what `which` can find (#51).
+//!   whose subject is what `which` can find (#51), and
+//!   [`TestEnv::plugin_hook`] adds what a plugin's hook reads: the two
+//!   variables Claude Code gives it, and the flag that makes it one.
 //!
 //! The third global arrived late for a reason worth keeping: `PATH` was being
 //! rewritten by hand in two modules, correctly in one and without a restore
@@ -252,6 +254,10 @@ pub struct TestEnv {
     /// Captured once, like the cwd, so repeated calls still restore the value
     /// the test started from.
     previous_path: Option<Option<OsString>>,
+    /// `None` until [`TestEnv::plugin_hook`] runs; then the
+    /// `CLAUDE_CONFIG_DIR` and `CLAUDE_PROJECT_DIR` the process had, each
+    /// absent if it had none.
+    previous_claude: Option<(Option<OsString>, Option<OsString>)>,
     watch: Option<(PathBuf, BTreeSet<OsString>)>,
 }
 
@@ -282,6 +288,7 @@ impl TestEnv {
             previous_home,
             previous_cwd: None,
             previous_path: None,
+            previous_claude: None,
             watch,
         }
     }
@@ -384,6 +391,36 @@ impl TestEnv {
         only_bin
     }
 
+    /// Make this test's thread a plugin's hook (`termaxa hook --plugin`)
+    /// until the guard drops, and take the two variables that hook reads
+    /// away from the machine the suite runs on.
+    ///
+    /// `CLAUDE_CONFIG_DIR` is pointed at an empty `.claude` inside the tree:
+    /// a plugin's hook reads the user's `settings.json` to learn whether the
+    /// user wires a hook of their own, and on a developer's machine that
+    /// does, every test here would see its hook stand down and assert a
+    /// property of that machine. `CLAUDE_PROJECT_DIR` is removed, which is
+    /// what a hook started by anything but Claude Code has; a test whose
+    /// subject is that variable sets it after this call, and the guard
+    /// restores both.
+    ///
+    /// Returns the user's `.claude` directory, for the tests that put a
+    /// `settings.json` there.
+    pub fn plugin_hook(&mut self) -> PathBuf {
+        if self.previous_claude.is_none() {
+            self.previous_claude = Some((
+                std::env::var_os("CLAUDE_CONFIG_DIR"),
+                std::env::var_os("CLAUDE_PROJECT_DIR"),
+            ));
+        }
+        let user = self.tree.path().join("user").join(".claude");
+        std::fs::create_dir_all(&user).expect("the user's config dir must be creatable");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &user);
+        std::env::remove_var("CLAUDE_PROJECT_DIR");
+        crate::paths::set_plugin_hook(true);
+        user
+    }
+
     /// Watch a stand-in directory instead of the real one, so the check at
     /// drop can be tested without writing to anybody's home.
     #[cfg(test)]
@@ -406,6 +443,20 @@ impl Drop for TestEnv {
             match previous {
                 Some(path) => std::env::set_var("PATH", path),
                 None => std::env::remove_var("PATH"),
+            }
+        }
+        // The flag is the thread's, and a thread can outlive a test
+        // (`--test-threads=1` runs them all on one).
+        if let Some((config, project)) = self.previous_claude.take() {
+            crate::paths::set_plugin_hook(false);
+            for (name, previous) in [
+                ("CLAUDE_CONFIG_DIR", config),
+                ("CLAUDE_PROJECT_DIR", project),
+            ] {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
             }
         }
         match self.previous_home.take() {
