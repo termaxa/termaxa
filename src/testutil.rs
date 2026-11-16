@@ -258,6 +258,9 @@ pub struct TestEnv {
     /// `CLAUDE_CONFIG_DIR` and `CLAUDE_PROJECT_DIR` the process had, each
     /// absent if it had none.
     previous_claude: Option<(Option<OsString>, Option<OsString>)>,
+    /// What [`TestEnv::set_var`] found in each variable it set, absent if
+    /// the process had none, in the order they were first set.
+    previous_vars: Vec<(&'static str, Option<OsString>)>,
     watch: Option<(PathBuf, BTreeSet<OsString>)>,
 }
 
@@ -289,6 +292,7 @@ impl TestEnv {
             previous_cwd: None,
             previous_path: None,
             previous_claude: None,
+            previous_vars: Vec::new(),
             watch,
         }
     }
@@ -391,6 +395,21 @@ impl TestEnv {
         only_bin
     }
 
+    /// Set an environment variable until the guard drops, for the tests
+    /// whose subject is a variable the gate reads from the harness
+    /// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). The lock this guard holds is
+    /// what makes that safe among the tests that take it. A test that does
+    /// not take it sees the variable while it is set, so a test names a
+    /// directory no other test writes about (one in this guard's tree, or
+    /// under `/tmx-moved`), and never a variable other tests read: not
+    /// `HOME`, not `PATH`.
+    pub fn set_var(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+        if !self.previous_vars.iter().any(|(n, _)| *n == name) {
+            self.previous_vars.push((name, std::env::var_os(name)));
+        }
+        std::env::set_var(name, value);
+    }
+
     /// Make this test's thread a plugin's hook (`termaxa hook --plugin`)
     /// until the guard drops, and take the two variables that hook reads
     /// away from the machine the suite runs on.
@@ -457,6 +476,12 @@ impl Drop for TestEnv {
                     Some(value) => std::env::set_var(name, value),
                     None => std::env::remove_var(name),
                 }
+            }
+        }
+        for (name, previous) in self.previous_vars.drain(..).rev() {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
             }
         }
         match self.previous_home.take() {

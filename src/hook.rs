@@ -983,7 +983,12 @@ fn sent_by_codex(v: &serde_json::Value) -> bool {
     v.get("turn_id").is_some()
         || v.get("transcript_path")
             .and_then(|p| p.as_str())
-            .map(|p| p.contains(".codex"))
+            .map(|p| {
+                p.contains(".codex")
+                    // Or under the directory `CODEX_HOME` names.
+                    || crate::protect::under_default_name(&crate::protect::segments(p))
+                        .is_some_and(|s| s.first().is_some_and(|name| name == ".codex"))
+            })
             .unwrap_or(false)
 }
 
@@ -1138,12 +1143,11 @@ fn payload_dir(json: &serde_json::Value) -> std::path::PathBuf {
 /// not make this one stand down.
 ///
 /// The hook stands down only on the word of a file `protect::classify`
-/// names: a `settings*.json` in a `.claude` directory, refused to a file
-/// tool in every mode and on the starter's floor for a command, so a
-/// session cannot write itself the registration that would stand this hook
-/// down. A user directory that `CLAUDE_CONFIG_DIR` puts under another name
-/// is not read: both hooks run there, which costs a second record and takes
-/// nothing away.
+/// names: a `settings*.json` in a `.claude` directory, or in the directory
+/// `CLAUDE_CONFIG_DIR` names (guarded like `.claude` since v0.22.0),
+/// refused to a file tool in every mode and on the starter's floor for a
+/// command, so a session cannot write itself the registration that would
+/// stand this hook down.
 ///
 /// The files are read at each call, and a registration counts once it has
 /// settled (`REGISTRATION_SETTLES`).
@@ -1169,13 +1173,12 @@ fn registers_own_hook(start_dir: &std::path::Path) -> bool {
         files.push(dir.join("settings.json"));
         files.push(dir.join("settings.local.json"));
     }
-    let user = match std::env::var("CLAUDE_CONFIG_DIR") {
-        Ok(d) if !d.trim().is_empty() => Some(std::path::PathBuf::from(d)),
-        _ => std::env::var("USERPROFILE")
+    let user = crate::protect::moved_to("CLAUDE_CONFIG_DIR").or_else(|| {
+        std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
             .ok()
-            .map(|h| std::path::PathBuf::from(h).join(".claude")),
-    };
+            .map(|h| std::path::PathBuf::from(h).join(".claude"))
+    });
     if let Some(user) = user {
         files.push(user.join("settings.json"));
     }
@@ -3201,13 +3204,22 @@ mod tests {
         assert!(stands_down(&bare));
         std::fs::remove_file(user.join("settings.json")).unwrap();
 
-        // And only a `.claude` directory's settings count: a user directory
-        // under another name is not read.
+        // A user directory under another name is the one
+        // `CLAUDE_CONFIG_DIR` names. Its settings file is guarded like the
+        // one in `.claude` (v0.22.0), so its registration counts too; the
+        // same file with the variable pointing elsewhere is a path like any
+        // other, and nothing is taken from it.
         let moved = env.root().join("claude-config");
         std::fs::create_dir_all(&moved).unwrap();
         std::fs::write(moved.join("settings.json"), wired(plain)).unwrap();
         settle(&moved.join("settings.json"));
         std::env::set_var("CLAUDE_CONFIG_DIR", &moved);
+        assert!(
+            crate::protect::classify("", &moved.join("settings.json").to_string_lossy()).is_some(),
+            "the file the hook takes a registration from is one the gate guards"
+        );
+        assert!(stands_down(&bare));
+        std::env::set_var("CLAUDE_CONFIG_DIR", &user);
         assert!(!stands_down(&bare));
     }
 
@@ -3314,5 +3326,140 @@ mod tests {
         assert!(!named(
             json!({ "command": "termaxa", "args": ["hook", "--plugin"] })
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // A directory its tool has moved (v0.22.0)
+    // -----------------------------------------------------------------
+
+    /// `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the gate's own `TERMAXA_HOME`
+    /// put a directory the guards know by name under another one, and
+    /// until v0.22.0 nothing followed it. With the starter, a file tool
+    /// wrote the settings file of a moved Claude Code directory with no
+    /// answer, `echo '{"disableAllHooks":true}' >
+    /// ~/.config/claude/settings.json` was allowed by `echo *`, and in
+    /// observe mode the copies under a moved state directory could be
+    /// deleted (found Nov 15, 2026, on the released 0.21.10). Each is
+    /// refused in both modes, as it is under the default name.
+    #[test]
+    fn a_directory_its_tool_has_moved_is_guarded_in_both_modes() {
+        let mut env = crate::testutil::TestEnv::new("hook-moved-dirs");
+        let claude = env.root().join("cfg").join("claude");
+        let codex = env.root().join("cfg").join("codex");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(claude.join("settings.json"), "{}\n").unwrap();
+        std::fs::write(codex.join("hooks.json"), "{}\n").unwrap();
+        // `TestEnv` has moved the state directory already.
+        let record = env.home().join("projects").join("k").join("logs");
+        std::fs::create_dir_all(&record).unwrap();
+        std::fs::write(record.join("audit.jsonl"), "").unwrap();
+        env.set_var("CLAUDE_CONFIG_DIR", &claude);
+        env.set_var("CODEX_HOME", &codex);
+        let show = |p: &std::path::Path| p.display().to_string();
+        let write = |proj: &std::path::Path, path: &std::path::Path| {
+            json!({
+                "session_id": "m",
+                "cwd": show(proj),
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": { "file_path": show(path), "content": "{}\n" }
+            })
+            .to_string()
+        };
+        let mut projects = Vec::new();
+        for mode in ["enforce", "observe"] {
+            let proj = env.project(mode);
+            let policy = crate::init::STARTER_POLICY.replacen(
+                "\nmode: enforce\n",
+                &format!("\nmode: {mode}\n"),
+                1,
+            );
+            assert!(policy.contains(&format!("\nmode: {mode}\n")));
+            std::fs::write(proj.join(".termaxa").join("policy.yaml"), policy).unwrap();
+
+            // A file tool, which no mode lets write a guarded file.
+            for path in [
+                claude.join("settings.json"),
+                claude.join("settings.local.json"),
+                codex.join("hooks.json"),
+                record.join("audit.jsonl"),
+            ] {
+                let out = decide(&write(&proj, &path)).expect("a write is judged");
+                assert_eq!(out.exit_code, 2, "{mode}: Write {}", path.display());
+            }
+            let out = decide(&write(&proj, &claude.join("notes.md"))).expect("judged");
+            assert_eq!(out.exit_code, 0, "{mode}: a file no guard names");
+
+            // A command: by the path, by the variable, by a tool the gate
+            // has no grammar for, and the directory as a whole.
+            for cmd in [
+                format!("echo '{{}}' > {}/settings.json", show(&claude)),
+                "echo '{}' > \"$CLAUDE_CONFIG_DIR/settings.json\"".to_string(),
+                "echo '{}' > \"$CLAUDE_CONFIG_DIR\"/settings.json".to_string(),
+                format!("truncate -s 0 {}/settings.json", show(&claude)),
+                format!("rm -rf {}", show(&claude)),
+                "rm -rf \"$CLAUDE_CONFIG_DIR\"".to_string(),
+                format!("mv {} /tmp/gone", show(&claude)),
+                format!("echo '{{}}' > {}/hooks.json", show(&codex)),
+                "cp /tmp/h.json \"$CODEX_HOME/hooks.json\"".to_string(),
+                format!("echo x >> {}/audit.jsonl", show(&record)),
+                "rm -rf \"$TERMAXA_HOME\"/projects/k/backups".to_string(),
+                format!("rm -rf {}", show(&env.home().join("projects").join("k"))),
+            ] {
+                let out = decide(&bash_payload(&proj, "m", &cmd)).expect("judged");
+                assert_eq!(out.exit_code, 2, "{mode}: {cmd}");
+                let said = out.rendered.unwrap_or_default();
+                assert!(
+                    said.contains("\"permissionDecision\":\"deny\""),
+                    "{mode}: {cmd}: {said}"
+                );
+            }
+            // Reading it, and what else the directory holds, is ordinary.
+            for cmd in [
+                format!("cat {}/settings.json", show(&claude)),
+                format!("ls -la {}", show(&claude)),
+                format!("echo hi > {}/notes.md", show(&claude)),
+            ] {
+                let out = decide(&bash_payload(&proj, "m", &cmd)).expect("judged");
+                assert_eq!(out.exit_code, 0, "{mode}: {cmd}");
+            }
+            projects.push(proj);
+        }
+
+        // With the variable unset the directory is a path like any other,
+        // and the variable's own name is still the directory: a supervisor
+        // does not have the session's environment.
+        env.set_var("CLAUDE_CONFIG_DIR", "");
+        for proj in &projects {
+            let out = decide(&bash_payload(
+                proj,
+                "m",
+                "echo '{}' > \"$CLAUDE_CONFIG_DIR/settings.json\"",
+            ))
+            .expect("judged");
+            assert_eq!(out.exit_code, 2, "by its name");
+            let out = decide(&write(proj, &claude.join("settings.json"))).expect("judged");
+            assert_eq!(out.exit_code, 0, "a directory nothing names");
+        }
+    }
+
+    /// Codex is known by `turn_id`, and failing that by a transcript under
+    /// its home: `~/.codex`, or the directory `CODEX_HOME` names.
+    #[test]
+    fn codex_is_known_by_a_transcript_under_its_moved_home() {
+        let mut env = crate::testutil::TestEnv::new("hook-codex-home");
+        let payload =
+            |transcript: &str| json!({ "session_id": "s", "transcript_path": transcript });
+        assert!(sent_by_codex(&payload(
+            "/home/dev/.codex/sessions/2026/09/19/rollout.jsonl"
+        )));
+        assert!(!sent_by_codex(&payload("/data/cx/sessions/rollout.jsonl")));
+        env.set_var("CODEX_HOME", "/data/cx");
+        assert!(sent_by_codex(&payload("/data/cx/sessions/rollout.jsonl")));
+        assert!(!sent_by_codex(&payload("/data/cxx/sessions/rollout.jsonl")));
+        assert!(!sent_by_codex(&payload(
+            "/home/dev/.claude/projects/p/s.jsonl"
+        )));
     }
 }
