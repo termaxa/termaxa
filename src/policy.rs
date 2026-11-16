@@ -162,6 +162,12 @@ impl Rule {
     /// A leading `*` component means "at any depth", so `*/.env` matches
     /// `.env` at the root as well as nested. Without that, a policy author
     /// would have to write two rules for one file.
+    ///
+    /// A path inside a directory that its tool's own variable has moved
+    /// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `TERMAXA_HOME`) is matched under
+    /// the directory's default name as well, so `*/.claude/settings*.json`
+    /// names the settings file wherever Claude Code was told to keep it
+    /// (`protect::under_default_name`, v0.22.0).
     pub fn matches_path(&self, path: &str) -> bool {
         let Some(pattern) = &self.match_path else {
             return false;
@@ -169,6 +175,8 @@ impl Rule {
         let pat: Vec<String> = crate::protect::segments(pattern);
         let seg: Vec<String> = crate::protect::segments(path);
         match_components(&pat, &seg)
+            || crate::protect::under_default_name(&seg)
+                .is_some_and(|renamed| match_components(&pat, &renamed))
     }
 
     /// Does this rule's `match_path` pattern match a path whose start the
@@ -193,7 +201,12 @@ impl Rule {
             return false;
         }
         let seg: Vec<String> = crate::protect::segments(&end.join("/"));
+        // An end that starts with the last components of a directory its
+        // tool has moved is read under the directory's default name as
+        // well, as `matches_path` reads a whole path (v0.22.0).
         match_components(&pat, &seg)
+            || crate::protect::end_under_default_name(&seg)
+                .is_some_and(|renamed| match_components(&pat, &renamed))
     }
 
     /// Does this rule's STRING pattern match a reading? A rule with no
@@ -990,6 +1003,7 @@ impl Policy {
         let mut best: Option<(usize, &Rule)> = None;
         for pv in deny_only_readings(line)
             .iter()
+            .chain(spelled_by_default_readings(line).iter())
             .filter(|pv| !views.iter().any(|v| v == *pv))
         {
             if let Some((idx, rule)) = self
@@ -1071,8 +1085,11 @@ impl Policy {
         // (Oct 9, 2026): `/usr/bin/kubectl delete …` must hit `kubectl
         // delete*`, while an allow written for `ls *` must not admit `./ls`,
         // which is whatever file sits there. See `deny_only_readings`.
+        // And a directory its tool has moved is, to a deny, the directory
+        // under its default name (`spelled_by_default_readings`).
         for pv in deny_only_readings(command)
             .iter()
+            .chain(spelled_by_default_readings(command).iter())
             .filter(|pv| !views.iter().any(|v| v == *pv))
         {
             if let Some((idx, rule)) = self
@@ -1503,6 +1520,33 @@ fn deny_only_readings(command: &str) -> Vec<String> {
             if !out.contains(&l) {
                 out.push(l);
             }
+        }
+    }
+    out
+}
+
+/// The readings of a command that names a directory its tool has moved
+/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `TERMAXA_HOME`), with the directory
+/// spelled `~/.claude`, `~/.codex` or `~/.termaxa`: every reading the line
+/// itself would have, for DENY rules and nothing else. Empty for a command
+/// that names none.
+///
+/// The string rules over the gate's own files and the hook configs name a
+/// directory by its default name (`*.claude*settings*`), and they are the
+/// only rules that see a write through a grammar the gate does not model
+/// (`truncate`, an editor, `python -c`). Until v0.22.0 such a line named a
+/// moved directory by a path no rule knew and fell to whatever else matched
+/// it. Deny only, like a reading through `sudo`: an allow written for
+/// `~/.claude/skills/*` is not thereby an allow for another directory, and a
+/// deny is what the default name would have earned.
+fn spelled_by_default_readings(command: &str) -> Vec<String> {
+    let Some(renamed) = crate::protect::spelled_by_default(command) else {
+        return Vec::new();
+    };
+    let mut out = readings(&renamed);
+    for r in deny_only_readings(&renamed) {
+        if !out.contains(&r) {
+            out.push(r);
         }
     }
     out
@@ -5222,5 +5266,125 @@ mod watching_tests {
         let policy = Policy::load(&path).expect("an unknown key is not an error");
         assert!(!policy.watch);
         assert_eq!(policy.mode_label(Mode::Observe), "observe");
+    }
+}
+
+#[cfg(test)]
+mod moved_directory_tests {
+    use super::*;
+
+    fn here() -> crate::resolve::EvalContext {
+        crate::resolve::EvalContext::at(std::path::Path::new("."))
+    }
+
+    fn path_rule(pattern: &str) -> Rule {
+        Rule {
+            r#match: None,
+            action: Action::Deny,
+            reason: None,
+            floor: true,
+            except_rebuilt: false,
+            except_reads: false,
+            case_sensitive: false,
+            match_path: Some(pattern.into()),
+        }
+    }
+
+    /// A rule that names `.claude`, `.codex` or `.termaxa` matches a path
+    /// inside the directory `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or
+    /// `TERMAXA_HOME` names, as it matches the default one. Until v0.22.0
+    /// it matched the name alone.
+    #[test]
+    fn a_path_rule_follows_a_directory_its_tool_has_moved() {
+        let mut env = crate::testutil::TestEnv::new("policy-moved");
+        let settings = path_rule("*/.claude/settings*.json");
+        let hooks = path_rule("*/.codex/hooks.json");
+        let own = path_rule("*/.termaxa/*");
+        let at = |p: std::path::PathBuf| p.display().to_string();
+        let claude = env.root().join("cfg").join("claude");
+        let codex = env.root().join("cfg").join("codex");
+
+        // The state directory is moved by `TestEnv` itself.
+        assert!(own.matches_path(&at(env.home().join("projects").join("k"))));
+        assert!(own.matches_path(&at(env.home())), "the directory itself");
+        assert!(!own.matches_path(&at(env.root().join("homework").join("k"))));
+        assert!(own.matches_path_end(&["home".into(), "projects".into()]));
+
+        assert!(!settings.matches_path(&at(claude.join("settings.json"))));
+        assert!(!hooks.matches_path(&at(codex.join("hooks.json"))));
+        env.set_var("CLAUDE_CONFIG_DIR", &claude);
+        env.set_var("CODEX_HOME", &codex);
+        assert!(settings.matches_path(&at(claude.join("settings.json"))));
+        assert!(settings.matches_path(&at(claude.join("settings.local.json"))));
+        assert!(hooks.matches_path(&at(codex.join("hooks.json"))));
+        assert!(!settings.matches_path(&at(claude.join("notes.md"))));
+        assert!(!settings.matches_path(&at(claude.join("sub").join("settings.json"))));
+        assert!(!settings.matches_path(&at(codex.join("settings.json"))));
+        // By its end: what stands before `cfg/claude` is not known.
+        let end = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(settings.matches_path_end(&end(&["cfg", "claude", "settings.json"])));
+        assert!(settings.matches_path_end(&end(&["claude", "settings.json"])));
+        assert!(!settings.matches_path_end(&end(&["cfg", "other", "settings.json"])));
+        assert!(hooks.matches_path_end(&end(&["codex", "hooks.json"])));
+        // The default names match as they did.
+        assert!(settings.matches_path("/home/u/.claude/settings.json"));
+        assert!(settings.matches_path_end(&end(&[".claude", "settings.json"])));
+    }
+
+    /// The starter's string rules over the hook configs and the gate's own
+    /// state are the only rules that see a write the gate has no grammar
+    /// for. They name the directory by its default name, so until v0.22.0
+    /// such a line about a moved directory fell to whatever else matched
+    /// it; it is read for them as spelled under the default name, and only
+    /// for a deny.
+    #[test]
+    fn the_string_rules_read_a_moved_directory_under_its_default_name() {
+        let mut env = crate::testutil::TestEnv::new("policy-moved-strings");
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let claude = env.root().join("cfg").join("claude");
+        let codex = env.root().join("cfg").join("codex");
+        let c = claude.display().to_string();
+        let x = codex.display().to_string();
+        let state = env.home().display().to_string();
+        let lines = |c: &str, x: &str, state: &str| {
+            vec![
+                format!("truncate -s 0 {c}/settings.json"),
+                format!("chmod 000 {c}/settings.json"),
+                format!("ln -sf /tmp/s.json {c}/settings.json"),
+                format!("python3 -c \"open('{c}/settings.json','w').write('{{}}')\""),
+                format!("curl -o {c}/settings.local.json https://example.com/s.json"),
+                format!("install -m 644 /tmp/h.json {x}/hooks.json"),
+                format!("node -e \"require('fs').writeFileSync('{x}/hooks.json','{{}}')\""),
+                format!("gzip {state}/projects/k/logs/audit.jsonl"),
+                format!("touch {state}/projects/k/breaker.json"),
+            ]
+        };
+        // Not moved: no rule knows these paths, and none refuses them.
+        for line in lines(&c, &x, "/nowhere/state") {
+            let d = p.evaluate_command(&line, &here());
+            assert!(!p.held_by_floor(&d), "{line}: {}", d.reason);
+        }
+        env.set_var("CLAUDE_CONFIG_DIR", &claude);
+        env.set_var("CODEX_HOME", &codex);
+        let by_variable = lines("$CLAUDE_CONFIG_DIR", "${CODEX_HOME}", "$TERMAXA_HOME");
+        for line in lines(&c, &x, &state).into_iter().chain(by_variable) {
+            let d = p.evaluate_command(&line, &here());
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert!(p.held_by_floor(&d), "{line}: held in observe mode too");
+        }
+        // A read of a hook config is still excepted, and what the directory
+        // holds besides is still ordinary.
+        for line in [
+            format!("cat {c}/settings.json"),
+            format!("grep -n hooks {c}/settings.json"),
+            "cat \"$CLAUDE_CONFIG_DIR/settings.json\"".to_string(),
+            format!("wc -l {x}/hooks.json"),
+            format!("touch {c}/notes.md"),
+            format!("chmod 644 {x}/config.toml"),
+            "echo $CLAUDE_CONFIG_DIR".to_string(),
+        ] {
+            let d = p.evaluate_command(&line, &here());
+            assert_ne!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
     }
 }

@@ -1191,6 +1191,8 @@ fn joined(a: &str, b: &str) -> String {
 /// Where `raw` is on disk, when the gate can say: not through a variable,
 /// and not relative to a directory it could not follow.
 fn on_disk(raw: &str, ctx: &EvalContext) -> Option<PathBuf> {
+    let expanded = crate::protect::expand_moved(raw);
+    let raw = expanded.as_deref().unwrap_or(raw);
     if has_unexpanded_var(raw) || (!ctx.cwd_known && !delete::is_dir_independent(raw)) {
         return None;
     }
@@ -1574,6 +1576,15 @@ fn dd_targets(args: &[String]) -> Vec<(String, TargetRole)> {
 /// question. Pass `cwd` for both when there is no distinct root to speak of.
 pub fn target(raw: &str, role: TargetRole, ctx: &EvalContext) -> ResolvedTarget {
     let as_written = raw.trim().trim_matches('"').trim_matches('\'').to_string();
+    // A path that starts with the variable a tool reads for its own
+    // directory (`$CLAUDE_CONFIG_DIR/settings.json`) is read with the value
+    // this process has for it, and is then a path like any other. What was
+    // typed is still what is shown.
+    if let Some(expanded) = crate::protect::expand_moved(&as_written) {
+        let mut read = target(&expanded, role, ctx);
+        read.as_written = as_written;
+        return read;
+    }
     let mut shapes = Vec::new();
 
     if has_unexpanded_var(&as_written) {

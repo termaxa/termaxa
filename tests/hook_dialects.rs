@@ -2010,6 +2010,111 @@ fn a_program_that_only_reads_cannot_redirect_into_a_hook_config() {
     }
 }
 
+/// `CLAUDE_CONFIG_DIR` puts Claude Code's user settings, and with them the
+/// hooks every session loads, in a directory that is not called `.claude`;
+/// `TERMAXA_HOME` does the same for the gate's own record. Until v0.22.0 no
+/// guard followed either: a file tool wrote the moved settings file with
+/// no answer and `echo '{}' > <dir>/settings.json` was allowed by `echo *`
+/// (found Nov 15, 2026, on the released 0.21.10). Through the binary, in
+/// both modes, with the variable in the hook's environment as the harness
+/// passes it on; and by the variable's own name where it is not.
+#[cfg(unix)]
+#[test]
+fn a_directory_its_tool_has_moved_is_guarded_through_the_hook() {
+    use serde_json::json;
+    for mode in ["enforce", "observe"] {
+        let tmp = scratch(&format!("moved-{mode}"));
+        let home = tmp.join("home");
+        let claude = tmp.join("cfg").join("claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), "{}\n").unwrap();
+        let policy = format!(
+            concat!(
+                "version: 1\nmode: {}\ndefault: ask\nrules:\n",
+                "  - match_path: \"*/.claude/settings*.json\"\n    action: deny\n    floor: true\n",
+                "  - match_path: \"*/.termaxa/*\"\n    action: deny\n    floor: true\n",
+                "  - match: \"*.claude*settings*\"\n    action: deny\n    floor: true\n    except_reads: true\n",
+                "  - match: \"echo *\"\n    action: allow\n",
+                "  - match: \"cat *\"\n    action: allow\n",
+                "  - match: \"truncate *\"\n    action: allow\n",
+            ),
+            mode
+        );
+        let proj = project(&tmp, &policy);
+        let dir = claude.to_string_lossy().into_owned();
+        let moved = [("CLAUDE_CONFIG_DIR", dir.as_str())];
+        // An empty value is no directory, whatever this machine's own
+        // environment says.
+        let unset = [("CLAUDE_CONFIG_DIR", "")];
+        let bash = |cmd: &str| {
+            json!({"session_id":"M","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+                   "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+        };
+        let write = |path: &std::path::Path| {
+            json!({"session_id":"M","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+                   "hook_event_name":"PreToolUse","tool_name":"Write",
+                   "tool_input":{"file_path":path.to_string_lossy(),"content":"{}"}})
+        };
+
+        // A file tool: refused where the variable names the directory, and
+        // a path like any other where nothing does.
+        let out = hook(&home, &proj, &write(&claude.join("settings.json")), &moved);
+        assert_eq!(out.code, 2, "{mode}: {}", out.stdout);
+        let out = hook(&home, &proj, &write(&claude.join("settings.json")), &unset);
+        assert_eq!(out.code, 0, "{mode}: {}", out.stdout);
+        let out = hook(&home, &proj, &write(&claude.join("notes.md")), &moved);
+        assert_eq!(out.code, 0, "{mode}: {}", out.stdout);
+        // The gate's own record, under the state directory the hook is
+        // given (`TERMAXA_HOME`, which every test here sets).
+        let record = home
+            .join("projects")
+            .join("k")
+            .join("logs")
+            .join("audit.jsonl");
+        let out = hook(&home, &proj, &write(&record), &unset);
+        assert_eq!(out.code, 2, "{mode}: {}", out.stdout);
+
+        for cmd in [
+            format!("echo '{{}}' > {dir}/settings.json"),
+            "echo '{}' > \"$CLAUDE_CONFIG_DIR/settings.json\"".to_string(),
+            "echo '{}' > \"${CLAUDE_CONFIG_DIR}\"/settings.local.json".to_string(),
+            format!("truncate -s 0 {dir}/settings.json"),
+            "truncate -s 0 $CLAUDE_CONFIG_DIR/settings.json".to_string(),
+            format!("echo x >> {}", record.display()),
+            "echo x >> \"$TERMAXA_HOME\"/projects/k/logs/audit.jsonl".to_string(),
+        ] {
+            let out = hook(&home, &proj, &bash(&cmd), &moved);
+            assert_eq!(out.code, 2, "{mode}: {cmd}: {}", out.stdout);
+            assert!(
+                out.stdout.contains("\"permissionDecision\":\"deny\""),
+                "{mode}: {cmd}: {}",
+                out.stdout
+            );
+        }
+        // By its name alone, where the hook's environment has no value.
+        for cmd in [
+            "echo '{}' > \"$CLAUDE_CONFIG_DIR/settings.json\"",
+            "truncate -s 0 $CLAUDE_CONFIG_DIR/settings.json",
+        ] {
+            let out = hook(&home, &proj, &bash(cmd), &unset);
+            assert_eq!(out.code, 2, "{mode}: {cmd}: {}", out.stdout);
+        }
+        // Reading the file, and writing beside it, is ordinary work.
+        for cmd in [
+            format!("cat {dir}/settings.json"),
+            format!("echo hi > {dir}/notes.md"),
+        ] {
+            let out = hook(&home, &proj, &bash(&cmd), &moved);
+            assert_eq!(out.code, 0, "{mode}: {cmd}: {}", out.stdout);
+            assert!(
+                !out.stdout.contains("\"permissionDecision\":\"deny\""),
+                "{mode}: {cmd}: {}",
+                out.stdout
+            );
+        }
+    }
+}
+
 /// The floor holds a git command that would unhook the gate without naming
 /// its file. In the state `termaxa init` leaves, the hook registration is
 /// an uncommitted change to a tracked `.claude/settings.json`: `git stash`

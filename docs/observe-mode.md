@@ -172,8 +172,9 @@ this every command would be judged, recorded and copied twice. Where
 the session started in, or the user's `settings.json`, registers `termaxa
 hook` under `PreToolUse`, the plugin's hook answers nothing and leaves no
 record, no witness and no copy, for any event. It reads only a
-`settings*.json` in a `.claude` directory, the files the floor holds
-against a session's own writes. A registration it does not recognise (a
+`settings*.json` in a `.claude` directory or in the directory
+`CLAUDE_CONFIG_DIR` names, the files the floor holds against a session's
+own writes. A registration it does not recognise (a
 wrapper script that runs the hook from inside) leaves both hooks running:
 a second record, and nothing taken away.
 

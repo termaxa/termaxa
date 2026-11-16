@@ -1490,8 +1490,9 @@ fn readable_end_in(
     literal_dollars: &[usize],
 ) -> Option<Vec<String>> {
     let chars: Vec<char> = text.chars().collect();
-    // Index just past the last unreadable part.
+    // Index just past the last unreadable part, and where that part began.
     let mut after: Option<usize> = None;
+    let mut began = 0usize;
     let mut i = 0;
     let is_name = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
     if chars.first() == Some(&'~') && !matches!(chars.get(1), None | Some('/') | Some('\\')) {
@@ -1569,6 +1570,7 @@ fn readable_end_in(
         match end {
             Some(e) => {
                 after = Some(e);
+                began = i;
                 i = e;
             }
             None => i += 1,
@@ -1579,6 +1581,14 @@ fn readable_end_in(
     // Up to the first separator is the rest of the component the unreadable
     // part sits in; the components after it are literal.
     let mut end: Vec<String> = Vec::new();
+    // One unreadable part is not unknown: the variable a tool reads for its
+    // own directory. `$CLAUDE_CONFIG_DIR/settings.json` is Claude Code's
+    // settings file whatever the variable holds, so the path ends in
+    // `.claude/settings.json`, the name every guard on that file is written
+    // against (`protect::moved_name`).
+    if let Some(name) = moved_directory(&chars, began, after) {
+        end.push(name.to_string());
+    }
     for comp in rest.split(['/', '\\']).skip(1) {
         match comp {
             "" | "." => {}
@@ -1589,6 +1599,40 @@ fn readable_end_in(
         }
     }
     Some(end)
+}
+
+/// The default name of the directory that `chars[began..after]` names, when
+/// that part is the whole of its component and is a variable a tool reads
+/// for its own directory: `$NAME`, `${NAME}` (with a default after it or
+/// not), `%NAME%`, and PowerShell's `$env:NAME`.
+fn moved_directory(chars: &[char], began: usize, after: usize) -> Option<&'static str> {
+    let sep = |at: usize| matches!(chars.get(at), None | Some('/') | Some('\\'));
+    if began > 0 && !matches!(chars.get(began - 1), Some('/') | Some('\\')) {
+        return None;
+    }
+    let part: String = chars[began..after].iter().collect();
+    let is_name = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
+    let name: String = if let Some(braced) = part.strip_prefix("${") {
+        braced.chars().take_while(is_name).collect()
+    } else if part.len() > 2 && part.starts_with('%') && part.ends_with('%') {
+        part[1..part.len() - 1].to_string()
+    } else if part.eq_ignore_ascii_case("$env") && chars.get(after) == Some(&':') {
+        // `$env:NAME`: the name runs from the colon to the separator.
+        let name: String = chars[after + 1..]
+            .iter()
+            .take_while(|c| is_name(c))
+            .collect();
+        if !sep(after + 1 + name.chars().count()) {
+            return None;
+        }
+        return crate::protect::moved_name(&name);
+    } else {
+        part.strip_prefix('$')?.to_string()
+    };
+    if !sep(after) {
+        return None;
+    }
+    crate::protect::moved_name(&name)
 }
 
 /// `end`, the known end of a directory, after a relative `path` from it:
@@ -2214,15 +2258,24 @@ pub fn is_rebuilt_name(name: &str) -> bool {
 /// `~/.codex`. A tree that is removed or copied over is read for what it
 /// changes in the project and in these, and nowhere else
 /// (`resolve::command_contents`).
+///
+/// And the directories `CLAUDE_CONFIG_DIR` and `CODEX_HOME` name, where a
+/// session keeps the first two somewhere else (v0.22.0).
 pub fn user_config_dirs() -> Vec<PathBuf> {
-    home_dir()
+    let mut dirs: Vec<PathBuf> = home_dir()
         .map(|h| {
             [".claude", ".cursor", ".codex"]
                 .iter()
                 .map(|d| h.join(d))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for variable in ["CLAUDE_CONFIG_DIR", "CODEX_HOME"] {
+        if let Some(moved) = crate::protect::moved_to(variable) {
+            dirs.push(moved);
+        }
+    }
+    dirs
 }
 
 // ---------------------------------------------------------------------------
@@ -3559,6 +3612,40 @@ mod segment_directory_tests {
         // The component holding the unreadable part is not known at all.
         assert_eq!(end("\"$(pwd)\".claude"), v(&[]));
         assert_eq!(end("$X-wt/.claude"), v(&[".claude"]));
+        // The variable a tool reads for its own directory is that
+        // directory, whatever it holds: the end starts with the name the
+        // directory has by default.
+        for raw in [
+            "$CLAUDE_CONFIG_DIR/settings.json",
+            "\"$CLAUDE_CONFIG_DIR/settings.json\"",
+            "${CLAUDE_CONFIG_DIR}/settings.json",
+            "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json",
+            "%CLAUDE_CONFIG_DIR%\\settings.json",
+            "$env:CLAUDE_CONFIG_DIR\\settings.json",
+        ] {
+            assert_eq!(end(raw), v(&[".claude", "settings.json"]), "{raw}");
+        }
+        assert_eq!(end("$CODEX_HOME/hooks.json"), v(&[".codex", "hooks.json"]));
+        assert_eq!(
+            end("$TERMAXA_HOME/projects/a/logs/audit.jsonl"),
+            v(&[".termaxa", "projects", "a", "logs", "audit.jsonl"])
+        );
+        assert_eq!(end("$CLAUDE_CONFIG_DIR"), v(&[".claude"]));
+        assert_eq!(end("$CLAUDE_CONFIG_DIR/../x"), v(&["x"]));
+        // Only as the whole of its component, and only those variables.
+        assert_eq!(
+            end("$CLAUDE_CONFIG_DIRX/settings.json"),
+            v(&["settings.json"])
+        );
+        assert_eq!(
+            end("$CLAUDE_CONFIG_DIR.bak/settings.json"),
+            v(&["settings.json"])
+        );
+        assert_eq!(
+            end("x$CLAUDE_CONFIG_DIR/settings.json"),
+            v(&["settings.json"])
+        );
+        assert_eq!(end("$HOME/settings.json"), v(&["settings.json"]));
         // `..` climbs: within the end, or into what is unknown.
         assert_eq!(end("$(pwd)/.claude/.."), v(&[]));
         assert_eq!(end("$(pwd)/../.claude"), v(&[".claude"]));
