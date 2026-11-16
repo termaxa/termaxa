@@ -16,7 +16,10 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     let policy = Policy::load(&paths.policy_file())?;
     let ctx =
         crate::resolve::EvalContext::from_paths(std::env::current_dir().unwrap_or_default(), paths);
-    let base = policy.evaluate_command(&command, &ctx);
+    // As in the hook: the verdict, and the readings of the line the preview
+    // and the copy aside are made for.
+    let read = policy.judge_command(&command, &ctx);
+    let base = read.decision.clone();
     let signals = context::gather_with(&command, &|inner| policy.allows_explicitly(inner, &ctx));
     let (decision, escalated) = context::apply(base, &signals);
 
@@ -58,7 +61,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     // with a warning by default; a policy that sets `backup_failure: deny`
     // refuses instead, because nobody is reading warnings on an unattended run.
     let insure = |backup_id: &mut Option<String>| -> bool {
-        match crate::backup::take(&paths.state_dir, &command, &run_cwd) {
+        match read.insure(&command, &paths.state_dir, &run_cwd) {
             Ok(Some(rec)) => {
                 println!("🛟 backup {} — {}", rec.id, rec.note);
                 *backup_id = Some(rec.id);
@@ -91,7 +94,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     };
 
     let root = paths.project_dir.parent();
-    let preview = crate::preview::generate(&command, root, &run_cwd, true);
+    let preview = read.preview(&command, root, &run_cwd, true);
     let preview_summary = preview.as_ref().map(|p| p.summary.clone());
 
     // OBSERVE MODE (decision #108), the same rule as the hook: outside the
@@ -143,7 +146,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
             (Some(false), None)
         }
         Action::Ask => {
-            if let Some(pv) = crate::preview::generate(&command, root, &run_cwd, true) {
+            if let Some(pv) = read.preview(&command, root, &run_cwd, true) {
                 println!("┌ {}", pv.title);
                 for l in &pv.lines {
                     println!("│{}", l);
