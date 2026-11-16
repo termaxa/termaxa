@@ -342,7 +342,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
             // coincide.
             let cwd = std::env::current_dir().unwrap_or_default();
             let ctx = resolve::EvalContext::at(cwd);
-            let base = policy.evaluate_command(&cmd, &ctx);
+            let read = policy.judge_command(&cmd, &ctx);
+            let base = read.decision.clone();
             let signals =
                 context::gather_with(&cmd, &|inner| policy.allows_explicitly(inner, &ctx));
             let (decision, escalated) = context::apply(base, &signals);
@@ -354,7 +355,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             // enforce another - the shape of bug this release keeps finding.
             let check_cwd =
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let pv = preview::generate(
+            let pv = read.preview(
                 &cmd,
                 root,
                 &check_cwd,

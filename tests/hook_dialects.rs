@@ -2560,3 +2560,64 @@ fn a_watched_project_never_trips_the_breaker() {
         "the observed project's third delete trips: {tripped:?}"
     );
 }
+
+/// A guarded name with an escape inside it, through the binary and in both
+/// modes: `echo x > .cl\aude/settings.json` wrote the hook config through
+/// `echo *` from v0.14.2 to v0.21.10, the plain spelling a floor deny
+/// (measured Nov 15, 2026, release by release). The line is judged as bash
+/// reads it, and the reason says so.
+#[cfg(unix)]
+#[test]
+fn a_name_with_an_escape_inside_it_is_refused_through_the_hook() {
+    use serde_json::json;
+    for mode in ["enforce", "observe"] {
+        let tmp = scratch(&format!("readings-{mode}"));
+        let home = tmp.join("home");
+        let policy = format!(
+            concat!(
+                "version: 1\nmode: {}\ndefault: ask\nrules:\n",
+                "  - match_path: \"*/.claude/settings*.json\"\n    action: deny\n    floor: true\n",
+                "  - match_path: \"*/.termaxa/*\"\n    action: deny\n    floor: true\n",
+                "  - match: \"*rm -rf /*\"\n    action: deny\n    floor: true\n",
+                "  - match: \"echo *\"\n    action: allow\n",
+                "  - match: \"cd *\"\n    action: allow\n",
+            ),
+            mode
+        );
+        let proj = project(&tmp, &policy);
+        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+        std::fs::write(proj.join(".claude").join("settings.json"), "{}\n").unwrap();
+        let bash = |cmd: &str| {
+            json!({"session_id":"R","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+                   "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+        };
+        for cmd in [
+            "echo x > .cl\\aude/settings.json",
+            "echo x > $'.cl\\x61ude/settings.json'",
+            "cd .cl\\aude && echo x > settings.json",
+            "sh -c 'echo x > .cl\\aude/settings.json'",
+            "echo x > .ter\\maxa/policy.yaml",
+            "r\\m -rf /",
+        ] {
+            let out = hook(&home, &proj, &bash(cmd), &[]);
+            assert_eq!(out.code, 2, "{mode}: {cmd}: {}", out.stdout);
+            assert!(
+                out.stdout.contains("\"permissionDecision\":\"deny\""),
+                "{mode}: {cmd}: {}",
+                out.stdout
+            );
+            assert!(
+                out.stdout.contains("(the line as bash reads it)"),
+                "{mode}: {cmd}: {}",
+                out.stdout
+            );
+        }
+        // The plain spelling is refused with no reading named, and a
+        // backslash that hides nothing changes nothing.
+        let out = hook(&home, &proj, &bash("echo x > .claude/settings.json"), &[]);
+        assert_eq!(out.code, 2, "{mode}: {}", out.stdout);
+        assert!(!out.stdout.contains("reads it)"), "{mode}: {}", out.stdout);
+        let out = hook(&home, &proj, &bash("echo hello\\ world"), &[]);
+        assert_eq!(out.code, 0, "{mode}: {}", out.stdout);
+    }
+}

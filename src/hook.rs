@@ -1680,7 +1680,10 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // from the located policy. Never the process cwd - a hook runs wherever
     // the harness spawned it.
     let ctx = crate::resolve::EvalContext::from_paths(&start_dir, &paths);
-    let base = policy.evaluate_command(&command, &ctx);
+    // The verdict, and with it the readings of the line the preview and the
+    // copy aside are made for (`policy::Judged`).
+    let judged = policy.judge_command(&command, &ctx);
+    let base = judged.decision.clone();
     let signals = context::gather_with(&command, &|inner| policy.allows_explicitly(inner, &ctx));
     let (mut decision, escalated) = context::apply(base, &signals);
 
@@ -1785,7 +1788,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         // A denied command must not cause a subprocess. The preview is still
         // generated — statically — so the denial reason keeps its detail.
         let live = decision.action != crate::policy::Action::Deny;
-        match crate::preview::generate(
+        match judged.preview(
             &command,
             paths.project_dir.parent(),
             std::path::Path::new(&input.cwd),
@@ -1878,7 +1881,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // var without the sentinel changes nothing.
     let mut backup_id: Option<String> = None;
     if !is_probe && will_run {
-        match crate::backup::take(&paths.state_dir, &command, std::path::Path::new(&input.cwd)) {
+        match judged.insure(&command, &paths.state_dir, std::path::Path::new(&input.cwd)) {
             Ok(Some(rec)) => {
                 backup_id = Some(rec.id);
                 // Retention (#72): one eligible backup at most, so the hook
@@ -3441,6 +3444,62 @@ mod tests {
             assert_eq!(out.exit_code, 2, "by its name");
             let out = decide(&write(proj, &claude.join("settings.json"))).expect("judged");
             assert_eq!(out.exit_code, 0, "a directory nothing names");
+        }
+    }
+
+    /// A guarded name spelled so that bash reads it and the walk did not:
+    /// a backslash inside the name, `$'…'`, a `cd` into the escaped name, a
+    /// string handed to a shell, and a program's name with a backslash in
+    /// it. `echo x > .cl\aude/settings.json` was allowed by `echo *` and ran
+    /// silently in observe mode (v0.14.2 to v0.21.10). Each is refused in
+    /// both modes, as its plain spelling is; an ordinary line with a
+    /// backslash in it is answered as before; and in observe mode a write
+    /// the copy aside cannot cover is held for the file bash would write.
+    #[test]
+    fn a_name_bash_reads_through_an_escape_is_refused_in_both_modes() {
+        let env = crate::testutil::TestEnv::new("hook-readings");
+        for mode in ["enforce", "observe"] {
+            let proj = env.project(mode);
+            let policy = crate::init::STARTER_POLICY.replacen(
+                "\nmode: enforce\n",
+                &format!("\nmode: {mode}\n"),
+                1,
+            );
+            assert!(policy.contains(&format!("\nmode: {mode}\n")));
+            std::fs::write(proj.join(".termaxa").join("policy.yaml"), policy).unwrap();
+            std::fs::create_dir_all(proj.join(".claude")).unwrap();
+            std::fs::write(proj.join(".claude").join("settings.json"), "{}\n").unwrap();
+            std::fs::create_dir_all(proj.join("sub")).unwrap();
+            std::fs::write(proj.join("sub").join(".env"), "K=1\n").unwrap();
+            std::fs::create_dir_all(proj.join("wt")).unwrap();
+            std::fs::write(proj.join("notes.md"), "n\n").unwrap();
+
+            for cmd in [
+                "echo x > .cl\\aude/settings.json",
+                "echo x > .claude/sett\\ings.json",
+                "echo x > $'.cl\\x61ude/settings.json'",
+                "cd .cl\\aude && echo x > settings.json",
+                "sh -c 'echo x > .cl\\aude/settings.json'",
+                "rm -r .cl\\aude",
+                "echo x > .ter\\maxa/policy.yaml",
+                "r\\m -rf /",
+                // Off the floor, and nothing can copy the file aside first:
+                // held for the `sub/.env` bash would write.
+                "cp notes.md s\\ub/.env",
+            ] {
+                let out = decide(&bash_payload(&proj, "r", cmd)).expect("judged");
+                assert_eq!(out.exit_code, 2, "{mode}: {cmd}");
+                let said = out.rendered.unwrap_or_default();
+                assert!(
+                    said.contains("\"permissionDecision\":\"deny\""),
+                    "{mode}: {cmd}: {said}"
+                );
+            }
+            // A backslash where no guarded name is: answered as before.
+            for cmd in ["echo x > wt\\notes.md", "echo hello\\ world"] {
+                let out = decide(&bash_payload(&proj, "r", cmd)).expect("judged");
+                assert_eq!(out.exit_code, 0, "{mode}: {cmd}");
+            }
         }
     }
 

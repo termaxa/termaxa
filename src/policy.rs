@@ -544,6 +544,103 @@ fn rebuilt_only(
     first
 }
 
+/// A line's verdict, and the readings of the line it is about.
+pub struct Judged {
+    pub decision: Decision,
+    /// Whether the line as typed is one the preview and the copy aside are
+    /// made for. Not when another shell's reading earned the verdict: the
+    /// refusal is about what that shell would run.
+    typed: bool,
+    /// The other readings of the line that a rule refuses, as the lines
+    /// those shells read; the one that earned the verdict first.
+    refused: Vec<(crate::shell::Reading, String)>,
+}
+
+impl Judged {
+    /// The lines the preview and the copy aside are made for, each with
+    /// the reading it is (`shell::reading_as`): the line as typed, and
+    /// every other reading of it a rule refuses. `cp new.env s\ub/.env` is
+    /// refused as typed for a `s/ub/.env` that is not there and as bash
+    /// reads it for the `sub/.env` that is; what cannot be copied aside is
+    /// that one, and observe mode holds the line for it.
+    fn lines<'a>(&'a self, command: &'a str) -> Vec<(crate::shell::Reading, &'a str)> {
+        self.typed
+            .then_some((crate::shell::Reading::Typed, command))
+            .into_iter()
+            .chain(self.refused.iter().map(|(r, l)| (*r, l.as_str())))
+            .collect()
+    }
+
+    /// `preview::generate` for the line: the preview of the first reading
+    /// whose copy cannot be taken, and failing that of the first that has
+    /// a preview at all.
+    pub fn preview(
+        &self,
+        command: &str,
+        root: Option<&std::path::Path>,
+        cwd: &std::path::Path,
+        live: bool,
+    ) -> Option<crate::preview::Preview> {
+        let mut first: Option<crate::preview::Preview> = None;
+        for (reading, line) in self.lines(command) {
+            let preview = crate::shell::reading_as(reading, || {
+                crate::preview::generate(line, root, cwd, live)
+            });
+            match preview {
+                Some(p) if p.uninsurable => return Some(p),
+                Some(p) => {
+                    first.get_or_insert(p);
+                }
+                None => {}
+            }
+        }
+        first
+    }
+
+    /// `backup::take` for the line: the copy aside of the first reading
+    /// that has something to copy.
+    pub fn insure(
+        &self,
+        command: &str,
+        termaxa_dir: &std::path::Path,
+        cwd: &std::path::Path,
+    ) -> anyhow::Result<Option<crate::backup::BackupRecord>> {
+        for (reading, line) in self.lines(command) {
+            let taken =
+                crate::shell::reading_as(reading, || crate::backup::take(termaxa_dir, line, cwd))?;
+            if taken.is_some() {
+                return Ok(taken);
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The deny rules that stood aside when a line was judged as typed, for the
+/// judging of its other readings (`Policy::evaluate_command`).
+///
+/// A rule stands aside where the policy says it does: a deny that says
+/// `except_rebuilt`, on a delete of nothing but what a build rebuilds, and
+/// a deny below an allow or an ask that matched the same reading first,
+/// which is how a policy writes an exception. Another shell's reading of
+/// the same line can lose what made the exception apply: `rm -rf
+/// node_modules\.cache` names `node_modules.cache` to bash, which no build
+/// rebuilds, and an allow written for `del build\*` does not match `del
+/// buildout.txt`. Without this, a line the policy lets through as typed
+/// would be refused for the rule it was excepted from, on every Windows
+/// path. With it, a reading refuses a line only by a rule the line as typed
+/// never met, or by a path rule, which has no exceptions.
+///
+/// `except_reads` is not carried: a reading has its own redirections, and
+/// whether its command only reads is asked of it afresh.
+#[derive(Default)]
+struct Aside {
+    /// Judging the line as typed, with other readings to come: collect.
+    collect: bool,
+    /// The rules, by their place in `Policy::rules`.
+    rules: Vec<usize>,
+}
+
 impl Policy {
     /// The `match_path` rule that decides for these targets, if any: the
     /// most severe, and among equals the earliest, over every target whose
@@ -643,7 +740,7 @@ impl Policy {
         if inner.trim().is_empty() {
             return false;
         }
-        let d = self.judge(inner, ctx, false);
+        let d = self.judge(inner, ctx, false, &mut Aside::default());
         d.action == Action::Allow && d.source == DecisionSource::ExplicitRule
     }
 
@@ -816,13 +913,77 @@ impl Policy {
                     || (self.held_by_floor(d) && !self.held_by_floor(w))))
     }
 
+    /// The verdict on a command line: as the walk reads it, and as each
+    /// shell that can run it here reads it (`shell::Reading`). A reading
+    /// adds a refusal and nothing else: where a rule denies what bash, cmd
+    /// or PowerShell would run from this line, the line is refused and the
+    /// reason says whose reading it is; what a reading would allow or ask
+    /// changes nothing.
     pub fn evaluate_command(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
-        self.judge(command, ctx, true)
+        self.judge_command(command, ctx).decision
     }
 
-    /// `evaluate_command`; with `inside` false, without the commands the
-    /// line runs out of its own words (`allows_explicitly`).
-    fn judge(&self, command: &str, ctx: &crate::resolve::EvalContext, inside: bool) -> Decision {
+    /// `evaluate_command`, with the readings of the line a rule refuses
+    /// (`Judged`), for the preview and the copy aside.
+    pub fn judge_command(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Judged {
+        self.judge_command_read_by(command, ctx, crate::shell::Reading::others())
+    }
+
+    /// `judge_command` with the shells named: the machine's own for the
+    /// hook, all three for a test of what each adds.
+    fn judge_command_read_by(
+        &self,
+        command: &str,
+        ctx: &crate::resolve::EvalContext,
+        shells: &[crate::shell::Reading],
+    ) -> Judged {
+        let readings = crate::shell::other_readings(command, shells);
+        let mut aside = Aside {
+            collect: !readings.is_empty(),
+            rules: Vec::new(),
+        };
+        let mut judged = Judged {
+            decision: self.judge(command, ctx, true, &mut aside),
+            typed: true,
+            refused: Vec::new(),
+        };
+        // Nothing outranks a deny every mode holds.
+        if self.held_by_floor(&judged.decision) || judged.decision.held_in_every_mode() {
+            return judged;
+        }
+        aside.collect = false;
+        for (reading, line) in readings {
+            let d = crate::shell::reading_as(reading, || self.judge(&line, ctx, true, &mut aside));
+            // Only a rule's deny: a default, an unresolved target or a
+            // reading the walk stopped short of is the reading's own
+            // trouble, not something the line was caught doing.
+            if d.action != Action::Deny || d.source != DecisionSource::ExplicitRule {
+                continue;
+            }
+            if self.outranks(&d, &judged.decision) {
+                judged.decision = Decision {
+                    reason: format!("{} (the line as {} reads it)", d.reason, reading.shell()),
+                    ..d
+                };
+                judged.typed = false;
+                judged.refused.insert(0, (reading, line));
+            } else {
+                judged.refused.push((reading, line));
+            }
+        }
+        judged
+    }
+
+    /// `evaluate_command`'s judging of one reading; with `inside` false,
+    /// without the commands the line runs out of its own words
+    /// (`allows_explicitly`).
+    fn judge(
+        &self,
+        command: &str,
+        ctx: &crate::resolve::EvalContext,
+        inside: bool,
+        aside: &mut Aside,
+    ) -> Decision {
         let mut segments = crate::shell::split_segments_deep(command);
         // A command the reading stopped short of was judged by nothing:
         // not by a rule, not by the floor. The line is refused whatever the
@@ -857,16 +1018,16 @@ impl Policy {
             && segments
                 .iter()
                 .filter(|s| s.inside)
-                .any(|s| self.evaluate(s, &ctx.for_segment(s)).action == Action::Deny);
+                .any(|s| self.evaluate_with(s, &ctx.for_segment(s), aside).action == Action::Deny);
         if spoken <= 1 && !denied_inside {
             // A file written through a literal heredoc (`cat > page.tsx
             // <<'EOF' … EOF`) is judged as the write, by its path, the way
             // the Write tool is: the segment leaves the body out, the line
             // as typed still carries it.
             if let Some(seg) = segments.first().filter(|s| s.literal_body) {
-                return self.evaluate(seg, &ctx.for_segment(seg));
+                return self.evaluate_with(seg, &ctx.for_segment(seg), aside);
             }
-            return self.evaluate(command, ctx);
+            return self.evaluate_with(command, ctx, aside);
         }
         let total = segments.len();
         let mut worst: Option<(usize, Decision)> = None;
@@ -899,7 +1060,7 @@ impl Policy {
             // it: a substitution the policy does not explicitly allow still
             // escalates the segment it sits in, as before (`context`).
             if seg.inside {
-                let d = self.evaluate(seg, &ctx.for_segment(seg));
+                let d = self.evaluate_with(seg, &ctx.for_segment(seg), aside);
                 if d.action == Action::Deny
                     && worst.as_ref().is_none_or(|(_, w)| self.outranks(&d, w))
                 {
@@ -910,7 +1071,7 @@ impl Policy {
             // Judged where it runs: `cd .termaxa && echo x > policy.yaml`
             // writes `.termaxa/policy.yaml`, and the path rule on the gate's
             // own files has to see that path, not `./policy.yaml`.
-            let d = self.evaluate(seg, &ctx.for_segment(seg));
+            let d = self.evaluate_with(seg, &ctx.for_segment(seg), aside);
             // A shell wrapper whose string was read is transparent unless a
             // rule names it. Under a policy with no rule for `sh`, the
             // wrapper segment fell to the default and outranked the allow
@@ -967,7 +1128,7 @@ impl Policy {
             // command inside - a `-c` string that is all preamble, or the
             // depth limit cutting the reading off. Judge the whole line as
             // typed, which is the default for a line nobody named.
-            return self.evaluate(command, ctx);
+            return self.evaluate_with(command, ctx, aside);
         };
         Decision {
             action: d.action,
@@ -1035,7 +1196,20 @@ impl Policy {
         })
     }
 
+    /// The verdict on one segment as it is given, with no other reading.
+    #[cfg(test)]
     pub fn evaluate(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Decision {
+        self.evaluate_with(command, ctx, &mut Aside::default())
+    }
+
+    /// The verdict on one segment, collecting into `aside` the deny rules
+    /// that stand aside for it, or leaving out the ones it holds (`Aside`).
+    fn evaluate_with(
+        &self,
+        command: &str,
+        ctx: &crate::resolve::EvalContext,
+        aside: &mut Aside,
+    ) -> Decision {
         // First-match PER READING, MOST SEVERE across readings, earliest rule
         // on ties. See `readings` for what the readings are.
         //
@@ -1070,8 +1244,16 @@ impl Policy {
         } else {
             Vec::new()
         };
+        // The denies that stood aside for the line as typed stand aside for
+        // its other readings (`Aside`).
+        let stood_aside: Vec<usize> = if aside.collect {
+            Vec::new()
+        } else {
+            aside.rules.clone()
+        };
         let excepted = |r: &Rule| {
             spared(r)
+                || stood_aside.iter().any(|&i| std::ptr::eq(r, &self.rules[i]))
                 || (reads
                     && r.except_reads
                     && r.action == Action::Deny
@@ -1087,11 +1269,22 @@ impl Policy {
         // which is whatever file sits there. See `deny_only_readings`.
         // And a directory its tool has moved is, to a deny, the directory
         // under its default name (`spelled_by_default_readings`).
-        for pv in deny_only_readings(command)
-            .iter()
-            .chain(spelled_by_default_readings(command).iter())
-            .filter(|pv| !views.iter().any(|v| v == *pv))
-        {
+        let deny_only: Vec<String> = deny_only_readings(command)
+            .into_iter()
+            .chain(spelled_by_default_readings(command))
+            .filter(|pv| !views.iter().any(|v| v == pv))
+            .collect();
+        if aside.collect && rebuilt.is_some() {
+            for (i, r) in self.rules.iter().enumerate() {
+                if spared(r)
+                    && views.iter().chain(deny_only.iter()).any(|v| r.matches(v))
+                    && !aside.rules.contains(&i)
+                {
+                    aside.rules.push(i);
+                }
+            }
+        }
+        for pv in &deny_only {
             if let Some((idx, rule)) = self
                 .rules
                 .iter()
@@ -1110,6 +1303,15 @@ impl Policy {
                 .enumerate()
                 .find(|(_, r)| !excepted(r) && r.matches(v))
             {
+                // An allow or an ask that matched first is the policy's
+                // exception to every deny below it that matches too.
+                if aside.collect && rule.action != Action::Deny {
+                    for (i, r) in self.rules.iter().enumerate().skip(idx + 1) {
+                        if r.action == Action::Deny && r.matches(v) && !aside.rules.contains(&i) {
+                            aside.rules.push(i);
+                        }
+                    }
+                }
                 best = Some(match best {
                     None => (idx, rule),
                     Some((bi, br)) => {
@@ -5386,5 +5588,400 @@ mod moved_directory_tests {
             let d = p.evaluate_command(&line, &here());
             assert_ne!(d.action, Action::Deny, "{line}: {}", d.reason);
         }
+    }
+}
+
+#[cfg(test)]
+mod shell_reading_tests {
+    use super::*;
+    use crate::shell::Reading;
+
+    const ALL: [Reading; 3] = [Reading::Posix, Reading::Cmd, Reading::PowerShell];
+
+    /// Five files the starter keeps on the floor, as directory and name,
+    /// and where a backslash, a caret or a backtick goes into the
+    /// directory's own name (a backtick before `a`, `b`, `e`, `f`, `n`,
+    /// `r`, `t`, `v` or `0` is a control character to PowerShell, not the
+    /// letter).
+    const GUARDED: [(&str, &str, usize); 5] = [
+        (".claude", "settings.json", 2),
+        (".cursor", "hooks.json", 2),
+        (".codex", "hooks.json", 2),
+        (".github/hooks", "copilot.json", 9),
+        (".termaxa", "policy.yaml", 4),
+    ];
+
+    fn policy_from(yaml: &str) -> Policy {
+        serde_yaml::from_str(yaml).expect("policy must parse")
+    }
+
+    fn project() -> (crate::testutil::TempTree, crate::resolve::EvalContext) {
+        let tmp = crate::testutil::TempTree::new("policy-readings");
+        tmp.file(".termaxa/policy.yaml", "default: ask\nrules: []\n");
+        tmp.file(".claude/settings.json", "{}\n");
+        tmp.file(".cursor/hooks.json", "{}\n");
+        tmp.file(".codex/hooks.json", "{}\n");
+        tmp.file(".github/hooks/hooks.json", "{}\n");
+        tmp.file("sub/.env", "K=1\n");
+        tmp.file("notes.md", "n\n");
+        tmp.file("wt/data/a.txt", "a\n");
+        tmp.file("package.json", "{}\n");
+        tmp.file("node_modules/.cache/x", "c\n");
+        let ctx = crate::resolve::EvalContext::at(tmp.path());
+        (tmp, ctx)
+    }
+
+    fn read_by(
+        p: &Policy,
+        line: &str,
+        ctx: &crate::resolve::EvalContext,
+        shells: &[Reading],
+    ) -> Decision {
+        p.judge_command_read_by(line, ctx, shells).decision
+    }
+
+    /// `text` with `mark` put in before its character `at`.
+    fn with(text: &str, at: usize, mark: &str) -> String {
+        format!("{}{mark}{}", &text[..at], &text[at..])
+    }
+
+    /// A guarded name with a backslash inside it is the guarded name to
+    /// bash, and is refused as the plain spelling is, in every mode: in a
+    /// redirection's target, in an operand, in a `cd`, in a string handed
+    /// to a shell, in a substitution, in a heredoc's body a shell runs, with
+    /// every character escaped, with `$'…'` spelling one, and with the
+    /// name broken across two lines. Until v0.22.0 the walk kept the
+    /// backslash and read a separator: `echo x > .ter\maxa/policy.yaml`
+    /// wrote the gate's own policy through `echo *` from v0.14.2 on, the
+    /// first release that refused the plain spelling (measured Nov 15,
+    /// 2026, on every release's own binary).
+    #[test]
+    fn a_guarded_name_with_a_backslash_inside_it_is_refused_as_bash_reads_it() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for (dir, file, at) in GUARDED {
+            let d = with(dir, at, "\\");
+            let f = with(file, 2, "\\");
+            let every: String = match dir.rsplit_once('/') {
+                Some((head, name)) => {
+                    format!(
+                        "{head}/{}",
+                        name.chars().map(|c| format!("\\{c}")).collect::<String>()
+                    )
+                }
+                None => dir.chars().map(|c| format!("\\{c}")).collect(),
+            };
+            let hex = format!(
+                "{}$'\\x{:02x}'{}",
+                &dir[..at],
+                dir.as_bytes()[at],
+                &dir[at + 1..]
+            );
+            let broken = with(dir, at, "\\\n");
+            let lines = [
+                format!("echo x > {d}/{file}"),
+                format!("echo x > {dir}/{f}"),
+                format!("echo x > {every}/{file}"),
+                format!("echo x > {hex}/{file}"),
+                format!("echo x > {broken}/{file}"),
+                format!("echo x >> {d}/{file}"),
+                format!("echo x &> {d}/{file}"),
+                format!("cat notes.md > {d}/{file}"),
+                format!("echo x | tee {d}/{file}"),
+                format!("cp notes.md {d}/{file}"),
+                format!("mv notes.md {d}/{file}"),
+                format!("rm {d}/{file}"),
+                format!("rm -f {dir}/{f}"),
+                format!("truncate -s 0 {d}/{file}"),
+                format!("sed -i s/a/b/ {d}/{file}"),
+                format!("cd {d} && echo x > {file}"),
+                format!("cd {d}; echo x > {file}"),
+                format!(
+                    "mkdir -p {} && cd {d} && echo x > {file}",
+                    d.replace('\\', "/")
+                ),
+                format!("sh -c 'echo x > {d}/{file}'"),
+                format!("bash -c \"echo x > {}/{file}\"", d.replace('\\', "\\\\")),
+                format!("eval 'echo x > {d}/{file}'"),
+                format!("echo $(echo x > {d}/{file})"),
+                format!("echo \"$(echo x > {d}/{file})\""),
+                format!("bash <<'EOF'\necho x > {d}/{file}\nEOF"),
+                format!("bash <<'EOF'\necho x > {broken}/{file}\nEOF"),
+                format!("cat > {d}/{file} <<'EOF'\n{{}}\nEOF"),
+                format!("cat <<'EOF' > {d}/{file}\n{{}}\nEOF"),
+                format!("D={d}; echo x > $D/{file}"),
+            ];
+            for line in &lines {
+                let r = read_by(&p, line, &ctx, &[Reading::Posix]);
+                assert_eq!(r.action, Action::Deny, "{line}: {}", r.reason);
+                assert!(p.held_by_floor(&r), "{line}: {:?}", r.matched_rule);
+            }
+            // The first of them, as the walk alone reads it: allowed.
+            let typed = read_by(&p, &lines[0], &ctx, &[]);
+            assert_eq!(
+                typed.action,
+                Action::Allow,
+                "{}: {}",
+                lines[0],
+                typed.reason
+            );
+            let r = read_by(&p, &lines[0], &ctx, &[Reading::Posix]);
+            assert!(
+                r.reason.ends_with("(the line as bash reads it)"),
+                "{}",
+                r.reason
+            );
+        }
+        // A directory removed whole, by a name bash reads as its own. The
+        // directory the walk reads is not there to hold anything.
+        for line in [
+            "rm -r .cl\\aude",
+            "rm -rf .ter\\maxa",
+            "rm -r .github/ho\\oks",
+        ] {
+            let r = read_by(&p, line, &ctx, &[Reading::Posix]);
+            assert_eq!(r.action, Action::Deny, "{line}: {}", r.reason);
+            assert!(p.held_by_floor(&r), "{line}: {:?}", r.matched_rule);
+        }
+        // A `.env` is refused, off the floor.
+        for line in [
+            "echo x > sub/.e\\nv",
+            "cp notes.md s\\ub/.env",
+            "rm \"sub\\.env\"",
+            "echo x > $'sub/.e\\x6ev'",
+        ] {
+            let r = read_by(&p, line, &ctx, &[Reading::Posix]);
+            assert_eq!(r.action, Action::Deny, "{line}: {}", r.reason);
+        }
+    }
+
+    /// cmd takes a caret out of a word and PowerShell a backtick, and to
+    /// both a backslash is an ordinary character: the `|` after one is a
+    /// pipe and the `"` after one closes its string. Each is judged where
+    /// that shell can run the line (`Reading::others`), and bash's reading
+    /// of the same lines names no guarded file.
+    #[test]
+    fn a_caret_and_a_backtick_are_read_as_cmd_and_powershell_read_them() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for (dir, file, at) in GUARDED {
+            let win = dir.replace('/', "\\");
+            let caret = with(&win, at, "^");
+            let tick = with(&win, at, "`");
+            // The name with the shell's escape inside it.
+            let spelled = [
+                (format!("echo x > {caret}\\{file}"), Reading::Cmd),
+                (format!("copy notes.md {caret}\\{file}"), Reading::Cmd),
+                (format!("del {caret}\\{file}"), Reading::Cmd),
+                (format!("echo x # > {caret}\\{file}"), Reading::Cmd),
+                (format!("echo x > {tick}\\{file}"), Reading::PowerShell),
+                (format!("Remove-Item {tick}\\{file}"), Reading::PowerShell),
+                (
+                    format!("Copy-Item notes.md {tick}\\{file}"),
+                    Reading::PowerShell,
+                ),
+            ];
+            for (line, shell) in &spelled {
+                let r = read_by(&p, line, &ctx, &[*shell]);
+                assert_eq!(r.action, Action::Deny, "{line}: {}", r.reason);
+                assert!(p.held_by_floor(&r), "{line}: {:?}", r.matched_rule);
+                assert!(
+                    r.reason
+                        .ends_with(&format!("(the line as {} reads it)", shell.shell())),
+                    "{line}: {}",
+                    r.reason
+                );
+                let bash = read_by(&p, line, &ctx, &[Reading::Posix]);
+                assert!(!p.held_by_floor(&bash), "{line}: {}", bash.reason);
+            }
+            // The plain name after a backslash the walk takes for an escape.
+            let after = [
+                (
+                    format!("echo a\\& copy notes.md {win}\\{file}"),
+                    Reading::Cmd,
+                ),
+                (format!("echo \"a\\\" > {win}\\{file}"), Reading::Cmd),
+                (
+                    format!("echo a\\| Set-Content {win}\\{file}"),
+                    Reading::PowerShell,
+                ),
+                (
+                    format!("echo a{}; Remove-Item {win}\\{file}", '\\'),
+                    Reading::PowerShell,
+                ),
+                (format!("echo \"a\\\" > {win}\\{file}"), Reading::PowerShell),
+            ];
+            for (line, shell) in &after {
+                let r = read_by(&p, line, &ctx, &[*shell]);
+                assert_eq!(r.action, Action::Deny, "{line}: {}", r.reason);
+                assert!(p.held_by_floor(&r), "{line}: {:?}", r.matched_rule);
+            }
+        }
+        // As the walk alone reads them, a pipe behind a backslash is no
+        // pipe and a quote behind one closes nothing: one `echo`.
+        for line in [
+            "echo a\\| Set-Content .claude\\settings.json",
+            "echo \"a\\\" > .claude\\settings.json",
+        ] {
+            let typed = read_by(&p, line, &ctx, &[]);
+            assert_eq!(typed.action, Action::Allow, "{line}: {}", typed.reason);
+        }
+        // A backtick before a letter that names a control character is not
+        // that letter: `` .cl`aude `` has a bell in it, and is no guarded
+        // name.
+        let bell = "echo x > .cl`aude\\settings.json";
+        let r = read_by(&p, bell, &ctx, &[Reading::PowerShell]);
+        assert_ne!(r.action, Action::Deny, "{bell}: {}", r.reason);
+    }
+
+    /// A program's name with an escape inside it is the program: `r\m -rf
+    /// /` met no rule, was asked in enforce mode and ran in observe mode.
+    #[test]
+    fn a_program_named_with_an_escape_inside_it_meets_its_hard_stop() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for (line, shell, floor) in [
+            ("r\\m -rf /", Reading::Posix, true),
+            ("kubect\\l delete ns prod", Reading::Posix, true),
+            ("gi\\t push --force origin main", Reading::Posix, false),
+            ("r^m -rf /", Reading::Cmd, true),
+            ("d^el /s /q wt", Reading::Cmd, false),
+            (
+                "Rem`ove-Item -Recurse -Force wt",
+                Reading::PowerShell,
+                false,
+            ),
+            ("kubect`l delete ns prod", Reading::PowerShell, true),
+        ] {
+            let typed = read_by(&p, line, &ctx, &[]);
+            assert_ne!(typed.action, Action::Deny, "{line}: {}", typed.reason);
+            let r = read_by(&p, line, &ctx, &[shell]);
+            assert_eq!(r.action, Action::Deny, "{line}: {}", r.reason);
+            assert_eq!(p.held_by_floor(&r), floor, "{line}: {:?}", r.matched_rule);
+        }
+    }
+
+    /// A reading adds a refusal and nothing else, and only one the line as
+    /// typed never met. An ordinary line with a backslash, a caret or a
+    /// backtick in it is judged as it always was, under every reading.
+    #[test]
+    fn a_reading_adds_a_refusal_and_nothing_else() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for line in [
+            "grep -n \"foo\\.bar\" notes.md",
+            "grep -rn 'TODO\\|FIXME' wt",
+            "sed -n 's/^\\s*//p' notes.md",
+            "sed -i 's/\\.env/.env.local/g' notes.md",
+            "find . -name \\*.rs",
+            r"find . -name '*.log' -exec rm {} \;",
+            "printf 'a\\nb\\n'",
+            "printf \"%s\\n\" one two > notes.md",
+            "echo \"a \\\"quoted\\\" word\"",
+            "echo 'it'\\''s fine'",
+            "echo hello\\ world",
+            "git commit -m \"fix: handle \\\"quoted\\\" names\"",
+            "git commit -m 'fix: don'\\''t crash; handle errors'",
+            "git log --format=%H\\ %s -5",
+            "git reset --hard HEAD^",
+            "git log HEAD^..HEAD",
+            "git diff .termaxa\\policy.yaml",
+            "git add .termaxa\\policy.yaml",
+            "curl -s -d \"{\\\"a\\\": \\\"b; c\\\"}\" http://localhost:3000/api",
+            "echo \"path is C:\\Users\\User\\code\"",
+            "ls C:\\Users\\User\\AppData\\Local\\Temp",
+            "copy wt\\data\\a.txt wt\\data\\b.txt",
+            "del wt\\data\\a.txt",
+            "cd wt\\data && npm test",
+            "python scripts\\gen.py > wt\\data.json",
+            "echo x > \"wt\\notes.md\"",
+            "rm -rf node_modules\\.cache",
+            "Remove-Item -Recurse -Force node_modules\\.cache",
+            "rm -rf \"node_modules\\.cache\"",
+            "rm -rf \"node\\_modules\"",
+            "Write-Host \"a`nb\"",
+            "git commit -m \"use `npm ci` in CI\"",
+            "echo one \\\n two",
+        ] {
+            let typed = read_by(&p, line, &ctx, &[]);
+            let read = read_by(&p, line, &ctx, &ALL);
+            assert_eq!(
+                (read.action, &read.matched_rule),
+                (typed.action, &typed.matched_rule),
+                "{line}: {} / {}",
+                typed.reason,
+                read.reason
+            );
+        }
+        // The exceptions the policy writes are kept: an allow above the
+        // deny it excepts, written for the line as it is typed, and a
+        // delete of what a build rebuilds.
+        let excepted = policy_from(concat!(
+            "version: 1\ndefault: ask\nrules:\n",
+            "  - match: \"del build\\\\*\"\n    action: allow\n",
+            "  - match: \"del *\"\n    action: deny\n",
+            "  - match: \"*rm -rf*\"\n    action: deny\n    except_rebuilt: true\n",
+        ));
+        for (line, action) in [
+            ("del build\\out.txt", Action::Allow),
+            ("del other\\out.txt", Action::Deny),
+            // What a build rebuilds as typed, and to bash a `node\_modules`
+            // that nothing rebuilds: the deny stood aside for the line.
+            ("rm -rf \"node\\_modules\"", Action::Allow),
+            ("rm -rf wt\\data", Action::Deny),
+            // A deny the line never met as typed is taken from a reading.
+            ("r\\m -rf wt", Action::Deny),
+            ("d\\el build\\out.txt", Action::Deny),
+        ] {
+            let r = read_by(&excepted, line, &ctx, &ALL);
+            assert_eq!(r.action, action, "{line}: {}", r.reason);
+        }
+        // `except_reads` is asked of each reading afresh: what a read
+        // program redirects into is a write in the reading that names it.
+        let belt = policy_from(concat!(
+            "version: 1\ndefault: ask\nrules:\n",
+            "  - match: \"*.claude*settings*\"\n    action: deny\n    except_reads: true\n",
+            "  - match: \"cat *\"\n    action: allow\n",
+        ));
+        let line = "cat .claude/settings.json > .cl\\aude/settings.json";
+        assert_eq!(read_by(&belt, line, &ctx, &[]).action, Action::Allow);
+        assert_eq!(
+            read_by(&belt, line, &ctx, &[Reading::Posix]).action,
+            Action::Deny
+        );
+    }
+
+    /// The preview and the copy aside are made for the line the refusal is
+    /// about: the reading that earned it, and beside the line as typed any
+    /// other reading a rule refuses. `cp notes.md s\ub/.env` is refused as
+    /// typed for a `s/ub/.env` that is not there, and as bash reads it for
+    /// the `sub/.env` that is: observe mode holds a line whose copy cannot
+    /// be taken, and that is asked of the file that is there.
+    #[test]
+    fn the_readings_a_rule_refuses_come_with_the_verdict() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        let line = "echo x > .cl\\aude/settings.json";
+        let judged = p.judge_command_read_by(line, &ctx, &[Reading::Posix]);
+        assert_eq!(
+            judged.lines(line),
+            vec![(Reading::Posix, "echo x > .claude/settings.json")]
+        );
+        let line = "cp notes.md s\\ub/.env";
+        let judged = p.judge_command_read_by(line, &ctx, &[Reading::Posix]);
+        assert_eq!(judged.decision.action, Action::Deny);
+        assert_eq!(
+            judged.lines(line),
+            vec![
+                (Reading::Typed, line),
+                (Reading::Posix, "cp notes.md sub/.env")
+            ]
+        );
+        let preview = judged.preview(line, Some(ctx.root.as_path()), &ctx.cwd, false);
+        assert!(preview.is_some_and(|p| p.uninsurable), "{line}");
+        // A line no reading refuses is the line as typed and nothing else.
+        let line = "echo x > wt\\notes.md";
+        let judged = p.judge_command_read_by(line, &ctx, &ALL);
+        assert_eq!(judged.lines(line), vec![(Reading::Typed, line)]);
     }
 }

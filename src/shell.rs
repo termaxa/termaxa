@@ -995,6 +995,514 @@ fn target_word(chars: &[char], cur: &mut String, mut j: usize, literal: bool) ->
 /// has its own syntax and is not read.
 const POSIX_SHELLS: [&str; 4] = ["sh", "bash", "dash", "zsh"];
 
+/// Whose quoting a line is read by.
+///
+/// The walk in this file reads a line one way, `Typed`: quotes as a POSIX
+/// shell has them, a backslash outside quotes kept where it stands (so
+/// `del build\out.txt` names `build\out.txt`, as cmd and PowerShell read
+/// it) and, in a command's operands, one inside double quotes dropped. No
+/// shell reads every line that way. bash takes a backslash outside quotes
+/// out of the word (`.cl\aude` is `.claude`), cmd does that with a caret
+/// and PowerShell with a backtick, and to cmd and PowerShell a backslash is
+/// an ordinary character wherever it stands, so the `;` after one is a
+/// separator and the `"` after one closes a string.
+///
+/// The gate is not told which shell runs a line. Until v0.22.0 a guarded
+/// name with one of those characters inside it was no rule's name: `echo x
+/// > .ter\maxa/policy.yaml` wrote the gate's own policy through `echo *`
+/// from v0.14.2 on, the first release that refused the plain spelling
+/// (measured Nov 15, 2026, release by release). Now the line is also judged
+/// as each shell that can run it reads it (`Reading::others`, `respelled`,
+/// `Policy::evaluate_command`), and a deny from any reading stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// As the walk reads it.
+    Typed,
+    /// bash, zsh, sh, dash.
+    Posix,
+    /// cmd.exe.
+    Cmd,
+    /// PowerShell.
+    PowerShell,
+}
+
+impl Reading {
+    /// The shell's name, for a reason a person reads.
+    pub fn shell(self) -> &'static str {
+        match self {
+            Reading::Typed => "the gate",
+            Reading::Posix => "bash",
+            Reading::Cmd => "cmd",
+            Reading::PowerShell => "PowerShell",
+        }
+    }
+
+    /// The shells that can run a line on this machine, besides the reading
+    /// the walk makes: bash everywhere (Git Bash on Windows), cmd and
+    /// PowerShell on Windows. PowerShell on macOS or Linux is read as bash
+    /// reads the line.
+    pub fn others() -> &'static [Reading] {
+        if cfg!(windows) {
+            &[Reading::Posix, Reading::Cmd, Reading::PowerShell]
+        } else {
+            &[Reading::Posix]
+        }
+    }
+
+    /// Whether `line` holds a character this reading takes differently
+    /// from `Typed` at all. Every one of them involves a backslash, a
+    /// caret or a backtick, so a line with none is read once.
+    fn concerns(self, line: &str) -> bool {
+        match self {
+            Reading::Typed => false,
+            Reading::Posix => line.contains('\\'),
+            Reading::Cmd => line.contains('\\') || line.contains('^'),
+            Reading::PowerShell => line.contains('\\') || line.contains('`'),
+        }
+    }
+}
+
+thread_local! {
+    /// The reading being judged on this thread (`reading_as`).
+    static READING: std::cell::Cell<Reading> = const { std::cell::Cell::new(Reading::Typed) };
+}
+
+/// Runs `f` while a line is judged as `reading` reads it: every deep split
+/// inside it reads a wrapper's string as the shell that runs the string
+/// does (`split_segments_deep`). The line itself is respelled by the caller
+/// (`other_readings`); this is for what the walk only finds once it is
+/// inside the line. The reading in force before is restored when `f`
+/// returns or unwinds.
+pub fn reading_as<T>(reading: Reading, f: impl FnOnce() -> T) -> T {
+    struct Restore(Reading);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READING.with(|r| r.set(self.0));
+        }
+    }
+    let _restore = Restore(READING.with(|r| r.replace(reading)));
+    f()
+}
+
+/// The other readings `line` has among `shells`, each as the line to judge
+/// in its place: respelled the way that shell reads it, or the line as it
+/// is when only a string it hands to another shell can read differently
+/// (`split_segments_deep`). Two shells that read the line alike are one
+/// entry; a line no shell reads differently has none.
+pub fn other_readings(line: &str, shells: &[Reading]) -> Vec<(Reading, String)> {
+    let mut out: Vec<(Reading, String)> = Vec::new();
+    let mut wraps: Option<bool> = None;
+    for &reading in shells {
+        if !reading.concerns(line) {
+            continue;
+        }
+        let read = match respelled(line, reading) {
+            Some(read) => read,
+            None => {
+                let wraps =
+                    *wraps.get_or_insert_with(|| split_segments_deep(line).iter().any(|s| s.wraps));
+                if !wraps {
+                    continue;
+                }
+                line.to_string()
+            }
+        };
+        if !out.iter().any(|(_, other)| *other == read) {
+            out.push((reading, read));
+        }
+    }
+    out
+}
+
+/// `line` spelled so that the walk in this file reads it the way `reading`
+/// does, or `None` when that is the line as it stands.
+///
+/// What each reading changes:
+///
+/// - `Posix`: outside quotes a backslash and the character after it are
+///   that character, literal (`.cl\aude` is `.claude`, `a\;b` is one word),
+///   and a backslash before a newline joins the lines. Inside double quotes
+///   a backslash stays unless `$`, a backtick, `"`, `\` or a newline
+///   follows, which is bash's rule and not the walk's (`rm "sub\.env"`
+///   names `sub\.env`). `$'…'` is decoded (`$'.cl\x61ude'` is `.claude`).
+/// - `Cmd`: outside double quotes a caret and the character after it are
+///   that character; a backslash is an ordinary character everywhere.
+/// - `PowerShell`: outside single quotes a backtick and the character
+///   after it are that character (a letter that names a control character
+///   is no letter of a file's name); a backslash is an ordinary character
+///   everywhere.
+///
+/// "An ordinary character" is what the walk does not make of it: `echo
+/// a\;Remove-Item -Recurse .claude` is one command to bash and two to
+/// PowerShell, and `"a\"` is a whole string there. A character made
+/// literal is written quoted where the walk would otherwise give it a
+/// meaning.
+///
+/// Read as the walk reads: a quote opens and closes as in `split_with`, a
+/// comment is left as it is (cmd has none, and takes its carets out of one
+/// too), a heredoc's word and its delimiter line are left as they are, and
+/// each line of a heredoc's body is respelled on its own, the way
+/// `read_lines` reads it. Inside `$( … )` a string's quotes do not reach.
+pub fn respelled(line: &str, reading: Reading) -> Option<String> {
+    if !reading.concerns(line) {
+        return None;
+    }
+    let read = respell(line, reading, false);
+    (read != line).then_some(read)
+}
+
+/// A character the walk gives no meaning to wherever it stands in a word.
+fn plain(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '+' | ',' | ':' | '@' | '%' | '=')
+}
+
+/// `c` as a literal character outside quotes, in the walk's own spelling.
+fn push_literal(out: &mut String, c: char) {
+    if plain(c) {
+        out.push(c);
+    } else if c == '\'' {
+        out.push_str("\"'\"");
+    } else {
+        out.push('\'');
+        out.push(c);
+        out.push('\'');
+    }
+}
+
+/// `text` as one single-quoted stretch of a word.
+fn push_single_quoted(out: &mut String, text: &str) {
+    out.push('\'');
+    for c in text.chars() {
+        if c == '\'' {
+            out.push_str("'\"'\"'");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+}
+
+/// The letters PowerShell's backtick turns into control characters
+/// (`` `n ``, `` `t ``, `` `0 `` and the rest): none of them is the letter.
+fn powershell_control(c: char) -> bool {
+    matches!(c, '0' | 'a' | 'b' | 'e' | 'f' | 'n' | 'r' | 't' | 'v')
+}
+
+/// What bash's `$'…'` holds, from just past its opening quote, and where
+/// the string ends (past its closing quote, or at the end of the input).
+/// The escapes are bash's: `\n` and its kind, `\\`, `\'`, `\"`, `\?`, one to
+/// three octal digits, `\x` and one or two hex digits, `\u` and `\U`, `\c`
+/// and a letter. A NUL ends the string, as it does there.
+fn ansi_c_string(chars: &[char], mut i: usize) -> (String, usize) {
+    let mut bytes: Vec<u8> = Vec::new();
+    let push = |c: char, bytes: &mut Vec<u8>| {
+        let mut buf = [0u8; 4];
+        bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    };
+    let digits = |from: usize, max: usize, radix: u32| -> (u32, usize) {
+        let mut value = 0u32;
+        let mut n = 0;
+        while n < max {
+            match chars.get(from + n).and_then(|d| d.to_digit(radix)) {
+                Some(d) => value = value.wrapping_mul(radix).wrapping_add(d),
+                None => break,
+            }
+            n += 1;
+        }
+        (value, n)
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            i += 1;
+            break;
+        }
+        if c != '\\' || i + 1 >= chars.len() {
+            push(c, &mut bytes);
+            i += 1;
+            continue;
+        }
+        let e = chars[i + 1];
+        i += 2;
+        match e {
+            'a' => bytes.push(0x07),
+            'b' => bytes.push(0x08),
+            'e' | 'E' => bytes.push(0x1b),
+            'f' => bytes.push(0x0c),
+            'n' => bytes.push(b'\n'),
+            'r' => bytes.push(b'\r'),
+            't' => bytes.push(b'\t'),
+            'v' => bytes.push(0x0b),
+            '\\' | '\'' | '"' | '?' => push(e, &mut bytes),
+            '0'..='7' => {
+                let (value, n) = digits(i - 1, 3, 8);
+                bytes.push(value as u8);
+                i += n - 1;
+            }
+            'x' => match digits(i, 2, 16) {
+                (_, 0) => bytes.extend_from_slice(b"\\x"),
+                (value, n) => {
+                    bytes.push(value as u8);
+                    i += n;
+                }
+            },
+            'u' | 'U' => match digits(i, if e == 'u' { 4 } else { 8 }, 16) {
+                (_, 0) => {
+                    bytes.push(b'\\');
+                    push(e, &mut bytes);
+                }
+                (value, n) => {
+                    if let Some(c) = char::from_u32(value) {
+                        push(c, &mut bytes);
+                    }
+                    i += n;
+                }
+            },
+            'c' if i < chars.len() => {
+                bytes.push((chars[i] as u32 & 0x1f) as u8);
+                i += 1;
+            }
+            _ => {
+                bytes.push(b'\\');
+                push(e, &mut bytes);
+            }
+        }
+    }
+    if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+        bytes.truncate(nul);
+    }
+    (String::from_utf8_lossy(&bytes).into_owned(), i)
+}
+
+/// `respelled`'s walk. `body` is a line of a heredoc's body: it opens no
+/// heredoc of its own.
+fn respell(line: &str, reading: Reading, body: bool) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len() + 8);
+    let mut quote: Option<char> = None;
+    // What is open: `Some(quote)` for a `$(`, with the quote it was opened
+    // in, `None` for a `(` inside one, so that its `)` is not the end.
+    let mut open: Vec<Option<Option<char>>> = Vec::new();
+    let mut in_comment = false;
+    let mut pending: Vec<PendingHeredoc> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if in_comment && c != '\n' {
+            // cmd has no comments and takes a caret out of this text too;
+            // a quote in it is a character to every shell, as to the walk.
+            match next {
+                Some(n) if reading == Reading::Cmd && c == '^' && plain(n) => {
+                    out.push(n);
+                    i += 2;
+                }
+                _ => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            Some(_) => {
+                match (c, reading) {
+                    ('"', _) => {
+                        quote = None;
+                        out.push(c);
+                    }
+                    ('\\', Reading::Posix) => match next {
+                        Some(n) if matches!(n, '$' | '`' | '"' | '\\') => {
+                            out.push('\\');
+                            out.push(n);
+                            i += 1;
+                        }
+                        Some('\n') => i += 1,
+                        _ => out.push_str("\\\\"),
+                    },
+                    ('\\', _) => out.push_str("\\\\"),
+                    ('`', Reading::PowerShell) => {
+                        match next {
+                            Some('\n') | None => {}
+                            Some(n) if matches!(n, '"' | '$' | '`' | '\\') => {
+                                out.push('\\');
+                                out.push(n);
+                            }
+                            Some(n) if powershell_control(n) => out.push(' '),
+                            Some(n) => out.push(n),
+                        }
+                        i += 1;
+                    }
+                    ('$', Reading::Posix | Reading::PowerShell) if next == Some('(') => {
+                        open.push(Some(quote));
+                        quote = None;
+                        out.push_str("$(");
+                        i += 1;
+                    }
+                    _ => out.push(c),
+                }
+                i += 1;
+                continue;
+            }
+            None => {}
+        }
+        match c {
+            '$' if next == Some('\'') && reading == Reading::Posix => {
+                let (text, end) = ansi_c_string(&chars, i + 2);
+                push_single_quoted(&mut out, &text);
+                i = end;
+                continue;
+            }
+            '\'' | '"' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            '$' if next == Some('(') => {
+                open.push(Some(None));
+                out.push_str("$(");
+                i += 1;
+            }
+            '(' if !open.is_empty() => {
+                open.push(None);
+                out.push(c);
+            }
+            ')' => {
+                if let Some(Some(was)) = open.pop() {
+                    quote = was;
+                }
+                out.push(c);
+            }
+            '#' if starts_comment(&chars, i) => {
+                in_comment = true;
+                out.push(c);
+            }
+            '\\' if reading == Reading::Posix => match next {
+                Some('\n') | None => i += 1,
+                Some(n) => {
+                    push_literal(&mut out, n);
+                    i += 1;
+                }
+            },
+            // An ordinary character to cmd and PowerShell: what follows it
+            // keeps its meaning, which the walk would take away.
+            '\\' => {
+                if next.is_some_and(|n| !plain(n)) {
+                    out.push_str("'\\'");
+                } else {
+                    out.push(c);
+                }
+            }
+            '^' if reading == Reading::Cmd => match next {
+                Some('\n') | None => i += 1,
+                Some(n) => {
+                    push_literal(&mut out, n);
+                    i += 1;
+                }
+            },
+            '`' if reading == Reading::PowerShell => match next {
+                Some('\n') | None => i += 1,
+                Some(n) if powershell_control(n) => {
+                    out.push_str("' '");
+                    i += 1;
+                }
+                Some(n) => {
+                    push_literal(&mut out, n);
+                    i += 1;
+                }
+            },
+            // `<<<` is a here-string, a word like any other.
+            '<' if next == Some('<') && chars.get(i + 2) == Some(&'<') => {
+                out.push_str("<<<");
+                i += 3;
+                continue;
+            }
+            // A heredoc: its word is left as written, since quoting it is
+            // what makes its body literal.
+            '<' if next == Some('<') && !body => {
+                let mut j = i + 2;
+                let strip_tabs = chars.get(j) == Some(&'-');
+                if strip_tabs {
+                    j += 1;
+                }
+                while j < chars.len() && chars[j].is_whitespace() && chars[j] != '\n' {
+                    j += 1;
+                }
+                let end = heredoc_word_end(&chars, j);
+                let raw: String = chars[j..end].iter().collect();
+                let delim = heredoc_delimiter(&raw);
+                pending.push(PendingHeredoc {
+                    owner: 0,
+                    literal: delim.as_ref().is_some_and(|(_, literal)| *literal),
+                    delim: delim.map(|(d, _)| d),
+                    strip_tabs,
+                });
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+            '\n' => {
+                in_comment = false;
+                out.push(c);
+                if !pending.is_empty() {
+                    let heredocs = std::mem::take(&mut pending);
+                    let (bodies, end) = heredoc_bodies(&chars, i + 1, &heredocs, true);
+                    let mut at = i + 1;
+                    for (h, (from, to)) in heredocs.iter().zip(bodies) {
+                        // The delimiter line of the body before this one.
+                        out.extend(&chars[at..from]);
+                        let text: String = chars[from..to].iter().collect();
+                        // A shell that reads the body as commands joins a
+                        // line ending in a backslash with the one after it.
+                        let mut lines: Vec<String> = Vec::new();
+                        let mut joined: Option<String> = None;
+                        for l in text.split('\n') {
+                            let l = match joined.take() {
+                                Some(head) => head + l,
+                                None => l.to_string(),
+                            };
+                            let escapes = l.chars().rev().take_while(|&c| c == '\\').count();
+                            if reading == Reading::Posix && escapes % 2 == 1 {
+                                joined = Some(l[..l.len() - 1].to_string());
+                            } else {
+                                lines.push(l);
+                            }
+                        }
+                        lines.extend(joined);
+                        let lines: Vec<String> = lines
+                            .iter()
+                            .map(|l| {
+                                let read = respell(l, reading, true);
+                                // A line that would now end the body early
+                                // stays as written.
+                                match &h.delim {
+                                    Some(d) if read.trim() == d.trim() => l.clone(),
+                                    _ => read,
+                                }
+                            })
+                            .collect();
+                        out.push_str(&lines.join("\n"));
+                        at = to;
+                    }
+                    out.extend(&chars[at..end]);
+                    i = end;
+                    continue;
+                }
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
 /// How many `-c` strings deep the reading goes. `sh -c "sh -c '…'"` is two;
 /// four is more than any harness produces and bounds a pathological input.
 const MAX_WRAP_DEPTH: usize = 4;
@@ -1032,13 +1540,20 @@ const MAX_INNER_COMMANDS: usize = 100;
 /// whole command line use this; callers handed one segment's text and
 /// asked about that segment alone keep `split_segments`.
 pub fn split_segments_deep(s: &str) -> Vec<Segment> {
-    let mut out = expand_line(s, true);
+    // The line itself is taken as given. A string a wrapper hands to a
+    // shell (`sh -c '…'`, `eval '…'`) is a command line of its own, read by
+    // that shell: while another reading of the line is being judged
+    // (`reading_as`), it is respelled as bash reads it before it is split.
+    // `sh -c 'echo x > .cl\aude/settings.json'` writes
+    // `.claude/settings.json`.
+    let reading = READING.with(|r| r.get());
+    let mut out = expand_line(s, true, reading);
     // As `split_with` checks a line, for the whole of it read through its
     // wrappers, and with each heredoc's write followed to where it lands.
     if out.iter().any(|seg| seg.literal_body)
         && (!out.iter().all(quiet) || out.iter().any(lands_where_it_runs))
     {
-        out = expand_line(s, false);
+        out = expand_line(s, false, reading);
     }
     // A body kept read is data (`Segment::body_line`) unless the line writes
     // a file that runs on its own once its `cd`s are followed: that body is
@@ -1053,7 +1568,7 @@ pub fn split_segments_deep(s: &str) -> Vec<Segment> {
 
 /// `split_segments_deep`'s reading, with literal heredoc bodies stepped over
 /// as data where `bodies` allows it.
-fn expand_line(s: &str, bodies: bool) -> Vec<Segment> {
+fn expand_line(s: &str, bodies: bool, reading: Reading) -> Vec<Segment> {
     let segments = if bodies {
         split_segments(s)
     } else {
@@ -1069,6 +1584,7 @@ fn expand_line(s: &str, bodies: bool) -> Vec<Segment> {
         RunDir::Start,
         bodies,
         &mut read,
+        reading,
     );
     out
 }
@@ -1080,6 +1596,7 @@ fn expand_line(s: &str, bodies: bool) -> Vec<Segment> {
 /// line these segments came from let a literal heredoc's body be stepped
 /// over (`split_with`); a string read here inherits it, and keeps it only
 /// while its wrapper's output stays where the line's goes.
+#[allow(clippy::too_many_arguments)]
 fn expand_into(
     out: &mut Vec<Segment>,
     segments: Vec<Segment>,
@@ -1088,6 +1605,7 @@ fn expand_into(
     start: RunDir,
     bodies: bool,
     read: &mut usize,
+    reading: Reading,
 ) -> RunDir {
     // A variable assigned earlier in the same command line, in the clear, is
     // not unknown: `SNAPSHOT_FILE=/home/dev/.claude/…` on line one and
@@ -1285,6 +1803,12 @@ fn expand_into(
             } else {
                 format!("{shell} -c")
             };
+            // The string is a command line the wrapper's shell reads: under
+            // a reading, as that shell reads it (`split_segments_deep`).
+            let script = match reading {
+                Reading::Typed => script,
+                _ => respelled(&script, Reading::Posix).unwrap_or(script),
+            };
             let after = expand_into(
                 out,
                 split_with(&script, string_bodies),
@@ -1293,6 +1817,7 @@ fn expand_into(
                 here.clone(),
                 string_bodies,
                 read,
+                reading,
             );
             // An `eval` runs in this shell, so a `cd` inside it moves it.
             if shell == "eval" && own_shell && after != here {
@@ -1329,6 +1854,7 @@ fn expand_into(
                 here.clone(),
                 false,
                 read,
+                reading,
             );
             for s in &mut out[from..] {
                 s.inside = true;
@@ -5843,6 +6369,312 @@ mod differential_harness {
                 ));
             }
             panic!("{report}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::*;
+
+    /// What each shell makes of a line, in the walk's own spelling
+    /// (`respelled`), and `None` where it reads the line as the walk does.
+    #[test]
+    fn each_shell_reads_a_line_its_own_way() {
+        use Reading::{Cmd, Posix, PowerShell};
+        for (line, reading, read) in [
+            // bash: a backslash outside quotes goes, and what it stood
+            // before is literal.
+            (
+                r"echo x > .cl\aude/settings.json",
+                Posix,
+                Some("echo x > .claude/settings.json"),
+            ),
+            (
+                r"echo x > \.\c\l\a\u\d\e/s.json",
+                Posix,
+                Some("echo x > .claude/s.json"),
+            ),
+            (r"r\m -rf /", Posix, Some("rm -rf /")),
+            (r"echo a\;b", Posix, Some("echo a';'b")),
+            (r"echo a\ b", Posix, Some("echo a' 'b")),
+            (r"echo it\'s", Posix, Some("echo it\"'\"s")),
+            (r"echo a\\b", Posix, Some(r"echo a'\'b")),
+            (r"echo a\*b \$HOME", Posix, Some("echo a'*'b '$'HOME")),
+            (
+                "echo x > .clau\\\nde/s.json",
+                Posix,
+                Some("echo x > .claude/s.json"),
+            ),
+            // Inside double quotes it stays, but for the four characters
+            // and the newline bash takes it from.
+            (r#"rm "sub\.env""#, Posix, Some(r#"rm "sub\\.env""#)),
+            (r#"echo "a\"b\$c\\d\`e""#, Posix, None),
+            ("echo \"a\\\nb\"", Posix, Some("echo \"ab\"")),
+            (r"echo 'a\b'", Posix, None),
+            // `$'…'` is decoded.
+            (
+                r"echo x > $'.cl\x61ude/s.json'",
+                Posix,
+                Some("echo x > '.claude/s.json'"),
+            ),
+            (
+                r"echo x > .cl$'\141'ude/s.json",
+                Posix,
+                Some("echo x > .cl'a'ude/s.json"),
+            ),
+            (r"echo $'it\'s'", Posix, Some("echo 'it'\"'\"'s'")),
+            // A string's quotes do not reach inside `$( … )`.
+            (
+                r#"echo "$(echo x > .cl\aude/s.json)""#,
+                Posix,
+                Some(r#"echo "$(echo x > .claude/s.json)""#),
+            ),
+            (
+                r#"echo "$(echo "a\.b")""#,
+                Posix,
+                Some(r#"echo "$(echo "a\\.b")""#),
+            ),
+            // A comment is nobody's words, and a caret or a backtick is an
+            // ordinary character to bash.
+            (r"echo x # a\b", Posix, None),
+            (
+                "echo x > .cl^aude\\s.json",
+                Posix,
+                Some("echo x > .cl^audes.json"),
+            ),
+            // cmd: a caret outside double quotes goes; a backslash is an
+            // ordinary character, and what follows it keeps its meaning.
+            (
+                r"echo x > .cl^aude\settings.json",
+                Cmd,
+                Some(r"echo x > .claude\settings.json"),
+            ),
+            (r"d^el /s /q wt", Cmd, Some("del /s /q wt")),
+            (r"echo a^&b", Cmd, Some("echo a'&'b")),
+            (r#"echo "a^b""#, Cmd, None),
+            (
+                r"echo x # > .cl^aude\s.json",
+                Cmd,
+                Some(r"echo x # > .claude\s.json"),
+            ),
+            (r"echo a\& del x", Cmd, Some(r"echo a'\'& del x")),
+            (r#"echo "a\" > x"#, Cmd, Some(r#"echo "a\\" > x"#)),
+            (r"del build\out.txt", Cmd, None),
+            // PowerShell: a backtick outside single quotes goes; a letter
+            // it makes a control character of is no letter.
+            (
+                r"Remove-Item .ter`maxa\policy.yaml",
+                PowerShell,
+                Some(r"Remove-Item .termaxa\policy.yaml"),
+            ),
+            (
+                r"Rem`ove-Item -Recurse x",
+                PowerShell,
+                Some("Remove-Item -Recurse x"),
+            ),
+            (
+                r"echo x > .cl`aude\s.json",
+                PowerShell,
+                Some(r"echo x > .cl' 'ude\s.json"),
+            ),
+            (r#"echo "a`"b`$c""#, PowerShell, Some(r#"echo "a\"b\$c""#)),
+            (r"echo 'a`b'", PowerShell, None),
+            (
+                r"echo a\| Set-Content x",
+                PowerShell,
+                Some(r"echo a'\'| Set-Content x"),
+            ),
+            (
+                r#"echo "a\" ; del x"#,
+                PowerShell,
+                Some(r#"echo "a\\" ; del x"#),
+            ),
+            (r"Remove-Item build\out.txt", PowerShell, None),
+            // Nothing any of them reads differently.
+            ("git status", Posix, None),
+            ("git reset --hard HEAD^", Posix, None),
+            ("echo `date`", Cmd, None),
+            (r"echo a\b", Reading::Typed, None),
+        ] {
+            assert_eq!(
+                respelled(line, reading).as_deref(),
+                read,
+                "{line} as {reading:?}"
+            );
+        }
+        // A semicolon behind a backslash, spelled apart from it here.
+        let hidden = format!("echo a{}; del x", '\\');
+        assert_eq!(
+            respelled(&hidden, PowerShell).as_deref(),
+            Some(r"echo a'\'; del x")
+        );
+    }
+
+    /// A heredoc's word is left as written, since quoting it is what makes
+    /// the body literal, and so is the line that ends the body. Each line
+    /// of the body is respelled on its own, the way the walk reads it, and
+    /// a line a backslash continues is one line to the shell that runs it.
+    #[test]
+    fn a_heredoc_keeps_its_word_and_its_body_is_read_line_by_line() {
+        // The quote in `it's` opens a string on its own line, as the walk
+        // reads a body's line, and reaches no further.
+        let line = "cat > .cl\\aude/s.json <<'E\\OF'\nit's a\\b\nx a\\b\nE\\OF\necho a\\b";
+        assert_eq!(
+            respelled(line, Reading::Posix).as_deref(),
+            Some("cat > .claude/s.json <<'E\\OF'\nit's a\\b\nx ab\nE\\OF\necho ab")
+        );
+        let fed = "bash <<EOF\necho x > .cl\\\naude/s.json\nEOF";
+        assert_eq!(
+            respelled(fed, Reading::Posix).as_deref(),
+            Some("bash <<EOF\necho x > .claude/s.json\nEOF")
+        );
+        // A here-string is a word like any other.
+        assert_eq!(
+            respelled("cat <<< a\\b", Reading::Posix).as_deref(),
+            Some("cat <<< ab")
+        );
+    }
+
+    #[test]
+    fn an_ansi_c_string_is_decoded_as_bash_decodes_it() {
+        for (body, text) in [
+            (r".cl\x61ude'", ".claude"),
+            (r"\141\142\143'", "abc"),
+            (r"a\tb\nc'", "a\tb\nc"),
+            (r#"it\'s \"so\" \\ \?'"#, "it's \"so\" \\ ?"),
+            (r"é\U0001F600'", "\u{e9}\u{1F600}"),
+            (r"\xc3\xa9'", "\u{e9}"),
+            (r"\cA\e'", "\u{1}\u{1b}"),
+            (r"a\0b'", "a"),
+            (r"\q\x'", "\\q\\x"),
+            ("open", "open"),
+        ] {
+            let chars: Vec<char> = body.chars().collect();
+            let (decoded, end) = ansi_c_string(&chars, 0);
+            assert_eq!(decoded, text, "{body}");
+            assert_eq!(end, chars.len(), "{body}");
+        }
+    }
+
+    /// The other readings of a line are the ones that differ, each once;
+    /// a line whose own words every shell reads alike is still read again
+    /// when it hands a string to a shell.
+    #[test]
+    fn a_line_has_the_other_readings_that_differ() {
+        let all = [Reading::Posix, Reading::Cmd, Reading::PowerShell];
+        assert!(other_readings("git status", &all).is_empty());
+        assert!(other_readings("echo 'a\\b'", &all).is_empty());
+        assert_eq!(
+            other_readings("del build\\out.txt", &all),
+            vec![(Reading::Posix, "del buildout.txt".to_string())]
+        );
+        // cmd and PowerShell read this one alike: judged once for both.
+        assert_eq!(
+            other_readings("rm \"sub\\.env\"", &[Reading::Cmd, Reading::PowerShell]),
+            vec![(Reading::Cmd, "rm \"sub\\\\.env\"".to_string())]
+        );
+        let wrapped = "sh -c 'echo x > .cl\\aude/s.json'";
+        assert_eq!(
+            other_readings(wrapped, &all),
+            vec![(Reading::Posix, wrapped.to_string())]
+        );
+        assert!(other_readings(wrapped, &[]).is_empty());
+    }
+
+    /// While another reading is judged, a string a wrapper hands to a
+    /// shell is read as that shell reads it, at every depth; and the
+    /// reading in force before comes back.
+    #[test]
+    fn a_wrappers_string_is_read_as_the_shell_it_is_handed_to() {
+        let texts = |line: &str| -> Vec<String> {
+            split_segments_deep(line)
+                .into_iter()
+                .map(|s| s.text.trim().to_string())
+                .collect()
+        };
+        for (line, inner) in [
+            (
+                "sh -c 'echo x > .cl\\aude/s.json'",
+                "echo x > .claude/s.json",
+            ),
+            (
+                "bash -lc \"echo x > .cl\\\\aude/s.json\"",
+                "echo x > .claude/s.json",
+            ),
+            (
+                "eval 'echo x > .cl\\aude/s.json'",
+                "echo x > .claude/s.json",
+            ),
+            (
+                "sh -c 'sh -c \"echo x > .cl\\\\aude/s.json\"'",
+                "echo x > .claude/s.json",
+            ),
+        ] {
+            assert!(!texts(line).iter().any(|t| t == inner), "{line}: as typed");
+            for reading in [Reading::Posix, Reading::Cmd, Reading::PowerShell] {
+                let read = reading_as(reading, || texts(line));
+                assert!(
+                    read.iter().any(|t| t == inner),
+                    "{line} as {reading:?}: {read:?}"
+                );
+            }
+            assert!(!texts(line).iter().any(|t| t == inner), "{line}: restored");
+        }
+    }
+
+    /// bash itself, asked what each word is, against the walk's reading of
+    /// the word respelled.
+    #[cfg(unix)]
+    #[test]
+    fn bash_reads_a_word_as_the_walk_reads_it_respelled() {
+        let Some(bash) = bash_for_tests() else {
+            return; // no bash on this machine: nothing to measure against
+        };
+        // An empty directory: no word here can match a file in it.
+        let empty = crate::testutil::TempTree::new("reading-bash");
+        for word in [
+            r".cl\aude/settings.json",
+            r"\.\c\l\a\u\d\e",
+            r"a\;b",
+            r"a\ b",
+            r"it\'s",
+            r#"a\"b"#,
+            r"a\\b",
+            r"a\|b\>c\<d\&e",
+            r"a\*b\?c",
+            r"a\#b",
+            r"\~x",
+            r#""sub\.env""#,
+            r#""a\\b""#,
+            r#""a\"b""#,
+            r#""a\$b""#,
+            r#""a\`b""#,
+            r#""a\*b""#,
+            r"'a\b'",
+            r#"a"b\c"d\e'f\g'"#,
+            r"$'.cl\x61ude'",
+            r"$'\141\142'",
+            r"$'a\tb'",
+            r"$'it\'s'",
+            r"$'a\\b'",
+            r#"$'a\"b'"#,
+            r".cl$'\x61'ude",
+            ".clau\\\nde",
+            "\"a\\\nb\"",
+        ] {
+            let out = std::process::Command::new(bash)
+                .arg("-c")
+                .arg(format!("printf '%s' {word}"))
+                .current_dir(empty.path())
+                .output()
+                .expect("bash runs");
+            let theirs = String::from_utf8_lossy(&out.stdout).into_owned();
+            let line = format!("printf {word}");
+            let read = respelled(&line, Reading::Posix).unwrap_or(line);
+            let ours = crate::delete::tokenize_public(&read);
+            assert_eq!(ours.len(), 2, "{word}: {read}: {ours:?}");
+            assert_eq!(ours[1], theirs, "{word}: respelled {read}");
         }
     }
 }
