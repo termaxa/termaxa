@@ -74,7 +74,10 @@ Three things are enforced in both modes:
    substitutions nested more than eight deep, more than a hundred of them
    on one line, or a `-c` string past the fourth. Nothing judged the
    command left over, so nothing can say the floor is not in it, and the
-   line is refused with no rule named.
+   line is refused with no rule named. Since v0.22.0 so is a line with a
+   word the shell opens into more names than the gate reads: past 100,000
+   words, more than 64 that a rule could be about, or a second spent
+   asking which.
 
 Since v0.21.9 the floor holds a floor command wherever the gate reads it on
 the line: after another deny, as the first command of a substitution,
@@ -107,6 +110,22 @@ Of 57 ways to copy, move, rename or delete a guarded file without naming it,
 observe mode held 6 on 0.21.9 and holds 47 now; the ten left are a `.env`,
 whose rule is not on the floor, two lines that touch nothing guarded, and
 seven the gate does not read.
+
+Since v0.22.0 the floor's path rules know a guarded file however the shell
+spells its name, not only as it is typed. A line is judged as bash reads
+it, and on Windows as cmd and PowerShell read it, and each word as the
+shell opens it: an escape, a pattern, a brace list or a range, zsh's
+groups. Until then `echo x > .ter\maxa/policy.yaml`, `echo x >
+.clau[d]e/settings.json`, `echo x > .claud{e..e}/settings.json` and `cd
+.cl\aude && echo x > settings.json` were allowed by `echo *` and ran in
+observe mode
+([GHSA-x6qc-h3gm-5fj2](https://github.com/termaxa/termaxa/security/advisories/GHSA-x6qc-h3gm-5fj2)).
+And a hook config, or the gate's own record and copies, in a directory its
+tool has moved (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `TERMAXA_HOME`) is held
+as it is under the default name. Until then a write to the hook config
+there was allowed in every mode, and observe mode let the copies under a
+moved state directory be deleted
+([GHSA-vh3g-qw73-h9gg](https://github.com/termaxa/termaxa/security/advisories/GHSA-vh3g-qw73-h9gg)).
 
 What the gate does not read it cannot hold. A command behind a runner it
 does not know (`strace`, `flock`, `chroot`, `docker exec`, `ssh`), piped
