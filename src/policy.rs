@@ -544,34 +544,59 @@ fn rebuilt_only(
     first
 }
 
-/// A line's verdict, and the readings of the line it is about.
+/// A line's verdict, and the spellings of the line it is about.
 pub struct Judged {
     pub decision: Decision,
     /// Whether the line as typed is one the preview and the copy aside are
     /// made for. Not when another shell's reading earned the verdict: the
     /// refusal is about what that shell would run.
     typed: bool,
-    /// The other readings of the line that a rule refuses, as the lines
-    /// those shells read; the one that earned the verdict first.
-    refused: Vec<(crate::shell::Reading, String)>,
+    /// The other spellings of the line that a rule refuses, in the order
+    /// the preview and the copy aside try them: `before` the line as typed
+    /// and `after` it. A spelling is another shell's reading of the whole
+    /// line (`shell::Reading`), or one segment of it with its words opened
+    /// (`words::opened`), which is what the refusal of such a segment is
+    /// about; the reading that earned the verdict comes first of all.
+    before: Vec<Spelling>,
+    after: Vec<Spelling>,
+}
+
+/// One spelling of a line, or of a segment of it, that a rule refuses.
+struct Spelling {
+    reading: crate::shell::Reading,
+    text: String,
+    /// Where it runs, for a segment: the line's own directory when `None`.
+    dir: Option<PathBuf>,
 }
 
 impl Judged {
     /// The lines the preview and the copy aside are made for, each with
-    /// the reading it is (`shell::reading_as`): the line as typed, and
-    /// every other reading of it a rule refuses. `cp new.env s\ub/.env` is
-    /// refused as typed for a `s/ub/.env` that is not there and as bash
-    /// reads it for the `sub/.env` that is; what cannot be copied aside is
-    /// that one, and observe mode holds the line for it.
-    fn lines<'a>(&'a self, command: &'a str) -> Vec<(crate::shell::Reading, &'a str)> {
-        self.typed
-            .then_some((crate::shell::Reading::Typed, command))
-            .into_iter()
-            .chain(self.refused.iter().map(|(r, l)| (*r, l.as_str())))
+    /// the reading it is (`shell::reading_as`) and the directory it runs
+    /// in: the line as typed, and every other spelling of it a rule
+    /// refuses. `cp new.env s\ub/.env` is refused as typed for a
+    /// `s/ub/.env` that is not there and as bash reads it for the `sub/.env`
+    /// that is, and `cp new.env sub/.en[v]` for the `sub/.env` its pattern
+    /// opens into; what cannot be copied aside is that file, and observe
+    /// mode holds the line for it.
+    fn lines<'a>(
+        &'a self,
+        command: &'a str,
+        cwd: &'a std::path::Path,
+    ) -> Vec<(crate::shell::Reading, &'a str, &'a std::path::Path)> {
+        let spelled =
+            |s: &'a Spelling| (s.reading, s.text.as_str(), s.dir.as_deref().unwrap_or(cwd));
+        self.before
+            .iter()
+            .map(spelled)
+            .chain(
+                self.typed
+                    .then_some((crate::shell::Reading::Typed, command, cwd)),
+            )
+            .chain(self.after.iter().map(spelled))
             .collect()
     }
 
-    /// `preview::generate` for the line: the preview of the first reading
+    /// `preview::generate` for the line: the preview of the first spelling
     /// whose copy cannot be taken, and failing that of the first that has
     /// a preview at all.
     pub fn preview(
@@ -582,9 +607,9 @@ impl Judged {
         live: bool,
     ) -> Option<crate::preview::Preview> {
         let mut first: Option<crate::preview::Preview> = None;
-        for (reading, line) in self.lines(command) {
+        for (reading, line, dir) in self.lines(command, cwd) {
             let preview = crate::shell::reading_as(reading, || {
-                crate::preview::generate(line, root, cwd, live)
+                crate::preview::generate(line, root, dir, live)
             });
             match preview {
                 Some(p) if p.uninsurable => return Some(p),
@@ -597,7 +622,7 @@ impl Judged {
         first
     }
 
-    /// `backup::take` for the line: the copy aside of the first reading
+    /// `backup::take` for the line: the copy aside of the first spelling
     /// that has something to copy.
     pub fn insure(
         &self,
@@ -605,9 +630,9 @@ impl Judged {
         termaxa_dir: &std::path::Path,
         cwd: &std::path::Path,
     ) -> anyhow::Result<Option<crate::backup::BackupRecord>> {
-        for (reading, line) in self.lines(command) {
+        for (reading, line, dir) in self.lines(command, cwd) {
             let taken =
-                crate::shell::reading_as(reading, || crate::backup::take(termaxa_dir, line, cwd))?;
+                crate::shell::reading_as(reading, || crate::backup::take(termaxa_dir, line, dir))?;
             if taken.is_some() {
                 return Ok(taken);
             }
@@ -639,6 +664,37 @@ struct Aside {
     collect: bool,
     /// The rules, by their place in `Policy::rules`.
     rules: Vec<usize>,
+    /// The rules that stand aside for the one segment being judged, when
+    /// that is wanted on its own: the segment is judged once more as the
+    /// shell opens its words, and what stood aside for it as written
+    /// stands aside for it opened (`Policy::evaluate_segment`).
+    noted: Option<Vec<usize>>,
+    /// The segments a rule refused as the shell opens them, each with the
+    /// directory it runs in: what the refusal is about, for the preview
+    /// and the copy aside (`Judged`).
+    opened: Vec<(String, PathBuf)>,
+    /// What the line being judged tells its shell about patterns
+    /// (`words::loosened`): every segment of it is opened that way.
+    loose: crate::words::Loose,
+}
+
+impl Aside {
+    /// Whether anybody wants to know which rules stand aside.
+    fn noting(&self) -> bool {
+        self.collect || self.noted.is_some()
+    }
+
+    /// `rule` stood aside.
+    fn note(&mut self, rule: usize) {
+        if self.collect && !self.rules.contains(&rule) {
+            self.rules.push(rule);
+        }
+        if let Some(noted) = self.noted.as_mut() {
+            if !noted.contains(&rule) {
+                noted.push(rule);
+            }
+        }
+    }
 }
 
 impl Policy {
@@ -940,12 +996,24 @@ impl Policy {
         let readings = crate::shell::other_readings(command, shells);
         let mut aside = Aside {
             collect: !readings.is_empty(),
-            rules: Vec::new(),
+            ..Aside::default()
+        };
+        let decision = self.judge(command, ctx, true, &mut aside);
+        let segments = |aside: &mut Aside, reading| -> Vec<Spelling> {
+            std::mem::take(&mut aside.opened)
+                .into_iter()
+                .map(|(text, dir)| Spelling {
+                    reading,
+                    text,
+                    dir: Some(dir),
+                })
+                .collect()
         };
         let mut judged = Judged {
-            decision: self.judge(command, ctx, true, &mut aside),
+            decision,
             typed: true,
-            refused: Vec::new(),
+            before: segments(&mut aside, crate::shell::Reading::Typed),
+            after: Vec::new(),
         };
         // Nothing outranks a deny every mode holds.
         if self.held_by_floor(&judged.decision) || judged.decision.held_in_every_mode() {
@@ -954,21 +1022,28 @@ impl Policy {
         aside.collect = false;
         for (reading, line) in readings {
             let d = crate::shell::reading_as(reading, || self.judge(&line, ctx, true, &mut aside));
+            let mut refused = segments(&mut aside, reading);
             // Only a rule's deny: a default, an unresolved target or a
             // reading the walk stopped short of is the reading's own
             // trouble, not something the line was caught doing.
             if d.action != Action::Deny || d.source != DecisionSource::ExplicitRule {
                 continue;
             }
+            refused.push(Spelling {
+                reading,
+                text: line,
+                dir: None,
+            });
             if self.outranks(&d, &judged.decision) {
                 judged.decision = Decision {
                     reason: format!("{} (the line as {} reads it)", d.reason, reading.shell()),
                     ..d
                 };
                 judged.typed = false;
-                judged.refused.insert(0, (reading, line));
+                refused.append(&mut judged.before);
+                judged.before = refused;
             } else {
-                judged.refused.push((reading, line));
+                judged.after.append(&mut refused);
             }
         }
         judged
@@ -985,6 +1060,7 @@ impl Policy {
         aside: &mut Aside,
     ) -> Decision {
         let mut segments = crate::shell::split_segments_deep(command);
+        aside.loose = crate::words::loosened(command);
         // A command the reading stopped short of was judged by nothing:
         // not by a rule, not by the floor. The line is refused whatever the
         // rest of it earned, in observe mode too
@@ -1015,19 +1091,18 @@ impl Policy {
         // unless what the substitution runs is denied.
         let spoken = segments.iter().filter(|s| !s.inside).count();
         let denied_inside = spoken <= 1
-            && segments
-                .iter()
-                .filter(|s| s.inside)
-                .any(|s| self.evaluate_with(s, &ctx.for_segment(s), aside).action == Action::Deny);
+            && segments.iter().filter(|s| s.inside).any(|s| {
+                self.evaluate_segment(s, &ctx.for_segment(s), aside).action == Action::Deny
+            });
         if spoken <= 1 && !denied_inside {
             // A file written through a literal heredoc (`cat > page.tsx
             // <<'EOF' … EOF`) is judged as the write, by its path, the way
             // the Write tool is: the segment leaves the body out, the line
             // as typed still carries it.
             if let Some(seg) = segments.first().filter(|s| s.literal_body) {
-                return self.evaluate_with(seg, &ctx.for_segment(seg), aside);
+                return self.evaluate_segment(seg, &ctx.for_segment(seg), aside);
             }
-            return self.evaluate_with(command, ctx, aside);
+            return self.evaluate_segment(command, ctx, aside);
         }
         let total = segments.len();
         let mut worst: Option<(usize, Decision)> = None;
@@ -1060,7 +1135,7 @@ impl Policy {
             // it: a substitution the policy does not explicitly allow still
             // escalates the segment it sits in, as before (`context`).
             if seg.inside {
-                let d = self.evaluate_with(seg, &ctx.for_segment(seg), aside);
+                let d = self.evaluate_segment(seg, &ctx.for_segment(seg), aside);
                 if d.action == Action::Deny
                     && worst.as_ref().is_none_or(|(_, w)| self.outranks(&d, w))
                 {
@@ -1071,7 +1146,7 @@ impl Policy {
             // Judged where it runs: `cd .termaxa && echo x > policy.yaml`
             // writes `.termaxa/policy.yaml`, and the path rule on the gate's
             // own files has to see that path, not `./policy.yaml`.
-            let d = self.evaluate_with(seg, &ctx.for_segment(seg), aside);
+            let d = self.evaluate_segment(seg, &ctx.for_segment(seg), aside);
             // A shell wrapper whose string was read is transparent unless a
             // rule names it. Under a policy with no rule for `sh`, the
             // wrapper segment fell to the default and outranked the allow
@@ -1128,7 +1203,7 @@ impl Policy {
             // command inside - a `-c` string that is all preamble, or the
             // depth limit cutting the reading off. Judge the whole line as
             // typed, which is the default for a line nobody named.
-            return self.evaluate_with(command, ctx, aside);
+            return self.evaluate_segment(command, ctx, aside);
         };
         Decision {
             action: d.action,
@@ -1194,6 +1269,159 @@ impl Policy {
                 .clone()
                 .unwrap_or_else(|| format!("matched rule `{}`", rule.label())),
         })
+    }
+
+    /// The verdict on one segment: as it is written, and as the shell
+    /// opens its words before the command sees them (`words::opened`): a
+    /// brace list into its words, a pattern into the names it matches from
+    /// the directory the segment runs in. `echo x > .clau[d]e/settings.json`
+    /// is `echo x > .claude/settings.json` to the command, `touch
+    /// .claud{e,x}/settings.json` touches the first of two files, and
+    /// neither spelling is a name any rule has.
+    ///
+    /// The opened spelling adds a refusal and nothing else, as another
+    /// shell's reading of the line does (`judge_command`): where a rule
+    /// denies it, by its words or by a path it names, the segment is
+    /// refused and the reason shows what the shell runs. What stood aside
+    /// for the segment as written stands aside for it opened (`Aside`), so
+    /// `rm -rf */node_modules` is not refused for the rule `rm -rf
+    /// node_modules` is excepted from.
+    ///
+    /// A brace list too long to open was read by nothing: the segment is
+    /// refused in every mode, as a command the reading stopped short of
+    /// is.
+    fn evaluate_segment(
+        &self,
+        text: &str,
+        ctx: &crate::resolve::EvalContext,
+        aside: &mut Aside,
+    ) -> Decision {
+        let dir = ctx.cwd_known.then_some(ctx.cwd.as_path());
+        // Asked only of a word that opens into more than can be written
+        // out, and then of each of its words: what a deny rule needs to
+        // see first, worked out once.
+        let guards = std::cell::OnceCell::new();
+        let keep = |word: &str| {
+            let (guards, words, paths, cwd) = guards.get_or_init(|| {
+                let (words, paths) = self.needles();
+                let here = ctx.cwd.display().to_string().to_lowercase();
+                let cwd = paths
+                    .as_ref()
+                    .is_none_or(|p| p.iter().any(|n| here.contains(n)));
+                (self.guards(), words, paths, cwd)
+            });
+            let lower = word.to_lowercase();
+            let seen = |needles: &Option<Vec<String>>| {
+                needles
+                    .as_ref()
+                    .is_none_or(|n| n.iter().any(|n| lower.contains(n.as_str())))
+            };
+            (*cwd || seen(words) || seen(paths)) && could_be_about(guards, word, ctx)
+        };
+        let opened = crate::words::opened(text, dir, aside.loose, &keep);
+        if opened.unread {
+            return Decision {
+                action: Action::Deny,
+                source: DecisionSource::Unread,
+                matched_rule: None,
+                reason: format!(
+                    "`{}` holds a word the shell opens into more names than Termaxa \
+                     reads: past {} words, or more than 64 that a rule could be \
+                     about. Nothing judged what those names are, so the line is \
+                     refused. Write the names out, or loop over them in a script.",
+                    clip(text, 80),
+                    crate::words::MOST_WORDS
+                ),
+            };
+        }
+        let Some(open) = opened.text else {
+            return self.evaluate_with(text, ctx, aside);
+        };
+        let outer = aside.noted.replace(Vec::new());
+        let written = self.evaluate_with(text, ctx, aside);
+        let noted = std::mem::replace(&mut aside.noted, outer).unwrap_or_default();
+        // Nothing outranks a deny every mode holds.
+        if self.held_by_floor(&written) || written.held_in_every_mode() {
+            return written;
+        }
+        let mut standing = Aside {
+            // In a judging that collects, `rules` holds what was noted
+            // here already; in one that does not, it is what stands aside.
+            rules: aside.rules.iter().copied().chain(noted).collect(),
+            ..Aside::default()
+        };
+        let d = self.evaluate_with(&open, ctx, &mut standing);
+        if d.action != Action::Deny || d.source != DecisionSource::ExplicitRule {
+            return written;
+        }
+        let said = clip(&open, 160);
+        aside.opened.push((open, ctx.cwd.clone()));
+        if self.outranks(&d, &written) {
+            Decision {
+                reason: format!("{} (as the shell opens it: `{}`)", d.reason, said),
+                ..d
+            }
+        } else {
+            written
+        }
+    }
+
+    /// The deny rules, split once for `could_be_about`.
+    fn guards(&self) -> Guards {
+        let deny = || self.rules.iter().filter(|r| r.action == Action::Deny);
+        Guards {
+            strings: deny()
+                .filter_map(|r| {
+                    let m = r.r#match.as_deref()?;
+                    Some(if r.case_sensitive {
+                        (collapse(m), true)
+                    } else {
+                        (normalize(m), false)
+                    })
+                })
+                .collect(),
+            paths: deny()
+                .filter_map(|r| Some(crate::protect::segments(r.match_path.as_deref()?)))
+                .collect(),
+        }
+    }
+
+    /// What a word, or the path it names, must hold before `could_be_about`
+    /// is worth asking, lowercased: for each deny rule with a string, the
+    /// longest stretch of literal text in it, which every word the rule
+    /// matches holds; for each with a path, every stretch of literal text
+    /// in its components, one of which a path it names or a directory on
+    /// the way to one holds. `None` for a kind when a rule of it has no
+    /// literal text at all, and every word is worth asking.
+    #[allow(clippy::type_complexity)]
+    fn needles(&self) -> (Option<Vec<String>>, Option<Vec<String>>) {
+        let mut words: Option<Vec<String>> = Some(Vec::new());
+        let mut paths: Option<Vec<String>> = Some(Vec::new());
+        for r in self.rules.iter().filter(|r| r.action == Action::Deny) {
+            if let Some(m) = &r.r#match {
+                let longest = normalize(m)
+                    .split('*')
+                    .max_by_key(|f| f.len())
+                    .unwrap_or_default()
+                    .to_string();
+                match words.as_mut() {
+                    Some(w) if !longest.is_empty() => w.push(longest),
+                    _ => words = None,
+                }
+            }
+            if let Some(p) = &r.match_path {
+                let fragments: Vec<String> = crate::protect::segments(p)
+                    .iter()
+                    .flat_map(|c| c.split('*').map(str::to_string).collect::<Vec<_>>())
+                    .filter(|f| !f.is_empty())
+                    .collect();
+                match paths.as_mut() {
+                    Some(n) if !fragments.is_empty() => n.extend(fragments),
+                    _ => paths = None,
+                }
+            }
+        }
+        (words, paths)
     }
 
     /// The verdict on one segment as it is given, with no other reading.
@@ -1274,13 +1502,10 @@ impl Policy {
             .chain(spelled_by_default_readings(command))
             .filter(|pv| !views.iter().any(|v| v == pv))
             .collect();
-        if aside.collect && rebuilt.is_some() {
+        if aside.noting() && rebuilt.is_some() {
             for (i, r) in self.rules.iter().enumerate() {
-                if spared(r)
-                    && views.iter().chain(deny_only.iter()).any(|v| r.matches(v))
-                    && !aside.rules.contains(&i)
-                {
-                    aside.rules.push(i);
+                if spared(r) && views.iter().chain(deny_only.iter()).any(|v| r.matches(v)) {
+                    aside.note(i);
                 }
             }
         }
@@ -1305,10 +1530,10 @@ impl Policy {
             {
                 // An allow or an ask that matched first is the policy's
                 // exception to every deny below it that matches too.
-                if aside.collect && rule.action != Action::Deny {
+                if aside.noting() && rule.action != Action::Deny {
                     for (i, r) in self.rules.iter().enumerate().skip(idx + 1) {
-                        if r.action == Action::Deny && r.matches(v) && !aside.rules.contains(&i) {
-                            aside.rules.push(i);
+                        if r.action == Action::Deny && r.matches(v) {
+                            aside.note(i);
                         }
                     }
                 }
@@ -1817,6 +2042,57 @@ fn match_components(pat: &[String], seg: &[String]) -> bool {
             None => false,
             Some((s, srest)) => wildcard_match(head, s) && match_components(rest, srest),
         },
+    }
+}
+
+/// The deny rules of a policy, split once: string patterns as `Rule::matches`
+/// compares them, path patterns as components.
+struct Guards {
+    strings: Vec<(String, bool)>,
+    paths: Vec<Vec<String>>,
+}
+
+/// Whether a deny rule could be about `word`, one of the many a word of the
+/// line opens into (`words::opened`): a rule that matches it as a string,
+/// a path rule that names it, as `Rule::matches_path` does, or one that
+/// names a file inside it, taken as a directory, by a component of its own
+/// (`starts_components`): `*/.claude/settings*.json` names a file inside
+/// `/p/.claude`, and `*/.env`, which names one inside any directory at
+/// all, says nothing about this one.
+fn could_be_about(guards: &Guards, word: &str, ctx: &crate::resolve::EvalContext) -> bool {
+    let (lower, kept) = (normalize(word), collapse(word));
+    if guards.strings.iter().any(|(pattern, case_sensitive)| {
+        wildcard_match(pattern, if *case_sensitive { &kept } else { &lower })
+    }) {
+        return true;
+    }
+    let path = crate::delete::resolve_path_in(word, &ctx.cwd)
+        .display()
+        .to_string();
+    let seg = crate::protect::segments(&path);
+    let renamed = crate::protect::under_default_name(&seg);
+    guards.paths.iter().any(|pat| {
+        match_components(pat, &seg)
+            || renamed
+                .as_ref()
+                .is_some_and(|renamed| match_components(pat, renamed))
+            || starts_components(pat, &seg, false)
+    })
+}
+
+/// Whether `seg`, the components of a directory, are the start of a path
+/// `pat` matches, with at least one of them matched by a component of the
+/// pattern that is not a bare `*` (`named`).
+fn starts_components(pat: &[String], seg: &[String], named: bool) -> bool {
+    match (pat.split_first(), seg.split_first()) {
+        (_, None) => named && !pat.is_empty(),
+        (None, Some(_)) => false,
+        (Some((head, rest)), Some(_)) if head == "*" => {
+            (0..=seg.len()).any(|skip| starts_components(rest, &seg[skip..], named))
+        }
+        (Some((head, rest)), Some((s, srest))) => {
+            wildcard_match(head, s) && starts_components(rest, srest, true)
+        }
     }
 }
 
@@ -5963,18 +6239,19 @@ mod shell_reading_tests {
         let (_tmp, ctx) = project();
         let line = "echo x > .cl\\aude/settings.json";
         let judged = p.judge_command_read_by(line, &ctx, &[Reading::Posix]);
+        let cwd = ctx.cwd.as_path();
         assert_eq!(
-            judged.lines(line),
-            vec![(Reading::Posix, "echo x > .claude/settings.json")]
+            judged.lines(line, cwd),
+            vec![(Reading::Posix, "echo x > .claude/settings.json", cwd)]
         );
         let line = "cp notes.md s\\ub/.env";
         let judged = p.judge_command_read_by(line, &ctx, &[Reading::Posix]);
         assert_eq!(judged.decision.action, Action::Deny);
         assert_eq!(
-            judged.lines(line),
+            judged.lines(line, cwd),
             vec![
-                (Reading::Typed, line),
-                (Reading::Posix, "cp notes.md sub/.env")
+                (Reading::Typed, line, cwd),
+                (Reading::Posix, "cp notes.md sub/.env", cwd)
             ]
         );
         let preview = judged.preview(line, Some(ctx.root.as_path()), &ctx.cwd, false);
@@ -5982,6 +6259,160 @@ mod shell_reading_tests {
         // A line no reading refuses is the line as typed and nothing else.
         let line = "echo x > wt\\notes.md";
         let judged = p.judge_command_read_by(line, &ctx, &ALL);
-        assert_eq!(judged.lines(line), vec![(Reading::Typed, line)]);
+        assert_eq!(judged.lines(line, cwd), vec![(Reading::Typed, line, cwd)]);
+    }
+}
+
+#[cfg(test)]
+mod opened_tests {
+    use super::*;
+    use crate::shell::Reading;
+
+    fn project() -> (crate::testutil::TempTree, crate::resolve::EvalContext) {
+        let tmp = crate::testutil::TempTree::new("policy-opened");
+        tmp.file(".termaxa/policy.yaml", "default: ask\nrules: []\n");
+        tmp.file(".claude/settings.json", "{}\n");
+        tmp.file(".github/hooks/hooks.json", "{}\n");
+        tmp.file("sub/.env", "K=1\n");
+        tmp.file("notes.md", "n\n");
+        tmp.file("app/[id]/page.tsx", "p\n");
+        tmp.file("package.json", "{}\n");
+        tmp.file("dist/x", "c\n");
+        tmp.file("node_modules/.cache/x", "c\n");
+        let ctx = crate::resolve::EvalContext::at(tmp.path());
+        (tmp, ctx)
+    }
+
+    /// A guarded file named through a pattern or a brace is refused by the
+    /// rule that names it, with no other shell's reading needed, and the
+    /// reason shows the spelling the shell hands the command.
+    #[test]
+    fn a_guarded_name_the_shell_opens_into_is_refused() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for line in [
+            "echo x > .clau[d]e/settings.json",
+            "echo x > .cl?ude/setting[!x].json",
+            "echo x > .cl*/settings.json",
+            "echo x > .claud{e..e}/settings.json",
+            "touch .claud{e,x}/settings.json",
+            "cat notes.md | tee .clau[d]e/settings.json",
+            "cd .clau[d]e && echo x > settings.json",
+            "cd .claud{e..e} && echo x > settings.json",
+            "echo x > .termax[a]/policy.yaml",
+            "echo x > .t*/policy.yaml",
+            "rm -rf .claud{e,x}",
+            "echo x > \"$PWD\"/.clau[d]e/settings.json",
+            "echo x > \"$PWD/.claude\"/setting[s].json",
+            "echo x > ${NOPE:-.clau[d]e}/settings.json",
+            "echo x > .github/hooks/hook?.json",
+            "cp notes.md sub/.en[v]",
+            "shopt -s dotglob; echo x > */settings.json",
+            "echo $(echo x > .clau[d]e/settings.json)",
+        ] {
+            let d = p.judge_command_read_by(line, &ctx, &[]).decision;
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert_eq!(
+                d.source,
+                DecisionSource::ExplicitRule,
+                "{line}: {}",
+                d.reason
+            );
+        }
+        let d = p
+            .judge_command_read_by("echo x > .clau[d]e/settings.json", &ctx, &[])
+            .decision;
+        assert!(
+            d.reason
+                .contains("(as the shell opens it: `echo x > .claude/settings.json`)"),
+            "{}",
+            d.reason
+        );
+        // zsh's group of alternatives, through bash's reading of the line.
+        for line in [
+            "echo x > .claud(e|x)/settings.json",
+            "echo x > .claud(e)/settings.json",
+            "cd .clau(d|x)e && echo x > settings.json",
+            "echo $(echo x > .claud(e)/settings.json)",
+            "echo x > (.claude|x)/settings.json",
+            "setopt globdots; echo x > **/hooks.json",
+        ] {
+            let d = p
+                .judge_command_read_by(line, &ctx, &[Reading::Posix])
+                .decision;
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+    }
+
+    /// What the shell opens into names nothing a rule guards: the line is
+    /// answered as it is written, a delete of what a build rebuilds
+    /// included.
+    #[test]
+    fn an_ordinary_line_the_shell_opens_is_answered_as_written() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        let read = |line: &str| {
+            p.judge_command_read_by(line, &ctx, &[Reading::Posix])
+                .decision
+        };
+        for line in [
+            "cat app/[id]/page.tsx",
+            "git add app/[id]/page.tsx",
+            "echo x > notes.m[d]",
+            "echo x > out/{a,b}.txt",
+            "for i in {1..2000}; do echo $i; done",
+            "cat .cl*/settings.json",
+            "ls sub/.e*",
+            "cd app/[id] && ls",
+        ] {
+            let d = read(line);
+            assert_eq!(d.action, Action::Allow, "{line}: {}", d.reason);
+            assert!(!d.reason.contains("as the shell opens it"), "{line}");
+        }
+        for line in ["rm -rf dist/*", "rm -rf node_modules/.cache/*"] {
+            let d = read(line);
+            assert_eq!(
+                (d.action, d.source),
+                (Action::Allow, DecisionSource::Rebuilt),
+                "{line}: {}",
+                d.reason
+            );
+        }
+    }
+
+    /// The spelling the shell runs is what the refusal is about: the
+    /// preview and the copy aside are made for it, where the segment runs,
+    /// and a write no copy can cover is held for the file the shell writes.
+    #[test]
+    fn the_spelling_the_shell_runs_comes_with_the_verdict() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        let cwd = ctx.cwd.as_path();
+        let line = "cp notes.md sub/.en[v]";
+        let judged = p.judge_command_read_by(line, &ctx, &[]);
+        assert_eq!(judged.decision.action, Action::Deny);
+        assert_eq!(
+            judged.lines(line, cwd),
+            vec![
+                (Reading::Typed, "cp notes.md sub/.env", cwd),
+                (Reading::Typed, line, cwd)
+            ]
+        );
+        let preview = judged.preview(line, Some(ctx.root.as_path()), cwd, false);
+        assert!(preview.is_some_and(|p| p.uninsurable), "{line}");
+        let line = "cd sub && cp ../notes.md .en[v]";
+        let judged = p.judge_command_read_by(line, &ctx, &[]);
+        assert_eq!(judged.decision.action, Action::Deny);
+        let sub = ctx.cwd.join("sub");
+        assert_eq!(
+            judged.lines(line, cwd)[0],
+            (Reading::Typed, "cp ../notes.md .env", sub.as_path())
+        );
+        // A word with more names a rule could be about than are written
+        // out is read by nothing, and refused in every mode.
+        let d = p
+            .judge_command_read_by("tee {1..500}/.env", &ctx, &[])
+            .decision;
+        assert!(d.held_in_every_mode(), "{}", d.reason);
     }
 }

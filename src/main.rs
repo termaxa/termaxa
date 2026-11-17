@@ -26,6 +26,7 @@ mod supervise;
 mod testutil;
 mod ui;
 mod witness;
+mod words;
 mod wrap;
 
 use anyhow::{bail, Result};

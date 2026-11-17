@@ -1051,11 +1051,12 @@ impl Reading {
 
     /// Whether `line` holds a character this reading takes differently
     /// from `Typed` at all. Every one of them involves a backslash, a
-    /// caret or a backtick, so a line with none is read once.
+    /// caret or a backtick, or a parenthesis that opens inside a word
+    /// (`group_as_braces`), so a line with none is read once.
     fn concerns(self, line: &str) -> bool {
         match self {
             Reading::Typed => false,
-            Reading::Posix => line.contains('\\'),
+            Reading::Posix => line.contains('\\') || has_group(line),
             Reading::Cmd => line.contains('\\') || line.contains('^'),
             Reading::PowerShell => line.contains('\\') || line.contains('`'),
         }
@@ -1274,6 +1275,173 @@ fn ansi_c_string(chars: &[char], mut i: usize) -> (String, usize) {
     (String::from_utf8_lossy(&bytes).into_owned(), i)
 }
 
+/// Whether a `(` written next would open inside a word: after a character
+/// of one, and not after the `$`, `<`, `>` or `=` of a substitution, a
+/// process substitution or an array.
+fn attaches(before: &str) -> bool {
+    before.chars().last().is_some_and(|p| {
+        !p.is_whitespace()
+            && !matches!(p, ';' | '&' | '|' | '<' | '>' | '(' | ')' | '$' | '=' | '`')
+    })
+}
+
+/// Whether a `(` written next, after a space, stands where zsh reads a
+/// pattern: past a command's first word, or after a redirection
+/// (`rm (a|b)/x`, and `echo x > (.claude|x)/settings.json`). Not where a
+/// command starts, which is a subshell: at the start of the line, after
+/// an operator, after a keyword (`if (true)`, `time (make)`, and in a
+/// `case`, `in (a)`).
+fn in_argument(before: &str) -> bool {
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    if trimmed.len() == before.len() {
+        return false;
+    }
+    let Some(last) = trimmed.chars().last() else {
+        return false;
+    };
+    if matches!(last, ';' | '&' | '|' | '(' | ')' | '{' | '}' | '\n' | '`') {
+        return false;
+    }
+    let word: String = trimmed
+        .chars()
+        .rev()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | '(' | ')'))
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    !matches!(
+        word.as_str(),
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "do"
+            | "while"
+            | "until"
+            | "!"
+            | "time"
+            | "case"
+            | "in"
+            | "for"
+            | "select"
+            | "function"
+            | "coproc"
+            | "exec"
+            | "{"
+    )
+}
+
+/// Whether `line` has a parenthesis that opens a group, with something in
+/// it: inside a word (`.claud(e|x)`, and not `f()`), or as a word of its
+/// own past a command's first (`rm (a|b)`).
+fn has_group(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    (1..chars.len()).any(|i| {
+        chars[i] == '(' && chars.get(i + 1).is_some_and(|n| *n != ')') && {
+            let before: String = chars[..i].iter().collect();
+            attaches(&before) || in_argument(&before)
+        }
+    })
+}
+
+/// A group inside a word, written as the pattern `words::opened` reads.
+///
+/// To zsh `.claud(e|x)/settings.json` is a pattern, one alternative or
+/// the other, matched against the names on disk like `*` and `[…]`, and
+/// `echo x > .claud(e)/settings.json` wrote Claude Code's hook config
+/// through `echo *` (measured Nov 16, 2026, zsh 5.9); the walk cut the
+/// first at its `|` into two commands. bash reads the same group behind
+/// `@`, `?`, `+`, `*` or `!` once `extglob` is on, and without it the line
+/// is a syntax error that runs nothing. So the group is read zsh's way
+/// wherever bash's reading is judged (`Reading::Posix`), marked with
+/// `words::GROUP_OPENS`, `GROUP_OR` and `GROUP_CLOSES`, which the walk
+/// gives no meaning to: `(a|b)` and `@(a|b)` are one of `a` and `b`,
+/// `?(a|b)` that or nothing, `+(a)` is `a*` and `*(a)` nothing or `a*`,
+/// each matching what the group matches and more, and `!(a)` is `*`. A
+/// group that ends its word with one alternative is also zsh's qualifiers,
+/// which add no character to the name (`settings.json(N)`), so it is that
+/// alternative or nothing.
+///
+/// `chars[open]` is the `(`, and `out` ends with the word so far; returns
+/// where the group ends. `None` when it is not a group: nothing in it
+/// (`f()`), or no `)` before the line ends.
+fn group_as_pattern(chars: &[char], open: usize, out: &mut String) -> Option<usize> {
+    use crate::words::{GROUP_CLOSES, GROUP_OPENS, GROUP_OR};
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut bars: Vec<usize> = Vec::new();
+    let mut close = None;
+    let mut j = open + 1;
+    while j < chars.len() {
+        let c = chars[j];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '\\' => j += 1,
+            Some(_) => {}
+            None => match c {
+                '\n' => return None,
+                '\'' | '"' => quote = Some(c),
+                '\\' => j += 1,
+                '(' => depth += 1,
+                ')' if depth == 0 => {
+                    close = Some(j);
+                    break;
+                }
+                ')' => depth -= 1,
+                '|' if depth == 0 => bars.push(j),
+                _ => {}
+            },
+        }
+        j += 1;
+    }
+    let close = close?;
+    if chars[open + 1..close].iter().all(|c| c.is_whitespace()) {
+        return None;
+    }
+    let mut alternatives: Vec<String> = Vec::new();
+    let mut from = open + 1;
+    for bar in bars.iter().copied().chain([close]) {
+        // In the walk's spelling, with a group inside it read the same
+        // way: the `x` it is read behind makes a `(` at its start one
+        // that opens inside a word.
+        let written: String = chars[from..bar].iter().collect();
+        let read = respell(&format!("x{written}"), Reading::Posix, true);
+        alternatives.push(read[1..].to_string());
+        from = bar + 1;
+    }
+    let operator = out
+        .chars()
+        .last()
+        .filter(|p| matches!(p, '?' | '*' | '+' | '@' | '!'));
+    if operator.is_some() {
+        out.pop();
+    }
+    let ends_word = chars
+        .get(close + 1)
+        .is_none_or(|n| n.is_whitespace() || matches!(n, ';' | '&' | '|' | '<' | '>' | ')'));
+    let group = |items: Vec<String>| {
+        let mut text = String::new();
+        text.push(GROUP_OPENS);
+        text.push_str(&items.join(&GROUP_OR.to_string()));
+        text.push(GROUP_CLOSES);
+        text
+    };
+    let or_nothing = |mut items: Vec<String>| {
+        items.insert(0, String::new());
+        items
+    };
+    let starting: Vec<String> = alternatives.iter().map(|a| format!("{a}*")).collect();
+    out.push_str(&match operator {
+        Some('!') => "*".to_string(),
+        Some('?') => group(or_nothing(alternatives)),
+        Some('+') => group(starting),
+        Some('*') => group(or_nothing(starting)),
+        _ if ends_word && alternatives.len() == 1 => group(or_nothing(alternatives)),
+        _ => group(alternatives),
+    });
+    Some(close + 1)
+}
+
 /// `respelled`'s walk. `body` is a line of a heredoc's body: it opens no
 /// heredoc of its own.
 fn respell(line: &str, reading: Reading, body: bool) -> String {
@@ -1369,6 +1537,22 @@ fn respell(line: &str, reading: Reading, body: bool) -> String {
                 open.push(Some(None));
                 out.push_str("$(");
                 i += 1;
+            }
+            // `.claud(e|x)`: a group of alternatives to zsh, and to bash
+            // with `extglob` behind `@`, `?`, `+`, `*` or `!`.
+            '(' if reading == Reading::Posix && (attaches(&out) || in_argument(&out)) => {
+                match group_as_pattern(&chars, i, &mut out) {
+                    Some(end) => {
+                        i = end;
+                        continue;
+                    }
+                    None => {
+                        if !open.is_empty() {
+                            open.push(None);
+                        }
+                        out.push(c);
+                    }
+                }
             }
             '(' if !open.is_empty() => {
                 open.push(None);
@@ -2027,9 +2211,20 @@ fn ending(end: &[String], path: &str) -> RunDir {
 /// only at the end that follows the glob (`wt*/.claude` ends in `.claude`;
 /// `.cla*` in nothing).
 fn ending_after_glob(path: &str) -> RunDir {
-    match crate::delete::readable_end_of(path) {
-        Some(end) if !end.is_empty() => RunDir::Ending(end),
+    match end_after_glob(path) {
+        end if !end.is_empty() => RunDir::Ending(end),
         _ => RunDir::Unknown,
+    }
+}
+
+/// The components of `path` after the last one the shell opens (a pattern,
+/// a brace list): `wt*/.claude` and `w[tx]1/.claude` end in `.claude`,
+/// `.cla*` in nothing.
+fn end_after_glob(path: &str) -> Vec<String> {
+    let components: Vec<&str> = path.split(['/', '\\']).collect();
+    match components.iter().rposition(|c| crate::words::is_opened(c)) {
+        Some(last) => crate::delete::join_end(&[], &components[last + 1..].join("/")),
+        None => crate::delete::readable_end_of(path).unwrap_or_default(),
     }
 }
 
@@ -2119,7 +2314,10 @@ fn cd_effect(command: &str) -> Option<CdEffect> {
                 w.starts_with('~') && w != "~" && !w.starts_with("~/") && !w.starts_with("~\\");
             let substitutes = w.contains('`') || w.contains("$(");
             let unreadable = anothers_home || substitutes || t.has_unexpanded_var();
-            if !unreadable && !t.has_glob() {
+            // `cd .cla*`, and since v0.22.0 `cd .clau[d]e` and `cd
+            // .claud{e..e}`: the shell opens the word before `cd` sees it.
+            let opens = t.has_glob() || (!t.single_quoted && crate::words::is_opened(w));
+            if !unreadable && !opens {
                 return Some(CdEffect::To(w.to_string()));
             }
             if !unreadable {
@@ -3007,11 +3205,16 @@ impl Segment {
                 let mut dir = start.to_path_buf();
                 for step in steps {
                     let next = if step.glob {
-                        let pattern = crate::delete::resolve_path_in(&step.path, &dir);
-                        match crate::delete::expand_glob(&pattern).as_deref() {
-                            Some([one]) if one.is_dir() => one.clone(),
-                            // Nothing, several, or a glob in a directory
-                            // component: the shell's choice is not known.
+                        match crate::words::directory(&step.path, &dir) {
+                            crate::words::Goes::To(one) => one,
+                            // A bracket or a brace that matches nothing is
+                            // the word as written, and `cd app/[id]` goes
+                            // to the directory of that name.
+                            crate::words::Goes::AsWritten if !step.path.contains(['*', '?']) => {
+                                crate::delete::resolve_path_in(&step.path, &dir)
+                            }
+                            // Several, a file, or a `*` that matches
+                            // nothing yet: the shell's choice is not known.
                             _ => return None,
                         }
                     } else {
@@ -3048,7 +3251,7 @@ impl Segment {
                 let mut end: Option<Vec<String>> = start_end.map(<[String]>::to_vec);
                 for step in steps {
                     if step.glob {
-                        end = Some(crate::delete::readable_end_of(&step.path).unwrap_or_default());
+                        end = Some(end_after_glob(&step.path));
                     } else if crate::delete::is_dir_independent(&step.path) {
                         // An absolute step would make the directory known,
                         // which `run_dir` does not follow from an unknown
@@ -3400,7 +3603,7 @@ pub fn has_substitution(s: &str) -> bool {
 /// the suite replace while they run: a lookup that lands then finds no
 /// bash. `None` on a machine without one.
 #[cfg(all(test, unix))]
-fn bash_for_tests() -> Option<&'static str> {
+pub(crate) fn bash_for_tests() -> Option<&'static str> {
     [
         "/bin/bash",
         "/usr/bin/bash",
@@ -5861,8 +6064,21 @@ mod segment_directory_tests {
             seg("cd .cla* && cd .. && rm y").run_dir(&start),
             Some(start.clone())
         );
-        // Two matches, none, a file, or a glob in a directory component:
-        // the shell's choice is not known.
+        // A bracket and a brace are opened the same way, and in any
+        // component; a bracket that matches nothing is the directory of
+        // that name.
+        assert_eq!(
+            seg("cd .clau[d]e && rm y").run_dir(&start),
+            Some(claude.clone())
+        );
+        assert_eq!(
+            seg("cd .claud{e..e} && rm y").run_dir(&start),
+            Some(claude.clone())
+        );
+        let id = tmp.dir("app/[id]");
+        assert_eq!(seg("cd app/[id] && rm y").run_dir(&start), Some(id));
+        assert_eq!(seg("cd .claud{e,x} && rm y").run_dir(&start), None);
+        // Two matches, none, a file: the shell's choice is not known.
         assert_eq!(seg("cd wt* && rm y").run_dir(&start), None);
         assert_eq!(seg("cd nowhere* && rm y").run_dir(&start), None);
         assert_eq!(seg("cd only.* && rm y").run_dir(&start), None);
@@ -6621,6 +6837,92 @@ mod reading_tests {
             }
             assert!(!texts(line).iter().any(|t| t == inner), "{line}: restored");
         }
+    }
+
+    /// A parenthesis that opens inside a word is zsh's group of
+    /// alternatives, and bash's behind an `extglob` operator: written as
+    /// the pattern `words::opened` reads (`group_as_pattern`). A function's
+    /// `()`, an array, a substitution and a subshell are left as they are.
+    #[test]
+    fn a_group_inside_a_word_is_read_as_a_pattern() {
+        use crate::words::{GROUP_CLOSES as C, GROUP_OPENS as O, GROUP_OR as B};
+        let g = |alternatives: &[&str]| format!("{O}{}{C}", alternatives.join(&B.to_string()));
+        for (line, read) in [
+            (
+                "echo x > .claud(e|x)/settings.json",
+                Some(format!("echo x > .claud{}/settings.json", g(&["e", "x"]))),
+            ),
+            (
+                "cat notes.md | tee .claud@(e|x)/settings.json",
+                Some(format!(
+                    "cat notes.md | tee .claud{}/settings.json",
+                    g(&["e", "x"])
+                )),
+            ),
+            (
+                "rm .claud?(e)/settings.json",
+                Some(format!("rm .claud{}/settings.json", g(&["", "e"]))),
+            ),
+            (
+                "rm .claud+(e)/settings.json",
+                Some(format!("rm .claud{}/settings.json", g(&["e*"]))),
+            ),
+            (
+                "rm .clau*(de|x)/settings.json",
+                Some(format!("rm .clau{}/settings.json", g(&["", "de*", "x*"]))),
+            ),
+            ("rm .claude/!(x)", Some("rm .claude/*".to_string())),
+            // One alternative at the end of a word is also zsh's
+            // qualifiers, which add nothing to the name.
+            (
+                "echo x > sub/.env(N)",
+                Some(format!("echo x > sub/.env{}", g(&["", "N"]))),
+            ),
+            (
+                "echo x > .claude/(settings).json",
+                Some(format!("echo x > .claude/{}.json", g(&["settings"]))),
+            ),
+            (
+                r"echo x > .cl\aud(e|x)/settings.json",
+                Some(format!("echo x > .claud{}/settings.json", g(&["e", "x"]))),
+            ),
+            (
+                "ls a(b|(c|d))",
+                Some(format!("ls a{}", g(&["b", &g(&["c", "d"])]))),
+            ),
+            (
+                "echo $(echo x > .claud(e)/settings.json)",
+                Some(format!(
+                    "echo $(echo x > .claud{}/settings.json)",
+                    g(&["e"])
+                )),
+            ),
+            // A group that is a word of its own, past a command's first.
+            (
+                "echo x > (.claude|x)/settings.json",
+                Some(format!("echo x > {}/settings.json", g(&[".claude", "x"]))),
+            ),
+            ("rm (a|b)", Some(format!("rm {}", g(&["a", "b"])))),
+            ("if (true); then ls; fi", None),
+            ("ls && (cd x)", None),
+            ("time (make)", None),
+            ("case a in (a) ls;; esac", None),
+            ("f() { echo x; }", None),
+            ("f () { echo x; }", None),
+            ("a=(1 2 3)", None),
+            ("echo $(ls) <(ls) >(cat) $((1+2))", None),
+            ("(cd src && ls)", None),
+            ("echo 'a(b|c)' \"a(b|c)\"", None),
+            ("echo a(b|c", None),
+            ("echo $(f() { x; }; f)", None),
+        ] {
+            assert_eq!(respelled(line, Reading::Posix), read, "{line}");
+        }
+        // The walk cut such a line at the `|` inside its group: two
+        // commands, neither of them the write.
+        let seen = other_readings("echo x > .claud(e|x)/settings.json", &[Reading::Posix]);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(split_segments_deep(&seen[0].1).len(), 1);
     }
 
     /// bash itself, asked what each word is, against the walk's reading of

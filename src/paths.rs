@@ -53,6 +53,8 @@ pub fn resolve() -> Result<Paths> {
 pub fn resolve_from(start: &std::path::Path) -> Result<Paths> {
     let paths = resolve_readonly(start)?;
 
+    #[cfg(test)]
+    crate::testutil::making_state(&paths.state_dir);
     fs::create_dir_all(paths.state_dir.join("logs"))?;
     fs::create_dir_all(paths.state_dir.join("backups"))?;
 
@@ -171,6 +173,8 @@ pub fn project_root(cwd: &Path) -> Option<PathBuf> {
 /// the caller is about to write the record.
 pub fn resolve_watched(start: &Path) -> Result<Paths> {
     let paths = watched_readonly(start)?;
+    #[cfg(test)]
+    crate::testutil::making_state(&paths.state_dir);
     for dir in ["logs", "backups"] {
         let dir = paths.state_dir.join(dir);
         fs::create_dir_all(&dir).with_context(|| {
@@ -236,6 +240,8 @@ pub fn home_base() -> Result<PathBuf> {
 /// runs are still recorded without requiring `termaxa init`.
 pub fn demo_state_dir() -> Result<PathBuf> {
     let dir = home_base()?.join("demo");
+    #[cfg(test)]
+    crate::testutil::making_state(&dir);
     fs::create_dir_all(dir.join("logs"))?;
     fs::create_dir_all(dir.join("backups"))?;
     Ok(dir)

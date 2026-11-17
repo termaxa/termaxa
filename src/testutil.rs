@@ -39,6 +39,10 @@
 //!
 //! Both fail the test that leaves something behind: every guard asserts its
 //! own tree is gone, and `TestEnv` additionally watches the real `~/.termaxa`.
+//! The watch sees what lands while a guard is alive, so a test that takes no
+//! guard at all is caught where it does the writing instead:
+//! [`making_state`] fails any test that makes the product's state on a
+//! thread holding no `TestEnv`.
 //! A helper nobody is obliged to use stops being used, so
 //! `no_module_builds_a_temp_path_by_hand` reads the source and fails on a
 //! `temp_dir()` call outside this module. That is what keeps this the only
@@ -56,6 +60,33 @@ use std::sync::{Mutex, MutexGuard};
 
 static GLOBAL_ENV: Mutex<()> = Mutex::new(());
 static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// How many `TestEnv`s this thread holds. A count and not a flag: the
+    /// tests of this module build one inside another.
+    static HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Called where the product is about to make state under its home:
+/// `paths::resolve_from`, `resolve_watched` and `demo_state_dir`.
+///
+/// A test that gets there without a `TestEnv` of its own makes that state
+/// in the real `~/.termaxa`, or in the tree of whichever test holds a guard
+/// at that instant, and which of the two is timing: `TERMAXA_HOME` is the
+/// process's and the tests are its threads. The watch at drop sees the first
+/// case only when the write lands between another guard's two listings, and
+/// then it fails that other test: the Windows run for the merge of #178
+/// failed one that had done nothing. This fails the test that did it, on
+/// its own thread, every time.
+pub fn making_state(dir: &Path) {
+    assert!(
+        HELD.with(|held| held.get()) > 0,
+        "this test is making state in {} without a `TestEnv` of its own: \
+         that is the real ~/.termaxa, or another test's tree, whichever the \
+         timing gives. Take a `TestEnv` and judge a project inside it.",
+        dir.display()
+    );
+}
 
 /// Take the lock, tolerating poisoning: if a test panicked while holding it,
 /// the rest should report their own verdicts instead of failing as collateral
@@ -279,6 +310,7 @@ impl TestEnv {
 
         let previous_home = std::env::var_os("TERMAXA_HOME");
         std::env::set_var("TERMAXA_HOME", tree.path().join("home"));
+        HELD.with(|held| held.set(held.get() + 1));
 
         let watch = real_state_root().map(|dir| {
             let before = listing(&dir);
@@ -490,6 +522,7 @@ impl Drop for TestEnv {
             // variable left pointing at a deleted tree is the original bug.
             None => std::env::remove_var("TERMAXA_HOME"),
         }
+        HELD.with(|held| held.set(held.get().saturating_sub(1)));
 
         let strays = self.watch.take().map(|(dir, before)| {
             let found = arrivals(&before, &listing(&dir));
@@ -665,6 +698,55 @@ mod tests {
         assert!(
             caught,
             "a test that writes outside its own tree must fail, not pass quietly"
+        );
+    }
+
+    /// The check that names the test that did it. A project in a tree with
+    /// no guard is resolved the way a hook resolves one: on a thread holding
+    /// no `TestEnv` that is refused before anything is made, and on one that
+    /// holds a guard the state lands in the guard's home.
+    #[test]
+    fn a_test_with_no_guard_of_its_own_cannot_make_state() {
+        let _outer = lock();
+        let holder = TempTree::new("unguarded");
+        holder.file(
+            "proj/.termaxa/policy.yaml",
+            "version: 1\ndefault: ask\nrules: []\n",
+        );
+        let proj = holder.path().join("proj");
+        let state = crate::paths::resolve_readonly(&proj)
+            .expect("computing a path makes nothing")
+            .state_dir;
+
+        let refused = panics_quietly({
+            let proj = proj.clone();
+            move || {
+                let _ = crate::paths::resolve_from(&proj);
+            }
+        });
+        assert!(
+            refused,
+            "a test with no guard that makes state must fail itself, every time"
+        );
+        assert!(
+            !state.exists(),
+            "and it is refused before anything is made, in {}",
+            state.display()
+        );
+
+        let env = TestEnv::build(None, "guarded");
+        let paths = crate::paths::resolve_from(&proj).expect("a guarded thread makes its state");
+        assert!(
+            paths.state_dir.starts_with(env.home()),
+            "{}",
+            paths.state_dir.display()
+        );
+        drop(env);
+        assert!(
+            panics_quietly(move || {
+                let _ = crate::paths::resolve_from(&proj);
+            }),
+            "the mark goes when the guard does"
         );
     }
 
