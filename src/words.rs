@@ -1542,6 +1542,11 @@ mod tests {
         tmp.file("x1", "x\n");
         tmp.file("x2", "x\n");
         tmp.file("x10", "x\n");
+        // The directory as `getcwd` names it, and bash's `$PWD` with it: on
+        // macOS the temporary directory is behind a link (`/var` is
+        // `/private/var`), and a bash whose inherited `PWD` names another
+        // directory takes the name `getcwd` gives.
+        let here = std::fs::canonicalize(tmp.path()).expect("the tree exists");
         // What bash has opened this way only since 4.0 (a padded range, a
         // step) or 5.2 (`.*` without `.` and `..`): macOS ships 3.2.
         let version = std::process::Command::new(bash)
@@ -1620,7 +1625,8 @@ mod tests {
             let line = format!("printf '%s\\n' {word}");
             let ran = std::process::Command::new(bash)
                 .args(["--norc", "--noprofile", "-c", &line])
-                .current_dir(tmp.path())
+                .current_dir(&here)
+                .env("PWD", &here)
                 .env("LC_ALL", "C")
                 .output()
                 .expect("bash runs");
@@ -1628,7 +1634,7 @@ mod tests {
                 .lines()
                 .map(str::to_string)
                 .collect();
-            let read = open(&line, tmp.path()).unwrap_or(line.clone());
+            let read = open(&line, &here).unwrap_or(line.clone());
             // The words after `printf '%s\n'`, as the walk's own tokenizer
             // reads the spelling.
             let ours: Vec<String> = crate::delete::tokenize_public(&read)
