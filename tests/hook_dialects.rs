@@ -2621,3 +2621,68 @@ fn a_name_with_an_escape_inside_it_is_refused_through_the_hook() {
         assert_eq!(out.code, 0, "{mode}: {}", out.stdout);
     }
 }
+
+/// A guarded name behind a pattern, a brace or a zsh group, through the
+/// binary and in both modes: `echo x > .clau[d]e/settings.json` wrote the
+/// hook config through `echo *` from v0.14.2 to v0.21.10, the plain spelling
+/// a floor deny (measured Nov 16, 2026, release by release, each line run
+/// by bash and by zsh). The line is judged as the shell opens it, and the
+/// reason says so.
+#[test]
+fn a_name_the_shell_opens_into_is_refused_through_the_hook() {
+    use serde_json::json;
+    for mode in ["enforce", "observe"] {
+        let tmp = scratch(&format!("opened-{mode}"));
+        let home = tmp.join("home");
+        let policy = format!(
+            concat!(
+                "version: 1\nmode: {}\ndefault: ask\nrules:\n",
+                "  - match_path: \"*/.claude/settings*.json\"\n    action: deny\n    floor: true\n",
+                "  - match_path: \"*/.termaxa/*\"\n    action: deny\n    floor: true\n",
+                "  - match: \"echo *\"\n    action: allow\n",
+                "  - match: \"cd *\"\n    action: allow\n",
+                "  - match: \"cat *\"\n    action: allow\n",
+            ),
+            mode
+        );
+        let proj = project(&tmp, &policy);
+        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+        std::fs::write(proj.join(".claude").join("settings.json"), "{}\n").unwrap();
+        let bash = |cmd: &str| {
+            json!({"session_id":"P","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+                   "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+        };
+        for cmd in [
+            "echo x > .clau[d]e/settings.json",
+            "echo x > .cl*/settings.json",
+            "echo x > .claud{e..e}/settings.json",
+            "cat notes.md | tee .claud{e,x}/settings.json",
+            "echo x > .termax[a]/policy.yaml",
+        ] {
+            let out = hook(&home, &proj, &bash(cmd), &[]);
+            assert_eq!(out.code, 2, "{mode}: {cmd}: {}", out.stdout);
+            assert!(
+                out.stdout.contains("\"permissionDecision\":\"deny\""),
+                "{mode}: {cmd}: {}",
+                out.stdout
+            );
+            assert!(
+                out.stdout.contains("as the shell opens it"),
+                "{mode}: {cmd}: {}",
+                out.stdout
+            );
+        }
+        // A `cd` the shell opens goes where the shell goes, and zsh's
+        // group is read through bash's reading of the line.
+        for cmd in [
+            "cd .clau[d]e && echo x > settings.json",
+            "echo x > .claud(e)/settings.json",
+        ] {
+            let out = hook(&home, &proj, &bash(cmd), &[]);
+            assert_eq!(out.code, 2, "{mode}: {cmd}: {}", out.stdout);
+        }
+        // A pattern that opens into nothing guarded changes nothing.
+        let out = hook(&home, &proj, &bash("cat .cl*/settings.json"), &[]);
+        assert_eq!(out.code, 0, "{mode}: {}", out.stdout);
+    }
+}

@@ -2828,13 +2828,21 @@ mod tests {
         assert!(parse_file_write(raw).is_none());
     }
 
+    /// In a project of the test's own: an event from a directory that does
+    /// not exist is judged from the process's, which under `cargo test` is
+    /// this repository, and the state that judging makes went to the real
+    /// home.
     #[test]
     fn a_write_that_already_happened_is_not_gated() {
+        let env = crate::testutil::TestEnv::new("hook-post-write");
+        let proj = env.project("repo");
         let raw = json!({
-            "cwd": "/repo",
+            "cwd": proj.display().to_string(),
             "hook_event_name": "PostToolUse",
             "tool_name": "Write",
-            "tool_input": { "file_path": "/repo/.termaxa/policy.yaml" }
+            "tool_input": {
+                "file_path": proj.join(".termaxa").join("policy.yaml").display().to_string()
+            }
         })
         .to_string();
         // It parses as a write event that already happened (#95): the gate
@@ -3498,6 +3506,63 @@ mod tests {
             // A backslash where no guarded name is: answered as before.
             for cmd in ["echo x > wt\\notes.md", "echo hello\\ world"] {
                 let out = decide(&bash_payload(&proj, "r", cmd)).expect("judged");
+                assert_eq!(out.exit_code, 0, "{mode}: {cmd}");
+            }
+        }
+    }
+
+    /// A guarded name the shell opens a pattern or a brace into is refused
+    /// in both modes, as its plain spelling is; an ordinary line with a
+    /// bracket, a glob or a brace in it is answered as before; and in
+    /// observe mode a write the copy aside cannot cover is held for the
+    /// file the shell writes.
+    #[test]
+    fn a_name_the_shell_opens_into_is_refused_in_both_modes() {
+        let env = crate::testutil::TestEnv::new("hook-opened");
+        for mode in ["enforce", "observe"] {
+            let proj = env.project(mode);
+            let policy = crate::init::STARTER_POLICY.replacen(
+                "\nmode: enforce\n",
+                &format!("\nmode: {mode}\n"),
+                1,
+            );
+            assert!(policy.contains(&format!("\nmode: {mode}\n")));
+            std::fs::write(proj.join(".termaxa").join("policy.yaml"), policy).unwrap();
+            std::fs::create_dir_all(proj.join(".claude")).unwrap();
+            std::fs::write(proj.join(".claude").join("settings.json"), "{}\n").unwrap();
+            std::fs::create_dir_all(proj.join("sub")).unwrap();
+            std::fs::write(proj.join("sub").join(".env"), "K=1\n").unwrap();
+            std::fs::create_dir_all(proj.join("app").join("[id]")).unwrap();
+            std::fs::write(proj.join("app").join("[id]").join("page.tsx"), "p\n").unwrap();
+            std::fs::write(proj.join("notes.md"), "n\n").unwrap();
+
+            for cmd in [
+                "echo x > .clau[d]e/settings.json",
+                "echo x > .cl?ude/settings.json",
+                "echo x > .claud{e..e}/settings.json",
+                "touch .claud{e,x}/settings.json",
+                "cd .clau[d]e && echo x > settings.json",
+                "echo x > .claud(e)/settings.json",
+                "echo x > .termax[a]/policy.yaml",
+                // Off the floor, and nothing can copy the file aside first:
+                // held for the `sub/.env` the shell writes.
+                "cp notes.md sub/.en[v]",
+            ] {
+                let out = decide(&bash_payload(&proj, "o", cmd)).expect("judged");
+                assert_eq!(out.exit_code, 2, "{mode}: {cmd}");
+                let said = out.rendered.unwrap_or_default();
+                assert!(
+                    said.contains("\"permissionDecision\":\"deny\""),
+                    "{mode}: {cmd}: {said}"
+                );
+            }
+            // A bracket, a glob or a brace where no guarded name is.
+            for cmd in [
+                "cat app/[id]/page.tsx",
+                "echo x > notes.m[d]",
+                "echo x > out/{a,b}.md",
+            ] {
+                let out = decide(&bash_payload(&proj, "o", cmd)).expect("judged");
                 assert_eq!(out.exit_code, 0, "{mode}: {cmd}");
             }
         }
