@@ -14,6 +14,7 @@ mod paths;
 mod pg;
 mod policy;
 mod preview;
+mod propose;
 mod protect;
 mod replay;
 mod report;

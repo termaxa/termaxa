@@ -207,6 +207,37 @@ the plugin's hook has stood down for a hook that is not running: restart
 the session, which is what Claude Code's hooks guide says of a missed
 change.
 
+When `termaxa init` writes the policy in a project that was watched, it
+reads that record first and proposes the project's own rules from it:
+
+- What is proposed is what asked because nothing in the starter decided
+  it, the policy's default. An ask a rule chose (`git push`, `curl`) stays
+  an ask, and a refusal is not proposed away.
+- Each proposal names the action as it was typed, `npm run build`, `npx
+  prisma generate`, `python3 manage.py migrate`, `supabase migration new`,
+  with how often it asked and the commands themselves. A runner is never
+  proposed on its own: `npx *`, `npm run *` and `python3 *` run whatever
+  they are handed, so a runner comes with the script, package or module it
+  ran, or not at all.
+- Not proposed, and listed as such: a command the gate reads as removing,
+  overwriting or discarding files (the ask is where its preview is shown),
+  one whose own words delete, drop, reset or destroy, an install of a
+  package named on the line, anything run as another user, code given on
+  the line (`python3 -c`, `node -e`), a database client's statements, a
+  shell in a container or on another machine, and anything that asked once.
+- At a terminal, each proposal is put to you, `y` to accept, anything else
+  to drop. With no terminal (an agent running `init`, a script), every
+  proposal is written as a comment that changes no verdict until you take
+  the `# ` off and run `termaxa init` again.
+- Accepted rules go at the end of the rules, below every rule of the
+  starter, so they decide only what nothing above them decides: the floor
+  and every refusal keep their place. `init` says how many of the record's
+  asks they would have let run.
+
+`init` also says what to do about a Claude Code session already open in the
+project: restart it, so that it runs the project's own hook; the plugin's
+hook stands down there ten seconds after the registration is written.
+
 Under a supervisor (`termaxa supervise`) a plugin's hook forwards as any
 hook does, and the supervisor refuses a project that has no policy:
 watching is the unsupervised hook's.

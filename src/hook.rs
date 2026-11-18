@@ -386,7 +386,7 @@ fn strings_in(v: &serde_json::Value, out: &mut Vec<String>) {
 /// direction. Read-shaped tools carry none of these verbs, which is what keeps
 /// `Read` on `.termaxa/policy.yaml` from being refused — reading the policy is
 /// allowed on the shell path too.
-const WRITE_VERBS: [&str; 9] = [
+pub(crate) const WRITE_VERBS: [&str; 9] = [
     "write", "edit", "create", "patch", "replace", "notebook", "save", "delete", "remove",
 ];
 
