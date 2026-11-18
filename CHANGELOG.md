@@ -2,6 +2,73 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.23.0 — the Claude Code plugin, and `init` proposes a watched project's own rules
+
+**In plain words:** v0.22.0 gave Claude Code a hook that a plugin could register for every project on the machine, watching a project that has no policy, and nothing registered it yet. This release is that plugin. It lives in this repository, which is its own marketplace, so `/plugin install termaxa --marketplace termaxa/termaxa` puts the gate on every project you open in Claude Code (2.1.275 or later; on an earlier version, `/plugin marketplace add termaxa/termaxa` and then `/plugin install termaxa@termaxa`). A plugin registers hooks that run as the session does, and this gate can be one of them, so the floor now holds the plugin as it holds the settings file: an agent cannot turn it off, uninstall it, or rewrite what Claude Code installed. And the record of a watched project has a use: `termaxa init` reads it and proposes the project's own rules, each with how often it asked, for you to take or leave.
+
+Two code PRs: #182, `init` proposing rules; #183, the plugin and its guards.
+
+### Added
+
+- The Claude Code plugin, in [`claude-code-plugin/`](claude-code-plugin/), with the repository's marketplace in `.claude-plugin/marketplace.json`. It holds no program and no script: it registers `termaxa hook --plugin` for `SessionStart`, and for `PreToolUse` and `PostToolUse` on the matchers `termaxa init` registers, and runs the `termaxa` you installed, which has to be this release or later. In a project with no policy it watches: a line at the start of the session says so, nothing is asked and nothing is approved, and only the floor is refused. A project with a policy is judged by it, and a project that registers `termaxa hook` itself is left to that hook. Its README says what it runs, sends and fetches. Its version, 0.1.0, is its own: Claude Code updates an installed plugin when that version changes (#183).
+- `termaxa init` reads the record a plugin's hook kept for the project and proposes the project's own allow rules before it writes the policy. What is proposed is what asked because nothing in the starter decided it. Each proposal names the action as it was typed (`npm run build`, `npx prisma generate`, followed by ` *` when it took arguments) and never a runner on its own, with how often it asked and the commands themselves. At a terminal each one is put to you, `y` to take it; with no terminal, as when an agent runs `init`, each is written as a comment that changes no verdict until you take the `# ` off and run `termaxa init` again. Rules you take go below every rule of the starter, so the floor and every refusal keep their place. Not proposed, and listed by why: a command that removes, overwrites or discards files, one whose own words delete or destroy, an install of a package named on the line, anything run as another user, code given on the line, a database client's statements, and anything that asked once. `init` also says to restart a Claude Code session already open in the project (#182).
+
+### Changed
+
+- The starter holds Claude Code's plugins as it holds the settings file, in every mode. A write or a removal under `.claude/plugins/`, where Claude Code keeps the registry of installed plugins, the marketplaces it knows and a copy of each plugin with its `hooks/hooks.json`, is refused by what a command touches (`match_path: "*/.claude/plugins/*"`), by a string rule for a program the gate cannot read (`*.claude*plugins*`, with `except_reads`), and from a file tool. So are `claude plugin disable`, `claude plugin uninstall` or `remove`, and `claude plugin marketplace remove` or `rm`, however the program is named or wrapped (five string rules, with `except_reads`). Any plugin, not only this one, as the settings file is held whole and not only its hooks. A `CLAUDE_CONFIG_DIR` elsewhere is read under its default name, as for the settings. Reading those files, and listing, installing, enabling or updating a plugin, are left to the policy. The starter has 236 rules (162 allow, 14 ask, 60 deny), 45 of them on the floor; `examples/policy.yaml` follows (#183).
+
+### Measured and documented
+
+- In a Claude Code session on Windows (2.1.266, Nov 18, 2026, auto mode), with the plugin installed from its pull request's branch and that build of `termaxa`: the session's line was shown at the start; `ls` ran with nothing said; `find . -name "*.tmp" -delete`, `claude plugin disable termaxa@termaxa` and a `Write` to `.claude/plugins/test.json` were each refused with the rule's sentence, which the agent read before it stopped. With no `termaxa` on PATH, Claude Code showed a hook error at the start and two on every call, ran every command, and told the agent nothing: until `termaxa` is installed, nothing is watched or refused.
+- The guards, watched, on the released 0.22.0 and on a static build of this release, with Claude Code's configuration directory under its own name and under another: of 32 lines that turn a plugin off or rewrite what Claude Code installed (14 commands, 15 writes through the shell, 3 from file tools), 0.22.0 refuses 1, an `rm -rf` of a path spelled with a variable, held because nothing could be copied first, and this release refuses 32. 11 ordinary lines (listing, reading, enabling and validating plugins, installing another, a `grep` and a commit message that name the command) get no answer on either.
+- Ordinary work is answered as before: watched, the 95 everyday calls, the 304 floor lines and the 112 directory lines, call for call as 0.22.0 answers them; and through `termaxa check` with the built-in starter, the 84 shell commands among the 95 (33 allow, 34 ask, 17 deny on both).
+- `termaxa init` on the record of the 95 everyday calls, watched: 89 commands, 34 that would have asked and 22 refused. It proposes two rules (`npm install` and `npm run build`, each asked twice), lists the rest under why it does not, and the two taken at a terminal would have let 4 of the 34 asks run.
+- Claude Code 2.1.327 and 2.1.266 install the plugin from this repository (`claude plugin marketplace add termaxa/termaxa`, then `claude plugin install termaxa@termaxa`), and 2.1.327 in one step (`claude plugin install termaxa --marketplace termaxa/termaxa`); `claude plugin validate --strict` passes on the plugin and on the marketplace.
+- docs/observe-mode.md says how the plugin is installed and what the floor holds of it, and SECURITY.md has a design bullet for it. 723 tests on Linux (16 new), 615 on Windows.
+
+### Upgrade note — a policy from before v0.23.0
+
+`init` never rewrites a policy, and a policy written before this release does not hold the plugin. To have it do so, paste these seven rules at the top of `rules:`:
+
+```yaml
+  - match_path: "*/.claude/plugins/*"
+    action: deny
+    reason: "Claude Code's plugin files decide which hooks run, this gate's among them. Change them yourself."
+    floor: true
+  - match: "*.claude*plugins*"
+    action: deny
+    reason: "Claude Code's plugin files decide which hooks run, this gate's among them. Change them yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* disable"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* disable *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* uninstall *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* remove *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* rm *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+```
+
+The file tools are held from `.claude/plugins/` with no change to the policy. Then run `termaxa init`, which is how `doctor` is told that the edited policy is the one you mean, and `termaxa check "claude plugin disable termaxa@termaxa"` should say `deny`.
+
 ## v0.22.0 — a write is judged however the shell spells it, and a plugin's hook watches a project that has no policy
 
 **In plain words:** a rule names a file, and the gate read a command line one way: quotes as a POSIX shell has them, and every other character as part of the name it spells. A shell reads more into a line before the command runs. bash takes a backslash out of a word, so `.ter\maxa` is `.termaxa`, and spells any character by its number inside `$'...'`; cmd does the first with a caret and PowerShell with a backtick. Every shell opens a word with a pattern in it (`.clau[d]e`, `.cl*`) into the names it matches on disk, bash and zsh open a brace list or a range (`.claud{e..e}`), and zsh reads a group (`.claud(e)`) as a pattern too. Four ways of sending output to a file, `&>`, `>&`, `&>>` and `<>`, were read as no file at all, and a quote inside a target (`".claude"/settings.json`) stayed part of the name. With the starter, `echo x > .ter\maxa/policy.yaml`, `echo x > .clau[d]e/settings.json`, `echo x > .claud{e..e}/settings.json` and `echo x &> .claude/settings.json` were allowed by `echo *`: a write to the gate's own policy, or to the file the gate is registered in. And a directory that its tool had moved (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `TERMAXA_HOME`) was guarded under its default name only. In observe mode, where the floor is the one thing held, all of these ran. A line is now judged as each shell that can run it reads it, each word as the shell opens it, a redirection however it is spelled, and a moved directory like the one it replaces. Apart from that, `termaxa hook --plugin` is the hook a plugin will register for every project on the machine: in a project with no policy it watches, holding the floor and recording the rest, and where the project wires its own hook it stands down.
