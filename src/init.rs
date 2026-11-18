@@ -901,6 +901,9 @@ pub fn run(
     write_copilot_hook: bool,
     observe: bool,
 ) -> Result<()> {
+    // Before anything is written: whether a plugin's hook kept a record of
+    // this project while it had no policy.
+    let was_watched = crate::paths::watched_record(dir).is_some();
     let termaxa_dir = dir.join(".termaxa");
     fs::create_dir_all(&termaxa_dir)?;
 
@@ -913,15 +916,42 @@ pub fn run(
             );
         }
     } else {
-        fs::write(&policy_path, starter_policy(observe))?;
+        // A project a plugin's hook has watched (decision #147) has a record
+        // of what the starter would have asked, and the rules that record
+        // proposes are put to the person here, before the policy is written
+        // (#149). Read from a terminal and from nowhere else: an agent that
+        // runs `init` has none, and gets the proposals as comments it cannot
+        // switch on.
+        let mut text = starter_policy(observe);
+        let mut added = String::new();
+        if let Some(watched) = crate::propose::Watched::read(dir) {
+            let root = crate::paths::watch_root(dir);
+            let stdin = std::io::stdin();
+            let mut out = std::io::stdout();
+            let written = if at_a_terminal() {
+                let mut lock = stdin.lock();
+                crate::propose::policy_for_init(&watched, &text, &root, Some(&mut lock), &mut out)?
+            } else {
+                crate::propose::policy_for_init(&watched, &text, &root, None, &mut out)?
+            };
+            let rules = |n: usize| if n == 1 { "rule" } else { "rules" };
+            added = match (written.accepted, written.commented) {
+                (0, 0) => String::new(),
+                (n, 0) => format!(", and {n} {} of this project's own", rules(n)),
+                (_, n) => format!(", and {n} proposed {} as comments", rules(n)),
+            };
+            text = written.text;
+            println!();
+        }
+        fs::write(&policy_path, text)?;
         if observe {
-            println!("✓ wrote .termaxa/policy.yaml (starter policy, observe mode)");
+            println!("✓ wrote .termaxa/policy.yaml (starter policy, observe mode{added})");
             println!(
                 "  every command runs and the floor still holds; `termaxa report` shows what \
                  enforcement would have done. Set `mode: enforce` once you have read it."
             );
         } else {
-            println!("✓ wrote .termaxa/policy.yaml (starter policy)");
+            println!("✓ wrote .termaxa/policy.yaml (starter policy{added})");
         }
     }
 
@@ -1025,7 +1055,25 @@ pub fn run(
 
     // --- wire up Claude Code PreToolUse hook ---
     if write_claude_hook {
-        install_claude_hook(dir)?;
+        // A session already open in the project read its settings when it
+        // started. Where a plugin's hook was watching, it steps aside once
+        // this registration has been unchanged for ten seconds (#147), and a
+        // session that has not read the registration then has neither hook.
+        if install_claude_hook(dir)? {
+            if was_watched {
+                println!(
+                    "  Restart any Claude Code session open in this project now: the plugin's"
+                );
+                println!(
+                    "  hook stops answering here ten seconds after this file last changed, and"
+                );
+                println!("  a session that has not read the file may then run with neither hook.");
+            } else {
+                println!(
+                    "  Restart any Claude Code session open in this project, so it runs this hook."
+                );
+            }
+        }
     } else {
         if write_cursor_hook {
             let dir_c = dir.join(".cursor");
@@ -1183,6 +1231,21 @@ pub fn run(
     Ok(())
 }
 
+/// Whether a person is at a terminal to answer `init`'s questions: the test
+/// `run` applies to an ask (`runner::stdin_is_terminal`), since a pipe can
+/// carry a `y` and is not a person. Never under test, where cargo may run
+/// from a terminal and a question would wait for an answer nobody gives.
+fn at_a_terminal() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        crate::runner::stdin_is_terminal()
+    }
+}
+
 /// Hash the policy and store the baseline in the project's state dir.
 /// Returns the short form for display, or `None` if the policy could not be
 /// read (which `doctor` will report on its own terms).
@@ -1197,7 +1260,9 @@ fn record_fingerprint(state_dir: &Path, policy_path: &Path) -> Result<Option<Str
     Ok(Some(crate::fingerprint::short(&hash)))
 }
 
-fn install_claude_hook(dir: &Path) -> Result<()> {
+/// Registers the hooks in `.claude/settings.json`; `true` when the shell
+/// hook was not registered there before.
+fn install_claude_hook(dir: &Path) -> Result<bool> {
     let claude_dir = dir.join(".claude");
     fs::create_dir_all(&claude_dir)?;
     let settings_path = claude_dir.join("settings.json");
@@ -1221,7 +1286,8 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
         .or_insert(json!([]));
     let arr = pre.as_array_mut().context("PreToolUse must be an array")?;
 
-    if ensure_hook(arr, BASH_MATCHER) {
+    let added = ensure_hook(arr, BASH_MATCHER);
+    if added {
         println!("\n✓ installed PreToolUse hook in .claude/settings.json");
     } else {
         println!("\n• Claude Code hook already installed in .claude/settings.json");
@@ -1266,7 +1332,7 @@ fn install_claude_hook(dir: &Path) -> Result<()> {
     }
 
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-    Ok(())
+    Ok(added)
 }
 
 /// Claude Code matches shell calls on the tool name `Bash`.

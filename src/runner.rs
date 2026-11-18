@@ -298,12 +298,12 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
 /// from. A pipe from a harness never closes, and a pipe from an agent can
 /// carry a `y`; neither is a person.
 #[cfg(unix)]
-fn stdin_is_terminal() -> bool {
+pub(crate) fn stdin_is_terminal() -> bool {
     // SAFETY: isatty on a constant fd is a pure query with no side effects.
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 #[cfg(not(unix))]
-fn stdin_is_terminal() -> bool {
+pub(crate) fn stdin_is_terminal() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal()
 }
