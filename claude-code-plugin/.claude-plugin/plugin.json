@@ -1,0 +1,19 @@
+{
+  "name": "termaxa",
+  "version": "0.1.0",
+  "description": "Watches the shell commands and file writes of a project that has no Termaxa policy, refuses only its built-in floor, and keeps the record `termaxa init` turns into the project's own rules. Runs the termaxa binary, 0.23.0 or later, which you install first.",
+  "author": {
+    "name": "Termaxa",
+    "url": "https://termaxa.com"
+  },
+  "homepage": "https://termaxa.com",
+  "repository": "https://github.com/termaxa/termaxa",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "security",
+    "hooks",
+    "shell",
+    "guardrails",
+    "audit"
+  ]
+}

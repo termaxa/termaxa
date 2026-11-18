@@ -49,9 +49,10 @@ verdicts send no notifications.
 
 Three things are enforced in both modes:
 
-1. Every rule marked `floor: true`. The starter marks 38 of its denies, in
+1. Every rule marked `floor: true`. The starter marks 45 of its denies, in
    three groups: the gate's own configuration and state (hook configs,
-   `.termaxa/` policy, record, backups, shims, `core.hooksPath`; since
+   Claude Code's plugins since v0.23.0, `.termaxa/` policy, record,
+   backups, shims, `core.hooksPath`; since
    v0.21.3 these are path rules as well as string rules, so a write into
    one of those files is held however the command is spelled, and reading
    them, `cat .claude/settings.json` or `git diff .termaxa/policy.yaml`,
@@ -143,7 +144,7 @@ Observe mode cannot relax any of them. Lowering the floor means editing the
 policy, which the fingerprint records. A policy that asks for observe but
 has no `floor: true` rule at all is enforced instead; `termaxa doctor`
 says why. Policies written before v0.20 have no markers: add `floor: true`
-to the rules you would never want relaxed, or take the 38 from
+to the rules you would never want relaxed, or take the 45 from
 `examples/policy.yaml`.
 
 ## Watching: a project that has no policy
@@ -158,7 +159,7 @@ that flag a project with no policy is watched:
   observe mode, whatever `TERMAXA_MODE` says. Nobody chose that policy, so
   nothing on the machine turns it into one that asks and refuses.
 - The floor above is what is refused, all three parts of it, with the
-  starter's 38 rules as the first. A refusal ends by saying that the
+  starter's 45 rules as the first. A refusal ends by saying that the
   project is watched by the built-in starter and that `termaxa init` writes
   a policy. The gate's own files are on that floor, so a session cannot
   write the policy, or the hook registration, that would end the watching.
@@ -237,6 +238,32 @@ reads that record first and proposes the project's own rules from it:
 `init` also says what to do about a Claude Code session already open in the
 project: restart it, so that it runs the project's own hook; the plugin's
 hook stands down there ten seconds after the registration is written.
+
+### The plugin
+
+The plugin is in this repository, in
+[`claude-code-plugin/`](../claude-code-plugin/), and the repository is its
+own marketplace. In Claude Code 2.1.275 or later:
+
+```
+/plugin install termaxa --marketplace termaxa/termaxa
+```
+
+or `/plugin marketplace add termaxa/termaxa` and then `/plugin install
+termaxa@termaxa`. It holds no program and no script: it registers `termaxa
+hook --plugin` for `SessionStart`, and for `PreToolUse` and `PostToolUse` on
+the tools `termaxa init` registers, and runs the `termaxa` installed on the
+machine, which has to be 0.23.0 or later.
+
+Since v0.23.0 the floor holds Claude Code's plugins as it holds the settings
+file. A write under `.claude/plugins/`, where Claude Code keeps what it
+installed (the registry, the marketplaces it knows, and a copy of each
+plugin with its `hooks/hooks.json`), is refused by a file tool or by a
+command, for any plugin, since any plugin's hooks run as the session does.
+So are `claude plugin disable`, `claude plugin uninstall` or `remove`, and
+`claude plugin marketplace remove` or `rm`, however the program is named.
+Reading those files, and listing, installing or enabling a plugin, are
+left alone. Turn the plugin off or remove it yourself, with `/plugin`.
 
 Under a supervisor (`termaxa supervise`) a plugin's hook forwards as any
 hook does, and the supervisor refuses a project that has no policy:

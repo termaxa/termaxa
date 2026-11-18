@@ -45,7 +45,7 @@ rules:
   # `termaxa doctor` fingerprints the policy for that case: what was not
   # blocked can at least be noticed.
   #
-  # These first five rules speak about PATHS, not spellings: they fire on a
+  # These first six rules speak about PATHS, not spellings: they fire on a
   # command that writes to, overwrites or removes one of the gate's own
   # files, whatever the command is called and however the path is spelled,
   # and they fire ahead of every string rule, so no read exception below can
@@ -65,6 +65,15 @@ rules:
   - match_path: "*/.claude/settings*.json"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  # Claude Code keeps the plugins it installed under `.claude/plugins/`: the
+  # registry of what is installed, the marketplaces it knows, and a copy of
+  # each plugin with its `hooks/hooks.json`. What is written there decides
+  # which hooks run, a plugin's copy of this gate's hook among them, so the
+  # directory is held whole, whichever plugin a file belongs to (v0.23.0).
+  - match_path: "*/.claude/plugins/*"
+    action: deny
+    reason: "Claude Code's plugin files decide which hooks run, this gate's among them. Change them yourself."
     floor: true
   - match_path: "*/.cursor/hooks.json"
     action: deny
@@ -212,7 +221,8 @@ rules:
   # the hook configs. A string cannot tell a write from a mention, so these
   # match a read too. For the gate's own files, reads are denied except for
   # the ones listed above; to add one, put it in that group — NOT at the top
-  # of the file. For the hook configs the four rules say `except_reads`
+  # of the file. For the hook configs, Claude Code's plugin files among them
+  # since v0.23.0, the rules say `except_reads`
   # (v0.21.10): they do not apply to a command that cannot write a file, one
   # of a short list of programs that only read or print (`cat`, `head`,
   # `tail`, `wc`, `grep`, `stat`, `ls`, `diff`, `jq`, `echo` and their kind,
@@ -255,6 +265,11 @@ rules:
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
     except_reads: true
+  - match: "*.claude*plugins*"
+    action: deny
+    reason: "Claude Code's plugin files decide which hooks run, this gate's among them. Change them yourself."
+    floor: true
+    except_reads: true
   - match: "*.cursor*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
@@ -268,6 +283,42 @@ rules:
   - match: "*.github*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  # Claude Code turns a plugin off, or removes it, on a command as well as in
+  # its own menu: `claude plugin disable`, `claude plugin uninstall` (or
+  # `remove`), and `claude plugin marketplace remove` (or `rm`) for the
+  # marketplace a plugin came from. Run by an agent, any of them turns off
+  # what the plugin's hooks were doing, and where this gate is installed as
+  # a plugin, the gate. Any plugin, not only this one, as the settings file
+  # is held whole and not only its hooks (v0.23.0). A `grep` of the command,
+  # or a commit message that names it, is ordinary work (`except_reads`).
+  # Each word is followed by a space, or for `disable`, which needs no
+  # plugin named, by the end of the line, so a plugin whose name starts with
+  # one (`claude plugin install remove-bg@x`) is not caught by it.
+  - match: "*claude* plugin* disable"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* disable *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* uninstall *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* remove *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* rm *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
     floor: true
     except_reads: true
   # Pointing git's hook directory anywhere runs whatever is there on the

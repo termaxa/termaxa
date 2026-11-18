@@ -17,6 +17,11 @@
        Get-ChildItem src\*.rs | ForEach-Object { $l=[IO.File]::ReadAllLines($_.FullName); $i=[array]::IndexOf($l,'#[cfg(test)]'); if ($i -lt 0) { $prod+=$l.Count } else { $prod+=$i; $tests+=$l.Count-$i } }
        Get-ChildItem tests -Recurse -Filter *.rs | ForEach-Object { $tests+=[IO.File]::ReadAllLines($_.FullName).Count }
        "production $prod  tests $tests"
+   - The Claude Code plugin (`claude-code-plugin/`) keeps a version of its
+     own in `.claude-plugin/plugin.json`: Claude Code updates an installed
+     plugin only when that version changes. Bump it in a release that
+     changes the folder, and only then; its README names the oldest
+     `termaxa` it needs.
    - commit message = the release headline, e.g.
      "v0.12.0: plugin registry — termaxa add <tool>"
    This is the commit that gets tagged, so its message becomes the

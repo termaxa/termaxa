@@ -3089,6 +3089,74 @@ mod tests {
         }
     }
 
+    /// The plugin that registers this hook is held as the settings file is
+    /// (v0.23.0): an agent that turns a plugin off or removes it, or writes
+    /// where Claude Code keeps what it installed, is refused while the
+    /// project is watched, by a command or by a file tool. Listing and
+    /// reading them is not.
+    #[test]
+    fn a_watched_project_holds_claude_codes_plugins_as_it_holds_its_settings() {
+        let mut env = crate::testutil::TestEnv::new("hook-watch-plugins");
+        let user = env.plugin_hook();
+        let proj = checkout(&env, "proj");
+        let plugins = user.join("plugins");
+        let hooks = plugins
+            .join("cache")
+            .join("termaxa")
+            .join("termaxa")
+            .join("0.1.0")
+            .join("hooks")
+            .join("hooks.json");
+        std::fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        std::fs::write(&hooks, "{}\n").unwrap();
+        let registry = plugins.join("installed_plugins.json");
+        std::fs::write(&registry, "{}\n").unwrap();
+
+        // Forward slashes, which every shell reading takes as they are.
+        let slashed = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+        for cmd in [
+            "claude plugin disable termaxa@termaxa".to_string(),
+            "claude plugins uninstall termaxa@termaxa --scope user".to_string(),
+            "claude plugin marketplace remove termaxa".to_string(),
+            format!("rm -rf {}", slashed(&plugins.join("cache"))),
+            format!("echo '{{}}' > {}", slashed(&registry)),
+        ] {
+            let out = decide(&bash_payload(&proj, "w-plugins", &cmd)).expect("judged");
+            assert_eq!(out.exit_code, 2, "{cmd}");
+            let said = out.rendered.expect("the floor answers");
+            assert!(said.contains("\"permissionDecision\":\"deny\""), "{said}");
+            assert!(said.contains("watching this project"), "{said}");
+        }
+        for cmd in [
+            "claude plugin list".to_string(),
+            "claude plugin details termaxa".to_string(),
+            format!("cat {}", slashed(&registry)),
+        ] {
+            let out = decide(&bash_payload(&proj, "w-plugins", &cmd)).expect("judged");
+            assert_eq!((out.rendered.as_deref(), out.exit_code), (None, 0), "{cmd}");
+        }
+
+        let raw = json!({
+            "cwd": proj.display().to_string(),
+            "hook_event_name": "PreToolUse",
+            "session_id": "w-plugins",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": hooks.display().to_string(),
+                "old_string": "{}",
+                "new_string": "{\"hooks\":{}}"
+            }
+        })
+        .to_string();
+        let out = gate_file_write(&parse_file_write(&raw).expect("an edit"));
+        assert_eq!(out.exit_code, 2);
+        let said = out.rendered.expect("a refusal is said");
+        assert!(said.contains("plugin files"), "{said}");
+        assert!(said.contains("watching this project"), "{said}");
+        assert_eq!(std::fs::read_to_string(&hooks).unwrap(), "{}\n");
+        assert_eq!(std::fs::read_to_string(&registry).unwrap(), "{}\n");
+    }
+
     /// A project that registers `termaxa hook` itself is left to that hook:
     /// Claude Code runs a plugin's handler beside a settings file's, and
     /// two would judge, record and copy every command twice. The plugin's
