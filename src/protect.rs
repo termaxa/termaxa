@@ -20,7 +20,8 @@
 //!   which covers `.termaxa/policy.yaml` in the repo and the logs, backups and
 //!   fingerprint baseline under `$TERMAXA_HOME`;
 //! - **the agent hook configuration** — the files that decide whether the hook
-//!   runs at all, one per dialect;
+//!   runs at all, one per dialect, and Claude Code's `.claude/plugins/`, where
+//!   a plugin's hooks are installed (v0.23.0);
 //! - **the record**, which lives under `.termaxa` and so is covered by the
 //!   first.
 //!
@@ -60,6 +61,15 @@ const HOOK_CONFIG: Protected = Protected {
     what: "agent-hook-config",
     reason: "Agent hook configuration is off limits — editing it unhooks the gate. \
              Edit it yourself if the change is intended.",
+};
+
+/// Claude Code's plugins are hook configuration too: what is written under
+/// `.claude/plugins/` decides which hooks run, the plugin's copy of this
+/// gate's hook among them (v0.23.0).
+const PLUGINS: Protected = Protected {
+    what: "agent-hook-config",
+    reason: "Claude Code's plugin files decide which hooks run, this gate's among them. \
+             Change them yourself if the change is intended.",
 };
 
 /// Is `path` one of the gate's own files?
@@ -496,6 +506,21 @@ fn classify_named(seg: &[String]) -> Option<Protected> {
         return Some(HOOK_CONFIG);
     }
 
+    // Claude Code keeps what it installs from a marketplace under
+    // `.claude/plugins/`: the registry of installed plugins, the
+    // marketplaces it knows and its copy of each, and a copy of each plugin,
+    // its `hooks/hooks.json` included. A plugin is enabled in a settings
+    // file, which the rule above already holds; whether it is installed,
+    // and what its hooks run, is decided here. So the directory and
+    // everything in it, whichever plugin a file belongs to: any plugin's
+    // hooks run as the session does, and one rewritten could undo this one.
+    if seg
+        .windows(2)
+        .any(|w| w[0] == ".claude" && w[1] == "plugins")
+    {
+        return Some(PLUGINS);
+    }
+
     if (parent == ".cursor" || parent == ".codex") && file == "hooks.json" {
         return Some(HOOK_CONFIG);
     }
@@ -573,6 +598,73 @@ mod tests {
         ] {
             assert_eq!(what("/repo", path), Some("agent-hook-config"), "{}", path);
         }
+    }
+
+    /// Where Claude Code 2.1.327 put a plugin installed from a marketplace,
+    /// read from an install into a configuration directory of its own: the
+    /// registry, the marketplaces it knows, the marketplace's clone and the
+    /// plugin's copy, whose `hooks/hooks.json` is what runs.
+    #[test]
+    fn claude_codes_plugin_files_are_hook_configuration() {
+        for path in [
+            "/home/u/.claude/plugins/installed_plugins.json",
+            "/home/u/.claude/plugins/known_marketplaces.json",
+            "/home/u/.claude/plugins/cache/termaxa/termaxa/0.1.0/hooks/hooks.json",
+            "/home/u/.claude/plugins/cache/termaxa/termaxa/0.1.0/.claude-plugin/plugin.json",
+            "/home/u/.claude/plugins/cache/other/formatter/1.2.0/hooks/format.sh",
+            "/home/u/.claude/plugins/marketplaces/termaxa/claude-code-plugin/hooks/hooks.json",
+            "/home/u/.claude/plugins/marketplaces/termaxa/.claude-plugin/marketplace.json",
+            "/home/u/.claude/plugins/data/termaxa-termaxa/state.json",
+            "/home/u/.claude/plugins",
+            "C:\\Users\\Dev\\.claude\\plugins\\installed_plugins.json",
+            "C:\\Users\\Dev\\.Claude\\Plugins\\cache\\termaxa\\termaxa\\0.1.0\\hooks\\hooks.json",
+        ] {
+            let p = classify("/repo", path).unwrap_or_else(|| panic!("{path}: not protected"));
+            assert_eq!(p.what, "agent-hook-config", "{path}");
+            assert!(p.reason.contains("plugin"), "{path}: {}", p.reason);
+        }
+        // Relative to the payload's directory, as every other guarded path.
+        assert_eq!(
+            what("/home/u/.claude", "plugins/installed_plugins.json"),
+            Some("agent-hook-config")
+        );
+        // A plugin's own source, wherever it is kept, is not the installed
+        // copy, and `.claude` beside a `plugins` directory is not this one.
+        for path in [
+            "/repo/claude-code-plugin/hooks/hooks.json",
+            "/repo/.claude-plugin/marketplace.json",
+            "/repo/plugins/termaxa/hooks/hooks.json",
+            "/repo/.claude/skills/plugins/SKILL.md",
+            "/home/u/.claude-plugins/installed_plugins.json",
+        ] {
+            assert_eq!(what("/repo", path), None, "{path}");
+        }
+    }
+
+    /// With `CLAUDE_CONFIG_DIR` moving Claude Code's directory, its plugins
+    /// move with it, and are read under the default name.
+    #[test]
+    fn plugin_files_in_a_moved_claude_directory_are_hook_configuration() {
+        let mut env = crate::testutil::TestEnv::new("protect-moved-plugins");
+        env.set_var("CLAUDE_CONFIG_DIR", "/tmx-moved/u/.config/claude");
+        assert_eq!(
+            what(
+                "/repo",
+                "/tmx-moved/u/.config/claude/plugins/installed_plugins.json"
+            ),
+            Some("agent-hook-config")
+        );
+        assert_eq!(
+            what(
+                "/repo",
+                "/tmx-moved/u/.config/claude/plugins/cache/termaxa/termaxa/0.1.0/hooks/hooks.json"
+            ),
+            Some("agent-hook-config")
+        );
+        assert_eq!(
+            what("/repo", "/tmx-moved/u/.config/other/plugins/x.json"),
+            None
+        );
     }
 
     #[test]

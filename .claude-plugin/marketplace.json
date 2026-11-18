@@ -1,0 +1,15 @@
+{
+  "name": "termaxa",
+  "owner": {
+    "name": "Termaxa",
+    "url": "https://termaxa.com"
+  },
+  "description": "Termaxa's plugin for Claude Code, from the repository that builds the termaxa binary.",
+  "plugins": [
+    {
+      "name": "termaxa",
+      "source": "./claude-code-plugin",
+      "description": "Watches the shell commands and file writes of a project that has no Termaxa policy, refuses only its built-in floor, and keeps the record `termaxa init` turns into rules."
+    }
+  ]
+}

@@ -5178,7 +5178,9 @@ mod except_reads_tests {
         assert_eq!(ask.evaluate_command(read, &here()).action, Action::Ask);
     }
 
-    /// The starter says it on the four hook-config belts and nowhere else.
+    /// The starter says it on the hook-config belts, Claude Code's plugin
+    /// files among them, and on the commands that turn a plugin off or
+    /// remove it (v0.23.0), and nowhere else.
     #[test]
     fn the_starter_says_except_reads_on_the_hook_config_belts_only() {
         let p = Policy::builtin().expect("built-in starter policy must parse");
@@ -5192,9 +5194,15 @@ mod except_reads_tests {
             said,
             vec![
                 "*.claude*settings*",
+                "*.claude*plugins*",
                 "*.cursor*hooks*",
                 "*.codex*hooks*",
-                "*.github*hooks*"
+                "*.github*hooks*",
+                "*claude* plugin* disable",
+                "*claude* plugin* disable *",
+                "*claude* plugin* uninstall *",
+                "*claude* plugin* remove *",
+                "*claude* plugin* rm *",
             ]
         );
         assert!(p
@@ -5202,6 +5210,122 @@ mod except_reads_tests {
             .iter()
             .filter(|r| r.except_reads)
             .all(|r| r.floor && r.action == Action::Deny));
+    }
+}
+
+#[cfg(test)]
+mod claude_plugin_tests {
+    use super::*;
+
+    fn here() -> crate::resolve::EvalContext {
+        crate::resolve::EvalContext::at(std::path::Path::new("."))
+    }
+
+    /// Claude Code turns a plugin off or removes it on a command, and an
+    /// agent's shell can run that command. Refused in every mode, however
+    /// the program is named or wrapped (v0.23.0).
+    #[test]
+    fn an_agent_cannot_turn_off_or_remove_a_claude_code_plugin() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        for line in [
+            "claude plugin disable termaxa@termaxa",
+            "claude plugins disable termaxa",
+            "claude plugin disable",
+            "claude plugin disable --all",
+            "claude plugin disable -a",
+            "claude plugin disable termaxa@termaxa --scope project",
+            "claude plugin disable termaxa 2>/dev/null",
+            "claude plugin uninstall termaxa@termaxa",
+            "claude plugin uninstall --keep-data termaxa",
+            "claude plugin remove termaxa",
+            "claude plugin rm termaxa",
+            "claude plugin marketplace remove termaxa",
+            "claude plugin marketplace rm termaxa",
+            "Claude Plugin Disable termaxa",
+            "claude \"plugin\" disable termaxa",
+            "npx -y @anthropic-ai/claude-code plugin disable termaxa",
+            "/usr/local/bin/claude plugin uninstall termaxa",
+            "claude.exe plugin uninstall termaxa",
+            "env DISABLE_AUTOUPDATER=1 claude plugin disable termaxa",
+            "sudo claude plugin uninstall termaxa",
+            "bash -c 'claude plugin disable termaxa'",
+            "claude plugin list && claude plugin disable termaxa",
+            "& claude plugin disable termaxa",
+        ] {
+            let d = p.evaluate_command(line, &here());
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert!(p.held_by_floor(&d), "{line}: held in observe mode too");
+            assert!(d.reason.contains("plugin"), "{line}: {}", d.reason);
+        }
+    }
+
+    /// Everything else `claude plugin` does is left to the policy, and a
+    /// read or a mention of the commands above is ordinary work.
+    #[test]
+    fn listing_installing_or_naming_a_plugin_is_not_refused() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        for line in [
+            "claude plugin list",
+            "claude plugin list --json",
+            "claude plugin details termaxa",
+            "claude plugin validate --strict claude-code-plugin",
+            "claude plugin marketplace list",
+            "claude plugin install termaxa@termaxa",
+            "claude plugin install remove-bg@tools",
+            "claude plugin install disable-telemetry@tools",
+            "claude plugin enable termaxa@termaxa",
+            "claude plugin update termaxa",
+            "grep -rn 'claude plugin disable' docs",
+            "git commit -m \"docs: claude plugin uninstall\"",
+            "echo 'run claude plugin disable termaxa yourself'",
+            "git log --oneline -- claude-code-plugin",
+        ] {
+            let d = p.evaluate_command(line, &here());
+            assert_ne!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+    }
+
+    /// What Claude Code installed is under `.claude/plugins/`: a write
+    /// there, a removal, or a program the gate cannot read that names it, is
+    /// refused in every mode. Reading it is not (v0.23.0).
+    #[test]
+    fn an_agent_cannot_write_where_claude_code_keeps_its_plugins() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let registry = "/home/u/.claude/plugins/installed_plugins.json";
+        let hooks = "/home/u/.claude/plugins/cache/termaxa/termaxa/0.1.0/hooks/hooks.json";
+        for line in [
+            format!("echo '{{}}' > {registry}"),
+            format!("echo x &> {registry}"),
+            format!("cp /tmp/h.json {hooks}"),
+            format!("sed -i 's/termaxa/none/' {hooks}"),
+            format!("truncate -s 0 {registry}"),
+            format!("python3 -c \"open('{registry}','w')\""),
+            format!("vim {hooks}"),
+            "rm -rf /home/u/.claude/plugins".to_string(),
+            "rm -rf /home/u/.claude/plugins/cache/termaxa".to_string(),
+            "rm /home/u/.claude/plugins/known_marketplaces.json".to_string(),
+            "mv /home/u/.claude/plugins /tmp/p".to_string(),
+            "find /home/u/.claude/plugins -name hooks.json -delete".to_string(),
+            "Remove-Item -Recurse $env:USERPROFILE\\.claude\\plugins".to_string(),
+            "echo x > .claude/plugins/installed_plugins.json".to_string(),
+        ] {
+            let d = p.evaluate_command(&line, &here());
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert!(p.held_by_floor(&d), "{line}: held in observe mode too");
+        }
+        for line in [
+            format!("cat {registry}"),
+            format!("jq . {registry}"),
+            format!("grep -n command {hooks}"),
+            "ls -la /home/u/.claude/plugins/cache".to_string(),
+            "du -sh /home/u/.claude/plugins".to_string(),
+            "cat .claude/plugins/known_marketplaces.json".to_string(),
+            "cat claude-code-plugin/hooks/hooks.json".to_string(),
+            "cat .claude-plugin/marketplace.json".to_string(),
+        ] {
+            let d = p.evaluate_command(&line, &here());
+            assert_ne!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
     }
 }
 

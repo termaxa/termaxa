@@ -51,7 +51,7 @@ rules:
   # `termaxa doctor` fingerprints the policy for that case: what was not
   # blocked can at least be noticed.
   #
-  # These first five rules speak about PATHS, not spellings: they fire on a
+  # These first six rules speak about PATHS, not spellings: they fire on a
   # command that writes to, overwrites or removes one of the gate's own
   # files, whatever the command is called and however the path is spelled,
   # and they fire ahead of every string rule, so no read exception below can
@@ -71,6 +71,15 @@ rules:
   - match_path: "*/.claude/settings*.json"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  # Claude Code keeps the plugins it installed under `.claude/plugins/`: the
+  # registry of what is installed, the marketplaces it knows, and a copy of
+  # each plugin with its `hooks/hooks.json`. What is written there decides
+  # which hooks run, a plugin's copy of this gate's hook among them, so the
+  # directory is held whole, whichever plugin a file belongs to (v0.23.0).
+  - match_path: "*/.claude/plugins/*"
+    action: deny
+    reason: "Claude Code's plugin files decide which hooks run, this gate's among them. Change them yourself."
     floor: true
   - match_path: "*/.cursor/hooks.json"
     action: deny
@@ -218,7 +227,8 @@ rules:
   # the hook configs. A string cannot tell a write from a mention, so these
   # match a read too. For the gate's own files, reads are denied except for
   # the ones listed above; to add one, put it in that group — NOT at the top
-  # of the file. For the hook configs the four rules say `except_reads`
+  # of the file. For the hook configs, Claude Code's plugin files among them
+  # since v0.23.0, the rules say `except_reads`
   # (v0.21.10): they do not apply to a command that cannot write a file, one
   # of a short list of programs that only read or print (`cat`, `head`,
   # `tail`, `wc`, `grep`, `stat`, `ls`, `diff`, `jq`, `echo` and their kind,
@@ -261,6 +271,11 @@ rules:
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
     except_reads: true
+  - match: "*.claude*plugins*"
+    action: deny
+    reason: "Claude Code's plugin files decide which hooks run, this gate's among them. Change them yourself."
+    floor: true
+    except_reads: true
   - match: "*.cursor*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
@@ -274,6 +289,42 @@ rules:
   - match: "*.github*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  # Claude Code turns a plugin off, or removes it, on a command as well as in
+  # its own menu: `claude plugin disable`, `claude plugin uninstall` (or
+  # `remove`), and `claude plugin marketplace remove` (or `rm`) for the
+  # marketplace a plugin came from. Run by an agent, any of them turns off
+  # what the plugin's hooks were doing, and where this gate is installed as
+  # a plugin, the gate. Any plugin, not only this one, as the settings file
+  # is held whole and not only its hooks (v0.23.0). A `grep` of the command,
+  # or a commit message that names it, is ordinary work (`except_reads`).
+  # Each word is followed by a space, or for `disable`, which needs no
+  # plugin named, by the end of the line, so a plugin whose name starts with
+  # one (`claude plugin install remove-bg@x`) is not caught by it.
+  - match: "*claude* plugin* disable"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* disable *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* uninstall *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* remove *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* rm *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
     floor: true
     except_reads: true
   # Pointing git's hook directory anywhere runs whatever is there on the
@@ -2142,6 +2193,59 @@ mod tests {
         let snippet = print_hook_snippet_text();
         assert!(snippet.contains(BASH_MATCHER));
         assert!(snippet.contains(WRITE_MATCHER));
+    }
+
+    /// The Claude Code plugin in `claude-code-plugin/` registers what `init`
+    /// registers, on the same matchers, with `--plugin`, and one hook more
+    /// for the line a watched session is told at its start. Read from the
+    /// folder the marketplace serves, so the two cannot drift apart.
+    #[test]
+    fn the_plugin_registers_what_init_registers_with_the_session_line() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |rel: &str| -> Value {
+            let raw =
+                std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        };
+        let hooks = read("claude-code-plugin/hooks/hooks.json");
+        let events = hooks["hooks"].as_object().expect("hooks by event");
+        let mut names: Vec<&str> = events.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["PostToolUse", "PreToolUse", "SessionStart"]);
+
+        let handler = json!([{ "type": "command", "command": "termaxa hook --plugin" }]);
+        for event in ["PreToolUse", "PostToolUse"] {
+            let groups = events[event].as_array().expect("matcher groups");
+            let matchers: Vec<&str> = groups
+                .iter()
+                .map(|g| g["matcher"].as_str().expect("a matcher"))
+                .collect();
+            assert_eq!(matchers, [BASH_MATCHER, WRITE_MATCHER], "{event}");
+            for g in groups {
+                assert_eq!(g["hooks"], handler, "{event}");
+            }
+        }
+        let start = events["SessionStart"].as_array().expect("one group");
+        assert_eq!(start.len(), 1);
+        assert!(
+            start[0].get("matcher").is_none(),
+            "every start: the hook chooses"
+        );
+        assert_eq!(start[0]["hooks"], handler);
+
+        // The manifest says what the crate says, and the repository's own
+        // marketplace lists the plugin from this folder.
+        let manifest = read("claude-code-plugin/.claude-plugin/plugin.json");
+        assert_eq!(manifest["name"], "termaxa");
+        assert_eq!(manifest["license"], env!("CARGO_PKG_LICENSE"));
+        assert_eq!(manifest["repository"], env!("CARGO_PKG_REPOSITORY"));
+        assert_eq!(manifest["homepage"], env!("CARGO_PKG_HOMEPAGE"));
+        let market = read(".claude-plugin/marketplace.json");
+        assert_eq!(market["name"], "termaxa");
+        let listed = market["plugins"].as_array().expect("plugins");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["name"], "termaxa");
+        assert_eq!(listed[0]["source"], "./claude-code-plugin");
     }
 
     /// The ordinary dev loop is allowed, and the commands next to it that

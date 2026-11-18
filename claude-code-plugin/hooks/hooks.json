@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "termaxa hook --plugin" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "termaxa hook --plugin" }] },
+      { "matcher": "Write|Edit|MultiEdit|NotebookEdit", "hooks": [{ "type": "command", "command": "termaxa hook --plugin" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "termaxa hook --plugin" }] },
+      { "matcher": "Write|Edit|MultiEdit|NotebookEdit", "hooks": [{ "type": "command", "command": "termaxa hook --plugin" }] }
+    ]
+  }
+}
