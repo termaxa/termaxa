@@ -183,8 +183,9 @@ and keeps one record of them. A directory is read only for where a command's
 paths land: `workdir` when it is given, and `cwd` when it is not Hermes's own
 (inside `HERMES_HOME`, or a directory holding Hermes's code). With neither,
 the directory is unknown: a path rule matches a path by its end, as after a
-`cd "$X"`, and nothing is previewed or copied aside, which the reason says.
-Without `--hermes`, a Hermes call is refused, and the reason names the flag.
+`cd "$X"`, and only a path given in full is previewed and copied aside; the
+reason says so. Without `--hermes`, a Hermes call is refused, and the reason
+names the flag.
 
 **Wiring it**, until `init` does, in the profile's `config.yaml`:
 

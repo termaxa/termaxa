@@ -275,3 +275,56 @@ fn the_policy_in_termaxas_home_judges_every_hermes_call() {
         "{reason}"
     );
 }
+
+#[test]
+fn a_path_given_in_full_is_previewed_and_copied_where_the_directory_is_unknown() {
+    let s = scene("absolute");
+    let abs = s.root.join("abs");
+    std::fs::create_dir_all(abs.join("data")).expect("a directory");
+    std::fs::write(abs.join("data").join("f.txt"), "x\n").expect("a file");
+    std::fs::write(abs.join("conf.yml"), "a: 1\n").expect("a file");
+    // Forward slashes: a full path as an agent writes it on every platform.
+    let full = |p: &Path| p.display().to_string().replace('\\', "/");
+
+    // A delete of a tree named in full: refused, with what it holds.
+    let rm = s.payload(
+        "pre_tool_call",
+        "terminal",
+        json!({ "command": format!("rm -rf {}", full(&abs.join("data"))) }),
+    );
+    let out = s.hook(&["hook", "--hermes"], &rm);
+    assert_eq!(out.code, 2, "{}", out.stdout);
+    let reason = answer(&out)["reason"].as_str().unwrap().to_string();
+    assert!(reason.contains("1 files across"), "{reason}");
+    assert!(
+        reason.contains("Hermes did not say where this runs"),
+        "{reason}"
+    );
+
+    // An overwrite of a file named in full that the policy allows: it runs,
+    // and its file is copied aside first.
+    let echo = s.payload(
+        "pre_tool_call",
+        "terminal",
+        json!({ "command": format!("echo b > {}", full(&abs.join("conf.yml"))) }),
+    );
+    let out = s.hook(&["hook", "--hermes"], &echo);
+    assert_eq!((out.code, out.stdout.trim()), (0, ""));
+    let record = s.record();
+    let copied = record
+        .iter()
+        .any(|(_, e)| e["decision"] == "allow" && e["backup"].is_string());
+    assert!(copied, "{record:?}");
+
+    // A relative path is neither previewed nor copied: nothing says what it
+    // is.
+    let rel = s.payload(
+        "pre_tool_call",
+        "terminal",
+        json!({ "command": "rm -rf data" }),
+    );
+    let out = s.hook(&["hook", "--hermes"], &rel);
+    assert_eq!(out.code, 2, "{}", out.stdout);
+    let reason = answer(&out)["reason"].as_str().unwrap().to_string();
+    assert!(!reason.contains("files across"), "{reason}");
+}

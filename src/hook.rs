@@ -1298,6 +1298,60 @@ fn call_context(
     ctx
 }
 
+/// What a preview and a copy aside can truthfully cover where the harness
+/// did not say where a line runs (`ParsedHook::cwd_known`): the files the
+/// line writes over or removes that it names by an absolute path, and that
+/// are there, each with whether it is removed. A relative path's file is
+/// unknown, and a tool that works on its own directory (a git discard,
+/// `terraform destroy`) names no absolute target to give.
+fn absolute_targets(
+    command: &str,
+    ctx: &crate::resolve::EvalContext,
+) -> Vec<(std::path::PathBuf, bool)> {
+    let mut out: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    for t in crate::resolve::command_targets(command, ctx) {
+        let removed = match t.role {
+            crate::resolve::TargetRole::Removed => true,
+            crate::resolve::TargetRole::Destination if !t.appends => false,
+            _ => continue,
+        };
+        if let Some(p) = t.resolved {
+            if p.is_absolute() && p.exists() && !out.iter().any(|(q, _)| q == &p) {
+                out.push((p, removed));
+            }
+        }
+    }
+    out
+}
+
+/// The preview of `absolute_targets`: each with what it holds, as a native
+/// write's reason gives it, and whether any is a tree too large to copy
+/// aside (which makes the line uninsurable, as on the shell path).
+fn absolute_preview(targets: &[(std::path::PathBuf, bool)]) -> (Option<String>, bool) {
+    let mut parts = Vec::new();
+    let mut uninsurable = false;
+    for (p, removed) in targets {
+        if *removed && p.is_dir() {
+            let scan = crate::delete::scan_budgeted(p);
+            uninsurable |= scan.capped;
+            parts.push(format!(
+                "{} · {}{} files across {} directories",
+                p.display(),
+                scan.files,
+                if scan.capped { "+" } else { "" },
+                scan.dirs
+            ));
+        } else if let Ok(m) = std::fs::metadata(p) {
+            parts.push(format!("{} · {} B on disk", p.display(), m.len()));
+        }
+    }
+    if parts.is_empty() {
+        (None, false)
+    } else {
+        (Some(parts.join("; ")), uninsurable)
+    }
+}
+
 /// A Hermes call to a hook registered without `--hermes`, refused in
 /// Hermes's shape. Hermes does not say which project a call belongs to, so
 /// a policy found from its directories would be one the agent could pick
@@ -2108,15 +2162,23 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // Pass the project root so the delete preview can answer "is this target
     // outside the project?" — the process cwd can't supply it, because the
     // agent may spawn us from anywhere (the Cursor cwd bug).
+    // Where the directory is unknown, what can be previewed and copied:
+    // the line's absolute targets (`absolute_targets`).
+    let unknown_dir_targets = if input.cwd_known {
+        Vec::new()
+    } else {
+        absolute_targets(&command, &ctx)
+    };
     let (preview_summary, uninsurable) = {
         // A denied command must not cause a subprocess. The preview is still
         // generated — statically — so the denial reason keeps its detail.
         let live = decision.action != crate::policy::Action::Deny;
-        // Where the harness did not say where the command runs, there is
-        // nothing a preview could truthfully say about a relative path
-        // (decision #84): no preview, and the reason says why.
+        // Where the harness did not say where the command runs, a preview
+        // can say nothing true about a relative path (decision #84): only
+        // the files named by an absolute path are previewed, and the reason
+        // says why the rest are not.
         if !input.cwd_known {
-            (None, false)
+            absolute_preview(&unknown_dir_targets)
         } else {
             match judged.preview(
                 &command,
@@ -2211,8 +2273,15 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // sentinel. An agent command cannot set its harness's env; a leaked env
     // var without the sentinel changes nothing.
     let mut backup_id: Option<String> = None;
-    if !is_probe && will_run && input.cwd_known {
-        match judged.insure(&command, &paths.state_dir, std::path::Path::new(&input.cwd)) {
+    if !is_probe && will_run {
+        let taken = if input.cwd_known {
+            judged.insure(&command, &paths.state_dir, std::path::Path::new(&input.cwd))
+        } else {
+            let files: Vec<std::path::PathBuf> =
+                unknown_dir_targets.iter().map(|(p, _)| p.clone()).collect();
+            crate::backup::take_target(&paths.state_dir, &command, &files)
+        };
+        match taken {
             Ok(Some(rec)) => {
                 backup_id = Some(rec.id);
                 // Retention (#72): one eligible backup at most, so the hook
@@ -2365,7 +2434,9 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
             reason.push_str(&format!(" | {}", s));
         }
         if !input.cwd_known {
-            reason.push_str(" | Hermes did not say where this runs: nothing previewed or copied");
+            reason.push_str(
+                " | Hermes did not say where this runs: a path not given in full is not previewed or copied",
+            );
         }
     }
     if let Some(id) = &backup_id {
