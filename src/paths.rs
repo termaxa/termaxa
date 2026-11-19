@@ -130,6 +130,82 @@ pub fn set_plugin_hook(on: bool) {
     PLUGIN_HOOK.with(|flag| flag.set(on));
 }
 
+/// Set by `termaxa hook --hermes`: this hook was registered in a Hermes
+/// profile's `config.yaml`, for every directory that profile's sessions
+/// work in. Hermes does not say which project a command belongs to: on
+/// 0.23.2 a hook's payload names the gateway process's own directory
+/// (measured Nov 19, 2026; NousResearch/hermes-agent#146570), and the one
+/// directory it does name, a terminal call's `workdir`, is the agent's to
+/// choose. A policy found from either would be a policy the agent could
+/// pick. So under this flag the policy and the record are found from no
+/// directory at all (`resolve_hermes`), and a directory is read only for
+/// where a command's paths land.
+///
+/// Only the command line sets it, for `PLUGIN_HOOK`'s reason; a thread's
+/// under test, for the same reason too.
+#[cfg(not(test))]
+static HERMES_HOOK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+thread_local! {
+    static HERMES_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(not(test))]
+pub fn hermes_hook() -> bool {
+    HERMES_HOOK.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(test)]
+pub fn hermes_hook() -> bool {
+    HERMES_HOOK.with(|flag| flag.get())
+}
+
+/// `termaxa hook --hermes` calls this once, before it reads its input.
+#[cfg(not(test))]
+pub fn set_hermes_hook(on: bool) {
+    HERMES_HOOK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(test)]
+pub fn set_hermes_hook(on: bool) {
+    HERMES_HOOK.with(|flag| flag.set(on));
+}
+
+/// Where a Hermes hook's policy lives and what its record is named for:
+/// `<termaxa home>/hermes`. The policy is `.termaxa/policy.yaml` under it,
+/// as in a project; with no file there, the built-in starter judges.
+pub fn hermes_root() -> Result<PathBuf> {
+    Ok(home_base()?.join("hermes"))
+}
+
+/// Paths for a hook `--hermes` registered (`hermes_hook`): one policy and
+/// one record for every Hermes session, whatever directory it works in.
+/// Creates the state directories, as `resolve_from` does: the caller is
+/// about to write the record.
+pub fn resolve_hermes() -> Result<Paths> {
+    let root = hermes_root()?;
+    // Made first, so that the record's name is the same before and after a
+    // policy is put there (the name comes from the canonical path, which a
+    // directory that does not exist yet has none of).
+    fs::create_dir_all(&root)
+        .with_context(|| format!("termaxa cannot create {}", root.display()))?;
+    let state_dir = state_dir_for(&root)?;
+    #[cfg(test)]
+    crate::testutil::making_state(&state_dir);
+    for dir in ["logs", "backups"] {
+        let dir = state_dir.join(dir);
+        fs::create_dir_all(&dir).with_context(|| {
+            format!(
+                "termaxa cannot create {} to keep the record of Hermes's tool calls in",
+                dir.display()
+            )
+        })?;
+    }
+    Ok(Paths {
+        project_dir: root.join(".termaxa"),
+        state_dir,
+        watched: false,
+    })
+}
+
 /// The directory a project with no policy is taken to be: the checkout
 /// `start` is in; outside any checkout, the directory the session was
 /// started in when `start` is inside it (Claude Code exports it to its

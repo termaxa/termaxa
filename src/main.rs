@@ -106,6 +106,12 @@ enum Cmd {
         /// to that hook
         #[arg(long)]
         plugin: bool,
+        /// For a hook a Hermes profile's config.yaml registers: read Hermes
+        /// Agent's tool calls, and judge every one by one policy (in
+        /// termaxa's home under hermes/), since Hermes does not say which
+        /// project a call belongs to
+        #[arg(long, conflicts_with = "plugin")]
+        hermes: bool,
     },
     /// Execute a command through the policy gate: termaxa run -- git push
     Run {
@@ -448,8 +454,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 policy::Action::Deny => 4,
             })
         }
-        Cmd::Hook { plugin } => {
-            hook::run(plugin)?;
+        Cmd::Hook { plugin, hermes } => {
+            hook::run(plugin, hermes)?;
             Ok(0)
         }
         Cmd::Run { argv } => {
