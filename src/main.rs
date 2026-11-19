@@ -6,6 +6,7 @@ mod delete;
 mod demo;
 mod doctor;
 mod fingerprint;
+mod hermes;
 mod hook;
 mod init;
 mod intent;
@@ -90,6 +91,13 @@ enum Cmd {
         /// and `termaxa report` shows what enforcement would have done
         #[arg(long = "observe")]
         observe: bool,
+        /// Wire Hermes Agent instead of a project: its profile's hooks, their
+        /// approval, and one policy in termaxa's home for every Hermes call
+        #[arg(
+            long = "hermes",
+            conflicts_with_all = ["claude_code", "cursor", "codex", "copilot", "supervised"]
+        )]
+        hermes: bool,
     },
     /// Check whether Termaxa is actually wired up and able to see commands
     Doctor,
@@ -289,7 +297,12 @@ fn dispatch(cli: Cli) -> Result<i32> {
             copilot,
             supervised,
             observe,
+            hermes,
         } => {
+            if hermes {
+                init::run_hermes(observe)?;
+                return Ok(0);
+            }
             let dir = std::env::current_dir()?;
             // `--supervised` prints the setup and nothing else. It used to run
             // the whole of `init` first, so an operator who had just run

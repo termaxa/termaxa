@@ -206,6 +206,140 @@ pub fn resolve_hermes() -> Result<Paths> {
     })
 }
 
+/// The state directory of the Hermes record (`resolve_hermes`), found
+/// without creating anything: `init --hermes` records the policy's
+/// fingerprint there, and `doctor` reads it.
+pub fn hermes_state_dir() -> Result<PathBuf> {
+    state_dir_for(&hermes_root()?)
+}
+
+/// Which of Hermes Agent's profiles a home is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HermesProfile {
+    /// The profile Hermes uses when nothing names another.
+    Default,
+    /// A profile the default home's `active_profile` file names, which a
+    /// bare `hermes` uses from then on.
+    Active(String),
+    /// Whatever directory `HERMES_HOME` names.
+    FromEnv,
+}
+
+/// The home of the Hermes profile a bare `hermes` serves, and which profile
+/// that is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HermesHome {
+    pub dir: PathBuf,
+    pub profile: HermesProfile,
+}
+
+/// Hermes's home as Hermes 0.23.2 finds it (`hermes_constants`, read Nov
+/// 20, 2026): `HERMES_HOME` when it is set; otherwise the platform default
+/// (`hermes_default_home_in`), or the profile under it that its
+/// `active_profile` file names. `None` when no home directory is known.
+pub fn hermes_home() -> Option<HermesHome> {
+    hermes_home_in(&|k| std::env::var_os(k), cfg!(windows))
+}
+
+/// The directories that are Hermes's own and never a project's: the one
+/// `HERMES_HOME` names, the platform default, which holds every profile,
+/// and on Windows `~/.hermes` as well, where Hermes keeps its home on every
+/// other platform.
+pub fn hermes_own_homes() -> Vec<PathBuf> {
+    let env = |k: &str| std::env::var_os(k);
+    let mut homes = Vec::new();
+    if let Some(dir) = env_text(&env, "HERMES_HOME") {
+        homes.push(expand_home_in(&dir, &env, cfg!(windows)));
+    }
+    if let Some(dir) = hermes_default_home_in(&env, cfg!(windows)) {
+        homes.push(dir);
+    }
+    if cfg!(windows) {
+        if let Some(home) = env_text(&env, "USERPROFILE") {
+            homes.push(PathBuf::from(home).join(".hermes"));
+        }
+    }
+    homes
+}
+
+type EnvFn<'a> = &'a dyn Fn(&str) -> Option<std::ffi::OsString>;
+
+/// A variable's value, trimmed, when it says anything.
+fn env_text(env: EnvFn, key: &str) -> Option<String> {
+    env(key)
+        .map(|v| v.to_string_lossy().trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Hermes's platform default, with `HERMES_DATA_DIR_SUFFIX` appended to the
+/// directory's name as Hermes appends it: `%LOCALAPPDATA%\hermes` on
+/// Windows (`~\AppData\Local\hermes` when that variable is unset), and
+/// `~/.hermes` everywhere else.
+pub(crate) fn hermes_default_home_in(env: EnvFn, windows: bool) -> Option<PathBuf> {
+    let suffix = env("HERMES_DATA_DIR_SUFFIX")
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if windows {
+        let base = match env_text(env, "LOCALAPPDATA") {
+            Some(local) => PathBuf::from(local),
+            None => PathBuf::from(env_text(env, "USERPROFILE")?)
+                .join("AppData")
+                .join("Local"),
+        };
+        Some(base.join(format!("hermes{suffix}")))
+    } else {
+        Some(PathBuf::from(env_text(env, "HOME")?).join(format!(".hermes{suffix}")))
+    }
+}
+
+pub(crate) fn hermes_home_in(env: EnvFn, windows: bool) -> Option<HermesHome> {
+    if let Some(dir) = env_text(env, "HERMES_HOME") {
+        return Some(HermesHome {
+            dir: expand_home_in(&dir, env, windows),
+            profile: HermesProfile::FromEnv,
+        });
+    }
+    let root = hermes_default_home_in(env, windows)?;
+    let active = fs::read_to_string(root.join("active_profile"))
+        .map(|s| s.trim_start_matches('\u{feff}').trim().to_string())
+        .unwrap_or_default();
+    if active.is_empty() || active == "default" || !hermes_profile_id(&active) {
+        return Some(HermesHome {
+            dir: root,
+            profile: HermesProfile::Default,
+        });
+    }
+    Some(HermesHome {
+        dir: root.join("profiles").join(&active),
+        profile: HermesProfile::Active(active),
+    })
+}
+
+/// A profile name as Hermes allows one (`PROFILE_ID_RE`,
+/// `^[a-z0-9][a-z0-9_-]{0,63}$`), so that a name read from a file cannot
+/// lead out of the profiles directory.
+fn hermes_profile_id(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 64
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
+}
+
+/// A leading `~` read as the home directory, as Hermes reads one in
+/// `HERMES_HOME`.
+fn expand_home_in(dir: &str, env: EnvFn, windows: bool) -> PathBuf {
+    let home = env_text(env, if windows { "USERPROFILE" } else { "HOME" });
+    match (dir.strip_prefix('~'), home) {
+        (Some(""), Some(home)) => PathBuf::from(home),
+        (Some(rest), Some(home)) if rest.starts_with(['/', '\\']) => {
+            PathBuf::from(home).join(rest.trim_start_matches(['/', '\\']))
+        }
+        _ => PathBuf::from(dir),
+    }
+}
+
 /// The directory a project with no policy is taken to be: the checkout
 /// `start` is in; outside any checkout, the directory the session was
 /// started in when `start` is inside it (Claude Code exports it to its
@@ -873,5 +1007,112 @@ mod tests {
         let found = resolve_record().expect("the watched record");
         assert!(found.watched);
         assert_eq!(found.state_dir, watched.state_dir);
+    }
+
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key: &str| {
+            vars.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        }
+    }
+
+    /// Hermes 0.23.2's own order: `HERMES_HOME`, then the platform default
+    /// with `HERMES_DATA_DIR_SUFFIX` on its name. Pure, so both platforms'
+    /// answers are checked wherever this runs.
+    #[test]
+    fn hermes_home_is_found_as_hermes_finds_it() {
+        let home = |vars: &[(&str, &str)], windows: bool| {
+            hermes_home_in(&env_of(vars), windows).map(|h| (h.dir, h.profile))
+        };
+        assert_eq!(
+            home(
+                &[("HERMES_HOME", "/srv/hermes"), ("HOME", "/home/u")],
+                false
+            ),
+            Some((PathBuf::from("/srv/hermes"), HermesProfile::FromEnv))
+        );
+        assert_eq!(
+            home(&[("HERMES_HOME", "~/h2"), ("HOME", "/home/u")], false),
+            Some((PathBuf::from("/home/u").join("h2"), HermesProfile::FromEnv))
+        );
+        assert_eq!(
+            home(&[("HERMES_HOME", "  "), ("HOME", "/home/u")], false),
+            Some((
+                PathBuf::from("/home/u").join(".hermes"),
+                HermesProfile::Default
+            ))
+        );
+        assert_eq!(
+            home(
+                &[("HOME", "/home/u"), ("HERMES_DATA_DIR_SUFFIX", "-dev")],
+                false
+            ),
+            Some((
+                PathBuf::from("/home/u").join(".hermes-dev"),
+                HermesProfile::Default
+            ))
+        );
+        let local = "C:\\Users\\U\\AppData\\Local";
+        assert_eq!(
+            home(
+                &[("LOCALAPPDATA", local), ("USERPROFILE", "C:\\Users\\U")],
+                true
+            ),
+            Some((PathBuf::from(local).join("hermes"), HermesProfile::Default))
+        );
+        assert_eq!(
+            home(&[("USERPROFILE", "C:\\Users\\U")], true),
+            Some((
+                PathBuf::from("C:\\Users\\U")
+                    .join("AppData")
+                    .join("Local")
+                    .join("hermes"),
+                HermesProfile::Default
+            ))
+        );
+        assert_eq!(home(&[], false), None);
+    }
+
+    /// A bare `hermes` uses the profile the default home's `active_profile`
+    /// names, so that is the profile `init --hermes` wires and `doctor`
+    /// reads; a name Hermes would not accept does not lead anywhere.
+    #[test]
+    fn hermes_home_follows_the_active_profile() {
+        let tree = TempTree::new("hermes-profile");
+        let root = tree.path().join(".hermes");
+        std::fs::create_dir_all(&root).unwrap();
+        let vars = [("HOME", tree.path().to_str().unwrap())];
+        let found = |text: &str| {
+            std::fs::write(root.join("active_profile"), text).unwrap();
+            hermes_home_in(&env_of(&vars), false).map(|h| (h.dir, h.profile))
+        };
+        assert_eq!(
+            found("work\n"),
+            Some((
+                root.join("profiles").join("work"),
+                HermesProfile::Active("work".into())
+            ))
+        );
+        assert_eq!(
+            found("\u{feff}work"),
+            Some((
+                root.join("profiles").join("work"),
+                HermesProfile::Active("work".into())
+            ))
+        );
+        assert_eq!(
+            found("default"),
+            Some((root.clone(), HermesProfile::Default))
+        );
+        assert_eq!(
+            found("../../etc"),
+            Some((root.clone(), HermesProfile::Default))
+        );
+        assert_eq!(found(""), Some((root.clone(), HermesProfile::Default)));
     }
 }

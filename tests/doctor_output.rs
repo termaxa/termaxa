@@ -32,12 +32,16 @@ struct Output {
 }
 
 /// Run `termaxa doctor` in `proj`, with a PATH holding only `also` plus a
-/// shell (the probe invokes the registered command through one).
+/// shell (the probe invokes the registered command through one). Hermes's
+/// home is pointed at a directory that does not exist: doctor reads a
+/// profile wherever it is run from, and the machine running these tests
+/// may have a Hermes of its own.
 fn doctor(home: &Path, proj: &Path, bin_dir: &Path) -> Output {
     let out = Command::new(env!("CARGO_BIN_EXE_termaxa"))
         .arg("doctor")
         .current_dir(proj)
         .env("TERMAXA_HOME", home)
+        .env("HERMES_HOME", home.join("no-hermes-here"))
         .env("NO_COLOR", "1")
         .env("PATH", bin_dir)
         .output()
