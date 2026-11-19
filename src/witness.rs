@@ -30,7 +30,7 @@ pub fn leave(raw_payload: &str) {
     if is_probe {
         return;
     }
-    let Ok(paths) = crate::hook::locate(Path::new(&p.cwd)) else {
+    let Ok(paths) = crate::hook::locate_call(p.dialect, Path::new(&p.cwd)) else {
         return;
     };
     let (ts_ms, ts) = crate::audit::now();

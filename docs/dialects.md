@@ -27,6 +27,7 @@ bytes.
 | Codex CLI | `--codex` | `.codex/hooks.json` | `PreToolUse` and `PostToolUse` on `Bash\|apply_patch` | `deny` only: an explicit `allow` is rejected, an `ask` is a refusal, a failed hook falls open to Codex's own prompt. Headless (`codex exec`) a hook runs only once trusted, or with `--dangerously-bypass-hook-trust` |
 | Cursor | `--cursor` | `.cursor/hooks.json` | `beforeShellExecution` / `afterShellExecution` for the shell; `preToolUse` / `postToolUse` on `Write\|Delete` for the file tools (3.11) | `permission` in the JSON; exit 2 blocks; other non-zero exits fail open |
 | Copilot CLI | `--copilot` | `.github/hooks/hooks.json`; also reads `.claude/settings.json` as repo settings | `toolName` / `toolArgs` (arguments as a JSON string) | top-level `permissionDecision`; a non-zero exit is a hook error, so a deny exits 0 |
+| Hermes Agent | none yet (by hand, below) | the profile's `config.yaml` (`hooks:`) | `pre_tool_call` and `post_tool_call` on `terminal\|write_file\|patch\|execute_code` | a top-level `decision` or `action`: `block`, and `approve` for its approval gate; exit 2 blocks; a failure falls open unless the entry sets `fail_closed: true` |
 
 A harness with no hooks runs under `termaxa wrap -- <agent>` (Unix), which
 puts shims for `sh`, `bash` and `zsh` on `PATH` and hands the agent the shim
@@ -58,10 +59,13 @@ Copilot CLI:
 {"permissionDecision":"deny","permissionDecisionReason":"[termaxa] …"}
 ```
 
+Hermes Agent: `{"decision":"block","reason":"[termaxa] …"}`, and for an ask
+`{"action":"approve","message":"…"}` (below).
+
 Silence - no output, exit 0 - is the answer for an allow no rule named, and
 only where the harness documents that no output means no opinion (Claude
-Code; Codex for every allow). Cursor and Copilot always get an answer in
-enforce mode. An observed verdict (observe mode) is silence in every
+Code; Codex and Hermes for every allow). Cursor and Copilot always get an
+answer in enforce mode. An observed verdict (observe mode) is silence in every
 harness, measured below, and since v0.21.10 so is an allow in observe mode:
 outside the floor the mode answers nothing, and each harness decides as it
 would without the hook.
@@ -137,6 +141,80 @@ string: `{"file_path":…,"success":true}` for a write,
 `{"file_path":…,"deleted":true}` for a delete) and `duration`. `Delete` had
 no verb the reader knew before this capture and passed through by default;
 it is a delete, judged by its target.
+
+## Hermes Agent, as captured (Nov 19, 2026, Hermes 0.23.2)
+
+Hermes declares shell hooks in a profile's `config.yaml`, and they run for
+every session the profile serves. A real session, driven by a scripted model
+so that every step ran through Hermes's own code, sent `pre_tool_call` and
+`post_tool_call` with `tool_name`, `tool_input`, `session_id`, `cwd`,
+`profile` and an `extra` of ids (`post_tool_call` adds `result`, `status`,
+`error_type`, `error_message` and `duration_ms` to it). Its shell is
+`terminal` (`tool_input.command`, and a `workdir` when the model passes one);
+`write_file` and `patch` write files (by `path`, or in a `*** Begin Patch`
+text read by its headers); `execute_code` runs Python. A subagent's calls
+arrive under the subagent's own session id, and a `terminal` call made from
+inside `execute_code` arrives on its own.
+
+Hermes reads a top-level `decision` or `action` and nothing else, so its
+answers are:
+
+```json
+{"decision":"block","reason":"[termaxa] …"}
+{"action":"approve","message":"[termaxa] asks: …"}
+```
+
+A deny also exits 2, which Hermes reads as a block by itself. An ask goes to
+Hermes's approval gate: a person answers it in an interactive session; where
+no one can, as in `hermes chat -q`, Hermes refuses the call; and `--yolo` or
+`approvals.single_query_mode: approve` lets it through, so under either an
+ask is an allow. Every allow is silence. `execute_code` is always an ask: its
+Python cannot be read, as a script file cannot.
+
+**The directory.** Hermes 0.23.2 puts the gateway process's own directory in
+`cwd` (its install directory, or `~/.hermes`), not the session's:
+NousResearch/hermes-agent#146570 reports it, and #139555 would fix it. A
+terminal call's `workdir` is where Hermes runs the command, but it is the
+agent's to choose. So a Hermes call is never judged by a policy found from a
+directory. `termaxa hook --hermes` judges every Hermes call by one policy,
+`hermes/.termaxa/policy.yaml` under termaxa's home (`~/.termaxa`, or
+`TERMAXA_HOME`), or by the built-in starter while that file does not exist,
+and keeps one record of them. A directory is read only for where a command's
+paths land: `workdir` when it is given, and `cwd` when it is not Hermes's own
+(inside `HERMES_HOME`, or a directory holding Hermes's code). With neither,
+the directory is unknown: a path rule matches a path by its end, as after a
+`cd "$X"`, and nothing is previewed or copied aside, which the reason says.
+Without `--hermes`, a Hermes call is refused, and the reason names the flag.
+
+**Wiring it**, until `init` does, in the profile's `config.yaml`:
+
+```yaml
+hooks:
+  pre_tool_call:
+    - matcher: "terminal|write_file|patch|execute_code"
+      command: "termaxa hook --hermes"
+      timeout: 30
+      fail_closed: true
+  post_tool_call:
+    - matcher: "terminal|write_file|patch"
+      command: "termaxa hook --hermes"
+      timeout: 30
+```
+
+With `fail_closed: true`, a missing or crashing `termaxa` refuses those four
+tools, in Hermes's own words; without it, every failure lets the call run.
+Hermes runs a hook only once its event and command are approved: a foreground
+`hermes chat` asks the first time, while the gateway, cron and the desktop app
+skip an unapproved hook with a line in `agent.log` and nothing else. Approve
+it once with `hermes --accept-hooks chat` (or `HERMES_ACCEPT_HOOKS=1`), which
+writes the approval to the profile's `shell-hooks-allowlist.json`, and check
+it with `hermes hooks list`.
+
+Not covered: a deferred tool reached through `tool_call` (an MCP server's),
+the Python inside `execute_code`, and a terminal backend other than `local`
+(Docker, SSH, Modal and the rest run the command elsewhere, where a preview or
+a copy made on this machine means nothing). Supervised mode does not carry
+`--hermes` to its daemon, so a Hermes call is refused there.
 
 ## What is not captured yet
 

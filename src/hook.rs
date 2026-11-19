@@ -45,6 +45,13 @@ pub enum Dialect {
     /// GitHub Copilot CLI: {"toolName":"shell","toolArgs":"{\"command\":...}"}
     /// -> bare {"permissionDecision":..., "permissionDecisionReason":...} (no wrapper)
     Copilot,
+    /// Hermes Agent's shell hooks (captured Nov 19, 2026, v0.23.2):
+    /// {"hook_event_name":"pre_tool_call","tool_name":"terminal",
+    /// "tool_input":{"command":...,"workdir":...},"cwd":...,"profile":...}
+    /// -> {"decision":"block","reason":...} with exit 2 for a deny, and
+    /// {"action":"approve","message":...} for an ask, which Hermes hands to
+    /// its own approval gate. Read only under `termaxa hook --hermes`.
+    Hermes,
 }
 
 pub struct ParsedHook {
@@ -59,6 +66,11 @@ pub struct ParsedHook {
     /// True for post-execution events (afterShellExecution / postToolUse /
     /// PostToolUse): the command already ran, so this is a receipt, not a gate.
     pub is_post: bool,
+    /// False when the harness did not say where the command runs (Hermes
+    /// 0.23.2 names its gateway's directory; see `hermes_dir`): `cwd` is
+    /// then empty, a relative path resolves to nothing the gate can know,
+    /// and nothing is previewed or copied aside.
+    pub cwd_known: bool,
 }
 
 /// Raw JSON in -> normalized hook event out. None = not for us; step aside.
@@ -75,6 +87,56 @@ fn normalize_uri_path(p: &str) -> String {
     p.to_string()
 }
 
+/// Hermes's two tool events: `Some(false)` before a call, `Some(true)`
+/// after it, `None` for anything else (Hermes sends them in lower case).
+fn hermes_event(event: Option<&str>) -> Option<bool> {
+    match event {
+        Some("pre_tool_call") => Some(false),
+        Some("post_tool_call") => Some(true),
+        _ => None,
+    }
+}
+
+/// Where a Hermes tool call runs, as far as its payload can say, and
+/// whether it says. A terminal call's `workdir` is where Hermes runs it.
+/// The payload's `cwd` is, on Hermes 0.23.2, the gateway process's own
+/// directory (measured Nov 19, 2026: Hermes's install directory, or
+/// `~/.hermes` behind its desktop app; NousResearch/hermes-agent#146570),
+/// so it is taken only when it is not Hermes's own (`hermes_own_dir`),
+/// which is what a Hermes that reports the session's directory sends.
+fn hermes_dir(workdir: &str, cwd: &str) -> (String, bool) {
+    if !workdir.is_empty() && std::path::Path::new(workdir).is_dir() {
+        return (workdir.to_string(), true);
+    }
+    let home = std::env::var_os("HERMES_HOME")
+        .filter(|h| !h.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|h| std::path::PathBuf::from(h).join(".hermes"))
+        });
+    let dir = std::path::Path::new(cwd);
+    if !cwd.is_empty() && dir.is_dir() && !hermes_own_dir(dir, home.as_deref()) {
+        return (cwd.to_string(), true);
+    }
+    (String::new(), false)
+}
+
+/// A directory that is Hermes's and not a project's: inside its home
+/// (`HERMES_HOME`, `~/.hermes` when unset), or one holding Hermes's own
+/// code, which is where its gateway runs from a source install.
+fn hermes_own_dir(dir: &std::path::Path, hermes_home: Option<&std::path::Path>) -> bool {
+    let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let dir = canonical(dir);
+    if let Some(home) = hermes_home {
+        if dir.starts_with(canonical(home)) {
+            return true;
+        }
+    }
+    dir.join("hermes_cli").join("main.py").is_file()
+}
+
 impl Dialect {
     /// Stable name for the audit record. Written to disk, so it is a wire
     /// format: changing one of these strings rewrites what past entries mean,
@@ -86,6 +148,7 @@ impl Dialect {
             Dialect::Codex => "codex",
             Dialect::Copilot => "copilot",
             Dialect::CopilotRepoSettings => "copilot",
+            Dialect::Hermes => "hermes",
         }
     }
 }
@@ -96,6 +159,43 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
     let raw = raw.trim_start_matches('\u{feff}').trim();
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+
+    // ---- Hermes Agent: `pre_tool_call` / `post_tool_call`, in snake case,
+    // which no other harness sends. `terminal` is its shell; any other tool
+    // is not a command (`write_file` and `patch` go to the write reader,
+    // `execute_code` to `hermes_unreadable`).
+    if let Some(post) = hermes_event(s("hook_event_name").as_deref()) {
+        if s("tool_name").as_deref() != Some("terminal") {
+            return None;
+        }
+        let input = v.get("tool_input");
+        let field = |k: &str| {
+            input
+                .and_then(|t| t.get(k))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let command = field("command");
+        if command.is_empty() {
+            return None;
+        }
+        let (cwd, cwd_known) = hermes_dir(&field("workdir"), &s("cwd").unwrap_or_default());
+        return Some(ParsedHook {
+            dialect: Dialect::Hermes,
+            command,
+            cwd,
+            session: s("session_id").filter(|x| !x.is_empty()),
+            call_id: v
+                .get("extra")
+                .and_then(|e| e.get("tool_call_id"))
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty())
+                .map(str::to_string),
+            is_post: post,
+            cwd_known,
+        });
+    }
 
     // Event name, lowercased for version-tolerant matching. Cursor renamed its
     // hooks between versions: older builds sent `beforeShellExecution` /
@@ -176,6 +276,7 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
                 .or_else(|| s("toolCallId"))
                 .or_else(|| s("tool_call_id")),
             is_post,
+            cwd_known: true,
         });
     }
 
@@ -218,6 +319,7 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
                     .or_else(|| s("tool_call_id"))
                     .or_else(|| s("tool_use_id")),
                 is_post,
+                cwd_known: true,
             });
         }
     }
@@ -257,6 +359,7 @@ pub fn parse_input(raw: &str) -> Option<ParsedHook> {
                 .or_else(|| s("toolCallId"))
                 .or_else(|| s("tool_call_id")),
             is_post,
+            cwd_known: true,
         });
     }
 
@@ -298,6 +401,9 @@ pub struct FileWrite {
     /// a receipt for it when a path rule names the target, and nothing
     /// otherwise.
     pub post: bool,
+    /// As `ParsedHook::cwd_known`: false when the harness did not say where
+    /// the write lands (Hermes), and `cwd` is then empty.
+    pub cwd_known: bool,
 }
 
 /// What a native write does to one path, read from the tool's verb and, for
@@ -416,7 +522,8 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
     if event.as_deref() == Some("aftershellexecution") {
         return None;
     }
-    let post = event.as_deref() == Some("posttooluse");
+    let hermes = hermes_event(event.as_deref());
+    let post = event.as_deref() == Some("posttooluse") || hermes == Some(true);
 
     let tool = s("tool_name").or_else(|| s("toolName"))?;
     let folded = tool.to_lowercase();
@@ -466,7 +573,9 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
         .map(|a| a.to_lowercase().contains("codex"))
         .unwrap_or(false)
         || sent_by_codex(&v);
-    let dialect = if v.get("toolName").is_some() {
+    let dialect = if hermes.is_some() {
+        Dialect::Hermes
+    } else if v.get("toolName").is_some() {
         Dialect::Copilot
     } else if is_cursor {
         Dialect::Cursor
@@ -478,13 +587,12 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
         Dialect::ClaudeCode
     };
 
-    Some(FileWrite {
-        dialect,
-        tool,
-        path,
-        targets,
-        post,
-        cwd: s("cwd")
+    // Hermes's write tools name no directory of their own, and its `cwd` is
+    // read as for a terminal call.
+    let (cwd, cwd_known) = if dialect == Dialect::Hermes {
+        hermes_dir("", &s("cwd").unwrap_or_default())
+    } else {
+        let cwd = s("cwd")
             .or_else(|| s("workingDirectory"))
             .or_else(|| {
                 v.get("workspace_roots")
@@ -493,7 +601,18 @@ pub fn parse_file_write(raw: &str) -> Option<FileWrite> {
                     .and_then(|x| x.as_str())
                     .map(normalize_uri_path)
             })
-            .unwrap_or_default(),
+            .unwrap_or_default();
+        (cwd, true)
+    };
+
+    Some(FileWrite {
+        dialect,
+        tool,
+        path,
+        targets,
+        post,
+        cwd_known,
+        cwd,
         session: s("session_id")
             .or_else(|| s("conversation_id"))
             .or_else(|| s("sessionId")),
@@ -527,6 +646,17 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
         exit_code: 0,
         audit_seq: None,
     };
+    // A Hermes write to a hook registered without `--hermes`: refused
+    // before anything is read (`hermes_unregistered`); its receipt, after
+    // the fact, is nothing to refuse.
+    if w.dialect == Dialect::Hermes && !crate::paths::hermes_hook() {
+        return if w.post {
+            silent
+        } else {
+            hermes_unregistered()
+        };
+    }
+
     // The gate's own files first, whatever the policy says: this does not
     // depend on a policy existing or parsing, and a write that lands in
     // `.termaxa/` or a hook config is refused before anything else is read.
@@ -545,13 +675,13 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
     // like the shell path's, because it is the shell path's path-rule
     // tournament on the same resolved targets.
     let start_dir = start_dir_of(&w.cwd);
-    let Ok(paths) = locate(&start_dir) else {
+    let Ok(paths) = locate_call(w.dialect, &start_dir) else {
         return silent;
     };
     let Ok(policy) = policy_for(&paths) else {
         return silent;
     };
-    let ctx = crate::resolve::EvalContext::from_paths(&start_dir, &paths);
+    let ctx = call_context(w.dialect, &start_dir, &paths, w.cwd_known);
     let resolved: Vec<crate::resolve::ResolvedTarget> = w
         .targets
         .iter()
@@ -890,7 +1020,7 @@ fn protected_write(w: &FileWrite, path: &str, protected: crate::protect::Protect
     // cannot be resolved there is nowhere to write the record, and a deny that
     // went unrecorded is still a deny.
     let start_dir = start_dir_of(&w.cwd);
-    if let Ok(paths) = locate(&start_dir) {
+    if let Ok(paths) = locate_call(w.dialect, &start_dir) {
         // The mode, when there is a policy to read it from: this refusal
         // does not depend on one, and is the floor in either mode.
         let policy = policy_for(&paths).ok();
@@ -970,6 +1100,8 @@ fn is_silent(dialect: Dialect, decision: &crate::policy::Decision) -> bool {
         // Every allow is silence, matched or not; the audit log keeps the
         // rule name.
         Dialect::Codex => decision.action == crate::policy::Action::Allow,
+        // Hermes has no answer that means allow: every allow is silence.
+        Dialect::Hermes => decision.action == crate::policy::Action::Allow,
         _ => false,
     }
 }
@@ -1027,6 +1159,18 @@ pub fn render_response(dialect: Dialect, permission: &str, reason: &str) -> Stri
             "permissionDecision": permission,
             "permissionDecisionReason": reason,
         })
+        .to_string(),
+        // Hermes reads a top-level `decision` or `action` and nothing else
+        // (its shell hooks' wire, measured Nov 19, 2026, v0.23.2): a block
+        // with its reason; for an ask, its own approval gate, which a
+        // person answers in an interactive session, which refuses where no
+        // one can answer, and which `--yolo` lets through; for an allow,
+        // nothing it acts on (Claude Code's `approve` is not read).
+        Dialect::Hermes => match permission {
+            "deny" => json!({ "decision": "block", "reason": reason }),
+            "ask" => json!({ "action": "approve", "message": reason }),
+            _ => json!({}),
+        }
         .to_string(),
     }
 }
@@ -1105,9 +1249,159 @@ pub(crate) fn locate(start_dir: &std::path::Path) -> Result<crate::paths::Paths>
 fn policy_for(paths: &crate::paths::Paths) -> Result<Policy> {
     if paths.watched {
         Policy::watching()
+    } else if crate::paths::hermes_hook() && !paths.policy_file().exists() {
+        // `--hermes` with no policy put in its home: the built-in starter,
+        // which `termaxa init` would have written (docs/dialects.md).
+        Policy::builtin()
     } else {
         Policy::load(&paths.policy_file())
     }
+}
+
+/// The project a call is judged in. A Hermes call has none it can name
+/// (`paths::hermes_hook`): under `--hermes` it is the one policy and record
+/// kept for Hermes (`paths::resolve_hermes`), and without the flag there
+/// is no policy to judge it by. Every other call's project is found from
+/// its directory.
+pub(crate) fn locate_call(
+    dialect: Dialect,
+    start_dir: &std::path::Path,
+) -> Result<crate::paths::Paths> {
+    if dialect != Dialect::Hermes {
+        return locate(start_dir);
+    }
+    if !crate::paths::hermes_hook() {
+        anyhow::bail!("a Hermes tool call reached a hook registered without --hermes");
+    }
+    crate::paths::resolve_hermes()
+}
+
+/// The context a call is judged in. For a Hermes call the project root is
+/// the checkout the command runs in, not Hermes's home; and where the
+/// harness did not say where the call runs (`cwd_known` false), the
+/// directory is one the gate cannot know, so a relative path is judged by
+/// its end, as after a `cd "$X"`.
+fn call_context(
+    dialect: Dialect,
+    start_dir: &std::path::Path,
+    paths: &crate::paths::Paths,
+    cwd_known: bool,
+) -> crate::resolve::EvalContext {
+    let mut ctx = crate::resolve::EvalContext::from_paths(start_dir, paths);
+    if dialect == Dialect::Hermes && cwd_known {
+        ctx.root = crate::paths::watch_root(start_dir);
+    }
+    if !cwd_known {
+        ctx.cwd_known = false;
+        ctx.cwd_end = Vec::new();
+    }
+    ctx
+}
+
+/// A Hermes call to a hook registered without `--hermes`, refused in
+/// Hermes's shape. Hermes does not say which project a call belongs to, so
+/// a policy found from its directories would be one the agent could pick
+/// (`paths::hermes_hook`); without the flag there is no policy this hook
+/// could honestly judge the call by (decision #19: never an invisible one).
+fn hermes_unregistered() -> Outcome {
+    Outcome {
+        rendered: Some(render_response(
+            Dialect::Hermes,
+            "deny",
+            "[termaxa] this hook was registered without --hermes. Hermes does not say which \
+             project a tool call belongs to, so termaxa judges Hermes's calls only as \
+             `termaxa hook --hermes`, by one policy for all of them; change the hook's \
+             command in Hermes's config.yaml (docs/dialects.md)",
+        )),
+        exit_code: 2,
+        audit_seq: None,
+    }
+}
+
+/// A Hermes call whose input the gate cannot read as a command or a file
+/// write: `execute_code`, whose Python can do whatever a script file can
+/// (the class decisions #44 and #90 leave to a person). An ask, in Hermes's
+/// shape, which hands it to Hermes's approval gate; said nothing of under
+/// observe mode; recorded either way. Each `terminal` call the code makes
+/// comes to this hook on its own and is judged there (measured Nov 19,
+/// 2026, Hermes 0.23.2).
+fn hermes_unreadable(raw: &str) -> Option<Outcome> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim_start_matches('\u{feff}').trim()).ok()?;
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    if hermes_event(s("hook_event_name").as_deref()) != Some(false)
+        || s("tool_name").as_deref() != Some("execute_code")
+    {
+        return None;
+    }
+    if !crate::paths::hermes_hook() {
+        return Some(hermes_unregistered());
+    }
+    let code = v
+        .get("tool_input")
+        .and_then(|t| t.get("code"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let subject: String = format!(
+        "execute_code: {}",
+        code.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+    .chars()
+    .take(200)
+    .collect();
+    let reason = "[termaxa] asks: execute_code runs Python the gate cannot read, as a script \
+                  file would; each terminal call it makes is judged on its own";
+    let paths = crate::paths::resolve_hermes().ok();
+    let observed = paths
+        .as_ref()
+        .and_then(|p| policy_for(p).ok())
+        .is_some_and(|p| p.effective_mode().0 == crate::policy::Mode::Observe);
+    if let Some(paths) = &paths {
+        if let Ok(log) = AuditLog::new(&paths.state_dir) {
+            let (ts_ms, ts) = now();
+            let _ = log.append(&AuditEntry {
+                call_id: v
+                    .get("extra")
+                    .and_then(|e| e.get("tool_call_id"))
+                    .and_then(|c| c.as_str())
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string),
+                mode: None,
+                enforced: None,
+                floor: None,
+                coverage: None,
+                ts_ms,
+                ts,
+                source: "hook".into(),
+                actor: Some(Dialect::Hermes.actor().into()),
+                decided_by: Some("policy".into()),
+                command: subject,
+                decision: "ask".into(),
+                matched_rule: Some("execute_code".into()),
+                reason: reason.to_string(),
+                signals: vec![],
+                escalated: false,
+                session: s("session_id").filter(|x| !x.is_empty()),
+                backup: None,
+                preview: None,
+                intent: None,
+                approved: None,
+                exit_code: None,
+                cwd: String::new(),
+                prev: None,
+                hash: None,
+            });
+        }
+    }
+    Some(Outcome {
+        rendered: if observed {
+            None
+        } else {
+            Some(render_response(Dialect::Hermes, "ask", reason))
+        },
+        exit_code: 0,
+        audit_seq: None,
+    })
 }
 
 /// The directory a payload says it is about, before any dialect is read:
@@ -1316,8 +1610,9 @@ pub(crate) fn plugin_answer(raw_payload: &str) -> Option<Outcome> {
     })
 }
 
-pub fn run(plugin: bool) -> Result<()> {
+pub fn run(plugin: bool, hermes: bool) -> Result<()> {
     crate::paths::set_plugin_hook(plugin);
+    crate::paths::set_hermes_hook(hermes);
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     let outcome = match plugin_answer(&buf) {
@@ -1367,8 +1662,15 @@ fn refuse_unrecognised(raw: &str) -> Option<Outcome> {
                 .map(std::path::PathBuf::from)
         })
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let paths = crate::paths::resolve_from(&cwd).ok()?;
-    let policy = Policy::load(&paths.policy_file()).ok()?;
+    // A Hermes call is judged by the policy `--hermes` keeps, and by none
+    // without the flag (`locate_call`).
+    let hermes = hermes_event(json.get("hook_event_name").and_then(|e| e.as_str())).is_some();
+    let paths = if hermes {
+        locate_call(Dialect::Hermes, &cwd).ok()?
+    } else {
+        crate::paths::resolve_from(&cwd).ok()?
+    };
+    let policy = policy_for(&paths).ok()?;
     if policy.unrecognised != crate::policy::Unrecognised::Deny {
         return None;
     }
@@ -1416,7 +1718,9 @@ fn refuse_unrecognised(raw: &str) -> Option<Outcome> {
     let copilot_shaped = json.get("toolName").is_some();
     Some(Outcome {
         rendered: Some(render_response(
-            if copilot_shaped {
+            if hermes {
+                Dialect::Hermes
+            } else if copilot_shaped {
                 Dialect::Copilot
             } else {
                 Dialect::ClaudeCode
@@ -1499,6 +1803,12 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         }
     }
 
+    // Hermes's `execute_code` first: neither a command nor a write, and
+    // nothing below reads it (`hermes_unreadable`).
+    if let Some(outcome) = hermes_unreadable(&buf) {
+        return Ok(outcome);
+    }
+
     // A patch before the shell reader (Sep 19, 2026, captured): Codex sends
     // `apply_patch` with the patch text in `tool_input.command`, the field a
     // shell command lives in, and the shell reader took it — `*** Begin
@@ -1534,6 +1844,20 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     };
     let command = input.command.clone();
 
+    // A Hermes command at a hook registered without `--hermes`: refused, as
+    // a Hermes write is (`hermes_unregistered`); a receipt is not refused.
+    if input.dialect == Dialect::Hermes && !crate::paths::hermes_hook() {
+        return Ok(if input.is_post {
+            Outcome {
+                rendered: None,
+                exit_code: 0,
+                audit_seq: None,
+            }
+        } else {
+            hermes_unregistered()
+        });
+    }
+
     // Post-execution event: the command already ran. Record a receipt
     // (source "post") so the circuit breaker can exclude human-approved
     // commands from the retry threshold (decision #13). No policy eval, no
@@ -1544,7 +1868,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         } else {
             std::env::current_dir().unwrap_or_default()
         };
-        if let Ok(paths) = locate(&start_dir) {
+        if let Ok(paths) = locate_call(input.dialect, &start_dir) {
             if let Ok(log) = AuditLog::new(&paths.state_dir) {
                 let (ts_ms, ts) = now();
                 let _ = log.append(&AuditEntry {
@@ -1599,7 +1923,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     } else {
         std::env::current_dir().unwrap_or_default()
     };
-    let paths = locate(&start_dir)?;
+    let paths = locate_call(input.dialect, &start_dir)?;
 
     // One-line resolution trace (reviewer request): set TERMAXA_HOOK_DEBUG to a
     // file path and this records exactly what got resolved, so future debugging
@@ -1679,7 +2003,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // The payload's cwd is where the command runs; the project root comes
     // from the located policy. Never the process cwd - a hook runs wherever
     // the harness spawned it.
-    let ctx = crate::resolve::EvalContext::from_paths(&start_dir, &paths);
+    let ctx = call_context(input.dialect, &start_dir, &paths, input.cwd_known);
     // The verdict, and with it the readings of the line the preview and the
     // copy aside are made for (`policy::Judged`).
     let judged = policy.judge_command(&command, &ctx);
@@ -1788,14 +2112,21 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
         // A denied command must not cause a subprocess. The preview is still
         // generated — statically — so the denial reason keeps its detail.
         let live = decision.action != crate::policy::Action::Deny;
-        match judged.preview(
-            &command,
-            paths.project_dir.parent(),
-            std::path::Path::new(&input.cwd),
-            live,
-        ) {
-            Some(p) => (Some(p.summary), p.uninsurable),
-            None => (None, false),
+        // Where the harness did not say where the command runs, there is
+        // nothing a preview could truthfully say about a relative path
+        // (decision #84): no preview, and the reason says why.
+        if !input.cwd_known {
+            (None, false)
+        } else {
+            match judged.preview(
+                &command,
+                Some(ctx.root.as_path()),
+                std::path::Path::new(&input.cwd),
+                live,
+            ) {
+                Some(p) => (Some(p.summary), p.uninsurable),
+                None => (None, false),
+            }
         }
     };
 
@@ -1880,7 +2211,7 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // sentinel. An agent command cannot set its harness's env; a leaked env
     // var without the sentinel changes nothing.
     let mut backup_id: Option<String> = None;
-    if !is_probe && will_run {
+    if !is_probe && will_run && input.cwd_known {
         match judged.insure(&command, &paths.state_dir, std::path::Path::new(&input.cwd)) {
             Ok(Some(rec)) => {
                 backup_id = Some(rec.id);
@@ -2032,6 +2363,9 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     if matches!(decision.action, Action::Ask | Action::Deny) {
         if let Some(s) = &preview_summary {
             reason.push_str(&format!(" | {}", s));
+        }
+        if !input.cwd_known {
+            reason.push_str(" | Hermes did not say where this runs: nothing previewed or copied");
         }
     }
     if let Some(id) = &backup_id {
@@ -3653,5 +3987,117 @@ mod tests {
         assert!(!sent_by_codex(&payload(
             "/home/dev/.claude/projects/p/s.jsonl"
         )));
+    }
+
+    // ---- Hermes Agent (captured Nov 19, 2026, Hermes 0.23.2) ----
+
+    /// The first call of the capture's first run, its ids shortened: a
+    /// `terminal` call whose `cwd` is Hermes's install directory.
+    const HERMES_PRE: &str = r#"{"hook_event_name":"pre_tool_call","tool_name":"terminal","tool_input":{"command":"echo hello > a.txt && cat a.txt"},"session_id":"local-2ac6a4c3","cwd":"/tmp/hermes-cap/hermes-v0.23.2","profile":"default","extra":{"task_id":"local-2ac6a4c3","tool_call_id":"call_1","turn_id":"t","api_request_id":"a","middleware_trace":[],"conversation_id":"local-2ac6a4c3","telemetry_schema_version":"hermes.observer.v1","kanban_task_id":""}}"#;
+
+    const HERMES_CODE: &str = r#"{"hook_event_name":"pre_tool_call","tool_name":"execute_code","tool_input":{"code":"print(1)"},"session_id":"s","cwd":"","profile":"default","extra":{}}"#;
+
+    #[test]
+    fn detects_hermes_dialect() {
+        let p = parse_input(HERMES_PRE).unwrap();
+        assert_eq!(p.dialect, Dialect::Hermes);
+        assert_eq!(p.command, "echo hello > a.txt && cat a.txt");
+        assert_eq!(p.session.as_deref(), Some("local-2ac6a4c3"));
+        assert_eq!(p.call_id.as_deref(), Some("call_1"));
+        assert!(!p.is_post);
+        // Hermes's own directory, or one not on this machine: either way
+        // nothing says where the command runs.
+        assert!(!p.cwd_known);
+        assert_eq!(p.cwd, "");
+        let post = HERMES_PRE.replace("pre_tool_call", "post_tool_call");
+        assert!(parse_input(&post).unwrap().is_post);
+    }
+
+    #[test]
+    fn hermes_workdir_is_where_the_command_runs() {
+        let tree = crate::testutil::TempTree::new("hermes-workdir");
+        let dir = tree.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = json!({
+            "hook_event_name": "pre_tool_call",
+            "tool_name": "terminal",
+            "tool_input": { "command": "rm -rf src", "workdir": dir.display().to_string() },
+            "session_id": "s",
+            "cwd": "/nonexistent/gateway",
+            "profile": "default",
+            "extra": {}
+        })
+        .to_string();
+        let p = parse_input(&raw).unwrap();
+        assert!(p.cwd_known);
+        assert_eq!(p.cwd, dir.display().to_string());
+    }
+
+    #[test]
+    fn hermes_own_directories_are_not_projects() {
+        let tree = crate::testutil::TempTree::new("hermes-own");
+        let home = tree.path().join(".hermes");
+        let inside = home.join("hermes-agent");
+        let source = tree.path().join("src-install");
+        let project = tree.path().join("proj");
+        for d in [&inside, &source.join("hermes_cli"), &project] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(source.join("hermes_cli").join("main.py"), "").unwrap();
+        assert!(hermes_own_dir(&home, Some(&home)));
+        assert!(hermes_own_dir(&inside, Some(&home)));
+        assert!(hermes_own_dir(&source, Some(&home)));
+        assert!(!hermes_own_dir(&project, Some(&home)));
+        assert!(!hermes_own_dir(&project, None));
+    }
+
+    #[test]
+    fn hermes_writes_go_to_the_write_reader() {
+        let wf = r#"{"hook_event_name":"pre_tool_call","tool_name":"write_file","tool_input":{"path":"notes.txt","content":"hi\n"},"session_id":"s","cwd":"/nonexistent/gateway","profile":"default","extra":{}}"#;
+        assert!(parse_input(wf).is_none());
+        let w = parse_file_write(wf).unwrap();
+        assert_eq!(w.dialect, Dialect::Hermes);
+        assert_eq!(w.path, "notes.txt");
+        assert!(!w.post);
+        assert!(!w.cwd_known);
+        let patch = r#"{"hook_event_name":"post_tool_call","tool_name":"patch","tool_input":{"mode":"patch","patch":"*** Begin Patch\n*** Update File: notes.txt\n@@\n-hello\n+hello world\n*** End Patch\n"},"session_id":"s","cwd":"/nonexistent/gateway","profile":"default","extra":{}}"#;
+        let p = parse_file_write(patch).unwrap();
+        assert_eq!(p.dialect, Dialect::Hermes);
+        assert!(p.post);
+        let paths: Vec<&str> = p.targets.iter().map(|t| t.path.as_str()).collect();
+        assert_eq!(paths, ["notes.txt"]);
+        // `execute_code` is neither: the hook's own question.
+        assert!(parse_input(HERMES_CODE).is_none());
+        assert!(parse_file_write(HERMES_CODE).is_none());
+    }
+
+    #[test]
+    fn hermes_answers_in_its_own_shape() {
+        let deny: serde_json::Value =
+            serde_json::from_str(&render_response(Dialect::Hermes, "deny", "no")).unwrap();
+        assert_eq!(deny, json!({ "decision": "block", "reason": "no" }));
+        let ask: serde_json::Value =
+            serde_json::from_str(&render_response(Dialect::Hermes, "ask", "why")).unwrap();
+        assert_eq!(ask, json!({ "action": "approve", "message": "why" }));
+        assert_eq!(render_response(Dialect::Hermes, "allow", "ok"), "{}");
+        assert_eq!(Dialect::Hermes.actor(), "hermes");
+    }
+
+    #[test]
+    fn hermes_calls_need_the_flag() {
+        // Under test the flag is this thread's, and off.
+        crate::paths::set_hermes_hook(false);
+        let refused = decide(HERMES_PRE).unwrap();
+        assert_eq!(refused.exit_code, 2);
+        let v: serde_json::Value =
+            serde_json::from_str(refused.rendered.as_deref().unwrap()).unwrap();
+        assert_eq!(v["decision"], "block");
+        assert!(v["reason"].as_str().unwrap().contains("--hermes"));
+        assert_eq!(decide(HERMES_CODE).unwrap().exit_code, 2);
+        // A receipt is not refused: the call already ran.
+        let post = HERMES_PRE.replace("pre_tool_call", "post_tool_call");
+        let receipt = decide(&post).unwrap();
+        assert_eq!(receipt.exit_code, 0);
+        assert!(receipt.rendered.is_none());
     }
 }
