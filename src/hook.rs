@@ -108,31 +108,25 @@ fn hermes_dir(workdir: &str, cwd: &str) -> (String, bool) {
     if !workdir.is_empty() && std::path::Path::new(workdir).is_dir() {
         return (workdir.to_string(), true);
     }
-    let home = std::env::var_os("HERMES_HOME")
-        .filter(|h| !h.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .or_else(|| std::env::var_os("HOME"))
-                .map(|h| std::path::PathBuf::from(h).join(".hermes"))
-        });
     let dir = std::path::Path::new(cwd);
-    if !cwd.is_empty() && dir.is_dir() && !hermes_own_dir(dir, home.as_deref()) {
+    if !cwd.is_empty() && dir.is_dir() && !hermes_own_dir(dir, &crate::paths::hermes_own_homes()) {
         return (cwd.to_string(), true);
     }
     (String::new(), false)
 }
 
-/// A directory that is Hermes's and not a project's: inside its home
-/// (`HERMES_HOME`, `~/.hermes` when unset), or one holding Hermes's own
-/// code, which is where its gateway runs from a source install.
-fn hermes_own_dir(dir: &std::path::Path, hermes_home: Option<&std::path::Path>) -> bool {
+/// A directory that is Hermes's and not a project's: inside one of its
+/// homes (`paths::hermes_own_homes`: `HERMES_HOME`, and the platform's
+/// default, which on Windows is `%LOCALAPPDATA%\hermes`), or one holding
+/// Hermes's own code, which is where its gateway runs from a source install.
+fn hermes_own_dir(dir: &std::path::Path, hermes_homes: &[std::path::PathBuf]) -> bool {
     let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let dir = canonical(dir);
-    if let Some(home) = hermes_home {
-        if dir.starts_with(canonical(home)) {
-            return true;
-        }
+    if hermes_homes
+        .iter()
+        .any(|home| dir.starts_with(canonical(home)))
+    {
+        return true;
     }
     dir.join("hermes_cli").join("main.py").is_file()
 }
@@ -4115,11 +4109,12 @@ mod tests {
             std::fs::create_dir_all(d).unwrap();
         }
         std::fs::write(source.join("hermes_cli").join("main.py"), "").unwrap();
-        assert!(hermes_own_dir(&home, Some(&home)));
-        assert!(hermes_own_dir(&inside, Some(&home)));
-        assert!(hermes_own_dir(&source, Some(&home)));
-        assert!(!hermes_own_dir(&project, Some(&home)));
-        assert!(!hermes_own_dir(&project, None));
+        let homes = [tree.path().join("elsewhere"), home.clone()];
+        assert!(hermes_own_dir(&home, &homes));
+        assert!(hermes_own_dir(&inside, &homes));
+        assert!(hermes_own_dir(&source, &homes));
+        assert!(!hermes_own_dir(&project, &homes));
+        assert!(!hermes_own_dir(&project, &[]));
     }
 
     #[test]

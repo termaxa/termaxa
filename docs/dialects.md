@@ -181,13 +181,19 @@ directory. `termaxa hook --hermes` judges every Hermes call by one policy,
 `TERMAXA_HOME`), or by the built-in starter while that file does not exist,
 and keeps one record of them. A directory is read only for where a command's
 paths land: `workdir` when it is given, and `cwd` when it is not Hermes's own
-(inside `HERMES_HOME`, or a directory holding Hermes's code). With neither,
-the directory is unknown: a path rule matches a path by its end, as after a
-`cd "$X"`, and only a path given in full is previewed and copied aside; the
-reason says so. Without `--hermes`, a Hermes call is refused, and the reason
+(inside Hermes's home, the one `HERMES_HOME` names or the platform's
+default, or a directory holding Hermes's code). With neither, the directory
+is unknown: a path rule matches a path by its end, as after a `cd "$X"`, and
+only a path given in full is previewed and copied aside; the reason says so. Without `--hermes`, a Hermes call is refused, and the reason
 names the flag.
 
-**Wiring it**, until `init` does, in the profile's `config.yaml`:
+**Wiring it.** `termaxa init --hermes` wires the profile a bare `hermes`
+uses: the one `HERMES_HOME` names, or else the default home (`~/.hermes`,
+and `%LOCALAPPDATA%\hermes` on Windows) or the profile its `active_profile`
+file names. It writes the policy above from the starter when there is none,
+adds these hooks to the profile's `config.yaml` (the file as it was is kept
+beside it, as `config.yaml.before-termaxa`), approves both, and sends the
+command a test call:
 
 ```yaml
 hooks:
@@ -202,14 +208,26 @@ hooks:
       timeout: 30
 ```
 
+On Windows the command is the binary's full path, because Windows looks for
+a bare name in the directory Hermes runs from before it looks on PATH, and a
+`termaxa.exe` left there would run in the gate's place. Elsewhere it is
+`termaxa` when PATH finds the binary that ran `init`, which an upgrade that
+moves the binary does not break, and the full path when PATH finds another
+or none. A `config.yaml` with a `hooks:` block of its own is not edited:
+`init` prints the entries to add to it, and approves them when run again.
+
 With `fail_closed: true`, a missing or crashing `termaxa` refuses those four
 tools, in Hermes's own words; without it, every failure lets the call run.
-Hermes runs a hook only once its event and command are approved: a foreground
-`hermes chat` asks the first time, while the gateway, cron and the desktop app
-skip an unapproved hook with a line in `agent.log` and nothing else. Approve
-it once with `hermes --accept-hooks chat` (or `HERMES_ACCEPT_HOOKS=1`), which
-writes the approval to the profile's `shell-hooks-allowlist.json`, and check
-it with `hermes hooks list`.
+Hermes runs a hook only once its event and its exact command are approved in
+the profile's `shell-hooks-allowlist.json`: a foreground `hermes chat` asks
+the first time, while the gateway, cron and the desktop app skip an
+unapproved hook with a line in `agent.log` and nothing else. `init` writes
+the approvals that `hermes --accept-hooks` would, without the binary's
+modification time, which every upgrade changes. `termaxa doctor` reads all of
+it back: the entry, its matcher, the approval, the command's answer to a test
+call, and the policy's fingerprint. `hermes hooks list` shows the hooks as
+Hermes sees them; `hermes hooks doctor` looks for a bare `termaxa` as a file
+in Hermes's own directory, so it reports one that PATH finds as missing.
 
 Not covered: a deferred tool reached through `tool_call` (an MCP server's),
 the Python inside `execute_code`, and a terminal backend other than `local`

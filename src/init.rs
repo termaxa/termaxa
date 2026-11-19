@@ -1286,6 +1286,161 @@ pub fn run(
 /// `run` applies to an ask (`runner::stdin_is_terminal`), since a pipe can
 /// carry a `y` and is not a person. Never under test, where cargo may run
 /// from a terminal and a question would wait for an answer nobody gives.
+/// `termaxa init --hermes`: wire the Hermes Agent profile a bare `hermes`
+/// uses (`paths::hermes_home`) to this gate. Nothing in the current
+/// directory is touched: a Hermes call is judged by one policy, kept in
+/// termaxa's home (`paths::resolve_hermes`), because Hermes does not say
+/// which project a call belongs to.
+///
+/// Four things, each reported: the policy (the starter, when there is
+/// none); the hooks in the profile's `config.yaml` (`hermes::config_with_hooks`,
+/// which adds them or leaves the file alone); their approval in the
+/// profile's allowlist, without which Hermes skips them in silence wherever
+/// no one is at a terminal to be asked; and a test call, because with
+/// `fail_closed` a command that does not answer refuses every gated call.
+pub fn run_hermes(observe: bool) -> Result<()> {
+    use crate::hermes::{self, ConfigEdit};
+
+    let home = crate::paths::hermes_home()
+        .context("cannot locate Hermes's home: set HERMES_HOME to the profile to wire")?;
+    let profile = match &home.profile {
+        crate::paths::HermesProfile::Default => "profile `default`".to_string(),
+        crate::paths::HermesProfile::Active(name) => format!("profile `{name}`, the active one"),
+        crate::paths::HermesProfile::FromEnv => "the profile HERMES_HOME names".to_string(),
+    };
+    println!("Hermes Agent, {profile}: {}", home.dir.display());
+    let config = home.dir.join("config.yaml");
+    if !config.is_file() {
+        anyhow::bail!(
+            "Hermes is not set up there (no config.yaml): run `hermes setup`, or set HERMES_HOME \
+             to the profile to wire, and run this again"
+        );
+    }
+    if std::env::var_os("TERMAXA_HOME").is_some_and(|h| !h.is_empty()) {
+        println!("• TERMAXA_HOME is set: Hermes must run with the same, or its hook reads another policy");
+    }
+
+    // --- the one policy every Hermes call is judged by ---
+    let paths = crate::paths::resolve_hermes()?;
+    fs::create_dir_all(&paths.project_dir)?;
+    let policy_path = paths.policy_file();
+    if policy_path.exists() {
+        println!(
+            "• {} already exists — leaving it untouched",
+            policy_path.display()
+        );
+        if observe {
+            println!("  to observe, set `mode: observe` in it (or TERMAXA_MODE=observe where Hermes runs)");
+        }
+    } else {
+        fs::write(&policy_path, starter_policy(observe))?;
+        let mode = if observe { ", observe mode" } else { "" };
+        println!("✓ wrote {} (starter policy{mode})", policy_path.display());
+        println!("  every Hermes call is judged by it, whatever directory the session works in");
+    }
+    match record_fingerprint(&paths.state_dir, &policy_path) {
+        Ok(Some(short)) => println!("✓ recorded policy fingerprint {}", short),
+        Ok(None) => {}
+        Err(e) => println!("! could not record policy fingerprint: {}", e),
+    }
+
+    // --- the hooks ---
+    let command = hermes::command_for_this_binary()?;
+    let original =
+        fs::read_to_string(&config).with_context(|| format!("cannot read {}", config.display()))?;
+    let by_hand = |why: &str| {
+        println!("! {why}");
+        println!(
+            "  Add these entries to it, then run `termaxa init --hermes` again to approve them:\n"
+        );
+        for line in hermes::hooks_block(&command)
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+        {
+            println!("    {line}");
+        }
+        println!();
+        anyhow::anyhow!("Hermes is not wired yet")
+    };
+    match hermes::config_with_hooks(&original, &command) {
+        Ok(ConfigEdit::Edited(text)) => {
+            let kept = keep_copy(&config)?;
+            hermes::write_atomically(&config, &text)?;
+            println!("✓ added the hooks to config.yaml: `{command}`");
+            println!("  config.yaml as it was is kept as {}", kept.display());
+        }
+        Ok(ConfigEdit::Wired) => println!("• config.yaml already runs `{command}`"),
+        Ok(ConfigEdit::OwnHooks { termaxa }) => {
+            if let Some(other) = termaxa {
+                println!("• config.yaml runs `{other}`; this binary is `{command}`");
+            }
+            return Err(by_hand(
+                "config.yaml has a `hooks:` block of its own, which termaxa does not edit",
+            ));
+        }
+        Err(e) => return Err(by_hand(&format!("{e:#}"))),
+    }
+
+    // --- the approval ---
+    let allowlist = home.dir.join(hermes::ALLOWLIST);
+    let existing = match fs::read_to_string(&allowlist) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", allowlist.display())),
+    };
+    match hermes::allowlist_with(existing.as_deref(), &command, &hermes::now_iso()) {
+        Ok(Some(text)) => {
+            hermes::write_atomically(&allowlist, &text)?;
+            println!(
+                "✓ approved both hooks in {}, as `hermes --accept-hooks` would",
+                hermes::ALLOWLIST
+            );
+        }
+        Ok(None) => println!("• {} already approves them", hermes::ALLOWLIST),
+        Err(e) => {
+            println!("! {e:#}: left as it is");
+            println!("  Hermes skips a hook it has no approval for: run `hermes --accept-hooks chat` once");
+        }
+    }
+
+    // --- does it answer? ---
+    let dir = std::env::current_dir()?;
+    match hermes::probe(&command, &dir) {
+        Some("deny") => println!("✓ it answers: a test call to `rm -rf /` was refused"),
+        Some(verdict) => println!(
+            "! it answers, but this policy does not refuse `rm -rf /` (its verdict: {verdict}) — check its rules"
+        ),
+        None => {
+            println!("✗ `{command}` did not answer a test call");
+            println!("  With fail_closed, Hermes refuses every terminal, write_file, patch and");
+            println!("  execute_code call until it does. `termaxa doctor` says what it finds.");
+        }
+    }
+    println!();
+    println!("A Hermes session started from now on runs the hooks (`hermes hooks list` shows");
+    println!("them). `termaxa doctor` checks all of this again.");
+    Ok(())
+}
+
+/// A copy of `file` beside it, before it is edited: `<name>.before-termaxa`,
+/// or the first `<name>.before-termaxa-N` not taken. `fs::copy` keeps the
+/// file's permissions.
+fn keep_copy(file: &Path) -> Result<std::path::PathBuf> {
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let copy = (1..1000)
+        .map(|n| match n {
+            1 => file.with_file_name(format!("{name}.before-termaxa")),
+            n => file.with_file_name(format!("{name}.before-termaxa-{n}")),
+        })
+        .find(|p| !p.exists())
+        .context("no free name to keep a copy of config.yaml under")?;
+    fs::copy(file, &copy).with_context(|| format!("cannot copy {} aside", file.display()))?;
+    Ok(copy)
+}
+
 fn at_a_terminal() -> bool {
     #[cfg(test)]
     {

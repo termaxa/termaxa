@@ -88,7 +88,7 @@ pub fn run(dir: &Path) -> Result<i32> {
                     problems.push("fix .termaxa/policy.yaml (it does not parse)".into());
                 }
             }
-            report_fingerprint(&pf, &p.state_dir, &mut problems);
+            report_fingerprint(&pf, &p.state_dir, &PROJECT_POLICY, &mut problems);
         }
         None => {
             println!(
@@ -204,6 +204,11 @@ pub fn run(dir: &Path) -> Result<i32> {
                 dim("dialect read from a live capture (Sep 2026); deny not yet seen in its UI (issue #10)")
             );
         }
+    }
+
+    // Hermes Agent: its hooks are a profile's, wherever this is run from.
+    if report_hermes(dir, &mut problems) {
+        any_agent = true;
     }
 
     if !any_agent {
@@ -432,48 +437,74 @@ pub fn run(dir: &Path) -> Result<i32> {
 /// the whole feature: it can say the bytes differ from the ones last
 /// recorded. It cannot say who changed them, and it cannot see a change made
 /// before the first baseline existed.
-fn report_fingerprint(policy_file: &Path, state_dir: &Path, problems: &mut Vec<String>) {
+/// Which policy a fingerprint report is about: the command that records
+/// its baseline, the name a problem gives it, and how far its lines are
+/// indented under the line above them.
+struct PolicyNames<'a> {
+    fix: &'a str,
+    shown: &'a str,
+    indent: &'a str,
+}
+
+const PROJECT_POLICY: PolicyNames = PolicyNames {
+    fix: "termaxa init",
+    shown: ".termaxa/policy.yaml",
+    indent: "  ",
+};
+
+fn report_fingerprint(
+    policy_file: &Path,
+    state_dir: &Path,
+    names: &PolicyNames,
+    problems: &mut Vec<String>,
+) {
+    let PolicyNames { fix, shown, indent } = names;
     use crate::fingerprint;
     use crate::ui::{amber, cyan, dim, green};
 
     let Some(current) = fingerprint::of_file(policy_file) else {
         return; // unreadable policy is already reported above
     };
-    println!("  fingerprint {}", dim(&fingerprint::short(&current)));
+    println!("{indent}fingerprint {}", dim(&fingerprint::short(&current)));
 
     match fingerprint::read_baseline(state_dir) {
         None => {
             println!(
-                "  {} no baseline recorded — a change to this file would be invisible",
+                "{indent}{} no baseline recorded — a change to this file would be invisible",
                 amber("!")
             );
-            println!("    {}", cyan("termaxa init"));
-            problems.push("record a policy baseline — `termaxa init`".into());
+            println!("{indent}  {}", cyan(fix));
+            problems.push(format!("record a policy baseline — `{fix}`"));
         }
         Some(base) if base.sha256 == current => {
-            println!("  {} unchanged since {}", green("✓"), dim(&base.recorded));
+            println!(
+                "{indent}{} unchanged since {}",
+                green("✓"),
+                dim(&base.recorded)
+            );
         }
         Some(base) => {
             println!(
-                "  {} CHANGED since {} (was {})",
+                "{indent}{} CHANGED since {} (was {})",
                 amber("!"),
                 base.recorded,
                 fingerprint::short(&base.sha256)
             );
             println!(
-                "    {}",
-                dim("if you made this change, re-record it: `termaxa init`")
+                "{indent}  {}",
+                dim(&format!("if you made this change, re-record it: `{fix}`"))
             );
             println!(
-                "    {}",
+                "{indent}  {}",
                 dim("if you did not, something edited the gate's own rules —")
             );
             println!(
-                "    {}",
+                "{indent}  {}",
                 dim("a hook wired by hand may be missing the write-tool matcher")
             );
-            problems
-                .push("review .termaxa/policy.yaml — it changed since the last baseline".into());
+            problems.push(format!(
+                "review {shown} — it changed since the last baseline"
+            ));
         }
     }
 }
@@ -538,6 +569,111 @@ fn report_agent(
             problems.push(format!("wire {} — `{}`", name, fix));
         }
     }
+}
+
+/// Hermes Agent, when its home has a `config.yaml` or `hermes` is on PATH:
+/// whether the profile a bare `hermes` uses runs the gate's hook, whether
+/// Hermes will run it (approved, and its matcher lets `terminal` through),
+/// whether the command answers, and the one policy every Hermes call is
+/// judged by. `true` when Hermes was found.
+fn report_hermes(dir: &Path, problems: &mut Vec<String>) -> bool {
+    use crate::ui::{amber, cyan, dim, red};
+    const NAME: &str = "Hermes Agent";
+    const FIX: &str = "termaxa init --hermes";
+
+    let Some(home) = paths::hermes_home() else {
+        return false;
+    };
+    if !home.dir.join("config.yaml").is_file() && !crate::init::which("hermes") {
+        return false;
+    }
+    let wiring = crate::hermes::read_wiring(&home.dir);
+    let broken = |what: &str, problem: String, problems: &mut Vec<String>| {
+        println!("{} {:<13}{}", red("✗"), NAME, dim(what));
+        println!("    {}", cyan(FIX));
+        problems.push(problem);
+    };
+    match (&wiring.unreadable, &wiring.entry) {
+        (Some(why), _) => broken(
+            &format!("config.yaml cannot be read: {why}"),
+            format!("{NAME}: config.yaml cannot be read"),
+            problems,
+        ),
+        (None, None) => report_agent(NAME, (HookState::Absent, None), FIX, problems),
+        (None, Some(entry)) if !entry.command.contains("--hermes") => broken(
+            "hook registered without --hermes — termaxa refuses every Hermes call",
+            format!("{NAME} hook runs `termaxa hook` without --hermes — `{FIX}`"),
+            problems,
+        ),
+        (None, Some(entry))
+            if crate::hermes::matcher_covers(entry.matcher.as_deref(), "terminal")
+                == Some(false) =>
+        {
+            broken(
+                "the hook's matcher leaves out `terminal` — commands are ungated",
+                format!("{NAME} hook's matcher leaves out terminal — `{FIX}`"),
+                problems,
+            )
+        }
+        (None, Some(_)) if !wiring.approved => broken(
+            "hook registered but NOT approved — Hermes skips it in silence",
+            format!("{NAME} hook is not approved, so Hermes does not run it — `{FIX}`"),
+            problems,
+        ),
+        (None, Some(entry)) => {
+            let state = match crate::hermes::probe(&entry.command, dir) {
+                Some(verdict) => (HookState::Live, Some(verdict == "deny")),
+                None => (HookState::Dead, None),
+            };
+            report_agent(NAME, state, FIX, problems);
+            if !entry.fail_closed {
+                println!(
+                    "    {}",
+                    amber("fail_closed is off: when termaxa cannot run, Hermes runs the call unjudged")
+                );
+            }
+            if cfg!(windows) && !entry.command.contains(['\\', '/']) {
+                println!(
+                    "    {}",
+                    amber("a bare name is looked for in Hermes's own directory before PATH; `termaxa init --hermes` writes the full path")
+                );
+            }
+            if !wiring.post {
+                println!(
+                    "    {}",
+                    dim("no post_tool_call entry: nothing is kept of what ran")
+                );
+            }
+        }
+    }
+    let profile = match &home.profile {
+        paths::HermesProfile::Default => "profile `default`".to_string(),
+        paths::HermesProfile::Active(name) => format!("profile `{name}` (the active one)"),
+        paths::HermesProfile::FromEnv => "the profile HERMES_HOME names".to_string(),
+    };
+    println!("    {}", dim(&format!("{profile}: {}", home.dir.display())));
+    if wiring.entry.is_none() {
+        return true;
+    }
+
+    if let (Ok(root), Ok(state_dir)) = (paths::hermes_root(), paths::hermes_state_dir()) {
+        let policy = root.join(".termaxa").join("policy.yaml");
+        if policy.is_file() {
+            println!("    {}", dim(&format!("judged by {}", policy.display())));
+            let names = PolicyNames {
+                fix: FIX,
+                shown: "the Hermes policy",
+                indent: "    ",
+            };
+            report_fingerprint(&policy, &state_dir, &names, problems);
+        } else {
+            println!(
+                "    {}",
+                dim("judged by the built-in starter (no policy written for Hermes yet)")
+            );
+        }
+    }
+    true
 }
 
 /// Count audit entries without creating anything.
@@ -665,7 +801,7 @@ fn parse_probe_decision(out: &str) -> Option<String> {
 /// Is this registered command one the probe may execute? First word (quoted
 /// or bare) must have file stem `termaxa` — `termaxa`, `termaxa.exe`, or an
 /// absolute path ending in one.
-fn probe_allowed(cmd: &str) -> bool {
+pub(crate) fn probe_allowed(cmd: &str) -> bool {
     let cmd = cmd.trim();
     let first = match cmd.chars().next() {
         Some(q @ ('\'' | '"')) => cmd[1..].split(q).next().unwrap_or(""),
@@ -739,22 +875,36 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// exits, which is acceptable in a short-lived diagnostic and stated here
 /// rather than hidden.
 fn invoke(cmd: &str, payload: &str, dir: &Path, timeout: std::time::Duration) -> Option<String> {
-    use std::io::Read as _;
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc;
+    use std::process::Command;
 
     #[cfg(not(windows))]
-    let mut command = {
+    let command = {
         let mut c = Command::new("sh");
         c.arg("-c").arg(cmd);
         c
     };
     #[cfg(windows)]
-    let mut command = {
+    let command = {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(cmd);
         c
     };
+    run_probe(command, payload, dir, timeout)
+}
+
+/// Run a probe's command with `payload` on stdin and return what it printed,
+/// or `None` if it could not be started or did not finish in `timeout`.
+/// Hermes starts a hook without a shell (`hermes::probe`); every other
+/// agent through one (`invoke`).
+pub(crate) fn run_probe(
+    mut command: std::process::Command,
+    payload: &str,
+    dir: &Path,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    use std::sync::mpsc;
 
     let mut child = command
         .current_dir(dir)
@@ -821,6 +971,8 @@ fn write_ignoring_sigpipe(mut stdin: impl std::io::Write, payload: &[u8]) -> std
 mod tests {
     use super::*;
     use crate::testutil::TempTree;
+
+    const PROJECT: &PolicyNames = &PROJECT_POLICY;
 
     /// The observed Windows failure, encoded: a registration that looks
     /// perfect and points at a command that cannot run. The old substring
@@ -1108,7 +1260,7 @@ mod tests {
         //    diagnostic that records the value it checks always reports
         //    "unchanged".
         let mut problems: Vec<String> = Vec::new();
-        report_fingerprint(&policy, &state, &mut problems);
+        report_fingerprint(&policy, &state, PROJECT, &mut problems);
         assert_eq!(problems.len(), 1, "a missing baseline is a real gap");
         assert!(
             !crate::fingerprint::baseline_file(&state).exists(),
@@ -1119,7 +1271,7 @@ mod tests {
         let hash = crate::fingerprint::of_file(&policy).unwrap();
         crate::fingerprint::record(&state, &hash).unwrap();
         let mut problems: Vec<String> = Vec::new();
-        report_fingerprint(&policy, &state, &mut problems);
+        report_fingerprint(&policy, &state, PROJECT, &mut problems);
         assert!(problems.is_empty(), "unchanged policy is not a problem");
 
         // 3. The edit from the review. The write-tool matcher denies this one
@@ -1127,7 +1279,7 @@ mod tests {
         //    what catches the change that got through.
         std::fs::write(&policy, "version: 1\ndefault: allow\nrules: []\n").unwrap();
         let mut problems: Vec<String> = Vec::new();
-        report_fingerprint(&policy, &state, &mut problems);
+        report_fingerprint(&policy, &state, PROJECT, &mut problems);
         assert_eq!(problems.len(), 1);
         assert!(
             problems[0].contains("changed"),
