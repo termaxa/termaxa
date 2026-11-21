@@ -839,7 +839,15 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
         );
         crate::notify::maybe_send(&policy, "ask", &subject, &decision.reason, "hook");
         return Outcome {
-            rendered: Some(render_response(w.dialect, "ask", &reason_shown)),
+            rendered: Some(if w.dialect == Dialect::Hermes {
+                hermes_ask(
+                    &subject,
+                    &reason_shown,
+                    &hermes_rule_key(&w.tool, &w.cwd, &subject),
+                )
+            } else {
+                render_response(w.dialect, "ask", &reason_shown)
+            }),
             exit_code: 0,
             audit_seq: None,
         };
@@ -1169,6 +1177,71 @@ pub fn render_response(dialect: Dialect, permission: &str, reason: &str) -> Stri
     }
 }
 
+/// Hermes's answer to an ask, naming the call. Hermes's approval prompt
+/// shows a hook's ask under a label of its own where the call would be,
+/// `<terminal> (plugin approval rule)`, with the hook's `message` beneath it
+/// (measured Nov 22, 2026, Hermes 0.23.3 on Windows), so the message says
+/// first what the call is. And Hermes keeps a person's "Allow for this
+/// session" and "Add to permanent allowlist" under the ask's `rule_key`, or
+/// under the tool's name when there is none (its `hermes_cli/plugins.py`):
+/// one such answer to an ask on `terminal` let every later ask on `terminal`
+/// run with no prompt, measured the same night. The key names this call
+/// alone (`hermes_rule_key`).
+fn hermes_ask(subject: &str, reason: &str, rule_key: &str) -> String {
+    let rest = reason.strip_prefix("[termaxa] ").unwrap_or(reason);
+    let rest = rest.strip_prefix("asks: ").unwrap_or(rest);
+    json!({
+        "action": "approve",
+        "message": format!("[termaxa] asks: {} — {rest}", shown_call(subject)),
+        "rule_key": rule_key,
+    })
+    .to_string()
+}
+
+/// The key Hermes keeps a person's standing answer to an ask under: the
+/// tool, the directory the call runs in (empty where nothing says) and the
+/// command or the paths it names, hashed. A standing answer then allows
+/// that call again, and nothing else.
+fn hermes_rule_key(tool: &str, dir: &str, subject: &str) -> String {
+    let digest = crate::fingerprint::sha256_hex(format!("{tool}\n{dir}\n{subject}").as_bytes());
+    format!("termaxa:{}", &digest[..16])
+}
+
+/// A call as a person reads it in Hermes's approval prompt: on one line,
+/// each run of whitespace as one space, a control character or one that
+/// reorders text shown as `?`, and cut at 120 characters with `…`. The
+/// record keeps the call whole.
+fn shown_call(subject: &str) -> String {
+    const MAX: usize = 120;
+    let mut out = String::new();
+    let mut count = 0;
+    let mut gap = false;
+    for c in subject.trim().chars() {
+        if c.is_whitespace() {
+            gap = true;
+            continue;
+        }
+        for shown in [gap.then_some(' '), Some(c)].into_iter().flatten() {
+            if count == MAX {
+                out.push('…');
+                return out;
+            }
+            let reorders = matches!(
+                shown,
+                '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            );
+            out.push(if shown.is_control() || reorders {
+                '?'
+            } else {
+                shown
+            });
+            count += 1;
+        }
+        gap = false;
+    }
+    out
+}
+
 /// Run as a Claude Code PreToolUse hook.
 ///
 /// Reads the hook event JSON from stdin and prints a JSON decision:
@@ -1399,6 +1472,7 @@ fn hermes_unreadable(raw: &str) -> Option<Outcome> {
     .collect();
     let reason = "[termaxa] asks: execute_code runs Python the gate cannot read, as a script \
                   file would; each terminal call it makes is judged on its own";
+    let answer = hermes_ask(&subject, reason, &hermes_rule_key("execute_code", "", code));
     let paths = crate::paths::resolve_hermes().ok();
     let observed = paths
         .as_ref()
@@ -1442,11 +1516,7 @@ fn hermes_unreadable(raw: &str) -> Option<Outcome> {
         }
     }
     Some(Outcome {
-        rendered: if observed {
-            None
-        } else {
-            Some(render_response(Dialect::Hermes, "ask", reason))
-        },
+        rendered: if observed { None } else { Some(answer) },
         exit_code: 0,
         audit_seq: None,
     })
@@ -2523,7 +2593,15 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // A probe must always answer — `doctor` reads the decision to prove the hook
     // can run at all, and silence is indistinguishable from a dead hook.
     let rendered = if !silent || is_probe {
-        Some(render_response(input.dialect, permission, &reason))
+        Some(if input.dialect == Dialect::Hermes && permission == "ask" {
+            hermes_ask(
+                &command,
+                &reason,
+                &hermes_rule_key("terminal", &input.cwd, &command),
+            )
+        } else {
+            render_response(input.dialect, permission, &reason)
+        })
     } else {
         None
     };
@@ -4347,6 +4425,73 @@ mod tests {
         assert_eq!(receipts.len(), 1, "{record}");
         assert_eq!(receipts[0]["command"], "git status");
         assert_eq!(receipts[0]["decision"], "executed");
+    }
+
+    #[test]
+    fn a_hermes_ask_names_its_call_and_keys_it_alone() {
+        let ask = |subject: &str, dir: &str| -> serde_json::Value {
+            let reason = "[termaxa] no rule matched; policy default is `ask`";
+            serde_json::from_str(&hermes_ask(
+                subject,
+                reason,
+                &hermes_rule_key("terminal", dir, subject),
+            ))
+            .unwrap()
+        };
+        let a = ask("hostname", "/proj");
+        assert_eq!(a["action"], "approve");
+        assert_eq!(
+            a["message"],
+            "[termaxa] asks: hostname — no rule matched; policy default is `ask`"
+        );
+        let key = a["rule_key"].as_str().unwrap().to_string();
+        assert!(
+            key.starts_with("termaxa:") && key.len() == "termaxa:".len() + 16,
+            "{key}"
+        );
+        assert!(
+            key["termaxa:".len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "{key}"
+        );
+        // The same call is the same key; another command, the same command
+        // somewhere else, or another tool is another.
+        assert_eq!(ask("hostname", "/proj")["rule_key"], key.as_str());
+        assert_ne!(ask("whoami", "/proj")["rule_key"], key.as_str());
+        assert_ne!(ask("hostname", "")["rule_key"], key.as_str());
+        assert_ne!(hermes_rule_key("write_file", "/proj", "hostname"), key);
+        // A reason that already says it asks is not said twice.
+        let code: serde_json::Value = serde_json::from_str(&hermes_ask(
+            "execute_code: import os",
+            "[termaxa] asks: execute_code runs Python the gate cannot read",
+            "k",
+        ))
+        .unwrap();
+        assert_eq!(
+            code["message"],
+            "[termaxa] asks: execute_code: import os — execute_code runs Python the gate cannot read"
+        );
+    }
+
+    #[test]
+    fn a_call_is_shown_on_one_line_as_written() {
+        assert_eq!(shown_call("  git   status\n\t-s "), "git status -s");
+        // Characters that reorder or hide text are shown, not obeyed.
+        assert_eq!(
+            shown_call("echo \u{202e}txt.exe\u{202c} \u{1b}[2Jok \u{2066}x\u{2069}"),
+            "echo ?txt.exe? ?[2Jok ?x?"
+        );
+        // Long: cut at 120 characters, the cut marked.
+        let long = format!("rm -r {}", "a/".repeat(100));
+        let shown = shown_call(&long);
+        assert_eq!(shown.chars().count(), 121);
+        assert!(
+            shown.starts_with("rm -r a/a/") && shown.ends_with('…'),
+            "{shown}"
+        );
+        assert_eq!(shown_call(&"x".repeat(120)), "x".repeat(120));
+        assert_eq!(shown_call(""), "");
     }
 
     #[test]

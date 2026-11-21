@@ -18,11 +18,18 @@
 //!   directory unknown, and nothing is previewed or copied.
 //! - `execute_code` runs Python the gate cannot read: an ask.
 //!
-//! And one measured on Nov 22, 2026, in a live Hermes 0.23.3 session on
-//! Windows, and read in its code: Hermes sends `post_tool_call` after every
-//! call, the ones a hook blocked included, with what became of the call in
-//! `extra.status` (`ok`, `error`, `blocked`, `cancelled`) and the tool's
-//! `result`. Only a call that ran gets a receipt.
+//! And two measured on Nov 22, 2026, in a live Hermes 0.23.3 session on
+//! Windows, and read in its code:
+//!
+//! - Hermes sends `post_tool_call` after every call, the ones a hook blocked
+//!   included, with what became of the call in `extra.status` (`ok`,
+//!   `error`, `blocked`, `cancelled`) and the tool's `result`. Only a call
+//!   that ran gets a receipt.
+//! - Hermes's approval prompt shows a hook's ask as `<terminal> (plugin
+//!   approval rule)` with the hook's `message` under it, and keeps a person's
+//!   "Allow for this session" or "Add to permanent allowlist" under the ask's
+//!   `rule_key`, or under the tool's name when there is none. An ask names its
+//!   call, and its key names that call alone.
 //!
 //! No `sh` is spawned, so this binary runs on every platform.
 
@@ -526,4 +533,113 @@ fn refused_hermes_asks_add_up_to_a_trip() {
         .map(|(_, e)| format!("{} {}", e["decision"], e["command"]))
         .collect();
     assert_eq!(receipts, ["\"executed\" \"cargo test\""]);
+}
+
+/// An ask names the call it is about, since Hermes's approval prompt shows
+/// its own label where the call would be, and carries a key for that call
+/// alone, since Hermes keeps "Allow for this session" and "Add to permanent
+/// allowlist" under it: without one, under the tool's name, one such answer
+/// let every later ask on the tool run with no prompt (measured Nov 22,
+/// 2026, Hermes 0.23.3 on Windows).
+#[test]
+fn a_hermes_ask_names_its_call_and_keys_it_alone() {
+    let s = scene("asks");
+    let workdir = s.proj.display().to_string();
+    let ask = |tool: &str, input: serde_json::Value| -> serde_json::Value {
+        let out = s.hook(
+            &["hook", "--hermes"],
+            &s.payload("pre_tool_call", tool, input),
+        );
+        assert_eq!(out.code, 0, "{}", out.stdout);
+        let v = answer(&out);
+        assert_eq!(v["action"], "approve", "{}", out.stdout);
+        v
+    };
+    let hostname = ask(
+        "terminal",
+        json!({ "command": "hostname", "workdir": workdir }),
+    );
+    let message = hostname["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("[termaxa] asks: hostname — no rule matched"),
+        "{message}"
+    );
+    let key = hostname["rule_key"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(key.starts_with("termaxa:"), "{key}");
+
+    // The same call again is the same key: a standing answer covers it.
+    let again = ask(
+        "terminal",
+        json!({ "command": "hostname", "workdir": workdir }),
+    );
+    assert_eq!(again["rule_key"], key.as_str());
+    // Any other call is another key: another command, the same command
+    // where nothing says where it runs, Python.
+    let whoami = ask(
+        "terminal",
+        json!({ "command": "whoami", "workdir": workdir }),
+    );
+    assert!(whoami["message"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("[termaxa] asks: whoami — "));
+    let nowhere = ask("terminal", json!({ "command": "hostname" }));
+    let code = ask(
+        "execute_code",
+        json!({ "code": "import os\nprint(os.getcwd())" }),
+    );
+    assert!(
+        code["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("[termaxa] asks: execute_code: import os print(os.getcwd()) — "),
+        "{}",
+        code["message"]
+    );
+    let keys: std::collections::BTreeSet<String> = [&hostname, &whoami, &nowhere, &code]
+        .iter()
+        .map(|v| v["rule_key"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(keys.len(), 4, "{keys:?}");
+}
+
+/// A write a policy asks about names its path, and keys it alone.
+#[test]
+fn a_hermes_write_ask_names_its_path() {
+    let s = scene("write-ask");
+    let dir = s.home.join("hermes").join(".termaxa");
+    std::fs::create_dir_all(&dir).expect("policy dir");
+    std::fs::write(
+        dir.join("policy.yaml"),
+        "version: 1\ndefault: allow\nrules:\n  - match_path: \"*/notes/*\"\n    action: ask\n    reason: \"notes are read before they change\"\n",
+    )
+    .expect("policy file");
+    let path = s.proj.join("notes").join("plan.md").display().to_string();
+    let out = s.hook(
+        &["hook", "--hermes"],
+        &s.payload(
+            "pre_tool_call",
+            "write_file",
+            json!({ "path": path, "content": "x\n" }),
+        ),
+    );
+    assert_eq!(out.code, 0, "{}", out.stdout);
+    let v = answer(&out);
+    assert_eq!(v["action"], "approve", "{}", out.stdout);
+    let message = v["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with(&format!("[termaxa] asks: write_file {path} — ")),
+        "{message}"
+    );
+    assert!(
+        message.contains("notes are read before they change"),
+        "{message}"
+    );
+    assert!(v["rule_key"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("termaxa:"));
 }
