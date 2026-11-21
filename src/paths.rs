@@ -241,6 +241,12 @@ pub fn hermes_home() -> Option<HermesHome> {
     hermes_home_in(&|k| std::env::var_os(k), cfg!(windows))
 }
 
+/// Hermes's platform default home in this process's environment
+/// (`hermes_default_home_in`).
+pub fn hermes_default_home() -> Option<PathBuf> {
+    hermes_default_home_in(&|k| std::env::var_os(k), cfg!(windows))
+}
+
 /// The directories that are Hermes's own and never a project's: the one
 /// `HERMES_HOME` names, the platform default, which holds every profile,
 /// and on Windows `~/.hermes` as well, where Hermes keeps its home on every

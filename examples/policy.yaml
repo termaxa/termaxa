@@ -45,7 +45,7 @@ rules:
   # `termaxa doctor` fingerprints the policy for that case: what was not
   # blocked can at least be noticed.
   #
-  # These first six rules speak about PATHS, not spellings: they fire on a
+  # These first ten rules speak about PATHS, not spellings: they fire on a
   # command that writes to, overwrites or removes one of the gate's own
   # files, whatever the command is called and however the path is spelled,
   # and they fire ahead of every string rule, so no read exception below can
@@ -86,6 +86,28 @@ rules:
   - match_path: "*/.github/hooks/*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  # Hermes Agent: a profile's config.yaml declares its hooks, and its
+  # shell-hooks-allowlist.json approves each one; a hook it has no approval
+  # for, Hermes skips, saying so only in its log. The profile a bare
+  # `hermes` uses keeps both in Hermes's home, `~/.hermes` (on Windows
+  # `%LOCALAPPDATA%\hermes`, and wherever HERMES_HOME points, both read as
+  # `~/.hermes`), and a named profile in `profiles/<name>` inside it.
+  - match_path: "*/.hermes/config.yaml"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.hermes/shell-hooks-allowlist.json"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.hermes/profiles/*/config.yaml"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.hermes/profiles/*/shell-hooks-allowlist.json"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
     floor: true
 
   # ---- destruction by overwrite (v0.15) ----
@@ -285,6 +307,16 @@ rules:
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
     floor: true
     except_reads: true
+  - match: "*.hermes*config.yaml*"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  - match: "*.hermes*hooks-allowlist*"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
   # Claude Code turns a plugin off, or removes it, on a command as well as in
   # its own menu: `claude plugin disable`, `claude plugin uninstall` (or
   # `remove`), and `claude plugin marketplace remove` (or `rm`) for the
@@ -319,6 +351,48 @@ rules:
   - match: "*claude* plugin* rm *"
     action: deny
     reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  # Hermes withdraws a hook's approval on a command, `hermes hooks revoke`
+  # (or `remove`, or `rm`), and skips the hook from then on; and `hermes
+  # config set`, `unset` and `edit` rewrite the config.yaml its hooks are
+  # declared in. Run by an agent, either can turn this gate off. A `grep`
+  # of the command, or a commit message that names it, is ordinary work
+  # (`except_reads`); `hermes hooks list`, `hermes config get` and the rest
+  # are not caught.
+  - match: "*hermes* hooks* revoke *"
+    action: deny
+    reason: "Revoking a Hermes hook's approval turns the hook off, and this gate is one. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* hooks* remove *"
+    action: deny
+    reason: "Revoking a Hermes hook's approval turns the hook off, and this gate is one. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* hooks* rm *"
+    action: deny
+    reason: "Revoking a Hermes hook's approval turns the hook off, and this gate is one. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* set *"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* unset *"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* edit"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* edit *"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
     floor: true
     except_reads: true
   # Pointing git's hook directory anywhere runs whatever is there on the

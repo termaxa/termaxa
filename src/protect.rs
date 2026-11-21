@@ -21,7 +21,9 @@
 //!   fingerprint baseline under `$TERMAXA_HOME`;
 //! - **the agent hook configuration** — the files that decide whether the hook
 //!   runs at all, one per dialect, and Claude Code's `.claude/plugins/`, where
-//!   a plugin's hooks are installed (v0.23.0);
+//!   a plugin's hooks are installed (v0.23.0); for Hermes Agent, two: a
+//!   profile's `config.yaml`, which declares its hooks, and its
+//!   `shell-hooks-allowlist.json`, without whose approval Hermes skips a hook;
 //! - **the record**, which lives under `.termaxa` and so is covered by the
 //!   first.
 //!
@@ -32,10 +34,12 @@
 //! refusing a write to a strangely-cased `.TERMAXA` is one puzzled agent, and
 //! the cost of missing one is the gate.
 //!
-//! A directory is known by its name, and three of these directories can be
+//! A directory is known by its name, and four of these directories can be
 //! given another: `CLAUDE_CONFIG_DIR` moves Claude Code's `~/.claude`,
-//! `CODEX_HOME` moves Codex's `~/.codex`, and `TERMAXA_HOME` moves the gate's
-//! own `~/.termaxa`. Until v0.22.0 nothing here followed them, so a settings
+//! `CODEX_HOME` moves Codex's `~/.codex`, `TERMAXA_HOME` moves the gate's
+//! own `~/.termaxa`, and `HERMES_HOME` moves Hermes's `~/.hermes`, whose
+//! default on Windows is `%LOCALAPPDATA%\hermes` and is read as `~/.hermes`
+//! too (`moved_paths`). Until v0.22.0 nothing here followed them, so a settings
 //! file under `~/.claude-work`, or a record under a state directory with a
 //! name of its own, was a path this module did not recognise, and the path
 //! rules of the starter did not either. A path inside a directory one of
@@ -70,6 +74,14 @@ const PLUGINS: Protected = Protected {
     what: "agent-hook-config",
     reason: "Claude Code's plugin files decide which hooks run, this gate's among them. \
              Change them yourself if the change is intended.",
+};
+
+/// Hermes Agent's hook configuration (`classify_named`).
+const HERMES: Protected = Protected {
+    what: "agent-hook-config",
+    reason:
+        "Hermes's config.yaml declares its hooks and its shell-hooks-allowlist.json approves them; \
+             changing either can turn this gate off. Edit them yourself if the change is intended.",
 };
 
 /// Is `path` one of the gate's own files?
@@ -116,14 +128,33 @@ fn is_absolute(path: &str) -> bool {
 /// when the variable is unset. The names are the ones every guard is
 /// written against: this module's, the starter's path rules, a policy
 /// somebody wrote.
-const MOVED: [(&str, &str); 3] = [
+const MOVED: [(&str, &str); 4] = [
     ("CLAUDE_CONFIG_DIR", ".claude"),
     ("CODEX_HOME", ".codex"),
     ("TERMAXA_HOME", ".termaxa"),
+    ("HERMES_HOME", ".hermes"),
 ];
 
+/// Every directory read under a default name, with that name: where each
+/// of the variables above points, and Hermes's default home wherever it is
+/// not called `.hermes`, which no variable names: `%LOCALAPPDATA%\hermes` on
+/// Windows, and a home `HERMES_DATA_DIR_SUFFIX` renames
+/// (`paths::hermes_default_home`).
+fn moved_paths() -> Vec<(std::path::PathBuf, &'static str)> {
+    let mut out: Vec<(std::path::PathBuf, &'static str)> = MOVED
+        .iter()
+        .filter_map(|(variable, name)| Some((moved_to(variable)?, *name)))
+        .collect();
+    if let Some(home) = crate::paths::hermes_default_home() {
+        if home.file_name().is_some_and(|n| n != ".hermes") {
+            out.push((home, ".hermes"));
+        }
+    }
+    out
+}
+
 /// The default name of the directory `variable` moves, if it is one of the
-/// three: `$CLAUDE_CONFIG_DIR/settings.json` names Claude Code's settings
+/// four: `$CLAUDE_CONFIG_DIR/settings.json` names Claude Code's settings
 /// whatever the variable holds, and is read as `.claude/settings.json` by
 /// the readers that cannot expand it (`delete::readable_end`).
 pub(crate) fn moved_name(variable: &str) -> Option<&'static str> {
@@ -183,7 +214,7 @@ fn variable_at(chars: &[char], at: usize) -> Option<(String, usize)> {
 
 /// `raw` with the variable it starts with put in: `$CLAUDE_CONFIG_DIR/x`,
 /// `${CODEX_HOME}/hooks.json`, `%TERMAXA_HOME%\\projects`, `$env:CODEX_HOME\\x`,
-/// for the three variables above and only where this process has a value for
+/// for the four variables above and only where this process has a value for
 /// the one named. The shell the command runs in has the same value, unless
 /// the line itself assigns another, and then what it writes is not the
 /// directory the tool reads. `None` for any other path, and for one of
@@ -228,10 +259,7 @@ fn moved_dirs() -> std::borrow::Cow<'static, [(Vec<String>, &'static str)]> {
 
 fn read_moved_dirs() -> Vec<(Vec<String>, &'static str)> {
     let mut out = Vec::new();
-    for (variable, name) in MOVED {
-        let Some(dir) = moved_to(variable) else {
-            continue;
-        };
+    for (dir, name) in moved_paths() {
         let seg = segments(&dir.to_string_lossy());
         if !seg.is_empty() {
             out.push((seg, name));
@@ -319,8 +347,8 @@ pub(crate) fn end_under_default_name(end: &[String]) -> Option<Vec<String>> {
 }
 
 /// `command` with every moved directory spelled the way the string rules
-/// were written to read it: `~/.claude`, `~/.codex`, `~/.termaxa`. `None`
-/// when the command names none of them.
+/// were written to read it: `~/.claude`, `~/.codex`, `~/.termaxa`,
+/// `~/.hermes`. `None` when the command names none of them.
 ///
 /// A string rule is a belt for the commands whose grammar the gate does not
 /// model (`truncate`, an editor, `python -c`): `*.claude*settings*` refuses a
@@ -364,10 +392,7 @@ pub(crate) fn spelled_by_default(command: &str) -> Option<String> {
         .map(|(v, name)| (v.to_ascii_lowercase(), *name))
         .collect();
     let mut moved: Vec<(String, &'static str)> = Vec::new();
-    for (variable, name) in MOVED {
-        let Some(dir) = moved_to(variable) else {
-            continue;
-        };
+    for (dir, name) in moved_paths() {
         let text = plain(&dir.to_string_lossy());
         if text.is_empty() {
             continue;
@@ -531,6 +556,21 @@ fn classify_named(seg: &[String]) -> Option<Protected> {
         let grandparent = seg.get(seg.len().checked_sub(3)?)?.as_str();
         if grandparent == ".github" {
             return Some(HOOK_CONFIG);
+        }
+    }
+
+    // Hermes Agent: a profile's `config.yaml` declares its hooks, and its
+    // `shell-hooks-allowlist.json` approves each one; a hook it has no
+    // approval for, Hermes skips, saying so only in its log. The profile a
+    // bare `hermes` uses keeps both in Hermes's home, read as `.hermes`
+    // wherever it is (`moved_paths`), and a named profile in
+    // `profiles/<name>` inside it. Nothing else in that home is held: its
+    // skills, memories and sessions are Hermes's own work.
+    if file == "config.yaml" || file == "shell-hooks-allowlist.json" {
+        let n = seg.len();
+        let profile = n >= 4 && seg[n - 3] == "profiles" && seg[n - 4] == ".hermes";
+        if parent == ".hermes" || profile {
+            return Some(HERMES);
         }
     }
 
@@ -1065,5 +1105,78 @@ mod tests {
             );
             assert_eq!(spelled_by_default("touch a~/tmx-moved-claude/x"), None);
         }
+    }
+
+    /// Hermes Agent runs a hook its profile's `config.yaml` declares and its
+    /// `shell-hooks-allowlist.json` approves: both files, in Hermes's home
+    /// and in a named profile's, on either separator. The rest of that
+    /// home (skills, memories, sessions) is Hermes's own work, and a file
+    /// of the same name anywhere else is ordinary.
+    #[test]
+    fn hermes_hook_configuration_is_refused_and_nothing_else_of_its_home() {
+        for path in [
+            "/home/u/.hermes/config.yaml",
+            "/home/u/.hermes/shell-hooks-allowlist.json",
+            "/home/u/.hermes/profiles/work/config.yaml",
+            "/home/u/.hermes/profiles/work/shell-hooks-allowlist.json",
+            "C:\\Users\\Dev\\.hermes\\config.yaml",
+            "C:\\Users\\Dev\\.Hermes\\Shell-Hooks-Allowlist.json",
+        ] {
+            assert_eq!(what("/repo", path), Some("agent-hook-config"), "{path}");
+        }
+        assert_eq!(
+            what("/home/u", ".hermes/config.yaml"),
+            Some("agent-hook-config")
+        );
+        let reason = classify("/repo", "/home/u/.hermes/config.yaml")
+            .unwrap()
+            .reason;
+        assert!(reason.contains("shell-hooks-allowlist.json"), "{reason}");
+        for path in [
+            "/home/u/.hermes/skills/notes/SKILL.md",
+            "/home/u/.hermes/memories/MEMORY.md",
+            "/home/u/.hermes/.env",
+            "/home/u/.hermes/profiles/work/skills/config.yaml.md",
+            "/repo/config.yaml",
+            "/repo/hermes/config.yaml",
+            "/repo/.hermes-notes/config.yaml",
+            "/repo/profiles/work/config.yaml",
+        ] {
+            assert_eq!(what("/repo", path), None, "{path}");
+        }
+    }
+
+    /// `HERMES_HOME` moves Hermes's home like the other three variables
+    /// move theirs, and a home `HERMES_DATA_DIR_SUFFIX` renames is Hermes's
+    /// default all the same (on Windows the default is
+    /// `%LOCALAPPDATA%\\hermes`, read the same way): each is read as
+    /// `~/.hermes`.
+    #[test]
+    fn hermes_home_is_guarded_wherever_hermes_keeps_it() {
+        let mut env = crate::testutil::TestEnv::new("protect-hermes");
+        let moved = env.root().join("agents").join("hermes-home");
+        let at = |p: std::path::PathBuf| what("/repo", &p.display().to_string());
+        assert_eq!(at(moved.join("config.yaml")), None);
+
+        env.set_var("HERMES_HOME", &moved);
+        assert_eq!(at(moved.join("config.yaml")), Some("agent-hook-config"));
+        assert_eq!(
+            at(moved
+                .join("profiles")
+                .join("ci")
+                .join("shell-hooks-allowlist.json")),
+            Some("agent-hook-config")
+        );
+        assert_eq!(at(moved.join("skills").join("SKILL.md")), None);
+        assert_eq!(
+            expand_moved("$HERMES_HOME/config.yaml"),
+            Some(format!("{}/config.yaml", moved.display()))
+        );
+
+        env.set_var("HERMES_DATA_DIR_SUFFIX", "-tmxtest");
+        let renamed = crate::paths::hermes_default_home().expect("a home directory");
+        assert!(renamed.to_string_lossy().ends_with("hermes-tmxtest"));
+        assert_eq!(at(renamed.join("config.yaml")), Some("agent-hook-config"));
+        assert_eq!(at(renamed.join("memories").join("MEMORY.md")), None);
     }
 }

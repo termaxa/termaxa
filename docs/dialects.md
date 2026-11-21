@@ -229,6 +229,17 @@ call, and the policy's fingerprint. `hermes hooks list` shows the hooks as
 Hermes sees them; `hermes hooks doctor` looks for a bare `termaxa` as a file
 in Hermes's own directory, so it reports one that PATH finds as missing.
 
+**The wiring holds.** The floor holds Hermes's hook configuration as it holds
+every other agent's. A profile's `config.yaml` and `shell-hooks-allowlist.json`,
+in Hermes's home (`~/.hermes`, `%LOCALAPPDATA%\hermes` on Windows, or wherever
+`HERMES_HOME` points) and in a named profile's (`profiles/<name>` inside it),
+are not written by `write_file` or `patch`, nor by a command, in any mode; and
+`hermes hooks revoke` (or `remove`, or `rm`) and `hermes config set`, `unset`
+and `edit` are refused. Reading those files is ordinary work, and so is
+writing the rest of the home: its skills, memories and sessions are Hermes's
+own. A profile switch (`hermes profile use`) is asked like any command no rule
+names; the profile it switches to runs the hooks it declares, and no others.
+
 Not covered: a deferred tool reached through `tool_call` (an MCP server's),
 the Python inside `execute_code`, and a terminal backend other than `local`
 (Docker, SSH, Modal and the rest run the command elsewhere, where a preview or
