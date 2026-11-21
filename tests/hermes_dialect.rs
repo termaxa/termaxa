@@ -18,6 +18,12 @@
 //!   directory unknown, and nothing is previewed or copied.
 //! - `execute_code` runs Python the gate cannot read: an ask.
 //!
+//! And one measured on Nov 22, 2026, in a live Hermes 0.23.3 session on
+//! Windows, and read in its code: Hermes sends `post_tool_call` after every
+//! call, the ones a hook blocked included, with what became of the call in
+//! `extra.status` (`ok`, `error`, `blocked`, `cancelled`) and the tool's
+//! `result`. Only a call that ran gets a receipt.
+//!
 //! No `sh` is spawned, so this binary runs on every platform.
 
 use serde_json::json;
@@ -113,6 +119,39 @@ impl Scene {
             }
         })
         .to_string()
+    }
+
+    /// A `post_tool_call` in Hermes 0.23.3's shape: the call's ids, and in
+    /// `extra` what became of the call, its `status` and the tool's `result`
+    /// (JSON text, as Hermes sends it), with the error fields a block sets.
+    fn post(
+        &self,
+        tool: &str,
+        input: serde_json::Value,
+        status: &str,
+        result: serde_json::Value,
+    ) -> String {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&self.payload("post_tool_call", tool, input)).expect("JSON");
+        let error = result
+            .get("error")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let extra = &mut v["extra"];
+        extra["result"] = json!(result.to_string());
+        extra["status"] = json!(status);
+        extra["error_type"] = if status == "blocked" {
+            json!("plugin_block")
+        } else {
+            json!(null)
+        };
+        extra["error_message"] = if status == "blocked" {
+            error
+        } else {
+            json!(null)
+        };
+        extra["duration_ms"] = json!(12);
+        v.to_string()
     }
 
     fn hook(&self, args: &[&str], payload: &str) -> Out {
@@ -212,10 +251,11 @@ fn a_hermes_call_is_judged_by_one_policy_and_answered_in_hermes_shape() {
     assert_eq!(answer(&out)["decision"], "block");
 
     // A receipt says nothing.
-    let receipt = s.payload(
-        "post_tool_call",
+    let receipt = s.post(
         "terminal",
         json!({ "command": "git status", "workdir": workdir }),
+        "ok",
+        json!({ "output": "", "exit_code": 0, "error": null }),
     );
     let out = s.hook(&["hook", "--hermes"], &receipt);
     assert_eq!((out.code, out.stdout.trim()), (0, ""));
@@ -401,4 +441,89 @@ fn a_hermes_session_cannot_unhook_the_gate() {
         let out = s.hook(&["hook", "--hermes"], call);
         assert_eq!((out.code, out.stdout.trim()), (0, ""), "{call}");
     }
+}
+
+/// A call that did not run gets no receipt. Hermes reports every call
+/// after it, a call a hook blocked with `status: "blocked"`: termaxa's own
+/// refusals, and the asks a person turned down at Hermes's approval gate.
+/// A receipt after an ask reads as that person's yes to the circuit breaker
+/// (`intent::recent_intent_count`), so asks refused one after another add up
+/// to a trip, as they do for every other agent. A call that ran keeps its
+/// receipt.
+#[test]
+fn refused_hermes_asks_add_up_to_a_trip() {
+    let s = scene("refused");
+    std::fs::create_dir_all(s.proj.join("build")).expect("build dir");
+    std::fs::write(s.proj.join("build").join("out.o"), "obj").expect("build file");
+    let workdir = s.proj.display().to_string();
+    let attempts = ["rm -r build/", "rm -r ./build", "rm -r build"];
+    for (i, command) in attempts.iter().enumerate() {
+        let call = json!({ "command": command, "workdir": workdir });
+        let out = s.hook(
+            &["hook", "--hermes"],
+            &s.payload("pre_tool_call", "terminal", call.clone()),
+        );
+        let v = answer(&out);
+        if i < 2 {
+            assert_eq!(v["action"], "approve", "{command}: {}", out.stdout);
+            // Turned down at Hermes's approval gate, and reported.
+            let refused = json!({
+                "error": "BLOCKED: User denied this potentially dangerous action (matched '[termaxa] asks'). Do NOT retry."
+            });
+            let out = s.hook(
+                &["hook", "--hermes"],
+                &s.post("terminal", call, "blocked", refused),
+            );
+            assert_eq!((out.code, out.stdout.trim()), (0, ""), "{command}");
+        } else {
+            assert_eq!(out.code, 2, "{command}: {}", out.stdout);
+            assert_eq!(v["decision"], "block", "{command}");
+            assert!(
+                v["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("circuit breaker"),
+                "{command}: {}",
+                v["reason"]
+            );
+        }
+    }
+    assert!(s.proj.join("build").join("out.o").exists());
+
+    // termaxa's own refusal, reported back: no receipt either.
+    let rm = json!({ "command": "rm -rf src", "workdir": workdir });
+    let out = s.hook(
+        &["hook", "--hermes"],
+        &s.payload("pre_tool_call", "terminal", rm.clone()),
+    );
+    assert_eq!(out.code, 2, "{}", out.stdout);
+    let reason = answer(&out)["reason"].clone();
+    s.hook(
+        &["hook", "--hermes"],
+        &s.post("terminal", rm, "blocked", json!({ "error": reason })),
+    );
+    assert!(
+        s.record().iter().all(|(_, e)| e["source"] != "post"),
+        "{:?}",
+        s.record()
+    );
+
+    // A command that ran keeps its receipt, a failed one included.
+    let ran = json!({ "command": "cargo test", "workdir": workdir });
+    s.hook(
+        &["hook", "--hermes"],
+        &s.post(
+            "terminal",
+            ran,
+            "error",
+            json!({ "output": "1 failed", "exit_code": 101, "error": null }),
+        ),
+    );
+    let receipts: Vec<String> = s
+        .record()
+        .iter()
+        .filter(|(_, e)| e["source"] == "post")
+        .map(|(_, e)| format!("{} {}", e["decision"], e["command"]))
+        .collect();
+    assert_eq!(receipts, ["\"executed\" \"cargo test\""]);
 }
