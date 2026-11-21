@@ -328,3 +328,77 @@ fn a_path_given_in_full_is_previewed_and_copied_where_the_directory_is_unknown()
     let reason = answer(&out)["reason"].as_str().unwrap().to_string();
     assert!(!reason.contains("files across"), "{reason}");
 }
+
+/// An agent in a Hermes session cannot unhook the gate: a `write_file` or
+/// a `patch` to the profile's `config.yaml` or `shell-hooks-allowlist.json`,
+/// a command that writes either, and `hermes hooks revoke` are refused,
+/// each with its reason. Reading them is not, nor writing the rest of
+/// Hermes's home.
+#[test]
+fn a_hermes_session_cannot_unhook_the_gate() {
+    let s = scene("unhook");
+    let config = s.hermes_home.join("config.yaml").display().to_string();
+    let allowlist = s
+        .hermes_home
+        .join("shell-hooks-allowlist.json")
+        .display()
+        .to_string();
+    let workdir = s.proj.display().to_string();
+    let refused = [
+        s.payload(
+            "pre_tool_call",
+            "write_file",
+            json!({ "path": config, "content": "model: {}\n" }),
+        ),
+        s.payload(
+            "pre_tool_call",
+            "write_file",
+            json!({ "path": allowlist, "content": "{\"approvals\": []}\n" }),
+        ),
+        s.payload(
+            "pre_tool_call",
+            "patch",
+            json!({ "mode": "replace", "path": config, "old_string": "hooks:", "new_string": "off:" }),
+        ),
+        s.payload(
+            "pre_tool_call",
+            "terminal",
+            json!({ "command": format!("echo 'hooks: {{}}' > '{config}'"), "workdir": workdir }),
+        ),
+        s.payload(
+            "pre_tool_call",
+            "terminal",
+            json!({ "command": "hermes hooks revoke 'termaxa hook --hermes'", "workdir": workdir }),
+        ),
+    ];
+    for call in &refused {
+        let out = s.hook(&["hook", "--hermes"], call);
+        assert_eq!(out.code, 2, "{call}: {}", out.stdout);
+        let v = answer(&out);
+        assert_eq!(v["decision"], "block", "{call}");
+        assert!(
+            v["reason"].as_str().unwrap_or_default().contains("Hermes"),
+            "{call}: {}",
+            v["reason"]
+        );
+    }
+    let let_through = [
+        s.payload(
+            "pre_tool_call",
+            "terminal",
+            json!({ "command": format!("cat '{config}'"), "workdir": workdir }),
+        ),
+        s.payload(
+            "pre_tool_call",
+            "write_file",
+            json!({
+                "path": s.hermes_home.join("memories").join("MEMORY.md").display().to_string(),
+                "content": "a note\n"
+            }),
+        ),
+    ];
+    for call in &let_through {
+        let out = s.hook(&["hook", "--hermes"], call);
+        assert_eq!((out.code, out.stdout.trim()), (0, ""), "{call}");
+    }
+}

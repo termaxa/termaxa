@@ -5198,11 +5198,20 @@ mod except_reads_tests {
                 "*.cursor*hooks*",
                 "*.codex*hooks*",
                 "*.github*hooks*",
+                "*.hermes*config.yaml*",
+                "*.hermes*hooks-allowlist*",
                 "*claude* plugin* disable",
                 "*claude* plugin* disable *",
                 "*claude* plugin* uninstall *",
                 "*claude* plugin* remove *",
                 "*claude* plugin* rm *",
+                "*hermes* hooks* revoke *",
+                "*hermes* hooks* remove *",
+                "*hermes* hooks* rm *",
+                "*hermes* config* set *",
+                "*hermes* config* unset *",
+                "*hermes* config* edit",
+                "*hermes* config* edit *",
             ]
         );
         assert!(p
@@ -6538,5 +6547,124 @@ mod opened_tests {
             .judge_command_read_by("tee {1..500}/.env", &ctx, &[])
             .decision;
         assert!(d.held_in_every_mode(), "{}", d.reason);
+    }
+}
+
+#[cfg(test)]
+mod hermes_wiring_tests {
+    use super::*;
+
+    fn here() -> crate::resolve::EvalContext {
+        crate::resolve::EvalContext::at(std::path::Path::new("."))
+    }
+
+    /// Hermes Agent runs a hook as its profile's `config.yaml` declares it
+    /// and its `shell-hooks-allowlist.json` approves it. A command that
+    /// writes, empties, moves or removes either, or a program the gate
+    /// cannot read that names one, is refused in every mode; reading them,
+    /// and writing the rest of Hermes's home, is not.
+    #[test]
+    fn an_agent_cannot_write_hermes_hook_configuration() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let config = "/home/u/.hermes/config.yaml";
+        let allowlist = "/home/u/.hermes/shell-hooks-allowlist.json";
+        let profile = "/home/u/.hermes/profiles/work/config.yaml";
+        for line in [
+            format!("echo 'hooks: {{}}' > {config}"),
+            format!("echo '{{\"approvals\": []}}' > {allowlist}"),
+            format!("echo x &> {profile}"),
+            format!("cp /tmp/config.yaml {config}"),
+            format!("sed -i '/termaxa/d' {config}"),
+            format!("truncate -s 0 {allowlist}"),
+            format!("python3 -c \"open('{config}','w')\""),
+            format!("vim {profile}"),
+            format!("rm {allowlist}"),
+            format!("mv {config} /tmp/c.yaml"),
+            "echo x > ~/.hermes/config.yaml".to_string(),
+            "Set-Content $env:USERPROFILE\\.hermes\\config.yaml 'model: {}'".to_string(),
+        ] {
+            let d = p.evaluate_command(&line, &here());
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert!(p.held_by_floor(&d), "{line}: held in observe mode too");
+        }
+        for line in [
+            format!("cat {config}"),
+            format!("grep -n termaxa {config}"),
+            format!("jq . {allowlist}"),
+            "ls -la /home/u/.hermes".to_string(),
+            "echo note > /home/u/.hermes/memories/MEMORY.md".to_string(),
+            "echo x > config.yaml".to_string(),
+            "echo x > /repo/hermes/config.yaml".to_string(),
+        ] {
+            let d = p.evaluate_command(&line, &here());
+            assert_ne!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+    }
+
+    /// Hermes withdraws a hook's approval on a command, and rewrites the
+    /// file its hooks are declared in on another. Refused in every mode,
+    /// however the program is named or wrapped; everything else `hermes
+    /// hooks` and `hermes config` do, and a mention of these, is not.
+    #[test]
+    fn an_agent_cannot_revoke_or_rewrite_hermes_hooks_by_command() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        for line in [
+            "hermes hooks revoke 'termaxa hook --hermes'",
+            "hermes hooks remove termaxa",
+            "hermes hooks rm \"termaxa hook --hermes\"",
+            "hermes config set hooks.pre_tool_call []",
+            "hermes config unset hooks",
+            "hermes config edit",
+            "hermes -p work config set approvals.single_query_mode approve",
+            "Hermes Hooks Revoke termaxa",
+            "/home/u/.local/bin/hermes hooks revoke termaxa",
+            "uv run hermes hooks revoke termaxa",
+            "bash -c 'hermes hooks revoke termaxa'",
+            "hermes hooks list && hermes hooks rm termaxa",
+        ] {
+            let d = p.evaluate_command(line, &here());
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert!(p.held_by_floor(&d), "{line}: held in observe mode too");
+            assert!(d.reason.contains("Hermes"), "{line}: {}", d.reason);
+        }
+        for line in [
+            "hermes hooks list",
+            "hermes hooks doctor",
+            "hermes hooks test pre_tool_call",
+            "hermes config",
+            "hermes config show",
+            "hermes config get model.default",
+            "hermes config path",
+            "hermes config check",
+            "grep -rn 'hermes hooks revoke' docs",
+            "git commit -m \"docs: hermes config set\"",
+            "echo 'run hermes hooks revoke yourself'",
+        ] {
+            let d = p.evaluate_command(line, &here());
+            assert_ne!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+    }
+
+    /// Where `HERMES_HOME` moves Hermes's home, a write there is refused by
+    /// its path and by the variable that spells it.
+    #[test]
+    fn a_moved_hermes_home_is_held_like_the_default() {
+        let mut env = crate::testutil::TestEnv::new("policy-hermes-home");
+        let moved = env.root().join("hermes-home");
+        env.set_var("HERMES_HOME", &moved);
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        for line in [
+            format!("echo x > {}", moved.join("config.yaml").display()),
+            format!(
+                "echo x > {}",
+                moved.join("shell-hooks-allowlist.json").display()
+            ),
+            "echo x > $HERMES_HOME/config.yaml".to_string(),
+            "python3 -c \"open(os.environ['HERMES_HOME'] + '/config.yaml', 'w')\"".to_string(),
+        ] {
+            let d = p.evaluate_command(&line, &here());
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert!(p.held_by_floor(&d), "{line}: held in observe mode too");
+        }
     }
 }
