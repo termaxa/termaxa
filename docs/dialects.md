@@ -171,6 +171,18 @@ no one can, as in `hermes chat -q`, Hermes refuses the call; and `--yolo` or
 ask is an allow. Every allow is silence. `execute_code` is always an ask: its
 Python cannot be read, as a script file cannot.
 
+**Receipts.** Hermes sends `post_tool_call` after every call, the ones a hook
+blocked included, and says in `extra.status` what became of it: `ok`,
+`error`, `blocked` (a hook refused it, or its approval gate did) or
+`cancelled` (measured Nov 22, 2026, Hermes 0.23.3 on Windows). termaxa keeps
+a receipt only for a call that ran: `ok`, or a terminal call's `error` whose
+result carries the command's own exit code (a refusal inside Hermes's
+terminal tool carries -1 or 126, and a `status` of its own); a `write_file`
+or `patch` that failed wrote nothing. A receipt after an ask is read as a
+person's yes by the circuit breaker and by `termaxa report`, so a refused
+call keeps no receipt, and asks refused one after another add up to a trip,
+as for every other agent.
+
 **The directory.** Hermes 0.23.2 puts the gateway process's own directory in
 `cwd` (its install directory, or `~/.hermes`), not the session's:
 NousResearch/hermes-agent#146570 reports it, and #139555 would fix it. A

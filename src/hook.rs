@@ -1452,6 +1452,59 @@ fn hermes_unreadable(raw: &str) -> Option<Outcome> {
     })
 }
 
+/// A Hermes `post_tool_call` for a call that did not run. Hermes sends the
+/// event after every call, the ones a `pre_tool_call` hook blocked included,
+/// and says in `extra.status` what became of the call (Hermes 0.23.3,
+/// `model_tools.handle_function_call`): `ok`, `error`, `blocked` (a hook
+/// blocked it, termaxa's own refusals and the asks its approval gate turned
+/// down among them) or `cancelled`. A receipt says a command ran, and the
+/// circuit breaker and `report` read one after an ask as a person's yes
+/// (`intent::recent_intent_count`): a receipt for a refused ask would take
+/// that ask out of the breaker's count, and asks refused one after another
+/// would never trip it. So only a call that ran gets one
+/// (`hermes_call_ran`).
+fn hermes_post_unrun(raw: &str) -> bool {
+    let Ok(v) =
+        serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}').trim())
+    else {
+        return false;
+    };
+    hermes_event(v.get("hook_event_name").and_then(|e| e.as_str())) == Some(true)
+        && !hermes_call_ran(&v)
+}
+
+/// Whether a Hermes `post_tool_call` reports a call that ran: its status
+/// is `ok`, or, for `terminal`, `error` with the result of a command that
+/// ran: an exit code of 0 or more and no `status` of the tool's own. Every
+/// refusal inside Hermes's terminal tool (its dangerous-command gate, a
+/// `workdir` that does not exist, a backend that did not start) answers
+/// with a `status` (`blocked`, `pending_approval`, `error`, `disabled`,
+/// `degraded`) and exit code -1 or 126; a command that ran and failed, or
+/// ran out of time (124), answers with neither. A `write_file` or `patch`
+/// that answers `error` wrote nothing (Hermes counts a write as landed only
+/// when its result has no `error`). With no status, nothing says the call
+/// ran.
+fn hermes_call_ran(v: &serde_json::Value) -> bool {
+    let extra = v.get("extra");
+    match extra.and_then(|e| e.get("status")).and_then(|s| s.as_str()) {
+        Some("ok") => true,
+        Some("error") if v.get("tool_name").and_then(|t| t.as_str()) == Some("terminal") => {
+            let result: Option<serde_json::Value> = match extra.and_then(|e| e.get("result")) {
+                Some(serde_json::Value::String(text)) => serde_json::from_str(text).ok(),
+                Some(other) => Some(other.clone()),
+                None => None,
+            };
+            result.is_some_and(|r| {
+                r.get("status").is_none()
+                    && r.get("exit_code")
+                        .and_then(|c| c.as_i64())
+                        .is_some_and(|c| c >= 0)
+            })
+        }
+        _ => false,
+    }
+}
+
 /// The directory a payload says it is about, before any dialect is read:
 /// `cwd`, or the first workspace root, or where this process was started.
 fn payload_dir(json: &serde_json::Value) -> std::path::PathBuf {
@@ -1855,6 +1908,17 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     // nothing below reads it (`hermes_unreadable`).
     if let Some(outcome) = hermes_unreadable(&buf) {
         return Ok(outcome);
+    }
+
+    // Then a Hermes receipt for a call that did not run, which is no
+    // receipt: Hermes reports the calls a hook blocked as well
+    // (`hermes_post_unrun`).
+    if hermes_post_unrun(&buf) {
+        return Ok(Outcome {
+            rendered: None,
+            exit_code: 0,
+            audit_seq: None,
+        });
     }
 
     // A patch before the shell reader (Sep 19, 2026, captured): Codex sends
@@ -4135,6 +4199,154 @@ mod tests {
         // `execute_code` is neither: the hook's own question.
         assert!(parse_input(HERMES_CODE).is_none());
         assert!(parse_file_write(HERMES_CODE).is_none());
+    }
+
+    /// A `post_tool_call` in Hermes 0.23.3's shape: the call's ids, and in
+    /// `extra` what became of the call, its `status` and the tool's
+    /// `result` (JSON text, as Hermes sends it).
+    fn hermes_post(
+        tool: &str,
+        input: serde_json::Value,
+        status: Option<&str>,
+        result: &str,
+    ) -> String {
+        let mut extra = json!({
+            "task_id": "local-2ac6a4c3",
+            "tool_call_id": "call_1",
+            "turn_id": "t",
+            "api_request_id": "a",
+            "conversation_id": "local-2ac6a4c3",
+            "result": result,
+            "duration_ms": 12,
+            "error_type": null,
+            "error_message": null,
+            "middleware_trace": [],
+            "kanban_task_id": ""
+        });
+        if let Some(status) = status {
+            extra["status"] = json!(status);
+        }
+        json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": tool,
+            "tool_input": input,
+            "session_id": "local-2ac6a4c3",
+            "cwd": "/tmp/hermes-cap/hermes-v0.23.3",
+            "profile": "default",
+            "extra": extra
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_hermes_receipt_is_for_a_call_that_ran() {
+        let rm = json!({ "command": "rm -r build" });
+        let ran = |status: Option<&str>, result: &str| {
+            !hermes_post_unrun(&hermes_post("terminal", rm.clone(), status, result))
+        };
+        // It ran: it succeeded, it failed, it ran out of time.
+        assert!(ran(
+            Some("ok"),
+            r#"{"output": "", "exit_code": 0, "error": null}"#
+        ));
+        assert!(ran(
+            Some("error"),
+            r#"{"output": "rm: build: No such file or directory", "exit_code": 1, "error": null}"#
+        ));
+        assert!(ran(
+            Some("error"),
+            r#"{"output": "", "exit_code": 124, "error": "Command timed out after 180 seconds"}"#
+        ));
+        // A hook blocked it: termaxa's refusal, or an ask turned down at
+        // Hermes's approval gate.
+        assert!(!ran(Some("blocked"), r#"{"error": "[termaxa] refused"}"#));
+        // Hermes's own terminal tool refused it, or could not start it.
+        assert!(!ran(
+            Some("error"),
+            r#"{"output": "", "exit_code": -1, "error": "BLOCKED: User denied this command.", "status": "blocked"}"#
+        ));
+        assert!(!ran(
+            Some("error"),
+            r#"{"output": "", "exit_code": 126, "error": "workdir /x does not exist or is not accessible; the command did not run.", "status": "error"}"#
+        ));
+        assert!(!ran(
+            Some("error"),
+            r#"{"output": "", "exit_code": -1, "error": "Command execution failed: OSError: x"}"#
+        ));
+        // Interrupted, or skipped before it started.
+        assert!(!ran(
+            Some("cancelled"),
+            r#"{"error": "Tool execution cancelled.", "status": "cancelled"}"#
+        ));
+        // Nothing says what became of it.
+        assert!(!ran(
+            None,
+            r#"{"output": "", "exit_code": 0, "error": null}"#
+        ));
+        assert!(!ran(Some("error"), "not json"));
+
+        // A write is a write only when it landed.
+        let wf = json!({ "path": "notes.txt", "content": "hi\n" });
+        let unrun = |status: &str, result: &str| {
+            hermes_post_unrun(&hermes_post("write_file", wf.clone(), Some(status), result))
+        };
+        assert!(!unrun(
+            "ok",
+            r#"{"bytes_written": 3, "dirs_created": false}"#
+        ));
+        assert!(unrun(
+            "error",
+            r#"{"error": "Permission denied: notes.txt"}"#
+        ));
+        assert!(unrun("blocked", r#"{"error": "[termaxa] refused"}"#));
+
+        // A call before it runs, and another harness's receipt, are not
+        // this question.
+        assert!(!hermes_post_unrun(HERMES_PRE));
+        let claude_post = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "rm -r build" },
+            "session_id": "s",
+            "cwd": "/tmp"
+        })
+        .to_string();
+        assert!(!hermes_post_unrun(&claude_post));
+    }
+
+    #[test]
+    fn a_hermes_receipt_for_a_call_that_did_not_run_is_not_recorded() {
+        let mut env = crate::testutil::TestEnv::new("hermes-unrun");
+        let hermes_home = env.root().join("hermes-home");
+        std::fs::create_dir_all(&hermes_home).unwrap();
+        env.set_var("HERMES_HOME", &hermes_home);
+        crate::paths::set_hermes_hook(true);
+        let blocked = hermes_post(
+            "terminal",
+            json!({ "command": "rm -r build" }),
+            Some("blocked"),
+            r#"{"error": "BLOCKED: User denied this potentially dangerous action"}"#,
+        );
+        let out = decide(&blocked).unwrap();
+        assert_eq!((out.exit_code, out.rendered.as_deref()), (0, None));
+        let ok = hermes_post(
+            "terminal",
+            json!({ "command": "git status" }),
+            Some("ok"),
+            r#"{"output": "", "exit_code": 0, "error": null}"#,
+        );
+        decide(&ok).unwrap();
+        crate::paths::set_hermes_hook(false);
+        let paths = crate::paths::resolve_hermes().unwrap();
+        let record = std::fs::read_to_string(paths.log_file()).unwrap_or_default();
+        let receipts: Vec<serde_json::Value> = record
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["source"] == "post")
+            .collect();
+        assert_eq!(receipts.len(), 1, "{record}");
+        assert_eq!(receipts[0]["command"], "git status");
+        assert_eq!(receipts[0]["decision"], "executed");
     }
 
     #[test]
