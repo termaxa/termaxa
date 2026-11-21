@@ -79,6 +79,24 @@ the assertion above proves nothing"
   fi
 }
 
+# supervise LOG — start the operator's supervisor, its output to LOG, and
+# wait until it says it is listening: that line comes after the socket is
+# bound and opened to the agent. Waiting a fixed second was a race on a slow
+# runner, and so was `[ -S "$SOCK" ]`: a supervisor killed with SIGKILL
+# leaves its socket file behind, so the test passes before a new one binds.
+supervise() {
+  TERMAXA_HOME="$TERMAXA_HOME" "$BIN" supervise > "$1" 2>&1 &
+  SUP_PID=$!
+  local _
+  for _ in $(seq 1 150); do
+    grep -q "supervising on" "$1" 2>/dev/null && return 0
+    kill -0 "$SUP_PID" 2>/dev/null || return 1
+    sleep 0.1
+  done
+  kill -9 "$SUP_PID" 2>/dev/null
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 say "Setup"
 # ---------------------------------------------------------------------------
@@ -182,10 +200,7 @@ allowed "operator reads a backup" cat "$BK"
 # ---------------------------------------------------------------------------
 say "4. The supervisor process — the agent cannot stop it"
 # ---------------------------------------------------------------------------
-TERMAXA_HOME="$TERMAXA_HOME" "$BIN" supervise >/dev/null 2>&1 &
-SUP_PID=$!
-sleep 1
-if kill -0 "$SUP_PID" 2>/dev/null; then
+if supervise "$PROJECT/sup4.log"; then
   echo "  supervisor pid: $SUP_PID"
   denied  "kill the supervisor"     kill -9 "$SUP_PID"
   sleep 0.3
@@ -226,13 +241,15 @@ say "5. Routing — a hook run as the AGENT reaches the operator's supervisor"
 # its own home, found no socket, concluded basic mode, and decided on its own
 # authority - while the supervisor sat idle. The walls held; the door led
 # nowhere.
-TERMAXA_HOME="$TERMAXA_HOME" "$BIN" supervise > "$PROJECT/sup.log" 2>&1 &
-SUP2=$!
-sleep 1
+#
+# The payload is refused by a rule, with no file to count: `rm -rf /` was
+# previewed first, its files under / counted, and on a slow runner that took
+# longer than the 2 s a hook waits for the supervisor's answer.
 SOCK="$TERMAXA_HOME/run/supervise.sock"
-
-if [ -S "$SOCK" ]; then
-  PAYLOAD='{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"'"$PROJECT"'"}'
+if supervise "$PROJECT/sup.log"; then
+  SUP2=$SUP_PID
+  COMMAND="git push --force origin main"
+  PAYLOAD='{"tool_name":"Bash","tool_input":{"command":"'"$COMMAND"'"},"cwd":"'"$PROJECT"'"}'
 
   # As the agent, with ONLY the endpoint - no TERMAXA_HOME, no path into the
   # operator's state. This is exactly what `wrap` gives a wrapped agent.
@@ -240,7 +257,12 @@ if [ -S "$SOCK" ]; then
         HOME=/home/$AGENT_USER PATH=/usr/bin:/bin \
         TERMAXA_SOCKET="$SOCK" "$BIN" hook 2>&1)"
 
-  if echo "$OUT" | grep -q '"permissionDecision":"deny"'; then
+  # A hook that cannot get the supervisor's answer refuses on its own,
+  # which is a deny too: that is no decision from the supervisor, and it
+  # is said so, with the hook's reason.
+  if echo "$OUT" | grep -qE 'supervisor (is not answering|did not answer in time|speaks protocol)|answer could not be read'; then
+    bad "the agent's hook refused on its own, without the supervisor's answer: $OUT"
+  elif echo "$OUT" | grep -q '"permissionDecision":"deny"'; then
     ok "the agent's hook got a decision back"
   else
     bad "the agent's hook did not get a decision: $OUT"
@@ -258,7 +280,7 @@ if [ -S "$SOCK" ]; then
 
   # The record landed in the OPERATOR's log, and the agent cannot read it.
   OPLOG="$(find "$TERMAXA_HOME" -name audit.jsonl 2>/dev/null | head -1)"
-  if [ -n "$OPLOG" ] && grep -q "rm -rf /" "$OPLOG"; then
+  if [ -n "$OPLOG" ] && grep -qF "$COMMAND" "$OPLOG"; then
     ok "the decision is in the operator's audit log"
   else
     bad "the decision is not in the operator's log"
@@ -282,7 +304,7 @@ if [ -S "$SOCK" ]; then
 
   kill -9 $SUP2 2>/dev/null
 else
-  bad "no socket at $SOCK; routing assertions could not run"
+  bad "the supervisor did not say it was listening; routing assertions could not run ($(tr '\n' ' ' < "$PROJECT/sup.log"))"
 fi
 
 # ---------------------------------------------------------------------------
