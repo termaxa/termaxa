@@ -161,7 +161,7 @@ answers are:
 
 ```json
 {"decision":"block","reason":"[termaxa] …"}
-{"action":"approve","message":"[termaxa] asks: …"}
+{"action":"approve","message":"[termaxa] asks: <the call> — …","rule_key":"termaxa:…"}
 ```
 
 A deny also exits 2, which Hermes reads as a block by itself. An ask goes to
@@ -170,6 +170,21 @@ no one can, as in `hermes chat -q`, Hermes refuses the call; and `--yolo` or
 `approvals.single_query_mode: approve` lets it through, so under either an
 ask is an allow. Every allow is silence. `execute_code` is always an ask: its
 Python cannot be read, as a script file cannot.
+
+**The prompt.** Hermes shows a hook's ask under a label of its own,
+`<terminal> (plugin approval rule)`, where the call would be, with the
+hook's message beneath it, and offers "Allow once", "Allow for this
+session", "Add to permanent allowlist" and "Deny" (measured Nov 22, 2026,
+Hermes 0.23.3 on Windows). So the message says first what the call is: the
+command, the paths a write names, or the start of the Python, on one line,
+cut at 120 characters, with a control character or one that reorders text
+shown as `?`. Hermes keeps a session or permanent answer under the ask's
+`rule_key`, and under the tool's name when there is none: one "Allow for
+this session" for `hostname` let `whoami` run with no prompt. termaxa's key
+names the call alone (the tool, the directory where it is known, and the
+command or paths), so a standing answer allows that call again and nothing
+else, and it is kept by Hermes, not in termaxa's policy, whose record still
+shows each ask.
 
 **Receipts.** Hermes sends `post_tool_call` after every call, the ones a hook
 blocked included, and says in `extra.status` what became of it: `ok`,
