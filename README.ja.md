@@ -6,7 +6,7 @@
 
 # 🛡 Termaxa
 
-**AI コーディングエージェントとシェルの間に立つ門番。** コマンドが実行される前に、Termaxa はそのコマンドが何を破壊するかを見せ、復元できるバックアップを取り、読めるポリシーに従って確認を求めるか拒否します。Claude Code、Codex、Cursor、Copilot CLI を、ひとりでも、無人でも使う人向けです。
+**AI コーディングエージェントとシェルの間に立つ門番。** コマンドが実行される前に、Termaxa はそのコマンドが何を破壊するかを見せ、復元できるバックアップを取り、読めるポリシーに従って確認を求めるか拒否します。Claude Code、Codex、Cursor、Copilot CLI、Hermes Agent を、ひとりでも、無人でも使う人向けです。
 
 **十秒で試せます：** [play.termaxa.com](https://play.termaxa.com) では、使い捨てのプロジェクトで本物の門番が動きます。**インストール：** `brew install termaxa/tap/termaxa` または `cargo install termaxa`。
 
@@ -36,7 +36,7 @@ Termaxa は単一の Rust バイナリで、エージェントのフックの経
 2. **文字列ではなく、結果をプレビューする。** 削除で消えるファイル、force push で失われるコミット、`DROP` で消える行、`reset --hard` で捨てられるコミットされていない編集です。
 3. **実行の前に保険をかける。** ファイルをコピーし、ref を固定し、テーブルをダンプし、編集のスナップショットを取るので、`termaxa rollback` で元に戻せます。
 4. **繰り返すエージェントには対応を強める。** サーキットブレーカーが、書き方やシェルが違っても破壊の*意図*を数え、作動します。
-5. **記録する。** すべての判断を、追記専用でハッシュ連鎖のログに残します。エージェントはこのログを書き換えられません。
+5. **記録する。** すべての判断を、追記専用でハッシュ連鎖のログに残します。既定のモードでは、この連鎖が破損や気軽な書き換えを明らかにし、supervised モードでは、エージェントはこのログにまったく手が届きません。
 
 ```console
 $ termaxa check "rm -rf ./scratch"
@@ -94,7 +94,7 @@ termaxa init --claude-code --observe    # or --codex, --cursor, --copilot
 termaxa doctor                          # proves the hook fires; "configured" alone is not enough
 ```
 
-observe モードでは、すべてのコマンドがこれまでどおり実行され、バックアップも取られ、記録には、強制していたら*どうしたか*が溜まっていきます。フックは何も言わないので、エージェントの確認プロンプトは以前とまったく同じです。Claude Code では、プラグインがこれを、開くすべてのプロジェクトで `init` なしに行います。ポリシーのないプロジェクトは見守られ、そこで `termaxa init` を実行すると、見守った記録からルールを提案します（[ハーネス](#ハーネス) を参照）。
+observe モードでは、すべてのコマンドがこれまでどおり実行され、バックアップも取られ、記録には、強制していたら*どうしたか*が溜まっていきます。フックは何も言わないので、エージェントの確認プロンプトは以前とまったく同じです。Claude Code では、プラグインがこれを、開くすべてのプロジェクトで `init` なしに行います。ポリシーのないプロジェクトは見守られ、そこで `termaxa init` を実行すると、見守った記録からルールを提案します（[ハーネス](#ハーネス) を参照）。Hermes Agent は、呼び出しがどのプロジェクトのものかを伝えないため、`termaxa init --hermes --observe` は、素の `hermes` が使うプロファイルをつなぎ、Hermes のすべての呼び出しを一つのポリシーで判定します。
 
 **4. レポートを読み、それから強制する。**
 
@@ -283,6 +283,7 @@ ran with no copy: 5
 | **Codex CLI** | `termaxa init --codex` → `.codex/hooks.json`（`Bash` と `apply_patch`） | **拒否のみ**：Codex は明示的な許可を受け付けず、確認の仕組みもないため、確認は理由つきの拒否になる。`apply_patch` は、書き込むファイルとして判定される | 0.155.1（2026年9月19日） | エージェントが拒否を読んで判断する。あなたにはプロンプトが出ない |
 | **Cursor** | `termaxa init --cursor` → `.cursor/hooks.json`（シェルとファイルのツール。`Delete` は削除として扱う） | 確認は、Allowlist と Run Everything で「Hook requested approval」と表示される。拒否はどのモードでもブロックされる | 3.21.16（2026年10月4日） | **Auto-review モードでは、Cursor のレビュアーがフックの確認を上書きして、コマンドを実行する。** 2026年10月5日に Cursor のサポートが確認し、開発チームにも報告済み。Termaxa では Allowlist か Run Everything を使うこと。`doctor` もそう表示する |
 | **Copilot CLI** | `termaxa init --copilot` → `.github/hooks/hooks.json` | 確認は Allow All でもプロンプトになる。拒否はブロックされる | 1.0.83 と 1.0.91（2026年10月4日） | Copilot は、フックの*許可*を承認として扱い、自分のプロンプトを省く。enforce モードでは、それは門番が承認していることになる。observe モードでは門番は黙っているので、Copilot のプロンプトは変わらない（v0.20.1 で、そうなっていなかった版を修正した） |
+| **Hermes Agent** | `termaxa init --hermes` → プロファイルの `config.yaml` と `shell-hooks-allowlist.json`（`terminal`、`write_file`、`patch`、`execute_code` へのフック。承認済みで `fail_closed`）。Hermes のすべての呼び出しに、termaxa のホームにある一つのポリシー | 確認は Hermes の承認プロンプトに届き、呼び出しの中身を示す。拒否はどのモードでも、理由とともにブロックされる | 0.23.3、Windows（2026年11月22日） | **`--yolo` や `hermes -z` では、Hermes が確認に自分で答え、コマンドは実行される**。`hermes chat -q` は拒否する。Hermes は呼び出しがどこで動くかを伝えないため、相対パスがプレビューされコピーされるのは、呼び出しが `workdir` を示したときだけ |
 | **Herdr** | `herdr plugin install termaxa/termaxa` | ペインが門番の下でエージェントを起動する。サイドバーに拒否が表示され、記録が隣に開く | [`herdr-plugin/`](herdr-plugin/) を参照 | プラグインは、自分が起動するハーネスをつなぐ |
 | **それ以外** | `termaxa run -- <cmd>`、または `termaxa wrap -- <agent>`（Unix） | `run` は一つのコマンドを門番に通す。`wrap` は、エージェントが名前で解決するシェルにシムを置く | `wrap` 配下の Claude Code、Linux、zsh あり・なしの両方 | `/bin/sh` を絶対パスで指定するハーネスは `wrap` の外に出る。入口はフック |
 
@@ -348,7 +349,7 @@ circuit_breaker:
   threshold: 2
 ```
 
-`init` が書き出すスターターには 236 個のルールがあります。内訳は許可 162、確認 14、拒否 60 で、うち 45 が floor です。ネイティブのファイルツール（Claude Code の `Write`、Cursor の `Delete`、Codex の `apply_patch`）は、同じパスのルールで、対象によって判定されます。門番自身のファイルは、読めるけれども、エージェントが気づかれずに書き換えることはできないルールで守られています。`doctor` がフィンガープリントを報告します。`unrecognised: deny` と `backup_failure: deny` は、無人で動かすときの二つのスイッチです。
+`init` が書き出すスターターには 249 個のルールがあります。内訳は許可 162、確認 14、拒否 73 で、うち 58 が floor です。ネイティブのファイルツール（Claude Code の `Write`、Cursor の `Delete`、Codex の `apply_patch`、Hermes の `write_file` と `patch`）は、同じパスのルールで、対象によって判定されます。門番自身のファイルは、読めるけれども、エージェントが気づかれずに書き換えることはできないルールで守られています。`doctor` がフィンガープリントを報告します。`unrecognised: deny` と `backup_failure: deny` は、無人で動かすときの二つのスイッチです。
 
 ## アーキテクチャ
 
@@ -384,6 +385,7 @@ circuit_breaker:
 |---|---|
 | `termaxa` | これが何か、次に何を試すか |
 | `termaxa init [--claude-code\|--codex\|--cursor\|--copilot] [--observe]` | `.termaxa/` を作り、ツールを検出し、フックをインストールする。`--observe` は observe モードで開始する |
+| `termaxa init --hermes [--observe]` | Hermes Agent のプロファイルをつなぐ。フック、その承認、そして Hermes のすべての呼び出しを判定する、termaxa のホームにある一つのポリシー |
 | `termaxa replay [paths…] [--all]` | エージェントのトランスクリプトにあるすべてのコマンドを判定する。何も実行しない |
 | `termaxa replay --against-record` | トランスクリプトをこのマシンの記録と突き合わせる：判定済み、フックは動いたが記録がない、フックが一度も動いていない。どちらかのバイパスが見つかると終了コード 1 |
 | `termaxa demo` | 使い捨てのプロジェクトで門番を動かす：三つのチェックと記録 |
@@ -424,7 +426,7 @@ Termaxa は 1.0 より前の版です。実際に動き、テストされてい�
 
 ## コントリビュート
 
-Rust 2021、本番コードは約 26,000 行、テストは約 28,000 行、Linux 上のテストは 723 件、CI は Linux、macOS、Windows で動きます。`cargo fmt`、`cargo clippy -- -D warnings`、`cargo test` が関門で、門番のルールは門番自身にも適用されます。ここでは意見より計測が勝ちます。判定を変える変更には、それを示すフィクスチャを付けてください。
+Rust 2021、本番コードは約 27,500 行、テストは約 29,900 行、Linux 上のテストは 757 件、CI は Linux、macOS、Windows で動きます。`cargo fmt`、`cargo clippy -- -D warnings`、`cargo test` が関門で、門番のルールは門番自身にも適用されます。ここでは意見より計測が勝ちます。判定を変える変更には、それを示すフィクスチャを付けてください。
 
 ## セキュリティ
 

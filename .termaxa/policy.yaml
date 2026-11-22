@@ -15,6 +15,13 @@
 # severe verdict governs.
 version: 1
 default: ask
+# How the gate acts on its verdicts (decision #108). `enforce`: asks ask and
+# denies deny. `observe`: nothing outside the floor is interrupted; every
+# verdict is still recorded, insurance is still taken, and `termaxa report`
+# shows what enforcement would have done. Rules marked `floor: true` are
+# enforced in both modes; observe mode cannot lower the floor. `TERMAXA_MODE`
+# overrides this line on one machine.
+mode: enforce
 
 rules:
   # ---- self-defence: the gate's own configuration ----
@@ -38,21 +45,70 @@ rules:
   # `termaxa doctor` fingerprints the policy for that case: what was not
   # blocked can at least be noticed.
   #
-  # Reads are denied too, except for the handful listed below, because
-  # separating reads from writes in general would mean enumerating every read
-  # command. To add one, put it in that group — NOT at the top of the file.
-  - match: "*.claude*settings*"
+  # These first ten rules speak about PATHS, not spellings: they fire on a
+  # command that writes to, overwrites or removes one of the gate's own
+  # files, whatever the command is called and however the path is spelled,
+  # and they fire ahead of every string rule, so no read exception below can
+  # launder a redirect into them. Until v0.21.3 the string rules carried this
+  # alone, and `cat .termaxa/policy.yaml > .termaxa/policy.yaml` matched the
+  # gate's own `cat .termaxa*` exception: allowed, and the policy truncated.
+  # A path rule reads what the command TOUCHES, so that spelling and every
+  # other one land here. A trailing `*` component matches nothing as well as
+  # anything, so `*/.termaxa/*` is the directory too, which makes `rm -rf
+  # .termaxa` a floor rule rather than an ordinary `*rm -rf*` deny (Max
+  # Petrusenko's field report, Oct 9, 2026: `git clean -fdx` removed
+  # `.termaxa/policy.yaml`; the rule holds every delete the gate can read).
+  - match_path: "*/.termaxa/*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
+  - match_path: "*/.claude/settings*.json"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
-  - match: "*.cursor*hooks*"
+    floor: true
+  # Claude Code keeps the plugins it installed under `.claude/plugins/`: the
+  # registry of what is installed, the marketplaces it knows, and a copy of
+  # each plugin with its `hooks/hooks.json`. What is written there decides
+  # which hooks run, a plugin's copy of this gate's hook among them, so the
+  # directory is held whole, whichever plugin a file belongs to (v0.23.0).
+  - match_path: "*/.claude/plugins/*"
+    action: deny
+    reason: "Claude Code's plugin files decide which hooks run, this gate's among them. Change them yourself."
+    floor: true
+  - match_path: "*/.cursor/hooks.json"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
-  - match: "*.codex*hooks*"
+    floor: true
+  - match_path: "*/.codex/hooks.json"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
-  - match: "*.github*hooks*"
+    floor: true
+  - match_path: "*/.github/hooks/*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  # Hermes Agent: a profile's config.yaml declares its hooks, and its
+  # shell-hooks-allowlist.json approves each one; a hook it has no approval
+  # for, Hermes skips, saying so only in its log. The profile a bare
+  # `hermes` uses keeps both in Hermes's home, `~/.hermes` (on Windows
+  # `%LOCALAPPDATA%\hermes`, and wherever HERMES_HOME points, both read as
+  # `~/.hermes`), and a named profile in `profiles/<name>` inside it.
+  - match_path: "*/.hermes/config.yaml"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.hermes/shell-hooks-allowlist.json"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.hermes/profiles/*/config.yaml"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.hermes/profiles/*/shell-hooks-allowlist.json"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
 
   # ---- destruction by overwrite (v0.15) ----
   #
@@ -94,23 +150,30 @@ rules:
   # `git diff .env`, even `vim .env.sample`. Reading a file is ordinary work.
   - match_path: "*/.env"
     action: deny
-    reason: "Overwriting .env destroys credentials that are not in the repo."
+    reason: "Writing to or removing .env destroys credentials that are not in the repo."
   - match: "*> /etc/*"
     action: deny
     reason: "Overwriting a system config file."
+    floor: true
   - match: "*> ~/.ssh/*"
     action: deny
     reason: "Overwriting an SSH key or config."
+    floor: true
   - match: "*> *id_rsa*"
     action: deny
     reason: "Overwriting an SSH private key."
+    floor: true
 
-  # The policy is an in-repo artifact, reviewable in PRs, and the deny below
-  # would otherwise make that workflow impossible: `git add .termaxa/…`,
+  # The policy is an in-repo artifact, reviewable in PRs, and the denies
+  # below would otherwise make that workflow impossible: `git add .termaxa/…`,
   # `git diff .termaxa/…` and `cp .termaxa/policy.yaml backup.yaml` are all
-  # blocked by it. These exceptions give the workflow back.
+  # blocked by them. These exceptions give the workflow back, for the gate's
+  # own files and, since v0.21.3, for the hook configs: `cat
+  # .claude/settings.json` and `git diff .claude/settings.json` were denied
+  # by the rule written to stop an agent EDITING the file, which the
+  # `.termaxa` rules had an exception for and the hook-config rules did not.
   #
-  # The test for inclusion is that the `.termaxa` path can only be READ, never
+  # The test for inclusion is that the path can only be READ, never
   # written. diff/status/log/show/cat read it; add/commit stage what is
   # already on disk. `checkout`, `restore` and `config` are absent on purpose
   # — overwriting the working tree from a ref is exactly what the deny is for,
@@ -120,11 +183,13 @@ rules:
   # safe way: `cp .termaxa/policy.yaml backup.yaml` matches,
   # `cp backup.yaml .termaxa/policy.yaml` does not.
   #
-  # Position matters twice over. Above the deny, or these never fire. Below
-  # the four denies above, because a trailing `*` swallows a redirect —
-  #     cat .termaxa/policy.yaml > .claude/settings.json
+  # Position matters twice over. Above the denies, or these never fire. Below
+  # the overwrite denies above, because a trailing `*` swallows a redirect —
+  #     cat .termaxa/policy.yaml > /etc/hosts
   # matches `cat .termaxa*` too, and at the top of the file it would allow
-  # that and shadow the rule that exists to stop it.
+  # that and shadow the rule that exists to stop it. A redirect into one of
+  # the gate's own files is caught by the path rules at the top whatever
+  # the order here; `/etc`, `~/.ssh` and the keys have string rules only.
   - match: "git diff *.termaxa*"
     action: allow
   - match: "git status *.termaxa*"
@@ -141,12 +206,216 @@ rules:
     action: allow
   - match: "cp .termaxa*"
     action: allow
-  - match: "*.termaxa*"
+  - match: "cat .claude/settings*"
+    action: allow
+  - match: "git diff *.claude/settings*"
+    action: allow
+  - match: "git show *.claude/settings*"
+    action: allow
+  - match: "git add *.claude/settings*"
+    action: allow
+  - match: "cat .cursor/hooks*"
+    action: allow
+  - match: "git diff *.cursor/hooks*"
+    action: allow
+  - match: "git show *.cursor/hooks*"
+    action: allow
+  - match: "git add *.cursor/hooks*"
+    action: allow
+  - match: "cat .codex/hooks*"
+    action: allow
+  - match: "git diff *.codex/hooks*"
+    action: allow
+  - match: "git show *.codex/hooks*"
+    action: allow
+  - match: "git add *.codex/hooks*"
+    action: allow
+  - match: "cat .github/hooks*"
+    action: allow
+  - match: "git diff *.github/hooks*"
+    action: allow
+  - match: "git show *.github/hooks*"
+    action: allow
+  - match: "git add *.github/hooks*"
+    action: allow
+  # A belt over the path rules for commands whose grammar the gate does not
+  # model (an editor, `python -c`, `truncate`): the gate's own files, then
+  # the hook configs. A string cannot tell a write from a mention, so these
+  # match a read too. For the gate's own files, reads are denied except for
+  # the ones listed above; to add one, put it in that group — NOT at the top
+  # of the file. For the hook configs, Claude Code's plugin files among them
+  # since v0.23.0, the rules say `except_reads`
+  # (v0.21.10): they do not apply to a command that cannot write a file, one
+  # of a short list of programs that only read or print (`cat`, `head`,
+  # `tail`, `wc`, `grep`, `stat`, `ls`, `diff`, `jq`, `echo` and their kind,
+  # and git's `diff`, `show`, `log`, `status`, `add` and `commit`), named
+  # plainly as the first word. What such a command writes through a redirect
+  # is judged by the path rules at the top, which come first. Until then
+  # `grep -n hooks .claude/settings.json` and `git commit -m "update .claude
+  # settings"` were refused by a rule written to stop an agent EDITING the
+  # file.
+  #
+  # The rules for the gate's own files are named by what they hold, because
+  # a plain `*.termaxa*` also matched the PATH line `wrap` itself injects
+  # into every shell it starts - `export PATH=~/.termaxa/shims:...` - and
+  # refused Claude Code's own startup snapshot (Sep 10, 2026). The matcher
+  # knows only `*`, so the separator is spanned by it; `shims/` with the
+  # slash is a file inside the shim directory, while `shims:` in a PATH is
+  # not.
+  - match: "*.termaxa*policy*"
     action: deny
     reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
+  - match: "*.termaxa*projects*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
+  - match: "*.termaxa*backups*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
+  - match: "*.termaxa*logs*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
+  - match: "*.termaxa*shims/*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+    floor: true
+  - match: "*.claude*settings*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  - match: "*.claude*plugins*"
+    action: deny
+    reason: "Claude Code's plugin files decide which hooks run, this gate's among them. Change them yourself."
+    floor: true
+    except_reads: true
+  - match: "*.cursor*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  - match: "*.codex*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  - match: "*.github*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  - match: "*.hermes*config.yaml*"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  - match: "*.hermes*hooks-allowlist*"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  # Claude Code turns a plugin off, or removes it, on a command as well as in
+  # its own menu: `claude plugin disable`, `claude plugin uninstall` (or
+  # `remove`), and `claude plugin marketplace remove` (or `rm`) for the
+  # marketplace a plugin came from. Run by an agent, any of them turns off
+  # what the plugin's hooks were doing, and where this gate is installed as
+  # a plugin, the gate. Any plugin, not only this one, as the settings file
+  # is held whole and not only its hooks (v0.23.0). A `grep` of the command,
+  # or a commit message that names it, is ordinary work (`except_reads`).
+  # Each word is followed by a space, or for `disable`, which needs no
+  # plugin named, by the end of the line, so a plugin whose name starts with
+  # one (`claude plugin install remove-bg@x`) is not caught by it.
+  - match: "*claude* plugin* disable"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* disable *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* uninstall *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* remove *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*claude* plugin* rm *"
+    action: deny
+    reason: "Turning off or removing a Claude Code plugin turns off its hooks, and this gate can be one of them. Do it yourself."
+    floor: true
+    except_reads: true
+  # Hermes withdraws a hook's approval on a command, `hermes hooks revoke`
+  # (or `remove`, or `rm`), and skips the hook from then on; and `hermes
+  # config set`, `unset` and `edit` rewrite the config.yaml its hooks are
+  # declared in. Run by an agent, either can turn this gate off. A `grep`
+  # of the command, or a commit message that names it, is ordinary work
+  # (`except_reads`); `hermes hooks list`, `hermes config get` and the rest
+  # are not caught.
+  - match: "*hermes* hooks* revoke *"
+    action: deny
+    reason: "Revoking a Hermes hook's approval turns the hook off, and this gate is one. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* hooks* remove *"
+    action: deny
+    reason: "Revoking a Hermes hook's approval turns the hook off, and this gate is one. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* hooks* rm *"
+    action: deny
+    reason: "Revoking a Hermes hook's approval turns the hook off, and this gate is one. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* set *"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* unset *"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* edit"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* edit *"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+  # Pointing git's hook directory anywhere runs whatever is there on the
+  # next commit. It used to be caught only when the target was inside
+  # `.termaxa`; the hazard is the redirection itself.
+  - match: "*git config*hooksPath*"
+    action: deny
+    reason: "Redirecting git hooks runs arbitrary code on the next commit. Do it yourself."
+    floor: true
 
   # ---- destructive: hard stops ----
   - match: "git push*--force*"
+    action: deny
+    reason: "Force pushes are blocked by policy. Open a PR instead."
+  # The short and the refspec spellings do the same thing (Sep 24, 2026:
+  # `git push -f origin main` was an ask while `--force` was a deny).
+  - match: "git push* -f *"
+    action: deny
+    reason: "Force pushes are blocked by policy. Open a PR instead."
+  - match: "git push* -f"
+    action: deny
+    reason: "Force pushes are blocked by policy. Open a PR instead."
+  - match: "git push* +*"
     action: deny
     reason: "Force pushes are blocked by policy. Open a PR instead."
   # The filesystem root, and only the root. `rm -rf /*` would be a WILDCARD
@@ -159,39 +428,57 @@ rules:
   - match: "rm -rf /"
     action: deny
     reason: "Recursive delete from the filesystem root is blocked."
+    floor: true
   - match: "rm -rf / *"
     action: deny
     reason: "Recursive delete from the filesystem root is blocked."
+    floor: true
   # GNU rm refuses `rm -rf /` on its own; --no-preserve-root is the one
   # spelling it obeys. The rule above is named for the command everybody
   # quotes, this one is named for the command that actually works.
   - match: "*--no-preserve-root*"
     action: deny
     reason: "--no-preserve-root is the only spelling `rm` obeys at `/`. Blocked."
+    floor: true
   # Broad recursive-force deletes (any target), Unix + PowerShell + cmd
-  # forms. DENY by default: with auto-approving agent UIs, `ask` silently
-  # degrades to `allow`. Relax deliberately, per project, if you need to.
+  # forms. DENY by default: an `ask` reaches a person only where the agent
+  # shows it, and some agents answer it themselves (Cursor's Auto-review,
+  # Hermes under `--yolo` or `-z`; SECURITY.md has the list), while a deny
+  # holds in every one. Relax deliberately, per project, if you need to.
+  # A directory a build or an install rebuilds, inside the project, is the
+  # exception (`except_rebuilt`): `rm -rf node_modules`, `.next`, `dist`,
+  # `build`, `target`, `.venv` and their kind run, copied aside first when
+  # they are under the budget, as observe mode has let them since v0.21.3.
+  # Nothing in one is the only copy of anything. The same command with any
+  # other target on it, or one outside the project, is denied as before.
   - match: "*rm -rf*"
     action: deny
     reason: "Recursive force delete blocked by default policy."
+    except_rebuilt: true
   - match: "*rm -fr*"
     action: deny
     reason: "Recursive force delete blocked by default policy."
+    except_rebuilt: true
   - match: "*Remove-Item*-Recurse*"
     action: deny
     reason: "Recursive delete (PowerShell) blocked by default policy."
+    except_rebuilt: true
   - match: "*Remove-Item*-Force*"
     action: deny
     reason: "Forced delete (PowerShell) blocked by default policy."
+    except_rebuilt: true
   - match: "*del /s*"
     action: deny
     reason: "Recursive delete (cmd) blocked by default policy."
+    except_rebuilt: true
   - match: "*rmdir /s*"
     action: deny
     reason: "Recursive delete (cmd) blocked by default policy."
+    except_rebuilt: true
   - match: "*rd /s*"
     action: deny
     reason: "Recursive delete (cmd) blocked by default policy."
+    except_rebuilt: true
   # A recovery point is the one delete with nothing behind it. Field report,
   # Sep 2026: an agent wiped a drive, and the parent agent sent to recover it
   # deleted the day-old shadow copy it was trying to restore. vssadmin and
@@ -200,12 +487,36 @@ rules:
   - match: "*delete shadows*"
     action: deny
     reason: "Deleting shadow copies destroys the recovery point itself."
+    floor: true
   - match: "*shadowcopy delete*"
     action: deny
     reason: "Deleting shadow copies destroys the recovery point itself."
+    floor: true
+  # A local database is somebody's months of work as often as it is a
+  # throwaway. Field report, Sep 2026: an agent asked to fix a UI ran
+  # `npx supabase db reset` and wiped a database holding months of notes,
+  # tasks and deadlines. These commands drop and recreate; the tools give
+  # no confirmation and no backup.
+  - match: "*db reset*"
+    action: deny
+    reason: "Resetting a database drops every row in it. Dump it first, or run this yourself."
+    floor: true
+  - match: "*migrate reset*"
+    action: deny
+    reason: "Resetting migrations drops and recreates the schema. Dump it first, or run this yourself."
+    floor: true
+  - match: "*db push*--force-reset*"
+    action: deny
+    reason: "A forced reset drops every row in the database. Dump it first, or run this yourself."
+    floor: true
+  - match: "*drizzle-kit drop*"
+    action: deny
+    reason: "Dropping the schema destroys the data under it. Dump it first, or run this yourself."
+    floor: true
   - match: "*Win32_ShadowCopy*Delete*"
     action: deny
     reason: "Deleting shadow copies destroys the recovery point itself."
+    floor: true
   # The PowerShell way to delete a WMI/CIM instance - shadow copies are the
   # common target. `Get-WmiObject Win32_ShadowCopy | ForEach-Object
   # { $_.Delete() }` is split at the pipe and neither half names both; it
@@ -213,24 +524,30 @@ rules:
   - match: "*Remove-WmiObject*"
     action: deny
     reason: "Removing a WMI instance (a shadow copy, typically) is not recoverable."
+    floor: true
   - match: "*Remove-CimInstance*"
     action: deny
     reason: "Removing a CIM instance (a shadow copy, typically) is not recoverable."
+    floor: true
   - match: "kubectl delete*"
     action: deny
     reason: "kubectl delete is blocked. Use a manifest change + apply."
+    floor: true
   - match: "*drop table*"
     action: deny
     reason: "DROP TABLE is blocked. Archive or rename instead."
   - match: "*drop database*"
     action: deny
     reason: "DROP DATABASE is blocked."
+    floor: true
   - match: "terraform destroy*"
     action: deny
     reason: "terraform destroy is blocked by policy."
+    floor: true
   - match: "tofu destroy*"
     action: deny
     reason: "tofu destroy is blocked by policy."
+    floor: true
 
   # ---- consequential: human in the loop ----
   #
@@ -283,14 +600,17 @@ rules:
   - match: "docker system prune*"
     action: deny
     reason: "docker system prune has no recovery path. Remove specific objects instead."
+    floor: true
   # Raw device writes destroy partition tables and filesystems with nothing
   # to restore from. Not insurable at any layer.
   - match: "dd*of=/dev/*"
     action: deny
     reason: "Writing to a raw device is not recoverable."
+    floor: true
   - match: "mkfs*"
     action: deny
     reason: "Formatting a device is not recoverable."
+    floor: true
   - match: "npm publish*"
     action: ask
   - match: "cargo publish*"
@@ -304,6 +624,13 @@ rules:
   - match: "ssh *"
     action: ask
 
+  # `find -delete` removes everything it matches with nothing copied first:
+  # a hard stop, above the allows like every other one (Sep 20, 2026 replay).
+  - match: "*find* -delete*"
+    action: deny
+    reason: "find -delete removes everything it matches and nothing is copied first. Delete named paths with rm instead."
+    floor: true
+
   # ---- read-only operations: let the agent work ----
   - match: "git status*"
     action: allow
@@ -312,6 +639,10 @@ rules:
   - match: "git log*"
     action: allow
   - match: "git branch*"
+    action: allow
+  # Staging never destroys anything. Two asks on `git add` in the replay of
+  # Sep 20, 2026, from a starter that had every other read-only git head.
+  - match: "git add*"
     action: allow
   - match: "git commit*"
     action: allow
@@ -330,6 +661,153 @@ rules:
     action: allow
   - match: "echo *"
     action: allow
+  # A bare `echo` prints a blank line; it asked in the Sep 20, 2026 replay
+  # in the middle of an otherwise allowed compound.
+  - match: "echo"
+    action: allow
+  # Four heads from the SynCircles record (an agent building a real product
+  # unattended, Oct 26 to Nov 5, 2026): `mkdir -p` asked four times, `ps aux`
+  # twice, `sleep 1` once, each in the middle of allowed work. `tee` is
+  # `cat >`'s twin: the file it writes is judged by the path rules and copied
+  # first, as a redirect's target is, and its heredoc body is data
+  # (v0.21.7).
+  - match: "mkdir *"
+    action: allow
+  - match: "ps"
+    action: allow
+  - match: "ps *"
+    action: allow
+  - match: "sleep *"
+    action: allow
+  - match: "tee *"
+    action: allow
+  # Read-only Unix filters and probes. The demo video's own hero shot was an
+  # ask on `head -5`; Claude Code's first act in a session is `bash -c env`
+  # (Sep 10, 2026, under `wrap`), and an unattended ask on that is a session
+  # that never starts. Filters that only read stdin stay on the default in
+  # their bare form, as `cat` and `grep` do. `sort` and `uniq` are left out on
+  # purpose: `sort -o FILE` and `uniq IN OUT` write a file with no redirect
+  # for the gate to see. `env` is bare only - `env CMD` runs CMD, and an
+  # allow list widens by the head that names the action, never the runner.
+  - match: "head *"
+    action: allow
+  # A bare `head` reads stdin; it asked mid-compound in a live Herdr
+  # session, Sep 20, 2026.
+  - match: "head"
+    action: allow
+  - match: "tail *"
+    action: allow
+  # `find` reads unless it deletes or runs something; those spellings are
+  # named first so the allow below cannot cover them (`*rm -rf*` and the
+  # `find -delete` hard stop above still decide theirs). `sed -n`
+  # prints; `sed -i` edits in place with no redirect for the gate to see and
+  # stays on the default, as `sort -o` does. Both asked on ordinary work in
+  # the Sep 20, 2026 replay.
+  - match: "*find* -exec*"
+    action: ask
+    reason: "find -exec runs a command per match; the command decides."
+  - match: "*find* -ok*"
+    action: ask
+    reason: "find -ok runs a command per match; the command decides."
+  - match: "find *"
+    action: allow
+  - match: "sed -n *"
+    action: allow
+  # The gate's own read-only subcommands; `backups --prune` and `rollback`
+  # change things and stay on the default.
+  - match: "termaxa log*"
+    action: allow
+  - match: "termaxa backups"
+    action: allow
+  - match: "termaxa report*"
+    action: allow
+  - match: "termaxa doctor*"
+    action: allow
+  - match: "termaxa check *"
+    action: allow
+  - match: "wc *"
+    action: allow
+  - match: "cut *"
+    action: allow
+  - match: "diff *"
+    action: allow
+  - match: "stat *"
+    action: allow
+  - match: "du"
+    action: allow
+  - match: "du *"
+    action: allow
+  - match: "pwd"
+    action: allow
+  - match: "pwd *"
+    action: allow
+  - match: "which *"
+    action: allow
+  - match: "date"
+    action: allow
+  - match: "date +*"
+    action: allow
+  - match: "env"
+    action: allow
+  - match: "printenv"
+    action: allow
+  - match: "printenv *"
+    action: allow
+  # The shell's own read-only tests and lookups: a harness probes its
+  # environment with these at startup (Claude Code 2.1.280, Sep 24, 2026).
+  - match: "command -v *"
+    action: allow
+  - match: "test *"
+    action: allow
+  - match: "[ *"
+    action: allow
+  - match: "[[ *"
+    action: allow
+  - match: "printf *"
+    action: allow
+  - match: "uname"
+    action: allow
+  - match: "uname *"
+    action: allow
+  - match: "id"
+    action: allow
+  - match: "id *"
+    action: allow
+  # `cd` runs nothing, and an agent under `wrap` was refused on
+  # `cd /home/dev/proj && git ls-files scratch` (Sep 11, 2026) - a read-only
+  # command, refused unattended on the one word in it that had no rule. The
+  # git heads below never write the tree: `ls-files`, `show`, `rev-parse`,
+  # `blame`, `describe`, `stash list`, `config --get`, a bare `remote`, and
+  # `tag` in its listing forms only (`git tag -d` deletes, so `tag *` stays
+  # on the default).
+  - match: "cd"
+    action: allow
+  - match: "cd *"
+    action: allow
+  - match: "git ls-files*"
+    action: allow
+  - match: "git check-ignore*"
+    action: allow
+  - match: "git show*"
+    action: allow
+  - match: "git rev-parse*"
+    action: allow
+  - match: "git blame*"
+    action: allow
+  - match: "git describe*"
+    action: allow
+  - match: "git stash list*"
+    action: allow
+  - match: "git config --get*"
+    action: allow
+  - match: "git remote"
+    action: allow
+  - match: "git tag"
+    action: allow
+  - match: "git tag -l*"
+    action: allow
+  - match: "git tag --list*"
+    action: allow
   - match: "git remote -v"
     action: allow
   - match: "git fetch*"
@@ -345,6 +823,69 @@ rules:
   - match: "kubectl describe*"
     action: allow
   - match: "docker ps*"
+    action: allow
+  # A variable assignment runs nothing. Claude Code's startup snapshot sets
+  # PATH inside the shell `wrap` hands it (Sep 10, 2026); asking about that
+  # line unattended is a refusal of the agent's own setup. A substitution in
+  # the value (`export X=$(...)`) is still escalated by the context check.
+  - match: "export *"
+    action: allow
+
+  # ---- PowerShell read-only cmdlets ----
+  # Codex on Windows speaks PowerShell, and under Codex an ask is a refusal
+  # (its hooks can only deny), so a read-only probe that falls to the
+  # default stops the agent. These take no script block; Where-Object and
+  # ForEach-Object are left out on purpose, because their block can hide a
+  # delete. A `$var = ...` assignment is read as the command it assigns.
+  - match: "Get-ChildItem*"
+    action: allow
+  - match: "Get-Item*"
+    action: allow
+  - match: "Get-Content*"
+    action: allow
+  - match: "Get-Location*"
+    action: allow
+  - match: "Get-Command*"
+    action: allow
+  - match: "Get-Date*"
+    action: allow
+  - match: "Get-Help*"
+    action: allow
+  - match: "Get-Member*"
+    action: allow
+  - match: "Get-FileHash*"
+    action: allow
+  - match: "Resolve-Path*"
+    action: allow
+  - match: "Test-Path*"
+    action: allow
+  - match: "Split-Path*"
+    action: allow
+  - match: "Join-Path*"
+    action: allow
+  - match: "Select-String*"
+    action: allow
+  - match: "Select-Object*"
+    action: allow
+  - match: "Sort-Object*"
+    action: allow
+  - match: "Measure-Object*"
+    action: allow
+  - match: "Compare-Object*"
+    action: allow
+  - match: "Format-Table*"
+    action: allow
+  - match: "Format-List*"
+    action: allow
+  - match: "Out-String*"
+    action: allow
+  - match: "Write-Output*"
+    action: allow
+  - match: "Write-Host*"
+    action: allow
+  - match: "ConvertTo-Json*"
+    action: allow
+  - match: "ConvertFrom-Json*"
     action: allow
 
   # ---- the ordinary dev loop: build, test, lint, run ----
@@ -374,21 +915,11 @@ rules:
     action: allow
   - match: "npm test*"
     action: allow
-  - match: "npm run *"
-    action: allow
-  - match: "npx *"
-    action: allow
   - match: "pnpm test*"
-    action: allow
-  - match: "pnpm run *"
     action: allow
   - match: "yarn test*"
     action: allow
-  - match: "yarn run *"
-    action: allow
   - match: "bun test*"
-    action: allow
-  - match: "bun run *"
     action: allow
   - match: "node *"
     action: allow
@@ -454,3 +985,18 @@ rules:
 circuit_breaker:
   enabled: true
   threshold: 2   # trip on the 3rd attempt
+  # A trip holds that intent for the PROJECT, across sessions, until a
+  # person runs `termaxa breaker resume --reason "…"` (the release is
+  # recorded with who, when and why). Optionally, resume_after releases it
+  # on its own after a time, recording an expiry line; omit it to require a
+  # person. `termaxa breaker status` shows what is holding.
+  # resume_after: 24h
+# Insurance copies (#72). A backup is removed only when it is BOTH outside
+# the `keep` most recent AND older than `days`; everything else stays. Each
+# insured command removes at most one, so the hook stays fast;
+# `termaxa backups --prune` removes all of them at once. The copy itself is
+# refused above the preview's budget (5,000 files), with the preview's own
+# words, so a "NOT recoverable" preview is never followed by a copy.
+# retention:
+#   keep: 50
+#   days: 30
