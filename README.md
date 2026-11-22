@@ -4,7 +4,7 @@
 
 [日本語](README.ja.md)
 
-**A gate between an AI coding agent and your shell.** Before a command runs, Termaxa shows what it would destroy, takes a backup it can restore, and asks or refuses by a policy you can read. For people running Claude Code, Codex, Cursor or Copilot CLI, alone or unattended.
+**A gate between an AI coding agent and your shell.** Before a command runs, Termaxa shows what it would destroy, takes a backup it can restore, and asks or refuses by a policy you can read. For people running Claude Code, Codex, Cursor, Copilot CLI or Hermes Agent, alone or unattended.
 
 **Try it in ten seconds:** [play.termaxa.com](https://play.termaxa.com) runs the real gate on a throwaway project. **Install:** `brew install termaxa/tap/termaxa` or `cargo install termaxa`.
 
@@ -34,7 +34,7 @@ Termaxa is a single Rust binary that sits in the agent's hook path, with no mode
 2. **Previews the consequence,** not the text: the files a delete takes, the commit a force push loses, the rows a `DROP` removes, the uncommitted edits a `reset --hard` discards.
 3. **Insures** before anything runs: copies the files, pins the ref, dumps the table, snapshots the edits, so `termaxa rollback` can undo it.
 4. **Escalates** an agent that keeps trying: a circuit breaker counts destructive *intent* across spellings and shells, and trips.
-5. **Records** every decision in an append-only, hash-chained log the agent cannot rewrite.
+5. **Records** every decision in an append-only, hash-chained log: in the default mode the chain shows corruption and casual edits, and in supervised mode the agent cannot reach the log at all.
 
 ```console
 $ termaxa check "rm -rf ./scratch"
@@ -92,7 +92,7 @@ termaxa init --claude-code --observe    # or --codex, --cursor, --copilot
 termaxa doctor                          # proves the hook fires; "configured" alone is not enough
 ```
 
-In observe mode every command still runs, the backups are still taken, and the record fills with what enforcement *would* have done. The hook says nothing, so your agent's prompts are exactly what they were. Commit `.termaxa/policy.yaml` and the hook config `init` wrote: until they are committed, a `git clean`, a `git stash` or a `git reset --hard` can undo them, and the gate refuses the ones that would. In Claude Code, the plugin does this for every project you open, with no `init`: a project with no policy is watched, and `termaxa init` there proposes rules from what was watched (see [Harnesses](#harnesses)).
+In observe mode every command still runs, the backups are still taken, and the record fills with what enforcement *would* have done. The hook says nothing, so your agent's prompts are exactly what they were. Commit `.termaxa/policy.yaml` and the hook config `init` wrote: until they are committed, a `git clean`, a `git stash` or a `git reset --hard` can undo them, and the gate refuses the ones that would. In Claude Code, the plugin does this for every project you open, with no `init`: a project with no policy is watched, and `termaxa init` there proposes rules from what was watched (see [Harnesses](#harnesses)). Hermes Agent does not say which project a call is for, so `termaxa init --hermes --observe` wires the profile a bare `hermes` uses, with one policy for every Hermes call.
 
 **4. Read the report, then enforce.**
 
@@ -281,6 +281,7 @@ Every line is a fact with a source in the audit log. The report reads the local 
 | **Codex CLI** | `termaxa init --codex` → `.codex/hooks.json` (`Bash` and `apply_patch`) | **deny only**: Codex rejects an explicit allow and has no ask, so an ask is a refusal with its reason; `apply_patch` is judged as the files it writes | 0.155.1 (Sep 19, 2026) | the agent reads the refusal and decides; nothing prompts you |
 | **Cursor** | `termaxa init --cursor` → `.cursor/hooks.json` (shell and file tools; `Delete` is a delete) | an ask shows "Hook requested approval" in Allowlist and Run Everything; a deny is blocked everywhere | 3.21.16 (Oct 4, 2026) | **in Auto-review mode, Cursor's reviewer overrides a hook's ask and runs the command.** Confirmed by Cursor's support, Oct 5, 2026, and flagged to their team. Use Allowlist or Run Everything with Termaxa; `doctor` says so |
 | **Copilot CLI** | `termaxa init --copilot` → `.github/hooks/hooks.json` | an ask prompts even under Allow All; a deny is blocked | 1.0.83 and 1.0.91 (Oct 4, 2026) | Copilot treats a hook's *allow* as an approval and skips its own prompt. In enforce mode that is the gate approving; in observe mode the gate stays silent, so Copilot's prompts are unchanged (v0.20.1 fixed the version that didn't; a rule's allow was still answered until v0.21.10) |
+| **Hermes Agent** | `termaxa init --hermes` → the profile's `config.yaml` and `shell-hooks-allowlist.json` (hooks on `terminal`, `write_file`, `patch` and `execute_code`, approved, `fail_closed`); one policy in termaxa's home for every Hermes call | an ask goes to Hermes's approval prompt and names the call; a deny is blocked in every mode, with its reason | 0.23.3 on Windows (Nov 22, 2026) | **under `--yolo` or `hermes -z`, Hermes approves an ask itself and the command runs**; `hermes chat -q` refuses it. Hermes does not say where a call runs, so a relative path is previewed and copied only when the call names its `workdir` |
 | **Herdr** | `herdr plugin install termaxa/termaxa` | a pane starts the agent under the gate; the sidebar shows a refusal; the record opens beside it | see [`herdr-plugin/`](herdr-plugin/) | the plugin wires the harness it starts |
 | **Anything else** | `termaxa run -- <cmd>`, or `termaxa wrap -- <agent>` (Unix) | `run` gates one command; `wrap` shims the shells an agent resolves by name | Claude Code under `wrap`, Linux, with and without zsh | a harness that names `/bin/sh` by absolute path stays outside `wrap`; hooks are the way in |
 
@@ -353,7 +354,7 @@ circuit_breaker:
   threshold: 2
 ```
 
-The starter `init` writes has 236 rules: 162 allow, 14 ask, 60 deny, 45 of them floor. A `match_path` rule judges the file a command changes, not its spelling: a redirect or a `cp` onto it, and since v0.21.10 a copy into its directory, a tree landed over it, its directory deleted, and a git discard or clean that would undo it. Native file tools (Claude Code's `Write`, Cursor's `Delete`, Codex's `apply_patch`) are judged by their target through the same path rules, and the gate's own files are protected by rules you can read but the agent cannot rewrite unnoticed: `doctor` reports the fingerprint. A deny written as a string can say `except_reads: true`, as the starter's rules over the hook configs do, and then leaves `cat`, `grep` and `git diff` of the file alone. `unrecognised: deny` and `backup_failure: deny` are the two switches for unattended runs.
+The starter `init` writes has 249 rules: 162 allow, 14 ask, 73 deny, 58 of them floor. A `match_path` rule judges the file a command changes, not its spelling: a redirect or a `cp` onto it, and since v0.21.10 a copy into its directory, a tree landed over it, its directory deleted, and a git discard or clean that would undo it. Native file tools (Claude Code's `Write`, Cursor's `Delete`, Codex's `apply_patch`, Hermes's `write_file` and `patch`) are judged by their target through the same path rules, and the gate's own files are protected by rules you can read but the agent cannot rewrite unnoticed: `doctor` reports the fingerprint. A deny written as a string can say `except_reads: true`, as the starter's rules over the hook configs do, and then leaves `cat`, `grep` and `git diff` of the file alone. `unrecognised: deny` and `backup_failure: deny` are the two switches for unattended runs.
 
 ## Architecture
 
@@ -389,6 +390,7 @@ Six engines, one binary. Policy is in-repo and reviewable in pull requests; logs
 |---|---|
 | `termaxa` | what this is, and what to try next |
 | `termaxa init [--claude-code\|--codex\|--cursor\|--copilot] [--observe]` | scaffold `.termaxa/`, detect tools, install the hook; `--observe` starts in observe mode |
+| `termaxa init --hermes [--observe]` | wire Hermes Agent's profile: its hooks, their approval, and one policy in termaxa's home for every Hermes call |
 | `termaxa replay [paths…] [--all]` | judge every command in your agents' transcripts; nothing executed |
 | `termaxa replay --against-record` | hold the transcripts against this machine's record: judged, fired-but-unrecorded, or never-fired. Exit 1 if either bypass is found |
 | `termaxa demo` | the gate on a throwaway project: three checks and the record |
@@ -420,7 +422,7 @@ Termaxa is pre-1.0. It's real and tested, and it is not magic.
 - **The gate fails open on a payload it doesn't recognise, by design.** `doctor` and the liveness probe are how you find out; `unrecognised: deny` is the switch for runs where a stopped agent is cheaper than an ungated one.
 - **The plugin runs the `termaxa` you installed.** Without it on PATH, the plugin's hook cannot run: Claude Code shows a hook error at the start of a session and on every call, and nothing is watched or refused. A marketplace added from a local directory has that directory as its source, and the floor does not hold it.
 - **Shell parsing is good, not perfect.** Compound commands, `-c` strings, `eval`, same-line variables and the global options of git, kubectl, terraform, tofu and docker are read as what they run, and a program named by its path is read by its name for deny rules; the first command of a `$(…)` or a `<(…)` is read as a command where it runs, denied if a rule denies it and flagged unless the policy would allow it, and a deny rule finds its command behind `timeout`, `time` and their kind. A line nested more than eight substitutions deep is refused, a runner the gate does not know (`strace`, `flock`, `docker exec`) is not read through, and subshells and deep quoting are judged conservatively. A path built from the caller's environment (`rm -rf ~/x/$SID`) is carried as *unresolved*, not guessed. A line is also judged as bash reads it, and on Windows as cmd and PowerShell read it, and each word as the shell opens it, so `echo x > .ter\maxa/policy.yaml`, `echo x > .clau[d]e/settings.json` and `echo x > .claud{e..e}/settings.json` meet the rule for the plain name; PowerShell on macOS and Linux is read as bash, and cmd's lack of single quotes is not read.
-- **A path rule sees what the gate can read of a command.** A file the command names, a file copied or moved into a directory, a tree it lands or removes (read up to 5,000 files), and what a git discard, stash or clean would undo, in a hook config's or the gate's own directory under the name its tool gives it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `TERMAXA_HOME`) as under the default one. Not `install`, `rsync`, `ln`, `find -exec`, an archive unpacked over the project, or what git brings in from another commit: a branch switch, a merge, a pull or `git stash pop` can replace a guarded file unseen. And until the policy and the hook config are committed, a `git stash`, `git reset --hard` or `git clean` that would undo them is refused.
+- **A path rule sees what the gate can read of a command.** A file the command names, a file copied or moved into a directory, a tree it lands or removes (read up to 5,000 files), and what a git discard, stash or clean would undo, in a hook config's or the gate's own directory under the name its tool gives it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`, `TERMAXA_HOME`) as under the default one. Not `install`, `rsync`, `ln`, `find -exec`, an archive unpacked over the project, or what git brings in from another commit: a branch switch, a merge, a pull or `git stash pop` can replace a guarded file unseen. And until the policy and the hook config are committed, a `git stash`, `git reset --hard` or `git clean` that would undo them is refused.
 - **Previews are best-effort.** No database connection means static analysis only; Terraform previews shell out to `terraform plan`.
 - **Backups have edges.** A delete expressed through a script or a language runtime is not insured; a glob target (`rm -rf build/*`) is previewed as what it expands to and is not insured, because the shell expands it after the gate has looked; a target over the budget is refused rather than silently uninsured, unless it is a directory a build rebuilds (`node_modules`, `.next`, `dist`, `target`, `.venv`, inside the project), which is left out of the copy and said so; a link is copied as a link, never followed into the tree behind it, which is the mechanism of the Sep 20, 2026 incident that deleted 48,218 live files through directory junctions.
 - **The format may still change.** Pin a release.
@@ -430,7 +432,7 @@ Every bug found in real use, with how it was found and where it was fixed, is in
 
 ## Contributing
 
-Rust 2021, ~26,000 lines of production code and ~28,000 of tests, 723 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
+Rust 2021, ~27,500 lines of production code and ~29,900 of tests, 757 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
 
 ## Security
 

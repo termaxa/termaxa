@@ -27,7 +27,7 @@ bytes.
 | Codex CLI | `--codex` | `.codex/hooks.json` | `PreToolUse` and `PostToolUse` on `Bash\|apply_patch` | `deny` only: an explicit `allow` is rejected, an `ask` is a refusal, a failed hook falls open to Codex's own prompt. Headless (`codex exec`) a hook runs only once trusted, or with `--dangerously-bypass-hook-trust` |
 | Cursor | `--cursor` | `.cursor/hooks.json` | `beforeShellExecution` / `afterShellExecution` for the shell; `preToolUse` / `postToolUse` on `Write\|Delete` for the file tools (3.11) | `permission` in the JSON; exit 2 blocks; other non-zero exits fail open |
 | Copilot CLI | `--copilot` | `.github/hooks/hooks.json`; also reads `.claude/settings.json` as repo settings | `toolName` / `toolArgs` (arguments as a JSON string) | top-level `permissionDecision`; a non-zero exit is a hook error, so a deny exits 0 |
-| Hermes Agent | none yet (by hand, below) | the profile's `config.yaml` (`hooks:`) | `pre_tool_call` and `post_tool_call` on `terminal\|write_file\|patch\|execute_code` | a top-level `decision` or `action`: `block`, and `approve` for its approval gate; exit 2 blocks; a failure falls open unless the entry sets `fail_closed: true` |
+| Hermes Agent | `--hermes` (the profile a bare `hermes` uses, not a project) | the profile's `config.yaml` (`hooks:`) and `shell-hooks-allowlist.json` (their approval); one policy for every Hermes call, `hermes/.termaxa/policy.yaml` in termaxa's home | `pre_tool_call` and `post_tool_call` on `terminal\|write_file\|patch\|execute_code` | a top-level `decision` or `action`: `block`, and `approve` for its approval gate; exit 2 blocks; a failure falls open unless the entry sets `fail_closed: true` |
 
 A harness with no hooks runs under `termaxa wrap -- <agent>` (Unix), which
 puts shims for `sh`, `bash` and `zsh` on `PATH` and hands the agent the shim
@@ -164,12 +164,17 @@ answers are:
 {"action":"approve","message":"[termaxa] asks: <the call> — …","rule_key":"termaxa:…"}
 ```
 
-A deny also exits 2, which Hermes reads as a block by itself. An ask goes to
-Hermes's approval gate: a person answers it in an interactive session; where
-no one can, as in `hermes chat -q`, Hermes refuses the call; and `--yolo` or
-`approvals.single_query_mode: approve` lets it through, so under either an
-ask is an allow. Every allow is silence. `execute_code` is always an ask: its
-Python cannot be read, as a script file cannot.
+A deny also exits 2, which Hermes reads as a block by itself, in every mode.
+An ask goes to Hermes's approval gate: a person answers it in an interactive
+session; where no one can, as in `hermes chat -q`, Hermes refuses the call;
+and `--yolo`, `hermes -z` or `approvals.single_query_mode: approve` lets it
+through, so under any of them an ask is an allow. `-z` runs its turn as one
+nobody can answer, and Hermes approves that turn's asks as `--yolo` does
+(measured Nov 22, 2026, Hermes 0.23.3 on Windows: under `-z` an ask for
+`hostname` ran with no prompt and kept its receipt, and `rm -rf` was still
+refused; `hermes chat -q` refused the same ask). Every allow is silence.
+`execute_code` is always an ask: its Python cannot be read, as a script file
+cannot.
 
 **The prompt.** Hermes shows a hook's ask under a label of its own,
 `<terminal> (plugin approval rule)`, where the call would be, with the

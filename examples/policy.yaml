@@ -441,8 +441,10 @@ rules:
     reason: "--no-preserve-root is the only spelling `rm` obeys at `/`. Blocked."
     floor: true
   # Broad recursive-force deletes (any target), Unix + PowerShell + cmd
-  # forms. DENY by default: with auto-approving agent UIs, `ask` silently
-  # degrades to `allow`. Relax deliberately, per project, if you need to.
+  # forms. DENY by default: an `ask` reaches a person only where the agent
+  # shows it, and some agents answer it themselves (Cursor's Auto-review,
+  # Hermes under `--yolo` or `-z`; SECURITY.md has the list), while a deny
+  # holds in every one. Relax deliberately, per project, if you need to.
   # A directory a build or an install rebuilds, inside the project, is the
   # exception (`except_rebuilt`): `rm -rf node_modules`, `.next`, `dist`,
   # `build`, `target`, `.venv` and their kind run, copied aside first when

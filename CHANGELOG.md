@@ -2,6 +2,105 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.24.0 — Hermes Agent: its calls judged, its wiring written by `init` and held by the floor
+
+**In plain words:** Hermes Agent runs shell hooks that a profile's `config.yaml` declares, for every session the profile serves, and termaxa 0.23.0 read none of its calls: in a Hermes session with the released hook wired in, and Hermes's own approval set aside, `rm -rf src` ran. This release reads them (`termaxa hook --hermes`), wires them (`termaxa init --hermes`, checked by `doctor`), and holds that wiring on the floor, so an agent cannot unhook the gate by editing Hermes's configuration or revoking its approval. Hermes does not say which project a call belongs to, so every Hermes call is judged by one policy in termaxa's home. A deny blocks in every mode. An ask goes to Hermes's own approval prompt and names the call, except under `--yolo` or `hermes -z`, where Hermes approves it itself. It was tried live on Windows with Hermes 0.23.3 before the release, and that run found two defects, fixed here.
+
+Five code PRs for Hermes: #186, its dialect; #187, `init --hermes` and `doctor`; #188, the floor; #189, receipts; #190, asks. #185 gives the Claude Code plugin its icon, and #191 fixes a race in the supervised-mode boundary rig.
+
+### Added
+
+- Hermes Agent's dialect, `termaxa hook --hermes` (#186). Hermes sends `pre_tool_call` and `post_tool_call` with `tool_name`, `tool_input`, `session_id`, `cwd`, `profile` and an `extra` of ids. Its shell, `terminal`, is judged as a command; `write_file` and `patch` go to the native-write reader; `execute_code`, whose Python cannot be read, is an ask. A deny is `{"decision":"block","reason":…}` with exit 2, an ask is `{"action":"approve","message":…,"rule_key":…}` for Hermes's approval gate, an allow is silence, and a `post_tool_call` for a call that ran is a receipt. Hermes's `cwd` is the gateway's own directory (NousResearch/hermes-agent#146570) and a terminal call's `workdir` is the agent's to choose, so neither picks the policy: every Hermes call is judged by `hermes/.termaxa/policy.yaml` in termaxa's home, or by the built-in starter while there is none, with one record. A directory is read only for where a command's paths land; with none known, a path rule matches a path by its end and only a path given in full is previewed and copied, and the reason says so. Without `--hermes`, a Hermes call is refused, and the reason names the flag.
+- `termaxa init --hermes` (#187) wires the profile a bare `hermes` uses: the one `HERMES_HOME` names, or else `~/.hermes` (`%LOCALAPPDATA%\hermes` on Windows) or the profile its `active_profile` file names. It writes the Hermes policy from the starter when there is none and records its fingerprint; adds the hooks to `config.yaml` (`pre_tool_call` on `terminal`, `write_file`, `patch` and `execute_code`, with `fail_closed`; receipts on `post_tool_call`), keeping the file as it was beside it; approves both in `shell-hooks-allowlist.json`, as `hermes --accept-hooks` would; and sends the command a test call. A `config.yaml` with hooks of its own is not edited: the entries to add are printed, and a second run approves them. On Windows the command is the binary's full path. `--observe` works with it. `termaxa doctor` has a Hermes Agent line: the entry, its matcher, the approval, the command's answer to a test call, `fail_closed`, the receipts, the profile and the policy's fingerprint.
+- A receipt only for a Hermes call that ran (#189). Hermes sends `post_tool_call` after every call, the refused ones included, and says in `extra.status` what became of it. A receipt after an ask is read as a person's yes by the circuit breaker and by `termaxa report`, so termaxa keeps one only for `ok`, or for a terminal call's `error` that carries the command's own exit code. Asks refused one after another add up to a trip, as for every other agent.
+- A Hermes ask names its call and carries a `rule_key` for that call alone (#190). Hermes's prompt shows the hook's message under a label of its own; the message now says first what the call is (the command, the paths a write names, or the start of the Python, on one line, cut at 120 characters, with a control character or one that reorders text shown as `?`). Hermes keeps a standing answer ("Allow for this session", "Add to permanent allowlist") under the ask's key, so it allows the same call again and nothing else.
+- The Claude Code plugin's icon, `.claude-plugin/icon.png` in the plugin's folder: the site's mark at 1024 × 1024, for the plugin directory (#185). The folder changed, so the plugin's version is 0.1.1; it still runs `termaxa` 0.23.0 or later.
+
+### Changed
+
+- The starter holds Hermes's wiring as it holds every other agent's hook configuration, in every mode (#188). A profile's `config.yaml` and `shell-hooks-allowlist.json`, in Hermes's home and in a named profile's (`profiles/<name>`), are refused by what a command touches (four `match_path` rules), by a string rule for a program the gate cannot read (two, with `except_reads`) and from a file tool. `hermes hooks revoke` (or `remove`, or `rm`) and `hermes config set`, `unset` and `edit`, which rewrite `config.yaml` through Hermes's own code, are refused (seven string rules, with `except_reads`). `HERMES_HOME` is read as a moved directory, as `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `TERMAXA_HOME` are, and so is Hermes's own default where it is not called `.hermes`. Reading those files is ordinary work, and the rest of Hermes's home (its skills, memories and sessions) is Hermes's own. The starter has 249 rules (162 allow, 14 ask, 73 deny), 58 of them on the floor; `examples/policy.yaml` and this repository's own `.termaxa/policy.yaml` follow.
+- The starter's comment over the broad recursive-force deletes no longer says that `ask` degrades to `allow` under auto-approving agent UIs, which Claude Code's auto mode disproves. It says where an agent answers an `ask` itself (Cursor's Auto-review, Hermes under `--yolo` or `-z`) and that a deny holds in every one. No verdict changes.
+
+### Measured and documented
+
+- Live on Windows with Hermes 0.23.3 and a real model (Nov 22, 2026): a refusal reached the agent in termaxa's words; an ask reached the person at Hermes's prompt; with `termaxa` moved aside, Hermes refused the call itself, under `fail_closed`; and a `write_file` to a profile's `config.yaml` was refused, after which the agent would not try another tool. The run found #189 (a receipt for a refused call) and #190 (an ask that did not name its call, and a standing answer that covered the whole tool), each fixed before this release.
+- `hermes -z` (Nov 22, 2026, Hermes 0.23.3 on Windows): Hermes runs a one-shot turn as one nobody can answer and approves its asks as `--yolo` does, so an ask for `hostname` ran with no prompt and kept its receipt, while `rm -rf` was still refused. `hermes chat -q` refused the same ask, as `approvals.single_query_mode: deny`, Hermes's default, says it will.
+- Claude Code, for anthropics/claude-code#111218, a report that a background session ran a command its hook had asked about (2.1.328): on 2.1.330 a `claude --bg` session in auto mode held termaxa's ask as an approval waiting in `claude agents`, and nothing ran. SECURITY.md's entry on whether an `ask` reaches a human has it, and names Hermes beside Cursor's Auto-review as harnesses that answer an ask themselves.
+- The supervised-mode boundary rig waits for its supervisor to say that its socket is open, and fails, with the hook's reason, on a refusal the supervisor never made (#191).
+- docs/dialects.md has Hermes's capture, its answers, its prompt and receipts, the directory and the wiring, and names `--hermes` in its table where it said the wiring was by hand. SECURITY.md has a design bullet for Hermes, and its sentence on Tim Schipper's corpus no longer says that every agent UI answers an `ask` for you. Both READMEs have Hermes's row in the harness table and a sentence in the quick start, and say what the hash-chained record proves in each mode, where they said the agent cannot rewrite it, which holds in supervised mode only. 757 tests on Linux (34 new), 649 on Windows.
+
+### Upgrade note — Hermes, and a policy from before v0.24.0
+
+`termaxa init --hermes` writes the Hermes policy from this release's starter. A Hermes policy written from `main` before this release has the file guard and not the command rules: delete `hermes/.termaxa/policy.yaml` under termaxa's home and run `termaxa init --hermes` again.
+
+A project policy from before v0.24.0 holds Hermes's files from a file tool, with no change, but not from a command. Where an agent of another harness can reach Hermes's home, paste these thirteen rules at the top of `rules:` to have it refuse a command too:
+
+```yaml
+  - match_path: "*/.hermes/config.yaml"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.hermes/shell-hooks-allowlist.json"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.hermes/profiles/*/config.yaml"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match_path: "*/.hermes/profiles/*/shell-hooks-allowlist.json"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+  - match: "*.hermes*config.yaml*"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  - match: "*.hermes*hooks-allowlist*"
+    action: deny
+    reason: "Hermes's hook configuration is off limits — editing it unhooks the gate."
+    floor: true
+    except_reads: true
+  - match: "*hermes* hooks* revoke *"
+    action: deny
+    reason: "Revoking a Hermes hook's approval turns the hook off, and this gate is one. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* hooks* remove *"
+    action: deny
+    reason: "Revoking a Hermes hook's approval turns the hook off, and this gate is one. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* hooks* rm *"
+    action: deny
+    reason: "Revoking a Hermes hook's approval turns the hook off, and this gate is one. Do it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* set *"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* unset *"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* edit"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+  - match: "*hermes* config* edit *"
+    action: deny
+    reason: "Hermes's config.yaml declares its hooks, and this gate is one of them. Change it yourself."
+    floor: true
+    except_reads: true
+```
+
+Then run `termaxa init`, which is how `doctor` is told that the edited policy is the one you mean, and `termaxa check "hermes hooks revoke pre_tool_call"` should say `deny`.
+
 ## v0.23.0 — the Claude Code plugin, and `init` proposes a watched project's own rules
 
 **In plain words:** v0.22.0 gave Claude Code a hook that a plugin could register for every project on the machine, watching a project that has no policy, and nothing registered it yet. This release is that plugin. It lives in this repository, which is its own marketplace, so `/plugin install termaxa --marketplace termaxa/termaxa` puts the gate on every project you open in Claude Code (2.1.275 or later; on an earlier version, `/plugin marketplace add termaxa/termaxa` and then `/plugin install termaxa@termaxa`). A plugin registers hooks that run as the session does, and this gate can be one of them, so the floor now holds the plugin as it holds the settings file: an agent cannot turn it off, uninstall it, or rewrite what Claude Code installed. And the record of a watched project has a use: `termaxa init` reads it and proposes the project's own rules, each with how often it asked, for you to take or leave.
