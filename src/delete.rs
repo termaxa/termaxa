@@ -1721,28 +1721,39 @@ pub(crate) fn tokenize_detailed(s: &str) -> Vec<Tok> {
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         match (quote, c) {
-            // Inside double quotes a backslash escapes the next character,
-            // so `"a\"b"` is the one argument `a"b` and the quote it hides
-            // closes nothing. This is `pg::shell_tokens`' rule verbatim, and
-            // adopting it is #50: until v0.17 the backslash was literal
-            // here, so the preview resolved `a\b` while the backup engine
-            // copied `a"b` — one delete, two filenames, and the resolved-path
-            // policy layer reading the preview's.
+            // Inside double quotes a backslash escapes `"`, `\`, `$`, a
+            // backtick and a newline, so `"a\"b"` is the one argument `a"b`
+            // and the quote it hides closes nothing. Adopting that is #50:
+            // until v0.17 the backslash was literal here, so the preview
+            // resolved `a\b` while the backup engine copied `a"b` — one
+            // delete, two filenames, and the resolved-path policy layer
+            // reading the preview's. `pg::shell_tokens` reads the same rule,
+            // and the two move together.
             //
-            // Verbatim includes where the rule is wrong: a shell keeps the
-            // backslash before an ordinary character, so `"a\nb"` is really
-            // `a\nb` and both lexers here say `anb`. That is a divergence
-            // from bash, not between the two engines, and closing it means
-            // moving both together rather than one of them now.
+            // Before any other character the backslash stays, as it does in
+            // bash. Both lexers used to drop it, which made `"a\nb"` into
+            // `anb` and every quoted Windows path into another name:
+            // `rm "C:\Users\me\x"` was previewed as `C:Usersmex`, "nothing
+            // to delete", and the copy aside found nothing to copy, while
+            // Git Bash, cmd and PowerShell all delete `C:\Users\me\x`.
             (Some('"'), '\\') => {
-                if let Some(next) = chars.next() {
-                    all_single = false;
-                    if next == '$' {
-                        // Only walked when an escaped `$` actually arrives,
-                        // which keeps the count off the hot path.
-                        literal_dollars.push(cur.chars().count());
+                all_single = false;
+                match chars.next() {
+                    // A line continuation: both go.
+                    Some('\n') => {}
+                    Some(next @ ('"' | '\\' | '$' | '`')) => {
+                        if next == '$' {
+                            // Only walked when an escaped `$` actually
+                            // arrives, which keeps the count off the hot path.
+                            literal_dollars.push(cur.chars().count());
+                        }
+                        cur.push(next);
                     }
-                    cur.push(next);
+                    Some(next) => {
+                        cur.push('\\');
+                        cur.push(next);
+                    }
+                    None => cur.push('\\'),
                 }
             }
             (Some(q), ch) if ch == q => quote = None,
@@ -2707,12 +2718,17 @@ mod tests {
             "\"rm\" -rf x",
             "del /s /q C:\\tmp",
             r#"rm -rf back\slash"#,
-            // Both lexers drop a backslash a shell would keep, so both say
-            // `anb`. Pinned deliberately: the property under test is that
-            // the preview and the insurance name one file, and this is the
-            // shape where they agree on a reading bash does not share.
+            // A backslash before an ordinary character stays, in both: the
+            // shape where both lexers used to agree on a reading bash did
+            // not share (`anb`), and where every quoted Windows path lost
+            // its separators.
             r#"rm -rf "a\nb""#,
             r#"rm -rf "\$SID""#,
+            r#"rm -rf "a\\b""#,
+            r#"rm -rf "C:\Users\me\x""#,
+            r#"Remove-Item -Recurse "C:\Users\me\x""#,
+            r#"del /s /q "C:\Program Files\x\""#,
+            "rm -rf \"a\\\nb\"",
         ] {
             assert_eq!(
                 extract_targets(cmd),
@@ -2720,6 +2736,51 @@ mod tests {
                 "preview and backup disagree about {cmd:?}"
             );
         }
+    }
+
+    /// What both lexers read inside double quotes, pinned as bash reads it:
+    /// a backslash escapes `"`, `\`, `$`, a backtick and a newline, and stays
+    /// before anything else. Dropping it there turned every quoted Windows
+    /// path into another name.
+    #[test]
+    fn a_backslash_inside_double_quotes_is_read_as_bash_reads_it() {
+        for (cmd, target) in [
+            (r#"rm -rf "a\"b""#, r#"a"b"#),
+            (r#"rm -rf "a\\b""#, r"a\b"),
+            (r#"rm -rf "a\nb""#, r"a\nb"),
+            (r#"rm -rf "a\`b""#, "a`b"),
+            ("rm -rf \"a\\\nb\"", "ab"),
+            (r#"rm -rf "C:\Users\me\x""#, r"C:\Users\me\x"),
+            (r#"Remove-Item -Recurse "C:\Users\me\x""#, r"C:\Users\me\x"),
+            (
+                r#"rd /s /q "D:\Projects\New Project""#,
+                r"D:\Projects\New Project",
+            ),
+            (r"rm -rf 'C:\Users\me\x'", r"C:\Users\me\x"),
+        ] {
+            assert_eq!(extract_targets(cmd), vec![target], "{cmd}");
+        }
+        // An escaped `$` is still a literal one.
+        let t = extract_targets_detailed(r#"rm -rf "\$SID""#);
+        assert_eq!(t[0].text, "$SID");
+        assert!(!t[0].has_unexpanded_var());
+    }
+
+    /// The everyday Windows spelling, a quoted path with backslashes, was
+    /// previewed as another name: "nothing to delete". On unix the same
+    /// spelling names a directory with a backslash in its name, which is
+    /// what bash deletes there; on Windows it is the native path.
+    #[test]
+    fn a_quoted_path_with_backslashes_is_previewed_as_the_shell_reads_it() {
+        let tmp = TempTree::new("del-quoted-backslash");
+        let dir = tmp.dir(if cfg!(windows) { "sub" } else { r"sub\dir" });
+        std::fs::write(dir.join("f"), "f").unwrap();
+        let command = format!(r#"rm -r "{}""#, dir.display());
+        let lines = preview_for(&command, None, tmp.path()).unwrap().lines;
+        assert!(
+            has_line(&lines, "1 files across 1 directory"),
+            "{command}: {lines:?}"
+        );
     }
 
     #[test]

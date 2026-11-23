@@ -1835,6 +1835,27 @@ mod tests {
         );
     }
 
+    /// A quoted path with backslashes is copied as the shell reads it. The
+    /// copy aside used to look for the name with its backslashes dropped,
+    /// find nothing, and leave a Windows delete of `"C:\Users\..."`
+    /// uninsured. On unix the spelling names a directory with a backslash in
+    /// its name; on Windows it is the native path.
+    #[test]
+    fn a_quoted_path_with_backslashes_is_copied_as_the_shell_reads_it() {
+        let env = TestEnv::new("bk-quoted-backslash");
+        let work = env.root().join("work");
+        let dir = work.join(if cfg!(windows) { "sub" } else { r"sub\dir" });
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), "f").unwrap();
+        let state = env.root().join("state");
+        let command = format!(r#"rm -r "{}""#, dir.display());
+        let rec = take(&state, &command, &work)
+            .expect("take must not fail")
+            .unwrap_or_else(|| panic!("{command}: an existing target is insured"));
+        let saved = PathBuf::from(rec.data["items"][0]["saved_as"].as_str().unwrap());
+        assert!(saved.join("f").is_file(), "{command}: {saved:?}");
+    }
+
     /// #62. `sh -c "cat /dev/null > src/main.rs"` was asked, approved and
     /// executed with no backup: insurance saw `sh` with two arguments.
     #[test]
@@ -1843,10 +1864,10 @@ mod tests {
         let state = tmp.dir("state");
         let doomed = tmp.file("doomed.txt", "precious");
         // Forward slashes on purpose. Inside the double-quoted -c string a
-        // backslash escapes the next character to this lexer (the #50 rule,
-        // where bash would keep `\U` as is), so a Windows temp path spelled
-        // `C:\Users\...` arrives as `C:Users...` and names nothing. That is
-        // #56's divergence, not this test's subject; Windows reads `C:/...`.
+        // backslash before an ordinary character survives, as in bash, but
+        // the shell that runs the string reads an unquoted backslash as an
+        // escape, so `C:\Users\...` is not the path rm would receive there.
+        // That reading is not this test's subject; Windows reads `C:/...`.
         let d = doomed.display().to_string().replace('\\', "/");
 
         for (command, expected_plan) in [
