@@ -3400,6 +3400,25 @@ mod tests {
         assert!(has_line(&lines, "files across"), "{lines:?}");
     }
 
+    /// #64. What cmd or PowerShell is handed to delete is previewed: the
+    /// wrapper alone used to have no target, so no count and no insurance.
+    #[test]
+    fn a_delete_inside_a_windows_shells_string_is_previewed() {
+        let tmp = TempTree::new("del-windows-wrapper");
+        std::fs::write(tmp.path().join("notes.txt"), "n").unwrap();
+        for cmd in [
+            r#"cmd /c "del notes.txt""#,
+            r#"powershell -Command "Remove-Item notes.txt""#,
+        ] {
+            let lines = preview_for(cmd, Some(tmp.path()), tmp.path())
+                .unwrap_or_else(|| panic!("{cmd}: no preview"))
+                .lines;
+            assert!(has_line(&lines, "notes.txt"), "{cmd}: {lines:?}");
+            assert!(has_line(&lines, "1 files"), "{cmd}: {lines:?}");
+            assert!(has_line(&lines, "insurance   :"), "{cmd}: {lines:?}");
+        }
+    }
+
     #[test]
     fn an_insurable_delete_within_budget_reports_its_insurance() {
         let tmp = TempTree::new("del-insurance");

@@ -1416,6 +1416,25 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #64. A delete handed to cmd or PowerShell is insured like the same
+    /// delete typed at the top level.
+    #[test]
+    fn a_delete_inside_a_windows_shells_string_is_insured() {
+        let tmp = TempTree::new("bk-windows-wrapper");
+        std::fs::write(tmp.path().join("notes.txt"), "n").unwrap();
+        for cmd in [
+            r#"cmd /c "del notes.txt""#,
+            r#"powershell -Command "Remove-Item notes.txt""#,
+            r#"pwsh -c "rm notes.txt""#,
+        ] {
+            assert_eq!(
+                plan(cmd, tmp.path()).as_deref(),
+                Some("copy 1 path(s) to .termaxa/backups before deletion"),
+                "{cmd}"
+            );
+        }
+    }
+
     #[test]
     fn powershell_and_cmd_deletes_are_insurable_too() {
         // Previously only `rm` was matched, so every PowerShell and cmd delete

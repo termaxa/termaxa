@@ -1709,7 +1709,8 @@ const MAX_INNER_DEPTH: usize = 8;
 /// is refused the same way (`Segment::unread`).
 const MAX_INNER_COMMANDS: usize = 100;
 
-/// `split_segments`, and then through every POSIX shell `-c` string found.
+/// `split_segments`, and then through every POSIX shell `-c` string found,
+/// and every string `cmd /c` or `powershell -Command` is handed (#64).
 ///
 /// #62. `sh -c "cat /dev/null > src/main.rs"` was a segment whose head is
 /// `sh`, with two arguments, to every engine: no overwrite intent, no
@@ -1937,7 +1938,18 @@ fn expand_into(
         let gated_or = prev_joiner == Some(Joiner::Or);
         // Past the depth limit a `-c` string is not read, and the segment
         // says so: a command is still inside it.
-        let wrapped = wrapped_command(&seg).or_else(|| wrapped_eval(&seg));
+        // The string a wrapper hands a shell: the name the reading gives it,
+        // the string, the shell that reads it, and whether it runs in this
+        // shell (`eval`) rather than a child.
+        let wrapped: Option<(String, String, Reading, bool)> = wrapped_command(&seg)
+            .map(|(shell, script)| (format!("{shell} -c"), script, Reading::Posix, false))
+            .or_else(|| {
+                wrapped_eval(&seg)
+                    .map(|(_, script)| ("eval".to_string(), script, Reading::Posix, true))
+            })
+            .or_else(|| {
+                wrapped_windows(&seg).map(|(label, script, shell)| (label, script, shell, false))
+            });
         let wrapped = if depth < MAX_WRAP_DEPTH {
             wrapped
         } else {
@@ -1981,17 +1993,14 @@ fn expand_into(
         let at = out.len();
         out.push(seg);
         let mut script_read: Option<String> = None;
-        if let Some((shell, script)) = wrapped {
-            let label = if shell == "eval" {
-                "eval".to_string()
-            } else {
-                format!("{shell} -c")
-            };
+        if let Some((label, script, reads_as, same_shell)) = wrapped {
             // The string is a command line the wrapper's shell reads: under
             // a reading, as that shell reads it (`split_segments_deep`).
+            // `cmd /c` and `powershell -Command` hand theirs to cmd and to
+            // PowerShell, whatever shell typed the line (#64).
             let script = match reading {
                 Reading::Typed => script,
-                _ => respelled(&script, Reading::Posix).unwrap_or(script),
+                _ => respelled(&script, reads_as).unwrap_or(script),
             };
             let after = expand_into(
                 out,
@@ -2004,7 +2013,7 @@ fn expand_into(
                 reading,
             );
             // An `eval` runs in this shell, so a `cd` inside it moves it.
-            if shell == "eval" && own_shell && after != here {
+            if same_shell && own_shell && after != here {
                 moves_to = Some(after);
             }
             script_read = Some(script);
@@ -2924,6 +2933,174 @@ fn wrapped_command(seg: &Segment) -> Option<(String, String)> {
     None
 }
 
+/// The string a Windows shell is handed to run (#64), with the name the
+/// reading gives the wrapper and the shell that reads the string.
+///
+/// `cmd /c "del /s /q build"` and `powershell -Command "Remove-Item
+/// build"` were a segment whose head is `cmd` or `powershell`, with
+/// arguments, to every engine: no preview, no insurance, no intent, and an
+/// ask from the policy default, or a refusal only where a rule happened to
+/// match the whole line's text. The spellings come from captures: Codex
+/// sends `C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -Command
+/// echo hi`, its command unquoted, and Cursor sends `cmd /c "rd /s /q
+/// \"C:\…\.cursor\" && rd /s /q \"C:\…\.termaxa\" && …"` (both read from a
+/// Windows machine's audit log, Nov 24, 2026).
+fn wrapped_windows(seg: &Segment) -> Option<(String, String, Reading)> {
+    let tokens = crate::delete::tokenize_public(seg.command());
+    let (head, at) = crate::delete::resolve_head(&tokens)?;
+    match head.as_str() {
+        "cmd" => cmd_string(seg.command()).map(|s| ("cmd /c".to_string(), s, Reading::Cmd)),
+        "powershell" | "pwsh" => powershell_string(&head, &tokens[at + 1..])
+            .map(|s| (format!("{head} -Command"), s, Reading::PowerShell)),
+        _ => None,
+    }
+}
+
+/// What `cmd /c` (or `/k`) runs: the rest of the line after the switch, with
+/// cmd's own rule for the quotes around it (`cmd /?`). They are kept when no
+/// `/s` came first, there are exactly two, and between them is whitespace,
+/// none of `&<>()@^|`, and the name of a program; otherwise the first and
+/// the last are taken out. "The name of a program" is read here as a name
+/// ending in .exe, .com, .bat or .cmd: whether it exists is not looked up.
+/// Other switches before `/c` (`/d /s /c`, as Node spawns a command) are
+/// stepped over; a word that is not a switch means cmd runs no `/c` string.
+fn cmd_string(text: &str) -> Option<String> {
+    let words = cmd_words(text);
+    let head = words
+        .iter()
+        .position(|&(s, e)| crate::delete::command_head(text[s..e].trim_matches('"')) == "cmd")?;
+    let mut strip = false;
+    for &(s, e) in &words[head + 1..] {
+        let word = text[s..e].to_ascii_lowercase();
+        if word == "/c" || word == "/k" {
+            let rest = text[e..].trim();
+            if rest.is_empty() {
+                return None;
+            }
+            return Some(cmd_quotes(rest, strip));
+        }
+        if !word.starts_with('/') {
+            return None;
+        }
+        strip |= word == "/s";
+    }
+    None
+}
+
+/// `rest` with cmd's `/c` quote rule applied (`cmd_string`).
+fn cmd_quotes(rest: &str, strip: bool) -> String {
+    if !rest.starts_with('"') {
+        return rest.to_string();
+    }
+    if !strip && rest.matches('"').count() == 2 {
+        let close = 1 + rest[1..].find('"').unwrap_or(0);
+        let inner = &rest[1..close];
+        let program = [".exe", ".com", ".bat", ".cmd"]
+            .iter()
+            .any(|x| inner.trim_end().to_ascii_lowercase().ends_with(x));
+        if program
+            && inner.contains(char::is_whitespace)
+            && !inner.contains(|c| "&<>()@^|".contains(c))
+        {
+            return rest.to_string();
+        }
+    }
+    let last = rest.rfind('"').unwrap_or(0);
+    if last == 0 {
+        rest[1..].to_string()
+    } else {
+        format!("{}{}", &rest[1..last], &rest[last + 1..])
+    }
+}
+
+/// The words of a line as cmd separates them: by whitespace, with a double
+/// quote opening and closing a stretch that whitespace does not split. Byte
+/// spans into `text`.
+fn cmd_words(text: &str) -> Vec<(usize, usize)> {
+    let mut words = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut quoted = false;
+    for (i, c) in text.char_indices() {
+        if c == '"' {
+            quoted = !quoted;
+        }
+        if c.is_whitespace() && !quoted {
+            if let Some(s) = start.take() {
+                words.push((s, i));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        words.push((s, text.len()));
+    }
+    words
+}
+
+/// What PowerShell runs from its command line (#64): every argument after
+/// `-Command` (or `-c`), joined with spaces, as PowerShell joins them; and
+/// for `powershell` every argument from the first that is not a parameter,
+/// which it takes as the command. `pwsh` takes that argument as a script
+/// file. A script file, `-File`, `-EncodedCommand` and `-Command -` (the
+/// command on stdin) are not read: what they run is not on the line.
+fn powershell_string(head: &str, args: &[String]) -> Option<String> {
+    let joined = |rest: &[String]| {
+        let s = rest.join(" ");
+        (!s.trim().is_empty()).then_some(s)
+    };
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let name = arg
+            .strip_prefix("--")
+            .or_else(|| arg.strip_prefix('-'))
+            .or_else(|| arg.strip_prefix('/'))
+            .map(str::to_ascii_lowercase);
+        let Some(name) = name.filter(|n| !n.is_empty()) else {
+            return if head == "powershell" {
+                joined(&args[i..])
+            } else {
+                None
+            };
+        };
+        if name == "c" || (name.len() >= 3 && "command".starts_with(&name)) {
+            let rest = &args[i + 1..];
+            if rest.first().is_some_and(|r| r == "-") {
+                return None;
+            }
+            return joined(rest);
+        }
+        let encoded =
+            name == "e" || name == "ec" || (name.len() >= 3 && "encodedcommand".starts_with(&name));
+        let file = name == "f" || (name.len() >= 2 && "file".starts_with(&name));
+        if encoded || file {
+            return None;
+        }
+        i += if powershell_takes_value(&name) { 2 } else { 1 };
+    }
+    None
+}
+
+/// PowerShell's command-line parameters that take a value, by the names and
+/// the short forms written for them: `-ExecutionPolicy Bypass`, `-ep
+/// Bypass`, `-WindowStyle Hidden`.
+fn powershell_takes_value(name: &str) -> bool {
+    const LONG: [&str; 10] = [
+        "executionpolicy",
+        "windowstyle",
+        "inputformat",
+        "outputformat",
+        "version",
+        "psconsolefile",
+        "configurationname",
+        "custompipename",
+        "workingdirectory",
+        "settingsfile",
+    ];
+    const SHORT: [&str; 8] = ["ep", "ex", "w", "if", "of", "o", "v", "wd"];
+    SHORT.contains(&name) || (name.len() >= 3 && LONG.iter().any(|l| l.starts_with(name)))
+}
+
 /// Whether what a `-c` or `eval` string writes stays where the line's own
 /// output goes, so a literal heredoc inside it can be a file's contents as
 /// it would be typed at the top level. The wrapper is named plainly (`env
@@ -3013,8 +3190,9 @@ pub struct Segment {
     /// Files this segment writes over, in order of appearance.
     pub redirects: Vec<Overwrite>,
     /// The shell wrapper this segment was read through, as `sh -c`, when
-    /// `split_segments_deep` found it inside a `-c` string. `None` for a
-    /// segment typed at the top level (#62).
+    /// `split_segments_deep` found it inside a `-c` string, or as `cmd /c`
+    /// or `powershell -Command` inside a Windows shell's string (#64).
+    /// `None` for a segment typed at the top level (#62).
     pub via: Option<String>,
     /// True when this segment is a shell wrapper whose `-c` string was read
     /// and follows it as segments of its own. The policy treats such a
@@ -3911,6 +4089,117 @@ mod tests {
         }
         // Nothing after the options is not a -c string.
         assert_eq!(split_segments_deep("sh -c -l").len(), 1);
+    }
+
+    /// #64. The string `cmd /c` or `powershell -Command` is handed is read
+    /// the way #62 reads a POSIX shell's `-c` string: the wrapper stays, and
+    /// the string's own segments follow it, each naming its wrapper.
+    #[test]
+    fn a_windows_shells_string_is_read_as_its_own_segments() {
+        fn read(cmd: &str) -> Vec<(String, Option<String>)> {
+            split_segments_deep(cmd)
+                .iter()
+                .map(|s| ((**s).to_string(), s.via.clone()))
+                .collect()
+        }
+        let inner = |cmd: &str| -> Vec<(String, String)> {
+            read(cmd)
+                .into_iter()
+                .skip(1)
+                .map(|(t, v)| (t, v.unwrap_or_default()))
+                .collect()
+        };
+        let cmd_c = |t: &str| (t.to_string(), "cmd /c".to_string());
+
+        // cmd: the first and last quote go; switches before /c are stepped
+        // over (`/d /s /c` is how Node spawns a command); case, a path and
+        // `.exe` do not matter; an unquoted string is the rest of the line.
+        let all = read(r#"cmd /c "del /s /q build""#);
+        assert_eq!(all[0], (r#"cmd /c "del /s /q build""#.to_string(), None));
+        assert_eq!(
+            inner(r#"cmd /c "del /s /q build""#),
+            [cmd_c("del /s /q build")]
+        );
+        assert_eq!(
+            inner(r#"cmd.exe /d /s /c "rd /s /q dist && del notes.txt""#),
+            [cmd_c("rd /s /q dist"), cmd_c("del notes.txt")]
+        );
+        assert_eq!(
+            inner(r"C:\WINDOWS\System32\cmd.exe /C del notes.txt"),
+            [cmd_c("del notes.txt")]
+        );
+        assert_eq!(
+            inner(r#"cmd /k "vssadmin delete shadows /all /quiet""#),
+            [cmd_c("vssadmin delete shadows /all /quiet")]
+        );
+        // Two quotes around a program's name keep them, unless /s came first.
+        assert_eq!(
+            inner(r#"cmd /c "C:\Program Files\tool.exe" --flag"#),
+            [cmd_c(r#""C:\Program Files\tool.exe" --flag"#)]
+        );
+        assert_eq!(
+            inner(r#"cmd /s /c "C:\Program Files\tool.exe" --flag"#)[0].0,
+            r"C:\Program Files\tool.exe --flag"
+        );
+        // Cursor's spelling, captured on Windows (Nov 24, 2026), its first
+        // two clauses: escaped quotes inside, and each clause read.
+        let cursor = inner(
+            r#"cmd /c "rd /s /q \"C:\Users\User\code\cursor-hn-test\.cursor\" && rd /s /q \"C:\Users\User\code\cursor-hn-test\.termaxa\"""#,
+        );
+        assert_eq!(cursor.len(), 2, "{cursor:?}");
+        assert!(
+            cursor
+                .iter()
+                .all(|(t, v)| t.starts_with("rd /s /q") && v == "cmd /c"),
+            "{cursor:?}"
+        );
+
+        // PowerShell: everything after -Command, joined. Codex's spelling,
+        // captured on the same machine: a full path, the command unquoted.
+        assert_eq!(
+            inner(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -Command echo hi"),
+            [("echo hi".to_string(), "powershell -Command".to_string())]
+        );
+        assert_eq!(
+            inner(
+                r#"powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -Recurse -Force build""#
+            ),
+            [(
+                "Remove-Item -Recurse -Force build".to_string(),
+                "powershell -Command".to_string()
+            )]
+        );
+        assert_eq!(
+            inner(r#"pwsh -c "rm -r build; Get-ChildItem""#),
+            [
+                ("rm -r build".to_string(), "pwsh -Command".to_string()),
+                ("Get-ChildItem".to_string(), "pwsh -Command".to_string())
+            ]
+        );
+        // `powershell` takes its first argument that is not a parameter as
+        // the command.
+        assert_eq!(
+            inner(r#"powershell -nop "Remove-Item notes.txt""#),
+            [(
+                "Remove-Item notes.txt".to_string(),
+                "powershell -Command".to_string()
+            )]
+        );
+
+        // Not read: what runs is not on the line, or no string is handed.
+        for cmd in [
+            "pwsh script.ps1",
+            "powershell -File clean.ps1",
+            "powershell -ExecutionPolicy Bypass -File clean.ps1",
+            "powershell -EncodedCommand ZQBjAGgAbwAgAGgAaQA=",
+            "powershell -Command -",
+            "powershell -NoProfile",
+            "cmd script.bat",
+            "cmd /c",
+            "cmd",
+        ] {
+            assert_eq!(read(cmd).len(), 1, "{cmd}: {:?}", read(cmd));
+        }
     }
 
     #[test]

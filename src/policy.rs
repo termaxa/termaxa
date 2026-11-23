@@ -6273,6 +6273,29 @@ mod shell_reading_tests {
     /// A reading adds a refusal and nothing else, and only one the line as
     /// typed never met. An ordinary line with a backslash, a caret or a
     /// backtick in it is judged as it always was, under every reading.
+    /// #64. A string `cmd /c` or `powershell -Command` is handed is read as
+    /// that shell reads it, under that shell's reading: a caret or a
+    /// backtick that hides a verb from the walk does not hide it from cmd or
+    /// PowerShell, and the line is refused as they read it. As typed, the
+    /// walk reads the string and asks, as it did before the wrapper was read
+    /// at all; a reading adds a refusal and nothing else.
+    #[test]
+    fn a_windows_shells_string_is_read_as_that_shell_reads_it() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for line in [
+            r#"cmd /c "r^d /s /q wt""#,
+            r#"cmd /d /s /c "rd /^s /q wt""#,
+            "powershell -Command \"Remove-Item -Rec`urse wt\"",
+            "pwsh -c \"Re`move-Item -Recurse wt\"",
+        ] {
+            let typed = read_by(&p, line, &ctx, &[]);
+            assert_eq!(typed.action, Action::Ask, "{line}: {}", typed.reason);
+            let read = read_by(&p, line, &ctx, &ALL);
+            assert_eq!(read.action, Action::Deny, "{line}: {}", read.reason);
+        }
+    }
+
     #[test]
     fn a_reading_adds_a_refusal_and_nothing_else() {
         let p = Policy::builtin().expect("built-in starter policy must parse");
