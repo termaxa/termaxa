@@ -284,30 +284,34 @@ pub fn stub_program(dir: &Path, name: &str, script: &StubScript) -> PathBuf {
     path
 }
 
-/// The `test_stub` example as a plain `cargo test` builds it: in `examples`,
-/// beside the `deps` directory the test binary runs from.
+/// The `test_stub` example as a plain `cargo test` builds it: in the
+/// `examples` directory of the profile the test binary was built for.
+///
+/// Found by walking up from the test binary, because where that binary runs
+/// from is Cargo's to change, and changed: under cargo 1.97 it is
+/// `target/<profile>/deps/`, and under 1.100, which CI runs, it is
+/// `target/<profile>/build/termaxa/<hash>/out/`. The example lands in
+/// `target/<profile>/examples/` under both (measured Nov 24, 2026). The
+/// first version of this looked only beside `deps`, and every CI job failed.
 fn test_stub_binary() -> PathBuf {
     let me = std::env::current_exe().expect("the test binary has a path");
-    let bin = me
-        .parent()
-        .and_then(Path::parent)
-        .map(|profile| {
-            profile
-                .join("examples")
-                .join(format!("test_stub{}", std::env::consts::EXE_SUFFIX))
-        })
-        .expect("the test binary runs from target/<profile>/deps");
+    let name = format!("test_stub{}", std::env::consts::EXE_SUFFIX);
+    let found = me
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join("examples").join(&name))
+        .find(|bin| bin.is_file());
     // Measured with cargo 1.97: `cargo test` and `cargo test --no-run` build
     // every example; `cargo test <name>` and `cargo test --bin termaxa` build
     // none. A narrowed run finds the copy an earlier plain run left.
-    assert!(
-        bin.is_file(),
-        "{} is missing. A plain `cargo test` builds it from examples/test_stub.rs; \
-         a run narrowed to a test name or to `--bin` does not. \
-         `cargo build --example test_stub` once, and narrowed runs find it.",
-        bin.display()
-    );
-    bin
+    found.unwrap_or_else(|| {
+        panic!(
+            "no examples/{name} above {}. A plain `cargo test` builds it from \
+             examples/test_stub.rs; a run narrowed to a test name or to `--bin` does not. \
+             `cargo build --example test_stub` once, and narrowed runs find it.",
+            me.display()
+        )
+    })
 }
 
 /// Absolute path of `bin` on the current `PATH`, if it resolves to a file.
