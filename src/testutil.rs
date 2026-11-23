@@ -247,6 +247,69 @@ pub fn wait_until_executable(path: &Path) {
     }
 }
 
+/// What a stand-in program prints and how it exits (`stub_program`).
+pub struct StubScript<'a> {
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    pub code: i32,
+    /// A file the stand-in writes its arguments to, one per line.
+    pub argv_to: Option<&'a Path>,
+}
+
+/// A stand-in for the program `name`, on every platform (#59).
+///
+/// The `test_stub` example (`examples/test_stub.rs`), copied into `dir` as
+/// `name`, `name.exe` on Windows, with `script` written beside it. The tests
+/// that drive a spawn used `#!/bin/sh` files, which left them unix-only: the
+/// spawn path, with Windows' own path handling and `.exe` resolution, went
+/// untested on the home platform.
+///
+/// A copy is written and then exec'd, the ETXTBSY shape, so on unix it gets
+/// `wait_until_executable`. Windows gets no wait: what a just-copied `.exe`
+/// does there under parallel load has not been measured, and the first
+/// Windows runs of these tests are that measurement.
+pub fn stub_program(dir: &Path, name: &str, script: &StubScript) -> PathBuf {
+    let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(test_stub_binary(), &path).expect("the stand-in must be copyable");
+    let json = serde_json::json!({
+        "stdout": script.stdout,
+        "stderr": script.stderr,
+        "code": script.code,
+        "argv_to": script.argv_to.map(|p| p.display().to_string()),
+    });
+    std::fs::write(path.with_extension("stub"), json.to_string())
+        .expect("the stand-in's script must be writable");
+    #[cfg(unix)]
+    wait_until_executable(&path);
+    path
+}
+
+/// The `test_stub` example as a plain `cargo test` builds it: in `examples`,
+/// beside the `deps` directory the test binary runs from.
+fn test_stub_binary() -> PathBuf {
+    let me = std::env::current_exe().expect("the test binary has a path");
+    let bin = me
+        .parent()
+        .and_then(Path::parent)
+        .map(|profile| {
+            profile
+                .join("examples")
+                .join(format!("test_stub{}", std::env::consts::EXE_SUFFIX))
+        })
+        .expect("the test binary runs from target/<profile>/deps");
+    // Measured with cargo 1.97: `cargo test` and `cargo test --no-run` build
+    // every example; `cargo test <name>` and `cargo test --bin termaxa` build
+    // none. A narrowed run finds the copy an earlier plain run left.
+    assert!(
+        bin.is_file(),
+        "{} is missing. A plain `cargo test` builds it from examples/test_stub.rs; \
+         a run narrowed to a test name or to `--bin` does not. \
+         `cargo build --example test_stub` once, and narrowed runs find it.",
+        bin.display()
+    );
+    bin
+}
+
 /// Absolute path of `bin` on the current `PATH`, if it resolves to a file.
 ///
 /// Used only to find the lookup tool itself before [`TestEnv::isolate_path`]

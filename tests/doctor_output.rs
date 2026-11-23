@@ -20,8 +20,7 @@
 //! budget bound inside the directory as well, the same probe answers in
 //! roughly 300ms and these tests can say what they mean.
 
-#![cfg(unix)]
-
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,6 +62,7 @@ fn scratch(tag: &str) -> PathBuf {
 /// `which` (doctor asks it whether a tool exists), and nothing else. Agent
 /// binaries are absent by construction, so their detection comes down to
 /// exactly what each test puts here.
+#[cfg(unix)]
 fn controlled_path(root: &Path) -> PathBuf {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir must be creatable");
@@ -77,13 +77,32 @@ fn controlled_path(root: &Path) -> PathBuf {
     bin
 }
 
+/// An empty PATH directory. The probe runs the registered command through
+/// `cmd`, and an agent's CLI is looked up with `where`; a Windows process
+/// finds both in System32 whatever PATH holds (Rust searches it after the
+/// child's PATH), so only the agents a test puts here are found (#59).
+#[cfg(windows)]
+fn controlled_path(root: &Path) -> PathBuf {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir must be creatable");
+    bin
+}
+
 /// A stub executable on the controlled PATH, so "this agent's CLI is
 /// installed" becomes a fact the test sets rather than one it inherits.
+#[cfg(unix)]
 fn stub_tool(bin: &Path, name: &str) {
     let path = bin.join(name);
     std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("stub must be writable");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .expect("stub must be executable");
+}
+
+/// A CLI `where` finds: `name.cmd`, which PATHEXT names, exiting 0.
+#[cfg(windows)]
+fn stub_tool(bin: &Path, name: &str) {
+    std::fs::write(bin.join(format!("{name}.cmd")), "@exit /b 0\r\n")
+        .expect("stub must be writable");
 }
 
 fn project(root: &Path, policy: &str) -> PathBuf {

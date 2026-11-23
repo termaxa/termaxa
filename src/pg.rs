@@ -875,9 +875,6 @@ mod tests {
         assert_eq!(psql_program(&shell_tokens("evilpsql -c 'x'")), None);
     }
 
-    // All three users are #[cfg(unix)] (they need shell stub binaries), so on
-    // Windows this import is unused and -D warnings makes it fatal.
-    #[cfg(unix)]
     use crate::testutil::TempTree;
 
     // -----------------------------------------------------------------------
@@ -1120,42 +1117,36 @@ mod tests {
     //
     // The stub is reached by ABSOLUTE PATH, taken from the command itself, so
     // nothing here touches the process environment: psql_program accepts any
-    // path whose file stem is psql.
+    // path whose file stem is psql. It is the suite's stand-in program
+    // (`testutil::stub_program`), so these run on Windows too (#59): there
+    // the stub is `psql.exe`, the path the command names has backslashes, and
+    // the spawn is CreateProcess's.
     // -----------------------------------------------------------------------
 
-    #[cfg(unix)]
     fn stub_psql(dir: &std::path::Path, body: &str, code: i32) -> std::path::PathBuf {
         stub_psql_full(dir, body, "", code)
     }
 
     /// A stub that can also speak on stderr, which is where real psql puts
-    /// the reason for a non-zero exit. Neither body may contain a `"`.
-    #[cfg(unix)]
+    /// the reason for a non-zero exit.
     fn stub_psql_full(
         dir: &std::path::Path,
         stdout: &str,
         stderr: &str,
         code: i32,
     ) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-        let path = dir.join("psql");
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"{stdout}\"\nprintf '%s\\n' \"{stderr}\" >&2\nexit {code}\n"
-            ),
+        crate::testutil::stub_program(
+            dir,
+            "psql",
+            &crate::testutil::StubScript {
+                stdout,
+                stderr,
+                code,
+                argv_to: None,
+            },
         )
-        .expect("stub must be writable");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("stub must be executable");
-        // Written and then exec'd at once: the ETXTBSY window (#51). Without
-        // the wait, an exec that lost the race read as a psql that failed,
-        // and the dependents came back empty.
-        crate::testutil::wait_until_executable(&path);
-        path
     }
 
-    #[cfg(unix)]
     #[test]
     fn introspection_reads_the_row_count_and_the_dependents() {
         let tmp = TempTree::new("pg-introspect");
@@ -1204,7 +1195,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn an_empty_dependent_list_is_not_a_dependent() {
         let tmp = TempTree::new("pg-deps");
@@ -1214,7 +1204,6 @@ mod tests {
         assert_eq!(fk_dependents(&command, "users"), ["orders", "invoices"]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_database_that_refuses_degrades_to_static_analysis() {
         // Wrong table, no permission, database down: a quieter preview rather
@@ -1255,7 +1244,6 @@ mod tests {
     /// The forced `-w` means a child can never type the password a human
     /// typed. psql says so on stderr; the footer repeats it and names the
     /// remedy, because "unreachable" sent the reader to check the network.
-    #[cfg(unix)]
     #[test]
     fn a_refused_password_is_reported_with_the_remedy() {
         let tmp = TempTree::new("pg-nopw");
@@ -1283,7 +1271,6 @@ mod tests {
     /// string, so the dependents arrive where the count should be. The argv
     /// now avoids that shape; if a psql produces it anyway, the footer shows
     /// the line it could not read instead of blaming the database.
-    #[cfg(unix)]
     #[test]
     fn an_answer_without_a_count_is_reported_as_unread() {
         let tmp = TempTree::new("pg-lastonly");
@@ -1306,26 +1293,20 @@ mod tests {
     /// read-only SET govern the two SELECTs. Asserted on the argv the stub
     /// received, not on the SQL text, so a future "tidy-up" back into one
     /// string is caught here rather than on a psql 14 box.
-    #[cfg(unix)]
     #[test]
     fn the_catalog_query_is_sent_as_three_separate_statements() {
-        use std::os::unix::fs::PermissionsExt as _;
         let tmp = TempTree::new("pg-argv");
         let argv_file = tmp.path().join("argv");
-        let psql = tmp.path().join("psql");
-        std::fs::write(
-            &psql,
-            format!(
-                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"{}\"\nprintf 'SET\\n7\\n\\n'\nexit 0\n",
-                argv_file.display()
-            ),
-        )
-        .expect("stub must be writable");
-        std::fs::set_permissions(&psql, std::fs::Permissions::from_mode(0o755))
-            .expect("stub must be executable");
-        // The same wait as `stub_psql_full` (#51). The warm-up run writes
-        // its own argv to the file; the run under test overwrites it.
-        crate::testutil::wait_until_executable(&psql);
+        let psql = crate::testutil::stub_program(
+            tmp.path(),
+            "psql",
+            &crate::testutil::StubScript {
+                stdout: "SET\n7\n",
+                stderr: "",
+                code: 0,
+                argv_to: Some(&argv_file),
+            },
+        );
         let command = format!("{} -d shop -c \"TRUNCATE users\"", psql.display());
 
         let p = preview_for(&command, std::path::Path::new("."), true)
