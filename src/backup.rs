@@ -805,7 +805,18 @@ fn rm_targets_in(tokens: &[String], cwd: Option<&Path>) -> Option<Vec<PathBuf>> 
     let paths: Vec<PathBuf> = tokens[at + 1..]
         .iter()
         .filter(|t| !crate::delete::is_flag(&head, t))
-        .filter_map(|t| resolve_in(t, cwd))
+        .filter_map(|t| {
+            let p = resolve_in(t, cwd)?;
+            // #7: what is copied is what the preview counts. `rm -r link/`
+            // removes what the link points to, and so may a command whose
+            // handling of links is unmeasured: that is copied. `rm -r link`
+            // removes only the link, copied as one by `copy_recursive`.
+            Some(match crate::delete::link_reach(&head, t, &p) {
+                crate::delete::LinkReach::Through(behind)
+                | crate::delete::LinkReach::Unmeasured { behind, .. } => behind,
+                _ => p,
+            })
+        })
         .filter(|p| p.exists())
         .collect();
     if paths.is_empty() {
@@ -1714,6 +1725,44 @@ mod tests {
             tf_state_target(&tokens_of("terraform destroy"), Some(&empty)),
             None
         );
+    }
+
+    /// #7. `rm -r link/` removes what the link points to, so the copy is of
+    /// that and not of the link; `rm -r link` removes the link, copied as one.
+    /// Until this, both copied the link, and the ask said "backup" over a
+    /// delete whose files the copy did not hold. A command whose handling of
+    /// links is unmeasured gets the copy of what the link points to.
+    #[cfg(unix)]
+    #[test]
+    fn a_delete_through_a_link_copies_what_the_link_points_to() {
+        let env = TestEnv::new("bk-link");
+        let outside = env.root().join("outside");
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::write(outside.join("a"), "a").unwrap();
+        std::fs::write(outside.join("sub").join("b"), "b").unwrap();
+        let work = env.root().join("work");
+        std::fs::create_dir_all(work.join("old")).unwrap();
+        std::os::unix::fs::symlink(&outside, work.join("old").join("link")).unwrap();
+        let state = env.root().join("state");
+        let saved = |cmd: &str| {
+            let rec = take(&state, cmd, &work)
+                .expect("take must not fail")
+                .expect("a delete of an existing target is insured");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            PathBuf::from(rec.data["items"][0]["saved_as"].as_str().unwrap())
+        };
+
+        let through = saved("rm -r old/link/");
+        assert!(through.join("a").is_file(), "{through:?}");
+        assert!(through.join("sub").join("b").is_file(), "{through:?}");
+
+        let the_link = saved("rm -r old/link");
+        let meta = std::fs::symlink_metadata(&the_link).unwrap();
+        assert!(meta.file_type().is_symlink(), "{the_link:?}");
+
+        let unmeasured = saved("Remove-Item -Recurse old/link");
+        assert!(unmeasured.join("a").is_file(), "{unmeasured:?}");
+        assert!(unmeasured.join("sub").join("b").is_file(), "{unmeasured:?}");
     }
 
     /// Max Petrusenko's field report (Oct 9, 2026): rollback restored every

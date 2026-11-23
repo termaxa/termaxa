@@ -127,7 +127,7 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
     // Computed while the preview walks its targets; reported, not acted on.
     let mut uninsurable = false;
 
-    for (tok, base) in targets.iter().take(3) {
+    for (tok, base, head) in targets.iter().take(3) {
         let raw = &tok.text;
         // The directory this target resolves in: where a `cd` earlier on the
         // line left the shell, and git's `-C` for `git rm`. A relative
@@ -288,6 +288,7 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
 
         let resolved = resolve_path_in(raw, cwd);
         let display = resolved.display().to_string();
+        let reach = link_reach(head, raw, &resolved);
 
         lines.push(format!("  target      : {}", display));
         // Only worth showing when the resolution genuinely changed the path
@@ -303,9 +304,49 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
             lines.push(format!("  as written  : {}", raw));
         }
 
+        // A link is reported for what the delete reaches (#7): the link
+        // itself, which is where it lives, or what it points to.
+        let reached = match &reach {
+            LinkReach::NotALink => resolved.clone(),
+            LinkReach::TheLink(to) => {
+                lines.push(format!(
+                    "  link        : → {} (the delete removes the link, not what it points to)",
+                    to.display()
+                ));
+                resolved.clone()
+            }
+            LinkReach::Through(behind) => {
+                lines.push(format!(
+                    "  ⚠ through a link → {}: with the trailing slash the delete reaches what \
+                     the link points to",
+                    behind.display()
+                ));
+                worst_first.push("through a link".into());
+                behind.clone()
+            }
+            LinkReach::Unmeasured { to, behind } => {
+                lines.push(format!(
+                    "  ⚠ link      : → {}: whether `{}` follows a link has not been measured \
+                     here, so what it points to is counted and copied",
+                    to.display(),
+                    head
+                ));
+                worst_first.push("a link".into());
+                behind.clone()
+            }
+        };
+
         // ---- tier 1: free ----
         if let Some(root) = project_root {
-            if !is_inside(&resolved, root) {
+            // The link itself lives where its parent directory is; `is_inside`
+            // canonicalizes, which would follow it.
+            let inside = match &reach {
+                LinkReach::TheLink(_) => resolved
+                    .parent()
+                    .is_none_or(|parent| is_inside(parent, root)),
+                _ => is_inside(&reached, root),
+            };
+            if !inside {
                 lines.push(format!("  ⚠ OUTSIDE the project root ({})", root.display()));
                 worst_first.push("OUTSIDE project root".into());
             }
@@ -319,14 +360,20 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
             worst_first.push("resolves to a filesystem root".into());
         }
 
-        if !resolved.exists() {
+        if matches!(reach, LinkReach::TheLink(_)) {
+            lines.push("  contains    : 1 link (nothing behind it is deleted)".into());
+            summary_parts.push(format!("{} (a link)", short(&display)));
+            continue;
+        }
+
+        if !reached.exists() {
             lines.push("  contains    : (path does not exist — nothing to delete)".into());
             summary_parts.push(format!("{} does not exist", short(&display)));
             continue;
         }
 
         // ---- tier 2: cheap, one level deep ----
-        let notable = sensitive_children(&resolved);
+        let notable = sensitive_children(&reached);
         if !notable.is_empty() {
             let names: Vec<String> = notable
                 .iter()
@@ -337,7 +384,7 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
         }
 
         // ---- tier 3: budgeted recursive scan ----
-        let scan = scan_budgeted(&resolved);
+        let scan = scan_budgeted(&reached);
         let count_str = if scan.capped {
             format!("{}+ files (stopped counting)", fmt_num(scan.files))
         } else {
@@ -349,6 +396,32 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
             fmt_num(scan.dirs),
             if scan.dirs == 1 { "y" } else { "ies" }
         ));
+        // Links inside the tree are never followed by the count or the copy
+        // (#7). Whether the delete follows them is the command's business:
+        // measured for `rm`, not for the rest.
+        if let Some(first) = &scan.first_link {
+            let to = std::fs::read_link(first).unwrap_or_default();
+            if removes_links_unfollowed(head) {
+                lines.push(format!(
+                    "  links       : {} inside; `{}` removes a link without following it, \
+                     and the count and the copy do not follow them either (first: {} → {})",
+                    fmt_num(scan.links),
+                    head,
+                    first.display(),
+                    to.display()
+                ));
+            } else {
+                lines.push(format!(
+                    "  ⚠ links     : {} inside; whether `{}` follows them has not been measured \
+                     here, and what they point to is neither counted nor copied (first: {} → {})",
+                    fmt_num(scan.links),
+                    head,
+                    first.display(),
+                    to.display()
+                ));
+                worst_first.push("links inside".into());
+            }
+        }
 
         // ---- insurance ----
         // Two different facts get two different sentences. "Not recoverable"
@@ -423,46 +496,57 @@ pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Op
 
 /// The delete targets of one segment, from its own words.
 pub fn segment_targets(segment: &crate::shell::Segment) -> Vec<Tok> {
+    segment_delete(segment)
+        .map(|(_, targets)| targets)
+        .unwrap_or_default()
+}
+
+/// The delete command of one segment (`delete_head`'s name for it) and its
+/// targets. The command is kept because what a delete does to a link
+/// depends on which command it is (#7, `link_reach`).
+fn segment_delete(segment: &crate::shell::Segment) -> Option<(String, Vec<Tok>)> {
     // The segment's own words. The split already found every redirection;
     // reading the full text here made `2>/dev/null` and `/dev/null` into
     // targets, and the insurance that then tried to copy a device failed —
     // with the real target deleted uninsured behind it (#61).
     let tokens = tokenize_detailed(segment.command());
     if tokens.is_empty() {
-        return Vec::new();
+        return None;
     }
     let texts: Vec<String> = tokens.iter().map(|t| t.text.clone()).collect();
-    let Some((head, at)) = delete_head(&texts) else {
-        return Vec::new();
-    };
+    let (head, at) = delete_head(&texts)?;
     // Targets start after the command, not after token zero: with a
     // wrapper present those are different positions, and reading from
     // token zero would take the wrapper's own arguments as targets.
-    tokens
+    let targets = tokens
         .iter()
         .skip(at + 1)
         .filter(|t| !is_flag(&head, &t.text))
         .cloned()
-        .collect()
+        .collect();
+    Some((head, targets))
 }
 
 /// Every delete target in the command, with the directory it resolves in
-/// (`operand_base`), or `None` where a `cd` before it cannot be followed.
+/// (`operand_base`), or `None` where a `cd` before it cannot be followed,
+/// and the command that deletes it.
 /// `cd ../wt && rm -r data` deletes `../wt/data`; read against the line's
 /// starting directory it counted and copied `./data` (Max Petrusenko's
 /// field report, Oct 9, 2026).
-pub fn targets_in(command: &str, start: &Path) -> Vec<(Tok, Option<PathBuf>)> {
+pub fn targets_in(command: &str, start: &Path) -> Vec<(Tok, Option<PathBuf>, String)> {
     let mut out = Vec::new();
     for seg in crate::shell::split_segments_deep(command)
         .into_iter()
         .filter(|s| !s.body_line)
     {
-        let targets = segment_targets(&seg);
+        let Some((head, targets)) = segment_delete(&seg) else {
+            continue;
+        };
         if targets.is_empty() {
             continue;
         }
         let base = operand_base(&seg, start);
-        out.extend(targets.into_iter().map(|t| (t, base.clone())));
+        out.extend(targets.into_iter().map(|t| (t, base.clone(), head.clone())));
     }
     out
 }
@@ -2063,6 +2147,67 @@ pub struct Scan {
     pub dirs: usize,
     /// True when we stopped early — the real number is larger than `files`.
     pub capped: bool,
+    /// Links among the entries counted in `files`, never followed (#7).
+    pub links: usize,
+    /// The first of them, for the preview to name.
+    pub first_link: Option<PathBuf>,
+}
+
+/// What a delete whose target is a link reaches (#7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkReach {
+    /// The target is not a link.
+    NotALink,
+    /// The delete removes the link itself; it points to this.
+    TheLink(PathBuf),
+    /// The delete resolves the link and reaches the directory behind it.
+    Through(PathBuf),
+    /// The command's handling of links has not been measured, so the delete
+    /// is taken to reach what the link points to (`behind`), the way every
+    /// link was counted and judged before links were named.
+    Unmeasured { to: PathBuf, behind: PathBuf },
+}
+
+/// The commands measured to remove a link without following it: `rm`, and
+/// `unlink` and `git rm`, which have no way to follow one. On unix only:
+/// what `rm` is in a Windows shell, and what `del`, `rd` and `Remove-Item` do
+/// with a junction, has not been measured.
+fn removes_links_unfollowed(head: &str) -> bool {
+    cfg!(unix) && matches!(head, "rm" | "unlink" | "git rm")
+}
+
+/// `rm -r old/link` removes the link; `rm -r old/link/` resolves it first and
+/// removes what it points to. Measured on GNU coreutils 9.4 (Nov 24, 2026):
+/// the folder behind the link was emptied by the second and untouched by the
+/// first, which is also what POSIX asks of `rm`. The trailing slash is the
+/// whole difference, and `resolve_path_in` collapses it, so it is read here
+/// from the token as written.
+///
+/// Any other command, and any command on Windows, is `Unmeasured` when the
+/// link leads somewhere: the preview counts and the insurance copies what it
+/// points to, which over-insures a delete that only removes the link and
+/// never under-insures one that follows it. A link that leads nowhere is
+/// only a link, whoever deletes it.
+pub fn link_reach(head: &str, raw: &str, resolved: &Path) -> LinkReach {
+    let Ok(meta) = std::fs::symlink_metadata(resolved) else {
+        return LinkReach::NotALink;
+    };
+    if !meta.file_type().is_symlink() {
+        return LinkReach::NotALink;
+    }
+    let to = std::fs::read_link(resolved).unwrap_or_default();
+    let Ok(behind) = std::fs::canonicalize(resolved) else {
+        return LinkReach::TheLink(to);
+    };
+    if !removes_links_unfollowed(head) {
+        return LinkReach::Unmeasured { to, behind };
+    }
+    let written = raw.trim().trim_matches('"').trim_matches('\'');
+    if written.ends_with('/') && behind.is_dir() {
+        LinkReach::Through(behind)
+    } else {
+        LinkReach::TheLink(to)
+    }
 }
 
 /// Recursive count under a hard budget on files AND wall-clock time.
@@ -2077,6 +2222,8 @@ pub fn scan_budgeted(root: &Path) -> Scan {
     let start = Instant::now();
     let mut files = 0usize;
     let mut dirs = 0usize;
+    let mut links = 0usize;
+    let mut first_link: Option<PathBuf> = None;
     let mut stack = vec![root.to_path_buf()];
 
     if root.is_file() {
@@ -2084,6 +2231,8 @@ pub fn scan_budgeted(root: &Path) -> Scan {
             files: 1,
             dirs: 0,
             capped: false,
+            links: 0,
+            first_link: None,
         };
     }
 
@@ -2094,6 +2243,8 @@ pub fn scan_budgeted(root: &Path) -> Scan {
                 files,
                 dirs,
                 capped: true,
+                links,
+                first_link,
             };
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -2119,6 +2270,8 @@ pub fn scan_budgeted(root: &Path) -> Scan {
                     files,
                     dirs,
                     capped: true,
+                    links,
+                    first_link,
                 };
             }
             // symlink_metadata: do NOT follow links. Following them would both
@@ -2126,7 +2279,13 @@ pub fn scan_budgeted(root: &Path) -> Scan {
             // (see the junction-traversal issue).
             match e.path().symlink_metadata() {
                 Ok(m) if m.is_dir() => stack.push(e.path()),
-                Ok(_) => files += 1,
+                Ok(m) => {
+                    files += 1;
+                    if m.file_type().is_symlink() {
+                        links += 1;
+                        first_link.get_or_insert_with(|| e.path());
+                    }
+                }
                 Err(_) => {}
             }
         }
@@ -2135,6 +2294,8 @@ pub fn scan_budgeted(root: &Path) -> Scan {
         files,
         dirs,
         capped: false,
+        links,
+        first_link,
     }
 }
 
@@ -2305,7 +2466,7 @@ pub fn target_signature(command: &str, cwd: &Path) -> Option<TargetSignature> {
     let mut bytes: Vec<u8> = Vec::new();
     let roots: Vec<PathBuf> = targets_in(command, cwd)
         .iter()
-        .filter_map(|(t, base)| match base {
+        .filter_map(|(t, base, _)| match base {
             Some(b) => Some(resolve_path_in(&t.text, b)),
             None if is_dir_independent(&t.text) => Some(resolve_path_in(&t.text, cwd)),
             None => None,
@@ -3047,6 +3208,116 @@ mod tests {
         assert!(
             !has_line(&lines, "OUTSIDE the project root"),
             "a warning that fires on ordinary work is one nobody reads: {lines:?}"
+        );
+    }
+
+    /// #7. A link as the target: without a trailing slash rm removes the
+    /// link, and with one it removes what the link points to (measured on GNU
+    /// coreutils 9.4, Nov 24, 2026). The preview says which, and judges
+    /// "outside" by what the delete reaches; a link inside a tree is named.
+    /// A command not measured with links is previewed as following them.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_previewed_for_what_the_delete_reaches() {
+        let tmp = TempTree::new("del-link");
+        let outside = tmp.dir("outside");
+        std::fs::write(outside.join("a"), "a").unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::write(outside.join("sub").join("b"), "b").unwrap();
+        let proj = tmp.dir("proj");
+        std::fs::create_dir_all(proj.join("old")).unwrap();
+        std::os::unix::fs::symlink(&outside, proj.join("old").join("link")).unwrap();
+        let lines = |cmd: &str| preview_for(cmd, Some(&proj), &proj).unwrap().lines;
+
+        let the_link = lines("rm -r old/link");
+        assert!(
+            has_line(&the_link, "the delete removes the link"),
+            "{the_link:?}"
+        );
+        assert!(
+            has_line(&the_link, "1 link (nothing behind it"),
+            "{the_link:?}"
+        );
+        assert!(!has_line(&the_link, "OUTSIDE"), "{the_link:?}");
+
+        let through = lines("rm -r old/link/");
+        assert!(has_line(&through, "through a link"), "{through:?}");
+        assert!(has_line(&through, "OUTSIDE"), "{through:?}");
+        assert!(
+            has_line(&through, "2 files across 2 directories"),
+            "{through:?}"
+        );
+
+        let tree = lines("rm -r old");
+        assert!(
+            has_line(&tree, "links       : 1 inside; `rm` removes a link without"),
+            "{tree:?}"
+        );
+        assert!(!has_line(&tree, "OUTSIDE"), "{tree:?}");
+
+        let unmeasured = lines("Remove-Item -Recurse old/link");
+        assert!(
+            has_line(&unmeasured, "whether `remove-item` follows a link"),
+            "{unmeasured:?}"
+        );
+        assert!(has_line(&unmeasured, "OUTSIDE"), "{unmeasured:?}");
+        assert!(
+            has_line(&unmeasured, "2 files across 2 directories"),
+            "{unmeasured:?}"
+        );
+
+        let unmeasured_tree = lines("Remove-Item -Recurse old");
+        assert!(
+            has_line(
+                &unmeasured_tree,
+                "⚠ links     : 1 inside; whether `remove-item`"
+            ),
+            "{unmeasured_tree:?}"
+        );
+    }
+
+    /// #7. Which commands are trusted not to follow a link, and that a link
+    /// leading nowhere is only a link whoever deletes it.
+    #[cfg(unix)]
+    #[test]
+    fn link_reach_trusts_only_the_measured_commands() {
+        let tmp = TempTree::new("del-link-reach");
+        let behind = tmp.dir("behind");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&behind, &link).unwrap();
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &dangling).unwrap();
+        let behind = std::fs::canonicalize(&behind).unwrap();
+        let reach = |head: &str, raw: &str, p: &Path| link_reach(head, raw, p);
+
+        for head in ["rm", "unlink", "git rm"] {
+            assert!(
+                matches!(reach(head, "link", &link), LinkReach::TheLink(_)),
+                "{head}"
+            );
+        }
+        assert_eq!(
+            reach("rm", "link/", &link),
+            LinkReach::Through(behind.clone())
+        );
+        for head in ["del", "rd", "rmdir", "remove-item", "ri"] {
+            for raw in ["link", "link/"] {
+                assert!(
+                    matches!(
+                        reach(head, raw, &link),
+                        LinkReach::Unmeasured { behind: ref b, .. } if *b == behind
+                    ),
+                    "{head} {raw}"
+                );
+            }
+            assert!(
+                matches!(reach(head, "dangling", &dangling), LinkReach::TheLink(_)),
+                "{head}"
+            );
+        }
+        assert_eq!(
+            reach("rm", "behind", &tmp.path().join("behind")),
+            LinkReach::NotALink
         );
     }
 
