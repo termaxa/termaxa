@@ -550,7 +550,7 @@ pub fn connection_args(tokens: &[String]) -> Vec<String> {
 pub fn shell_tokens(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
-    let mut chars = s.chars().peekable();
+    let mut chars = s.chars();
     let mut in_single = false;
     let mut in_double = false;
 
@@ -558,12 +558,21 @@ pub fn shell_tokens(s: &str) -> Vec<String> {
         match c {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
-            '\\' if in_double => {
-                if let Some(&n) = chars.peek() {
+            // Inside double quotes a backslash escapes `"`, `\`, `$`, a
+            // backtick and a newline, and stays before anything else, as in
+            // bash: `"C:\Users\x"` is `C:\Users\x`. The delete preview's
+            // lexer reads the same rule (`delete::tokenize_detailed`), and
+            // the two move together, or the preview and the copy aside name
+            // different files (#50).
+            '\\' if in_double => match chars.next() {
+                Some('\n') => {}
+                Some(n @ ('"' | '\\' | '$' | '`')) => cur.push(n),
+                Some(n) => {
+                    cur.push('\\');
                     cur.push(n);
-                    chars.next();
                 }
-            }
+                None => cur.push('\\'),
+            },
             c if c.is_whitespace() && !in_single && !in_double => {
                 if !cur.is_empty() {
                     tokens.push(std::mem::take(&mut cur));

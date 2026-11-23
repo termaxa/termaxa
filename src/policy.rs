@@ -6334,9 +6334,23 @@ mod shell_reading_tests {
         for (line, action) in [
             ("del build\\out.txt", Action::Allow),
             ("del other\\out.txt", Action::Deny),
-            // What a build rebuilds as typed, and to bash a `node\_modules`
-            // that nothing rebuilds: the deny stood aside for the line.
-            ("rm -rf \"node\\_modules\"", Action::Allow),
+            // What a build rebuilds as typed on Windows, and to bash a
+            // `node_modules.cache` that nothing rebuilds: the deny stood
+            // aside for the line (`Aside`). On unix the line as typed names
+            // one directory, `node_modules\.cache`, that nothing rebuilds.
+            (
+                "rm -rf node_modules\\.cache",
+                if cfg!(windows) {
+                    Action::Allow
+                } else {
+                    Action::Deny
+                },
+            ),
+            // To every shell `"node\_modules"` is `node\_modules`, and so it
+            // is as typed now: nothing rebuilds it, and the deny applies.
+            // The lexers used to drop that backslash and read
+            // `node_modules`, which made an exception out of a misreading.
+            ("rm -rf \"node\\_modules\"", Action::Deny),
             ("rm -rf wt\\data", Action::Deny),
             // A deny the line never met as typed is taken from a reading.
             ("r\\m -rf wt", Action::Deny),
