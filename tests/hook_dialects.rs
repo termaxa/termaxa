@@ -8,9 +8,8 @@
 //! The dialect matters as much as the verdict. A correct deny rendered in the
 //! wrong shape is a deny nobody receives.
 
-#![cfg(unix)]
-
 use std::io::Write as _;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -571,6 +570,8 @@ fn insurance_is_taken_for_what_runs_and_for_nothing_else() {
 // A denied command must not cause a subprocess (v0.14.2), on the hook path.
 // ---------------------------------------------------------------------------
 
+// A `#!/bin/sh` terraform on PATH, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn a_denied_command_never_runs_its_preview() {
     let tmp = scratch("inert");

@@ -5,8 +5,6 @@
 //! PATH is reduced to a shell and `which`, so "is Claude installed?" is a
 //! fact each test sets rather than a property of the developer's laptop.
 
-#![cfg(unix)]
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -18,6 +16,7 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 /// A PATH with a shell and `which` on it, and no agent CLI whatsoever.
+#[cfg(unix)]
 fn controlled_path(root: &Path) -> PathBuf {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir must be creatable");
@@ -29,6 +28,16 @@ fn controlled_path(root: &Path) -> PathBuf {
             .unwrap_or_else(|| panic!("{tool} must exist somewhere standard"));
         std::os::unix::fs::symlink(&real, bin.join(tool)).expect("symlink must be creatable");
     }
+    bin
+}
+
+/// An empty PATH directory. `init` looks a CLI up with `where`, which a
+/// Windows process finds in System32 whatever PATH holds (Rust searches it
+/// after the child's PATH), so nothing needs to be put here (#59).
+#[cfg(windows)]
+fn controlled_path(root: &Path) -> PathBuf {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir must be creatable");
     bin
 }
 
@@ -160,6 +169,7 @@ fn verdict(home: &Path, proj: &Path, command: &str) -> String {
 
 /// `init`, with its input a terminal a person types into (`openpty`): the
 /// one way an answer to its questions is taken, as for `run`'s ask.
+#[cfg(unix)]
 fn init_at_terminal(home: &Path, dir: &Path, bin: &Path, answers: &str) -> String {
     use std::io::Write;
     use std::os::unix::io::FromRawFd;
@@ -260,6 +270,8 @@ fn init_without_a_terminal_writes_the_watch_records_proposals_as_comments() {
 
 /// At a terminal each proposal is put to the person, and only what they
 /// accept is written, below every rule of the starter.
+// Answered through a pseudo-terminal, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn init_at_a_terminal_writes_only_what_the_person_accepted() {
     let tmp = scratch("watched-tty");

@@ -7,8 +7,6 @@
 //! Everything is seeded through the CLI: `run` is the only path that records
 //! an approval and an exit code, which is what the outcome column renders.
 
-#![cfg(unix)]
-
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -29,6 +27,7 @@ fn termaxa(home: &Path, cwd: &Path, args: &[&str], stdin: &str) -> Output {
 /// minutes, and the agent noted it could have piped `y` into the same
 /// stdin. A pipe carrying `y` is refused; this helper hands the child a
 /// pseudo-terminal and types into it, which is the one path that approves.
+#[cfg(unix)]
 fn termaxa_tty(home: &Path, cwd: &Path, args: &[&str], answer: &str) -> Output {
     use std::os::unix::io::FromRawFd;
     let (mut master, mut slave) = (0i32, 0i32);
@@ -111,6 +110,7 @@ fn run_termaxa(
 /// Like `termaxa`, but gives up after `secs` and kills the child: the
 /// wrapper used to recurse without end (#65), and a hung test is worse
 /// than a failed one.
+#[cfg(unix)]
 fn termaxa_within(home: &Path, cwd: &Path, args: &[&str], stdin: &str, secs: u64) -> Output {
     termaxa_within_env(home, cwd, args, stdin, secs, &[])
 }
@@ -185,6 +185,7 @@ fn project(root: &Path) -> PathBuf {
 }
 
 /// A project that denies `terraform destroy` and asks about everything else.
+#[cfg(unix)]
 fn project_gating_terraform(root: &Path) -> PathBuf {
     let proj = root.join("proj");
     std::fs::create_dir_all(proj.join(".termaxa")).expect("project dir must be creatable");
@@ -198,6 +199,7 @@ fn project_gating_terraform(root: &Path) -> PathBuf {
 
 /// A stub `terraform` that leaves a marker behind, so "did the preview spawn
 /// anything?" is answerable as a fact rather than inferred from output.
+#[cfg(unix)]
 fn stub_terraform(bin_dir: &Path, marker: &Path) {
     std::fs::create_dir_all(bin_dir).expect("stub dir must be creatable");
     let path = bin_dir.join("terraform");
@@ -214,6 +216,8 @@ fn stub_terraform(bin_dir: &Path, marker: &Path) {
         .expect("stub must be executable");
 }
 
+// A `#!/bin/sh` terraform on PATH, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn a_denied_command_never_causes_the_preview_to_run_anything() {
     // v0.14.2, reported by Tim Schipper: `check` builds the preview before it
@@ -258,6 +262,8 @@ fn a_denied_command_never_causes_the_preview_to_run_anything() {
     );
 }
 
+// Seeded through `run -- sh -c`, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn log_filters_by_decision_and_by_source() {
     let tmp = scratch("log-filter");
@@ -294,6 +300,8 @@ fn log_filters_by_decision_and_by_source() {
     );
 }
 
+// `sh -c`, and an answer through a pseudo-terminal, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn the_log_says_what_became_of_each_command() {
     let tmp = scratch("log-outcome");
@@ -375,6 +383,7 @@ fn stats_stays_quiet_about_denials_when_there_are_none() {
 /// (…); proceeding" and carries on — so a failure here must report what the
 /// gate actually said, or the test just says "no backup" and leaves the cause
 /// to guesswork.
+#[cfg(unix)]
 fn take_a_backup(home: &Path, proj: &Path) -> String {
     std::fs::write(proj.join("doomed.txt"), "precious\n").expect("file must be writable");
     let deleted = termaxa_tty(home, proj, &["run", "--", "rm", "doomed.txt"], "y\n");
@@ -403,6 +412,8 @@ fn take_a_backup(home: &Path, proj: &Path) -> String {
     id
 }
 
+// The backup is taken through a pseudo-terminal, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn rollback_refuses_an_id_it_does_not_have() {
     let tmp = scratch("rollback-unknown");
@@ -424,6 +435,8 @@ fn rollback_refuses_an_id_it_does_not_have() {
     );
 }
 
+// The backup is taken through a pseudo-terminal, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn rollback_restores_nothing_unless_it_is_confirmed() {
     let tmp = scratch("rollback-declined");
@@ -465,6 +478,8 @@ fn rollback_restores_nothing_unless_it_is_confirmed() {
 /// execution. The fixture allows `sh*` and `exit*`, so `sh -c "exit 3"` is
 /// allowed at both levels, and its exit code must come back through the
 /// wrapper and the shim.
+// `wrap` around `sh`, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn wrap_executes_what_it_allows() {
     let tmp = scratch("wrap-allow");
@@ -505,6 +520,8 @@ fn wrap_executes_what_it_allows() {
 /// the wrapper with a pipe for stdin, an asked delete is refused at once,
 /// with the reason, the file untouched, and nothing hangs. A person at a
 /// terminal is exercised by the `run` tests through a pseudo-terminal.
+// `wrap` around `sh`, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn wrap_refuses_an_ask_when_nobody_is_at_a_terminal() {
     let tmp = scratch("wrap-unattended");
@@ -545,6 +562,8 @@ fn wrap_refuses_an_ask_when_nobody_is_at_a_terminal() {
 /// through the real shell ungated. Now every spelling is gated exactly once
 /// and the shell's own options reach execution, while a script file and a
 /// bare `-c` still pass through untouched.
+// `wrap` around `sh` and `bash`, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn wrap_reads_a_c_wherever_the_shell_would() {
     let tmp = scratch("wrap-cluster");
@@ -596,6 +615,8 @@ fn wrap_reads_a_c_wherever_the_shell_would() {
 /// else bash (Sep 11: v0.18.5 handed a zsh machine the bash shim and moved
 /// the agent to `bash -l`). An operator value naming one of the shims is
 /// kept; one pointing elsewhere is overridden and said.
+// `wrap` around `sh`, so unix only (#59).
+#[cfg(unix)]
 #[test]
 fn wrap_hands_the_agent_the_shim_for_its_own_shell_by_name() {
     let tmp = scratch("wrap-agent-shell");
@@ -819,6 +840,8 @@ fn an_unrecognised_shell_event_passes_through_by_default_and_is_refused_by_polic
 /// by default - the approved command runs uninsured; under `backup_failure:
 /// deny` the command is refused and the target survives. A socket inside
 /// the target is a copy that fails the way `/dev/null` did in #61.
+#[cfg(unix)]
+// A unix socket in the target, and an answer through a pseudo-terminal, so unix only (#59).
 #[cfg(unix)]
 #[test]
 fn a_failed_backup_proceeds_by_default_and_is_refused_by_policy() {
