@@ -873,6 +873,21 @@ mod tests {
         assert_eq!(classify_command("unlink"), None);
     }
 
+    /// #64. A delete handed to cmd or PowerShell is classified as the
+    /// delete it is; the wrapper alone used to classify as nothing.
+    #[test]
+    fn a_delete_inside_a_windows_shells_string_is_classified() {
+        for cmd in [
+            r#"cmd /c "rd /s /q build""#,
+            r#"cmd.exe /d /s /c "del /s /q build""#,
+            r#"powershell -NoProfile -Command "Remove-Item -Recurse -Force build""#,
+            r#"pwsh -c "rm -r build""#,
+        ] {
+            assert_eq!(classify_command(cmd), Some(Intent::FileDelete), "{cmd}");
+        }
+        assert_eq!(classify_command("powershell -File clean.ps1"), None);
+    }
+
     #[test]
     fn classifies_compound_by_most_dangerous_segment() {
         // The exact Cursor evasion shape from live testing.
