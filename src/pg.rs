@@ -1148,6 +1148,10 @@ mod tests {
         .expect("stub must be writable");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("stub must be executable");
+        // Written and then exec'd at once: the ETXTBSY window (#51). Without
+        // the wait, an exec that lost the race read as a psql that failed,
+        // and the dependents came back empty.
+        crate::testutil::wait_until_executable(&path);
         path
     }
 
@@ -1319,6 +1323,9 @@ mod tests {
         .expect("stub must be writable");
         std::fs::set_permissions(&psql, std::fs::Permissions::from_mode(0o755))
             .expect("stub must be executable");
+        // The same wait as `stub_psql_full` (#51). The warm-up run writes
+        // its own argv to the file; the run under test overwrites it.
+        crate::testutil::wait_until_executable(&psql);
         let command = format!("{} -d shop -c \"TRUNCATE users\"", psql.display());
 
         let p = preview_for(&command, std::path::Path::new("."), true)

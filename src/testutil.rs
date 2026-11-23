@@ -223,8 +223,9 @@ fn listing(dir: &Path) -> BTreeSet<OsString> {
 ///
 /// Measured with this write-then-exec shape lifted into a standalone program:
 /// 37 of 4800 execs at 16 threads returned `ExecutableFileBusy`, none serially
-/// (#51). Both stub helpers in this suite have that shape, which is why the
-/// wait lives here rather than in either of them.
+/// (#51). Every stub this suite writes and runs has that shape (preview's,
+/// backup's and pg's), which is why the wait lives here rather than in any of
+/// them. pg's two went without it until a CI run lost the race (Nov 24, 2026).
 ///
 /// Retry-then-verdict, the shape #47 settled on: the window is microseconds
 /// and closes on its own, and once an `exec` has succeeded no writer remains
