@@ -1,3 +1,4 @@
+mod archive;
 mod audit;
 mod backup;
 mod breaker;

@@ -1028,6 +1028,22 @@ fn named(name: &str) -> Option<Vec<(char, char)>> {
     })
 }
 
+/// Whether `name`, one component of a path, is matched by `pattern`, read
+/// as rsync reads an `--exclude` and unzip a member's name (#12): `*`, `?`
+/// and `[...]`, within the component, and a name that starts with a dot
+/// matched like any other. Not the shell's reading: no group, no brace.
+pub fn component_matches(pattern: &str, name: &str) -> bool {
+    let component: Vec<(char, bool)> = pattern.chars().map(|c| (c, false)).collect();
+    names(
+        &flattened(&component).0,
+        name,
+        Loose {
+            dots: true,
+            case: false,
+        },
+    )
+}
+
 /// Whether `name`, one entry of a directory, is matched by `glob`. A name
 /// that starts with a dot is matched only by a pattern that starts with
 /// one, as in bash and zsh, unless the line said otherwise (`Loose`). On

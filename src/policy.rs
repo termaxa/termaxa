@@ -6730,3 +6730,55 @@ mod hermes_wiring_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod rsync_unpack_rule_tests {
+    use super::*;
+
+    /// #12. The starter's rules on the gate's own files and the hook config
+    /// see what an rsync removes and what an archive unpacks: an `rsync
+    /// --delete` from a template without them, and a tar or zip that holds
+    /// a hook config, are refused by the files they touch. A compressed
+    /// archive is not read, and is answered as the line is written.
+    #[test]
+    fn an_rsync_or_an_unpacking_over_the_gates_files_is_refused() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let tmp = crate::testutil::TempTree::new("rules-rsync");
+        tmp.file(".termaxa/policy.yaml", "default: ask\nrules: []\n");
+        tmp.file(".claude/settings.json", "{}\n");
+        tmp.file("tpl/README.md", "t\n");
+        std::fs::write(
+            tmp.path().join("evil.tar"),
+            crate::archive::testing::tar_of(&[(".claude/settings.json", "{}")]),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("evil.zip"),
+            crate::archive::testing::zip_of(&[(".claude/settings.json", "{}")]),
+        )
+        .unwrap();
+        let ctx = crate::resolve::EvalContext::at(tmp.path());
+        for line in [
+            "rsync -a --delete tpl/ ./",
+            "tar -xf evil.tar",
+            "unzip -o evil.zip",
+        ] {
+            let d = p.evaluate_command(line, &ctx);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert!(
+                d.matched_rule
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("path:")),
+                "{line}: {:?}",
+                d.matched_rule
+            );
+        }
+        let d = p.evaluate_command("rsync -a tpl/ ./", &ctx);
+        assert_ne!(
+            d.action,
+            Action::Deny,
+            "nothing guarded is touched: {}",
+            d.reason
+        );
+    }
+}

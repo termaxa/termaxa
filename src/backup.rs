@@ -770,11 +770,12 @@ fn all_overwrite_paths(
     }
 }
 
-/// What a copy or a move writes over that its preview reports (#12): the
-/// file it lands on, when its destination is a file, and when it lands in a
-/// directory, the files there it replaces, if the delete preview's warning
-/// signs are on them (`resolve::Replacement::signs`). Past the budget none
-/// of a directory's are copied, and the preview says it is not recoverable.
+/// What a copy, a move or an unpacking writes over, and what an `rsync
+/// --delete` removes, that its preview reports (#12): the file it lands on,
+/// when its destination is a file, and when it lands in a directory, the
+/// files there it replaces or removes, if the delete preview's warning signs
+/// are on them (`resolve::Replacement::signs`). Past the budget none of a
+/// directory's are copied, and the preview says it is not recoverable.
 ///
 /// Until #12 a `cp` or a `mv` onto an existing file was previewed as a loss
 /// with "no backup covers this command — NOT recoverable", while the
@@ -790,7 +791,7 @@ fn replaced_paths(
     crate::resolve::segment_replacements(segment, &ctx)
         .into_iter()
         .filter(|r| !r.into_directory || (!r.capped && !r.signs(root.as_deref()).is_empty()))
-        .flat_map(|r| r.files)
+        .flat_map(|r| r.files.into_iter().chain(r.removed))
         .collect()
 }
 
@@ -1681,6 +1682,41 @@ mod tests {
         assert_eq!(
             plan("cp draft.txt notes.txt", &proj).as_deref(),
             Some("copy 1 path(s) to .termaxa/backups before they are overwritten")
+        );
+    }
+
+    /// #12. What `rsync --delete` writes over and removes outside the
+    /// project is copied first, and `rollback` brings back both.
+    #[test]
+    fn what_an_rsync_delete_writes_over_and_removes_is_copied_first() {
+        let tmp = TempTree::new("bk-rsync");
+        let state = tmp.dir("state");
+        tmp.file(
+            "proj/.termaxa/policy.yaml",
+            "version: 1\ndefault: ask\nrules: []\n",
+        );
+        tmp.file("proj/build/index.html", "new\n");
+        let www = tmp.dir("www");
+        tmp.file("www/index.html", "live\n");
+        tmp.file("www/old/x.html", "stale\n");
+        let proj = tmp.path().join("proj");
+        let line = format!("rsync -a --delete build/ \"{}/\"", www.display());
+        assert_eq!(
+            plan(&line, &proj).as_deref(),
+            Some("copy 2 path(s) to .termaxa/backups before they are overwritten")
+        );
+        let record = take(&state, &line, &proj).unwrap().expect("insured");
+        // The rsync runs.
+        std::fs::write(www.join("index.html"), "new\n").unwrap();
+        std::fs::remove_dir_all(www.join("old")).unwrap();
+        restore(&state, &record.id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(www.join("index.html")).unwrap(),
+            "live\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(www.join("old/x.html")).unwrap(),
+            "stale\n"
         );
     }
 
