@@ -314,7 +314,8 @@ Destructive doesn't mean recoverable. Each row is what the code does; the last t
 | Command | Preview | Insurance, taken before execution | `rollback` |
 |---|---|---|---|
 | a delete (`rm`, `rmdir`, `Remove-Item`, `del`, `rd`; `sudo rm`, `/bin/rm`, `git -C … rm`) | target, file count, what's inside, outside-the-project and credential warnings | the paths copied under `~/.termaxa/`, within the budget (5,000 files or 300 ms); over budget, the copy is refused with the preview's words rather than silently skipped | copies them back |
-| an overwrite (a truncating redirect, `cp` onto an existing file, an option that writes a file) | what the existing file loses | the file copied | copies it back |
+| an overwrite (a truncating redirect, `cp` or `mv` onto an existing file, an option that writes a file) | what the existing file loses | the file copied | copies it back |
+| a copy over a directory that holds files (`cp -r`, `mv`, `Copy-Item`, `rsync`, with what `--delete` removes), or an archive unpacked over one (`tar -x`, `unzip`, `Expand-Archive`) | the files it replaces and removes, when they are outside the project, directly in a user profile, named like a credential, or past the budget; an ordinary copy inside the project says nothing | those files copied, within the budget; a compressed archive is not read, and anything there may be written over | copies them back |
 | a force push, or a push that removes refs | the commits the remote would lose; which refs go | the remote ref pinned to a local backup branch | force-pushes the pinned ref back |
 | `git reset --hard`, `git checkout -- <paths>`, `git restore <paths>`, `git checkout -f`, `git switch --discard-changes` | the uncommitted changes that would be discarded, by file | a stash snapshot pinned under `refs/termaxa/backup/` | applies it, staged state included |
 | `DROP`, `TRUNCATE`, `DELETE` through `psql` | rows, dependents, whether the statement even succeeds | `pg_dump` of the tables (schema and data for `DROP`, data only otherwise) | replays the dump |
@@ -354,7 +355,7 @@ circuit_breaker:
   threshold: 2
 ```
 
-The starter `init` writes has 249 rules: 162 allow, 14 ask, 73 deny, 58 of them floor. A `match_path` rule judges the file a command changes, not its spelling: a redirect or a `cp` onto it, and since v0.21.10 a copy into its directory, a tree landed over it, its directory deleted, and a git discard or clean that would undo it. Native file tools (Claude Code's `Write`, Cursor's `Delete`, Codex's `apply_patch`, Hermes's `write_file` and `patch`) are judged by their target through the same path rules, and the gate's own files are protected by rules you can read but the agent cannot rewrite unnoticed: `doctor` reports the fingerprint. A deny written as a string can say `except_reads: true`, as the starter's rules over the hook configs do, and then leaves `cat`, `grep` and `git diff` of the file alone. `unrecognised: deny` and `backup_failure: deny` are the two switches for unattended runs.
+The starter `init` writes has 249 rules: 162 allow, 14 ask, 73 deny, 58 of them floor. A `match_path` rule judges the file a command changes, not its spelling: a redirect or a `cp` onto it, and since v0.21.10 a copy into its directory, a tree landed over it, its directory deleted and a git discard or clean that would undo it, and since v0.25.0 what an rsync lands or removes and what a zip or a tar unpacks. Native file tools (Claude Code's `Write`, Cursor's `Delete`, Codex's `apply_patch`, Hermes's `write_file` and `patch`) are judged by their target through the same path rules, and the gate's own files are protected by rules you can read but the agent cannot rewrite unnoticed: `doctor` reports the fingerprint. A deny written as a string can say `except_reads: true`, as the starter's rules over the hook configs do, and then leaves `cat`, `grep` and `git diff` of the file alone. `unrecognised: deny` and `backup_failure: deny` are the two switches for unattended runs.
 
 ## Architecture
 
@@ -432,7 +433,7 @@ Every bug found in real use, with how it was found and where it was fixed, is in
 
 ## Contributing
 
-Rust 2021, ~27,500 lines of production code and ~29,900 of tests, 757 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
+Rust 2021, ~29,900 lines of production code and ~31,500 of tests, 790 tests on Linux, CI on Linux, macOS and Windows. `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` are the gate, and the gate's rules apply to the gate. Measurements beat opinions here: a change that alters a verdict comes with the fixture that shows it.
 
 ## Security
 
