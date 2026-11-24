@@ -847,12 +847,29 @@ fn backup_files(
     fs::create_dir_all(&dir)?;
     let mut saved = Vec::new();
     let mut longest = 0usize;
+    // The names taken at the top of the copy, in lower case: a
+    // case-insensitive filesystem holds one `Config.json` and `config.json`.
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
     for p in paths {
         let name = p
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "item".into());
-        let dest = dir.join(&name);
+        // Each path is copied to a place of its own. Two with one name
+        // (`rm a/config.json b/config.json`) were both copied to
+        // `<id>/config.json`, the second over the first, and `rollback`
+        // put the second's content back in both places: 0.24.0 reported
+        // "2 path(s) copied" and restored `b`'s file over `a` (measured Nov
+        // 24, 2026). A name already taken goes into a numbered directory.
+        let dest = if taken.insert(name.to_lowercase()) {
+            dir.join(&name)
+        } else {
+            let mut n = 2usize;
+            while !taken.insert(n.to_string()) {
+                n += 1;
+            }
+            dir.join(n.to_string()).join(&name)
+        };
         copy_recursive(p, &dest, &mut longest, true)?;
         // The original modes, recorded beside the copy: the copy itself is
         // made private, so a restore has nothing else to read them from.
@@ -1536,6 +1553,47 @@ mod tests {
         // not destroy what is already there.
         assert!(plan("echo hi > brand-new.txt", dir).is_none());
         assert!(plan("echo hi >> config.json", dir).is_none());
+    }
+
+    /// Two paths with one name are each copied to a place of their own, and
+    /// each comes back to where it was. 0.24.0 copied both to
+    /// `<id>/config.json`, the second over the first, reported "2 path(s)
+    /// copied", and `rollback` put the second's content in both places
+    /// (measured Nov 24, 2026). Names that differ only in case are one name
+    /// to a case-insensitive filesystem, and are kept apart too.
+    #[test]
+    fn two_paths_with_one_name_are_both_kept_and_both_restored() {
+        let tmp = TempTree::new("bk-one-name");
+        let state = tmp.dir("state");
+        let a = tmp.file("proj/a/config.json", "A-content");
+        let b = tmp.file("proj/b/config.json", "B-content");
+        let c = tmp.file("proj/c/Config.json", "C-content");
+        let proj = tmp.path().join("proj");
+        let record = take(
+            &state,
+            "rm a/config.json b/config.json c/Config.json",
+            &proj,
+        )
+        .unwrap()
+        .expect("insured");
+        let saved: Vec<String> = record.data["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["saved_as"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(saved.len(), 3, "{saved:?}");
+        let mut distinct = saved.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3, "each has a place of its own: {saved:?}");
+        for p in [&a, &b, &c] {
+            std::fs::remove_file(p).unwrap();
+        }
+        restore(&state, &record.id).unwrap();
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "A-content");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "B-content");
+        assert_eq!(std::fs::read_to_string(&c).unwrap(), "C-content");
     }
 
     #[test]
