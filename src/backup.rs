@@ -116,12 +116,9 @@ fn plan_segment(segment: &crate::shell::Segment, cwd: &Path) -> Option<String> {
     // report and the mechanism disagreeing is the bug shape this release
     // keeps finding; found by roadmap 2.2, which is the first caller to ask
     // `plan` about a write.
-    if let Some(paths) = all_overwrite_paths(
-        &segment.redirects,
-        &tokens,
-        shell.as_deref(),
-        operands.as_deref(),
-    ) {
+    if let Some(paths) =
+        all_overwrite_paths(segment, &tokens, shell.as_deref(), operands.as_deref(), cwd)
+    {
         return Some(format!(
             "copy {} path(s) to .termaxa/backups before they are overwritten",
             paths.len()
@@ -226,7 +223,6 @@ fn take_segment(
     // The segment's own words for the operand readers, its redirects for
     // the overwrite reader — both from the one split (#61).
     let tokens = crate::pg::shell_tokens(segment.command());
-    let redirects = &segment.redirects;
     let (ts_ms, ts) = now();
     let id = format!("b-{}", ts_ms);
     // The same directories `plan_segment` reads: what the preview promised
@@ -274,7 +270,7 @@ fn take_segment(
     } else if let Some(state) = tf_state_target(&tokens, shell.as_deref()) {
         backup_files(termaxa_dir, &id, &ts, command, &[state])?
     } else if let Some(paths) =
-        all_overwrite_paths(redirects, &tokens, shell.as_deref(), operands.as_deref())
+        all_overwrite_paths(segment, &tokens, shell.as_deref(), operands.as_deref(), cwd)
     {
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else {
@@ -746,17 +742,23 @@ fn option_overwrite_paths(tokens: &[String], cwd: Option<&Path>) -> Option<Vec<P
     }
 }
 
-/// A redirect's targets and an option's written files, together, each once.
-/// A redirect resolves where the shell is (`shell`); an option's file is the
-/// command's own operand (`operands`, after git's `-C`).
+/// A redirect's targets, an option's written files and what a copy or a
+/// move writes over, together, each once. A redirect resolves where the
+/// shell is (`shell`); an option's file and a copy's destination are the
+/// command's own operands (`operands`, after git's `-C`).
 fn all_overwrite_paths(
-    redirects: &[crate::shell::Overwrite],
+    segment: &crate::shell::Segment,
     tokens: &[String],
     shell: Option<&Path>,
     operands: Option<&Path>,
+    cwd: &Path,
 ) -> Option<Vec<PathBuf>> {
-    let mut paths = overwrite_paths_in(redirects, shell).unwrap_or_default();
-    for p in option_overwrite_paths(tokens, operands).unwrap_or_default() {
+    let mut paths = overwrite_paths_in(&segment.redirects, shell).unwrap_or_default();
+    let more = option_overwrite_paths(tokens, operands)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(replaced_paths(segment, operands, cwd));
+    for p in more {
         if !paths.contains(&p) {
             paths.push(p);
         }
@@ -766,6 +768,30 @@ fn all_overwrite_paths(
     } else {
         Some(paths)
     }
+}
+
+/// What a copy or a move writes over that its preview reports (#12): the
+/// file it lands on, when its destination is a file, and when it lands in a
+/// directory, the files there it replaces, if the delete preview's warning
+/// signs are on them (`resolve::Replacement::signs`). Past the budget none
+/// of a directory's are copied, and the preview says it is not recoverable.
+///
+/// Until #12 a `cp` or a `mv` onto an existing file was previewed as a loss
+/// with "no backup covers this command — NOT recoverable", while the
+/// README's table said the file was copied first.
+fn replaced_paths(
+    segment: &crate::shell::Segment,
+    operands: Option<&Path>,
+    cwd: &Path,
+) -> Vec<PathBuf> {
+    let mut ctx = crate::resolve::EvalContext::at(operands.unwrap_or(cwd));
+    ctx.cwd_known = operands.is_some();
+    let root = project_root_of(cwd);
+    crate::resolve::segment_replacements(segment, &ctx)
+        .into_iter()
+        .filter(|r| !r.into_directory || (!r.capped && !r.signs(root.as_deref()).is_empty()))
+        .flat_map(|r| r.files)
+        .collect()
 }
 
 fn overwrite_paths_in(
@@ -1594,6 +1620,68 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "A-content");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "B-content");
         assert_eq!(std::fs::read_to_string(&c).unwrap(), "C-content");
+    }
+
+    /// #12. What a copy writes over outside the project is copied first and
+    /// comes back with `rollback`: the incident's `cp -r backend/*
+    /// /opt/proxypilot/backend/`, small, with the two `__init__.py` a Python
+    /// tree always has. What it does not land on is not copied. A copy the
+    /// project makes of its own files shows no sign and is not copied; one
+    /// file over another is, as the README's table has said all along.
+    #[test]
+    fn what_a_copy_writes_over_outside_the_project_is_copied_first() {
+        let tmp = TempTree::new("bk-copy-over");
+        let state = tmp.dir("state");
+        tmp.file(
+            "proj/.termaxa/policy.yaml",
+            "version: 1\ndefault: ask\nrules: []\n",
+        );
+        tmp.file("proj/backend/app.py", "new app\n");
+        tmp.file("proj/backend/__init__.py", "new root\n");
+        tmp.file("proj/backend/pkg/__init__.py", "new pkg\n");
+        let prod = tmp.dir("opt/proxypilot/backend");
+        tmp.file("opt/proxypilot/backend/app.py", "production app\n");
+        tmp.file("opt/proxypilot/backend/__init__.py", "production root\n");
+        tmp.file("opt/proxypilot/backend/pkg/__init__.py", "production pkg\n");
+        tmp.file("opt/proxypilot/backend/data.db", "rows\n");
+        let proj = tmp.path().join("proj");
+        let line = format!("cp -r backend/* \"{}/\"", prod.display());
+        assert_eq!(
+            plan(&line, &proj).as_deref(),
+            Some("copy 3 path(s) to .termaxa/backups before they are overwritten")
+        );
+        let record = take(&state, &line, &proj).unwrap().expect("insured");
+        // The copy runs.
+        for (rel, text) in [
+            ("app.py", "new app\n"),
+            ("__init__.py", "new root\n"),
+            ("pkg/__init__.py", "new pkg\n"),
+        ] {
+            std::fs::write(prod.join(rel), text).unwrap();
+        }
+        restore(&state, &record.id).unwrap();
+        for (rel, text) in [
+            ("app.py", "production app\n"),
+            ("__init__.py", "production root\n"),
+            ("pkg/__init__.py", "production pkg\n"),
+            ("data.db", "rows\n"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(prod.join(rel)).unwrap(),
+                text,
+                "{rel}"
+            );
+        }
+
+        tmp.file("proj/src/a.js", "new\n");
+        tmp.file("proj/public/a.js", "old\n");
+        assert_eq!(plan("cp -r src/* public/", &proj), None);
+        tmp.file("proj/notes.txt", "old notes\n");
+        tmp.file("proj/draft.txt", "new notes\n");
+        assert_eq!(
+            plan("cp draft.txt notes.txt", &proj).as_deref(),
+            Some("copy 1 path(s) to .termaxa/backups before they are overwritten")
+        );
     }
 
     #[test]

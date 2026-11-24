@@ -96,6 +96,12 @@ pub fn generate(
 /// Uses the roles from 2.1, so a command's SOURCES are not reported as at
 /// risk: `cp .env backup.txt` reads `.env` and writes `backup.txt`, and only
 /// the second is losing anything.
+///
+/// And what a copy or a move lands on (#12): a file it replaces always, with
+/// the delete preview's warning signs when they are on it; the files of a
+/// directory it lands in only when they are. `cp -r src/* dist/` says
+/// nothing, and `cp -r backend/* /opt/proxypilot/backend/` names the
+/// directory outside the project and what it replaces there.
 fn overwrite_preview(
     command: &str,
     root: Option<&std::path::Path>,
@@ -108,7 +114,34 @@ fn overwrite_preview(
 
     let mut lines = Vec::new();
     let mut summary_parts = Vec::new();
+    let mut worst_first: Vec<String> = Vec::new();
     let mut uninsurable = false;
+    // What `backup::take` copies is planned for the line, not for one
+    // target: asked once, when there is something to say it of.
+    let plan = std::cell::OnceCell::new();
+    let insurance = || -> (String, bool) {
+        match plan.get_or_init(|| crate::backup::plan(command, cwd)) {
+            Some(plan) => (
+                format!("  insurance   : {} (automatic on run/hook)", plan),
+                true,
+            ),
+            None => (
+                "  ✗ insurance : no backup covers this command — NOT recoverable".into(),
+                false,
+            ),
+        }
+    };
+    let replaced: Vec<(
+        crate::resolve::Replacement,
+        Vec<crate::resolve::ReplaceSign>,
+    )> = crate::resolve::replacements(command, &ctx)
+        .into_iter()
+        .map(|r| {
+            let signs = r.signs(root);
+            (r, signs)
+        })
+        .collect();
+    let mut reported: Vec<std::path::PathBuf> = Vec::new();
 
     for t in crate::resolve::command_targets(command, &ctx) {
         if t.role != crate::resolve::TargetRole::Destination {
@@ -142,15 +175,15 @@ fn overwrite_preview(
         for s in &t.shapes {
             lines.push(format!("  ⚠ {}", s.label()));
         }
-
-        match crate::backup::plan(command, cwd) {
-            Some(plan) => lines.push(format!("  insurance   : {} (automatic on run/hook)", plan)),
-            None => {
-                lines
-                    .push("  ✗ insurance : no backup covers this command — NOT recoverable".into());
-                uninsurable = true;
-            }
+        if let Some((_, signs)) = replaced
+            .iter()
+            .find(|(r, _)| !r.into_directory && r.destination == *path)
+        {
+            sign_lines(signs, root, &mut lines, &mut worst_first);
         }
+        let (line, insured) = insurance();
+        lines.push(line);
+        uninsurable |= !insured;
         summary_parts.push(format!(
             "{} loses {}",
             path.file_name()
@@ -158,17 +191,144 @@ fn overwrite_preview(
                 .unwrap_or_else(|| path.display().to_string()),
             fmt_bytes(bytes)
         ));
+        reported.push(path.clone());
+    }
+
+    for (r, signs) in &replaced {
+        if r.into_directory && signs.is_empty() {
+            continue; // an ordinary copy into a directory says nothing
+        }
+        if !r.into_directory && reported.contains(&r.destination) {
+            continue; // said above, as a destination the command names
+        }
+        if !r.into_directory {
+            // A file the command names in a grammar the targets above do
+            // not read (`Copy-Item`, `Move-Item`, `git mv`).
+            let bytes = r
+                .files
+                .first()
+                .and_then(|f| std::fs::metadata(f).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            lines.push(format!("  target      : {}", r.destination.display()));
+            lines.push(format!(
+                "  loses       : {} of existing content",
+                fmt_bytes(bytes)
+            ));
+            sign_lines(signs, root, &mut lines, &mut worst_first);
+            let (line, insured) = insurance();
+            lines.push(line);
+            uninsurable |= !insured;
+            summary_parts.push(format!(
+                "{} loses {}",
+                r.destination
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| r.destination.display().to_string()),
+                fmt_bytes(bytes)
+            ));
+            continue;
+        }
+        lines.push(format!("  destination : {}", r.destination.display()));
+        sign_lines(signs, root, &mut lines, &mut worst_first);
+        let named: Vec<String> = r
+            .files
+            .iter()
+            .take(3)
+            .map(|f| match f.strip_prefix(&r.destination) {
+                Ok(rel) => rel.display().to_string(),
+                Err(_) => f.display().to_string(),
+            })
+            .collect();
+        let more = r.files.len().saturating_sub(named.len());
+        let list = match (named.is_empty(), more) {
+            (true, _) => String::new(),
+            (false, 0) => format!(": {}", named.join(", ")),
+            (false, n) => format!(
+                ": {}, and {} more",
+                named.join(", "),
+                crate::delete::count_words(n)
+            ),
+        };
+        let count = crate::delete::count_words(r.files.len());
+        if r.capped {
+            lines.push(format!(
+                "  replaces    : at least {} existing file(s), the reading stopped at its budget ({}){}",
+                count,
+                crate::delete::walk_budget_words(),
+                list
+            ));
+            lines.push(
+                "  ✗ insurance : what it writes over is past the copy budget — NOT recoverable"
+                    .into(),
+            );
+            uninsurable = true;
+        } else {
+            lines.push(format!(
+                "  replaces    : {} existing file(s){}",
+                count, list
+            ));
+            let (line, insured) = insurance();
+            lines.push(line);
+            uninsurable |= !insured;
+        }
+        summary_parts.push(format!(
+            "{} — replaces {}{} existing file(s)",
+            r.destination.display(),
+            count,
+            if r.capped { "+" } else { "" }
+        ));
     }
 
     if lines.is_empty() {
         return None;
     }
+    worst_first.dedup();
+    let summary = if worst_first.is_empty() {
+        summary_parts.join("; ")
+    } else {
+        format!("{} — {}", worst_first.join(", "), summary_parts.join("; "))
+    };
     Some(Preview {
         title: "overwrite impact".into(),
         lines,
-        summary: summary_parts.join("; "),
+        summary,
         uninsurable,
     })
+}
+
+/// The lines a replacement's warning signs add to the preview (#12), in the
+/// delete preview's words, and the label each puts at the front of the
+/// summary, where an agent's confirmation prompt shows it.
+fn sign_lines(
+    signs: &[crate::resolve::ReplaceSign],
+    root: Option<&std::path::Path>,
+    lines: &mut Vec<String>,
+    worst_first: &mut Vec<String>,
+) {
+    use crate::resolve::ReplaceSign;
+    for s in signs {
+        match s {
+            ReplaceSign::Outside => {
+                let root = root.map(|r| r.display().to_string()).unwrap_or_default();
+                lines.push(format!("  ⚠ OUTSIDE the project root ({})", root));
+                worst_first.push("OUTSIDE project root".into());
+            }
+            ReplaceSign::UserProfile => {
+                lines.push("  ⚠ lands in a USER PROFILE directory".into());
+                worst_first.push("lands in a user profile".into());
+            }
+            ReplaceSign::Sensitive(names) => {
+                let named: Vec<String> = names
+                    .iter()
+                    .map(|(n, w)| format!("{} ({})", n, w))
+                    .collect();
+                lines.push(format!("  ⚠ writes over: {}", named.join(", ")));
+                worst_first.push(format!("writes over {}", names[0].0));
+            }
+            ReplaceSign::TooLarge => worst_first.push("NOT recoverable".into()),
+        }
+    }
 }
 
 /// Bytes in the shape a human reads at a glance. Deliberately coarse: the
@@ -1514,6 +1674,64 @@ mod live_gate_tests {
             assert!(!pv.uninsurable, "{c}: the copy is taken first");
         }
         assert!(generate("find . -name '*.txt' -print", None, dir, false).is_none());
+    }
+
+    /// #12. A copy over files outside the project names the directory, the
+    /// sign and what it replaces, and the summary, which an agent's prompt
+    /// shows, leads with the sign. What it replaces is copied first, so it
+    /// is not "NOT recoverable". An ordinary copy inside the project has
+    /// nothing to preview. One file over another was previewed as a loss no
+    /// backup covers; it is copied first now.
+    #[test]
+    fn a_copy_over_files_outside_the_project_shows_what_it_replaces() {
+        let t = crate::testutil::TempTree::new("ov-copy-over");
+        t.file(
+            "proj/.termaxa/policy.yaml",
+            "version: 1\ndefault: ask\nrules: []\n",
+        );
+        t.file("proj/backend/app.py", "new\n");
+        t.file("proj/backend/routes.py", "new\n");
+        t.file("opt/proxypilot/backend/app.py", "old\n");
+        let proj = t.path().join("proj");
+        let prod = t.path().join("opt").join("proxypilot").join("backend");
+        let line = format!("cp -r backend/* \"{}\"", prod.display());
+        let pv = generate(&line, Some(&proj), &proj, false).expect("a preview");
+        assert_eq!(pv.title, "overwrite impact");
+        let body = pv.lines.join("\n");
+        assert!(
+            body.contains(&format!("destination : {}", prod.display())),
+            "{body}"
+        );
+        assert!(body.contains("⚠ OUTSIDE the project root"), "{body}");
+        assert!(
+            body.contains("replaces    : 1 existing file(s): app.py"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "insurance   : copy 1 path(s) to .termaxa/backups before they are overwritten"
+            ),
+            "{body}"
+        );
+        assert!(!pv.uninsurable, "{body}");
+        assert!(
+            pv.summary.starts_with("OUTSIDE project root — ")
+                && pv.summary.ends_with("replaces 1 existing file(s)"),
+            "{}",
+            pv.summary
+        );
+
+        t.file("proj/src/a.js", "new\n");
+        t.file("proj/public/a.js", "old\n");
+        assert!(generate("cp -r src/* public/", Some(&proj), &proj, false).is_none());
+
+        t.file("proj/src.txt", "new\n");
+        t.file("proj/dst.txt", "old\n");
+        let pv = generate("cp src.txt dst.txt", Some(&proj), &proj, false).expect("a preview");
+        let body = pv.lines.join("\n");
+        assert!(body.contains("loses"), "{body}");
+        assert!(body.contains("insurance   : copy 1 path(s)"), "{body}");
+        assert!(!pv.uninsurable, "{body}");
     }
 
     /// Creating a file destroys nothing. A preview announcing it would be

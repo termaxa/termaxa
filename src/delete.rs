@@ -2141,16 +2141,29 @@ fn sensitive_children(dir: &Path) -> Vec<(String, &'static str)> {
     };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        for (needle, what) in SENSITIVE {
-            if name.eq_ignore_ascii_case(needle) || name.starts_with(needle) {
-                found.push((name.clone(), *what));
-                break;
-            }
+        if let Some(what) = sensitive_name(&name) {
+            found.push((name, what));
         }
     }
     found.sort();
     found.dedup_by(|a, b| a.0 == b.0);
     found
+}
+
+/// What a file or directory named `name` holds, when the name is one of
+/// `SENSITIVE`, in any casing, or one of them with more after a `.` or a
+/// `_`: `.env.local`, `credentials.json`, `id_rsa_work`.
+///
+/// Until #12 any name that merely began with one counted, in that casing
+/// only, so `.gitignore` and `.github` were "git history" and
+/// `.dockerignore` was "Docker credentials" in the delete preview's
+/// warning, and would have been in what a copy writes over.
+pub fn sensitive_name(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    SENSITIVE.iter().find_map(|(needle, what)| {
+        let more = lower.strip_prefix(needle)?;
+        (more.is_empty() || more.starts_with(['.', '_'])).then_some(*what)
+    })
 }
 
 pub struct Scan {
@@ -2364,6 +2377,20 @@ impl Default for WalkBudget {
 /// out the walk stops and says so in `budget.capped`; the rest of the tree
 /// was not read.
 pub fn files_under(root: &Path, budget: &mut WalkBudget) -> Vec<String> {
+    walk_files(root, budget, false)
+}
+
+/// Every file under `root`, the same walk as `files_under` but into every
+/// directory: what a copy of the tree writes over where it lands (#12). A
+/// file written over is lost whatever made it, a build or a person, and
+/// wherever it is; only inside the project is a rebuilt directory known to
+/// be rebuilt (`reproducible_within`). A link is still an entry, never
+/// followed.
+pub fn every_file_under(root: &Path, budget: &mut WalkBudget) -> Vec<String> {
+    walk_files(root, budget, true)
+}
+
+fn walk_files(root: &Path, budget: &mut WalkBudget, every: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let started = Instant::now();
     let mut queue: std::collections::VecDeque<(PathBuf, String)> =
@@ -2398,9 +2425,10 @@ pub fn files_under(root: &Path, budget: &mut WalkBudget) -> Vec<String> {
                 }
                 budget.files += 1;
                 out.push(rel);
-            } else if !is_rebuilt_name(&name)
-                && !name.eq_ignore_ascii_case(".git")
-                && !is_checkout(&dir.join(&name))
+            } else if every
+                || (!is_rebuilt_name(&name)
+                    && !name.eq_ignore_ascii_case(".git")
+                    && !is_checkout(&dir.join(&name)))
             {
                 queue.push_back((dir.join(&name), rel));
             }
@@ -2538,6 +2566,21 @@ pub fn too_large_to_copy() -> String {
         "too large to copy ({}+ files) — NOT recoverable",
         fmt_num(MAX_FILES)
     )
+}
+
+/// The budget a reading of the disk stops at, in words: "5,000 files or
+/// 300 ms".
+pub fn walk_budget_words() -> String {
+    format!(
+        "{} files or {} ms",
+        fmt_num(MAX_FILES),
+        MAX_TIME.as_millis()
+    )
+}
+
+/// A count with thousands separators, as the previews print one.
+pub fn count_words(n: usize) -> String {
+    fmt_num(n)
 }
 
 fn fmt_num(n: usize) -> String {
@@ -3763,6 +3806,37 @@ mod tests {
             !names.contains(&"notes.txt"),
             "ordinary files are not findings: {names:?}"
         );
+    }
+
+    /// A sensitive name is the name, in any casing, or the name with more
+    /// after a `.` or a `_`. Until #12 any name that began with one in its
+    /// own casing counted, so `.gitignore` was git history.
+    #[test]
+    fn a_sensitive_name_is_the_name_or_the_name_and_a_suffix() {
+        for (name, what) in [
+            (".env", "environment secrets"),
+            (".ENV", "environment secrets"),
+            (".env.local", "environment secrets"),
+            (".Env.production", "environment secrets"),
+            ("credentials.json", "credentials file"),
+            ("id_rsa_work", "SSH private key"),
+            (".git", "git history"),
+            (".SSH", "SSH private keys"),
+        ] {
+            assert_eq!(sensitive_name(name), Some(what), "{name}");
+        }
+        for name in [
+            ".gitignore",
+            ".github",
+            ".gitattributes",
+            ".dockerignore",
+            ".envrc",
+            "credentialsless",
+            "notes.txt",
+            "env",
+        ] {
+            assert_eq!(sensitive_name(name), None, "{name}");
+        }
     }
 
     /// The command is further along than a runner, a `!`, a `{` or a
