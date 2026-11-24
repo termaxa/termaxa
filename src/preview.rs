@@ -179,7 +179,7 @@ fn overwrite_preview(
             .iter()
             .find(|(r, _)| !r.into_directory && r.destination == *path)
         {
-            sign_lines(signs, root, &mut lines, &mut worst_first);
+            sign_lines(signs, root, false, &mut lines, &mut worst_first);
         }
         let (line, insured) = insurance();
         lines.push(line);
@@ -215,7 +215,7 @@ fn overwrite_preview(
                 "  loses       : {} of existing content",
                 fmt_bytes(bytes)
             ));
-            sign_lines(signs, root, &mut lines, &mut worst_first);
+            sign_lines(signs, root, false, &mut lines, &mut worst_first);
             let (line, insured) = insurance();
             lines.push(line);
             uninsurable |= !insured;
@@ -230,54 +230,107 @@ fn overwrite_preview(
             continue;
         }
         lines.push(format!("  destination : {}", r.destination.display()));
-        sign_lines(signs, root, &mut lines, &mut worst_first);
-        let named: Vec<String> = r
-            .files
-            .iter()
-            .take(3)
-            .map(|f| match f.strip_prefix(&r.destination) {
-                Ok(rel) => rel.display().to_string(),
-                Err(_) => f.display().to_string(),
-            })
-            .collect();
-        let more = r.files.len().saturating_sub(named.len());
-        let list = match (named.is_empty(), more) {
-            (true, _) => String::new(),
-            (false, 0) => format!(": {}", named.join(", ")),
-            (false, n) => format!(
-                ": {}, and {} more",
-                named.join(", "),
-                crate::delete::count_words(n)
-            ),
+        sign_lines(
+            signs,
+            root,
+            !r.removed.is_empty(),
+            &mut lines,
+            &mut worst_first,
+        );
+        // A few of the files, by their path below the destination.
+        let listed = |files: &[std::path::PathBuf]| -> String {
+            let named: Vec<String> = files
+                .iter()
+                .take(3)
+                .map(|f| match f.strip_prefix(&r.destination) {
+                    Ok(rel) => rel.display().to_string(),
+                    Err(_) => f.display().to_string(),
+                })
+                .collect();
+            match (named.is_empty(), files.len() - named.len()) {
+                (true, _) => String::new(),
+                (false, 0) => format!(": {}", named.join(", ")),
+                (false, n) => format!(
+                    ": {}, and {} more",
+                    named.join(", "),
+                    crate::delete::count_words(n)
+                ),
+            }
         };
         let count = crate::delete::count_words(r.files.len());
-        if r.capped {
-            lines.push(format!(
-                "  replaces    : at least {} existing file(s), the reading stopped at its budget ({}){}",
+        let removed = crate::delete::count_words(r.removed.len());
+        let at_most = if r.approximate { "up to " } else { "" };
+        let stopped = if r.capped {
+            format!(
+                ", the reading stopped at its budget ({})",
+                crate::delete::walk_budget_words()
+            )
+        } else {
+            String::new()
+        };
+        match &r.unknown {
+            Some(why) => lines.push(format!(
+                "  ⚠ not read  : {}; any of the {}{} file(s) there may be written over{}{}",
+                why,
+                if r.capped { "at least " } else { "" },
                 count,
-                crate::delete::walk_budget_words(),
-                list
-            ));
+                stopped,
+                listed(&r.files)
+            )),
+            None => {
+                if !r.files.is_empty() || (r.capped && r.removed.is_empty()) {
+                    lines.push(format!(
+                        "  replaces    : {}{}{} existing file(s){}{}",
+                        at_most,
+                        if r.capped { "at least " } else { "" },
+                        count,
+                        stopped,
+                        listed(&r.files)
+                    ));
+                }
+                if !r.removed.is_empty() {
+                    lines.push(format!(
+                        "  removes     : {}{} file(s) the source does not have{}",
+                        at_most,
+                        removed,
+                        listed(&r.removed)
+                    ));
+                }
+            }
+        }
+        if r.capped {
             lines.push(
                 "  ✗ insurance : what it writes over is past the copy budget — NOT recoverable"
                     .into(),
             );
             uninsurable = true;
         } else {
-            lines.push(format!(
-                "  replaces    : {} existing file(s){}",
-                count, list
-            ));
             let (line, insured) = insurance();
             lines.push(line);
             uninsurable |= !insured;
         }
-        summary_parts.push(format!(
-            "{} — replaces {}{} existing file(s)",
-            r.destination.display(),
-            count,
-            if r.capped { "+" } else { "" }
-        ));
+        let plus = if r.capped { "+" } else { "" };
+        summary_parts.push(match (&r.unknown, r.removed.is_empty()) {
+            (Some(_), _) => format!(
+                "{} — may write over any of {}{} existing file(s)",
+                r.destination.display(),
+                count,
+                plus
+            ),
+            (None, true) => format!(
+                "{} — replaces {}{} existing file(s)",
+                r.destination.display(),
+                count,
+                plus
+            ),
+            (None, false) => format!(
+                "{} — replaces {}{} existing file(s), removes {}",
+                r.destination.display(),
+                count,
+                plus,
+                removed
+            ),
+        });
     }
 
     if lines.is_empty() {
@@ -303,9 +356,15 @@ fn overwrite_preview(
 fn sign_lines(
     signs: &[crate::resolve::ReplaceSign],
     root: Option<&std::path::Path>,
+    removes: bool,
     lines: &mut Vec<String>,
     worst_first: &mut Vec<String>,
 ) {
+    let verb = if removes {
+        "writes over or removes"
+    } else {
+        "writes over"
+    };
     use crate::resolve::ReplaceSign;
     for s in signs {
         match s {
@@ -323,8 +382,8 @@ fn sign_lines(
                     .iter()
                     .map(|(n, w)| format!("{} ({})", n, w))
                     .collect();
-                lines.push(format!("  ⚠ writes over: {}", named.join(", ")));
-                worst_first.push(format!("writes over {}", names[0].0));
+                lines.push(format!("  ⚠ {}: {}", verb, named.join(", ")));
+                worst_first.push(format!("{} {}", verb, names[0].0));
             }
             ReplaceSign::TooLarge => worst_first.push("NOT recoverable".into()),
         }
@@ -1732,6 +1791,59 @@ mod live_gate_tests {
         assert!(body.contains("loses"), "{body}");
         assert!(body.contains("insurance   : copy 1 path(s)"), "{body}");
         assert!(!pv.uninsurable, "{body}");
+    }
+
+    /// #12. `rsync --delete` over a directory outside the project names
+    /// what it writes over and what it removes, and both are copied first;
+    /// a compressed archive unpacked there says it was not read and that
+    /// anything there may be written over.
+    #[test]
+    fn an_rsync_delete_and_an_unread_archive_are_previewed() {
+        let t = crate::testutil::TempTree::new("ov-rsync");
+        t.file(
+            "proj/.termaxa/policy.yaml",
+            "version: 1\ndefault: ask\nrules: []\n",
+        );
+        t.file("proj/build/index.html", "new\n");
+        t.file("www/index.html", "live\n");
+        t.file("www/old/x.html", "stale\n");
+        t.file("www/.env", "SECRET=1\n");
+        let proj = t.path().join("proj");
+        let www = t.path().join("www");
+        let line = format!("rsync -a --delete build/ \"{}/\"", www.display());
+        let pv = generate(&line, Some(&proj), &proj, false).expect("a preview");
+        let body = pv.lines.join("\n");
+        assert!(
+            body.contains("replaces    : 1 existing file(s): index.html"),
+            "{body}"
+        );
+        assert!(
+            body.contains("removes     : 2 file(s) the source does not have"),
+            "{body}"
+        );
+        assert!(
+            body.contains("⚠ writes over or removes: .env (environment secrets)"),
+            "{body}"
+        );
+        assert!(body.contains("insurance   : copy 3 path(s)"), "{body}");
+        assert!(!pv.uninsurable, "{body}");
+        assert!(
+            pv.summary
+                .ends_with("replaces 1 existing file(s), removes 2"),
+            "{}",
+            pv.summary
+        );
+        std::fs::write(proj.join("rel.tgz"), b"\x1f\x8b\x08\0").unwrap();
+        let line = format!("tar -xzf rel.tgz -C \"{}\"", www.display());
+        let pv = generate(&line, Some(&proj), &proj, false).expect("a preview");
+        let body = pv.lines.join("\n");
+        assert!(
+            body.contains(
+                "⚠ not read  : the archive is gzip-compressed; any of the 3 file(s) there may be written over"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("insurance   : copy 3 path(s)"), "{body}");
     }
 
     /// Creating a file destroys nothing. A preview announcing it would be

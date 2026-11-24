@@ -493,6 +493,10 @@ pub fn command_contents(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget>
             renamed(&tokens[at + 1..], &ctx, &mut budget, &mut out);
             continue;
         }
+        if let Some(ex) = extract_of(&head, &tokens[at..]) {
+            unpacked_for_rules(&ex, &ctx, &mut out);
+            continue;
+        }
         let Some(cm) = copy_move_of(&head, &tokens[at..]) else {
             if head == "git" {
                 undone_by_git(&tokens[at..], &ctx, &mut budget, &mut out);
@@ -504,15 +508,62 @@ pub fn command_contents(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget>
                 removed_with(s, &ctx, &mut budget, &mut out);
             }
         }
+        let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let before = out.len();
         landed(&cm, &ctx, &mut out, &mut |tree, place| {
+            pairs.push((tree.to_path_buf(), place.to_path_buf()));
             if not_read(tree, &ctx) {
-                Vec::new()
-            } else {
-                guarded_files(tree, place, &ctx, &mut budget)
+                return Vec::new();
             }
+            guarded_files(tree, place, &ctx, &mut budget)
+                .into_iter()
+                .filter(|p| {
+                    p.strip_prefix(place)
+                        .map(|rel| cm.copies(&rel.to_string_lossy().replace('\\', "/")))
+                        .unwrap_or(true)
+                })
+                .collect()
         });
+        if let Some(rsync) = cm.rsync.as_ref().filter(|r| r.deletes && !r.remote_source) {
+            let lands: Vec<PathBuf> = out[before..]
+                .iter()
+                .filter_map(|t| t.resolved.clone())
+                .collect();
+            removed_by_rsync(&pairs, &lands, rsync, &ctx, &mut budget, &mut out);
+        }
     }
     out
+}
+
+/// What `rsync --delete` removes where the path rules guard (#12): the
+/// project and the agent configuration under the user's home, as a tree
+/// copied there is read (`guarded_files`). `rsync -a --delete tpl/ ./`
+/// removes the policy and the hook config when the template has neither.
+fn removed_by_rsync(
+    pairs: &[(PathBuf, PathBuf)],
+    lands: &[PathBuf],
+    rsync: &Rsync,
+    ctx: &EvalContext,
+    budget: &mut delete::WalkBudget,
+    out: &mut Vec<ResolvedTarget>,
+) {
+    let mut guarded = vec![ctx.root.clone()];
+    guarded.extend(delete::user_config_dirs());
+    let read: Vec<(PathBuf, PathBuf)> = pairs
+        .iter()
+        .filter(|(_, place)| {
+            guarded
+                .iter()
+                .any(|g| delete::is_inside(place, g) || delete::is_inside(g, place))
+        })
+        .cloned()
+        .collect();
+    let mut capped = false;
+    for p in extraneous(&read, lands, rsync, budget, &mut capped, false) {
+        if guarded.iter().any(|g| delete::is_inside(&p, g)) {
+            out.push(inside(p, TargetRole::Removed));
+        }
+    }
 }
 
 fn unquoted(s: &str) -> String {
@@ -524,12 +575,277 @@ fn unquoted(s: &str) -> String {
 struct CopyMove {
     /// `Source` for a copy, whose sources stay; `Removed` for a move.
     source_role: TargetRole,
-    /// Its arguments in `cp`/`mv` grammar, PowerShell's read into it.
+    /// Its arguments in `cp`/`mv` grammar, PowerShell's and rsync's read
+    /// into it.
     args: Vec<String>,
     /// The destination as written, quotes stripped.
     dest: String,
-    /// The sources as written, quotes stripped.
+    /// The sources as written, quotes stripped; a source rsync copies the
+    /// contents of (`src/`) as `src/.`.
     sources: Vec<String>,
+    /// What rsync does beyond a copy, when the command is rsync.
+    rsync: Option<Rsync>,
+}
+
+impl CopyMove {
+    /// Whether a link where a file lands is replaced, as `mv` and rsync
+    /// replace it, or written through, as `cp` writes through it
+    /// (`written_over`).
+    fn replaces_links(&self) -> bool {
+        self.source_role == TargetRole::Removed || self.rsync.is_some()
+    }
+
+    /// Whether the file at `rel`, below where a tree lands, is copied at
+    /// all: rsync leaves out what an `--exclude` matches.
+    fn copies(&self, rel: &str) -> bool {
+        self.rsync
+            .as_ref()
+            .is_none_or(|r| !rsync_excluded(rel, &r.excludes))
+    }
+}
+
+/// What rsync does beyond a copy (#12), read off its options.
+#[derive(Debug, Clone, Default)]
+struct Rsync {
+    /// `--delete` and its kin: in each directory the copy enters, what the
+    /// destination holds and the source does not is removed.
+    deletes: bool,
+    /// `--ignore-existing`: a file already there is left as it is.
+    keeps_existing: bool,
+    /// The `--exclude` patterns: what they match is not copied and, unless
+    /// `--delete-excluded`, not removed.
+    excludes: Vec<String>,
+    delete_excluded: bool,
+    /// A filter this does not follow (`--include`, `--filter`, `-F`,
+    /// `--files-from`, `--cvs-exclude`, a `**` pattern): what is written
+    /// over and removed is at most what the reading lists.
+    approximate: bool,
+    /// A source on another machine, whose files are not known here.
+    remote_source: bool,
+}
+
+/// rsync's own grammar (#12), as measured on rsync 3.2.7 (Nov 24, 2026). A
+/// source written with a trailing separator lands its contents in the
+/// destination; one written without lands under its own name, whether or
+/// not the destination is there yet (`cp -r src new` makes `new` the copy;
+/// `rsync -a src new` makes `new/src`). Without `-r`, `-a` or `-d` a
+/// directory is skipped, and `--delete` without them stops the command
+/// before it copies anything. `-n` copies nothing. `-d` copies a
+/// directory's own entries only, and is read as `-r`: more than it copies,
+/// never less.
+///
+/// `None` for what writes nothing here or what this does not read: a dry
+/// run, a single operand (a listing), a destination on another machine,
+/// and `-R`, which keeps each source's path below the destination.
+fn rsync_of(rest: &[String]) -> Option<CopyMove> {
+    const VALUED_SHORT: &[char] = &['e', 'f', 'T', 'B', 'M', '@'];
+    const VALUED_LONG: &[&str] = &[
+        "rsh",
+        "rsync-path",
+        "filter",
+        "exclude",
+        "include",
+        "exclude-from",
+        "include-from",
+        "files-from",
+        "temp-dir",
+        "backup-dir",
+        "suffix",
+        "compare-dest",
+        "copy-dest",
+        "link-dest",
+        "block-size",
+        "max-delete",
+        "max-size",
+        "min-size",
+        "max-alloc",
+        "partial-dir",
+        "log-file",
+        "log-file-format",
+        "out-format",
+        "password-file",
+        "bwlimit",
+        "port",
+        "sockopts",
+        "timeout",
+        "contimeout",
+        "chmod",
+        "chown",
+        "usermap",
+        "groupmap",
+        "iconv",
+        "modify-window",
+        "info",
+        "debug",
+        "stop-after",
+        "stop-at",
+        "time-limit",
+        "checksum-choice",
+        "cc",
+        "compress-choice",
+        "zc",
+        "compress-level",
+        "zl",
+        "skip-compress",
+        "protocol",
+        "write-batch",
+        "only-write-batch",
+        "read-batch",
+        "outbuf",
+        "remote-option",
+        "address",
+        "early-input",
+        "checksum-seed",
+        "copy-as",
+    ];
+    let mut r = Rsync::default();
+    let (mut recursive, mut dry, mut relative) = (false, false, false);
+    let mut operands: Vec<String> = Vec::new();
+    let mut ended = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = unquoted(&rest[i]);
+        i += 1;
+        if ended || !a.starts_with('-') || a == "-" {
+            operands.push(a);
+            continue;
+        }
+        if a == "--" {
+            ended = true;
+            continue;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (long, None),
+            };
+            let value = if inline.is_none() && VALUED_LONG.contains(&name) {
+                i += 1;
+                rest.get(i - 1).map(|v| unquoted(v))
+            } else {
+                inline
+            };
+            match name {
+                "recursive" | "archive" | "dirs" => recursive = true,
+                "dry-run" | "list-only" => dry = true,
+                "relative" => relative = true,
+                "ignore-existing" => r.keeps_existing = true,
+                "delete" | "del" | "delete-before" | "delete-during" | "delete-delay"
+                | "delete-after" => r.deletes = true,
+                "delete-excluded" => {
+                    r.deletes = true;
+                    r.delete_excluded = true;
+                }
+                "exclude" => match value {
+                    Some(p) if !p.contains("**") => r.excludes.push(p),
+                    _ => r.approximate = true,
+                },
+                "include" | "filter" | "exclude-from" | "include-from" | "files-from"
+                | "cvs-exclude" => r.approximate = true,
+                _ => {}
+            }
+            continue;
+        }
+        // A cluster of short options. One that takes a value takes the rest
+        // of the cluster, or the next word.
+        let cluster: Vec<char> = a[1..].chars().collect();
+        for (k, c) in cluster.iter().enumerate() {
+            if VALUED_SHORT.contains(c) {
+                if k + 1 == cluster.len() {
+                    i += 1;
+                }
+                if *c == 'f' {
+                    r.approximate = true;
+                }
+                break;
+            }
+            match c {
+                'r' | 'a' | 'd' => recursive = true,
+                'n' => dry = true,
+                'R' => relative = true,
+                'C' | 'F' => r.approximate = true,
+                _ => {}
+            }
+        }
+    }
+    if dry || relative || operands.len() < 2 || (r.deletes && !recursive) {
+        return None;
+    }
+    let dest = operands.pop()?;
+    if rsync_remote(&dest) {
+        return None;
+    }
+    r.remote_source = operands.iter().any(|s| rsync_remote(s));
+    let sources: Vec<String> = operands
+        .into_iter()
+        .map(|s| {
+            if s.ends_with('/') || s.ends_with('\\') {
+                format!("{s}.")
+            } else {
+                s
+            }
+        })
+        .collect();
+    let mut args: Vec<String> = Vec::new();
+    if recursive {
+        args.push("-r".into());
+    }
+    args.extend(sources.iter().cloned());
+    args.push(dest.clone());
+    Some(CopyMove {
+        source_role: TargetRole::Source,
+        args,
+        dest,
+        sources,
+        rsync: Some(r),
+    })
+}
+
+/// An rsync operand on another machine: `host:path`, `user@host:path`,
+/// `host::module` or `rsync://...`, a colon before any separator. One
+/// letter before the colon is a Windows drive, not a host.
+fn rsync_remote(s: &str) -> bool {
+    if s.starts_with("rsync://") {
+        return true;
+    }
+    s.find(':').is_some_and(|at| {
+        let host = &s[..at];
+        host.len() > 1 && !host.contains(['/', '\\'])
+    })
+}
+
+/// Whether rsync's `--exclude` patterns leave out `rel`, a path below the
+/// directory a tree lands in, `/` between its components. A pattern with no
+/// `/` matches any one component, a file's own name or a directory above
+/// it, which leaves out all it holds; with a `/` it matches components in
+/// a row, from the top when it starts with one and at any depth when it
+/// does not; ending in `/` it matches a directory only. Measured on rsync
+/// 3.2.7: `--exclude .git`, `--exclude node_modules` and `--exclude /sub`
+/// kept those directories from `--delete`, `--exclude '*.log'` a log file.
+fn rsync_excluded(rel: &str, patterns: &[String]) -> bool {
+    let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+    patterns.iter().any(|pattern| {
+        let dir_only = pattern.ends_with('/');
+        let anchored = pattern.starts_with('/');
+        let pieces: Vec<&str> = pattern
+            .trim_matches('/')
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .collect();
+        if pieces.is_empty() {
+            return false;
+        }
+        (0..parts.len()).any(|start| {
+            let end = start + pieces.len();
+            (!anchored || start == 0)
+                && end <= parts.len()
+                && !(dir_only && end == parts.len())
+                && pieces
+                    .iter()
+                    .zip(&parts[start..end])
+                    .all(|(p, c)| crate::words::component_matches(p, c))
+        })
+    })
 }
 
 /// The commands that copy or move: `cp` and `mv` and their cmd names,
@@ -555,6 +871,7 @@ fn copy_move_of(head: &str, tokens: &[String]) -> Option<CopyMove> {
             }
             (TargetRole::Removed, g[2..].to_vec())
         }
+        "rsync" => return rsync_of(rest),
         _ => return None,
     };
     let grammar_head = match source_role {
@@ -576,6 +893,7 @@ fn copy_move_of(head: &str, tokens: &[String]) -> Option<CopyMove> {
         args,
         dest,
         sources,
+        rsync: None,
     })
 }
 
@@ -1402,7 +1720,9 @@ fn landed(
                     // Where the tree's root lands: inside the directory
                     // under its own name, unless it is the contents
                     // (`tree/.`) or the destination is the tree's new name.
-                    let place = if into && !contents {
+                    // rsync puts a tree under its own name whether or not
+                    // the destination is there (`rsync_of`).
+                    let place = if (into || cm.rsync.is_some()) && !contents {
                         joined(dest, &name)
                     } else {
                         dest.to_string()
@@ -1436,8 +1756,9 @@ fn landed(
 /// destination directory, which the overwrite preview passes over as where
 /// files land rather than what is lost. What is lost is what the copy lands
 /// on: each file of the sources, at its place under the destination, where a
-/// file is now. A copy takes nothing away that it does not land on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// file is now. A copy takes nothing away that it does not land on; an
+/// `rsync --delete` takes away what the source does not have.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Replacement {
     /// Where the command lands its files: a directory, or the one file a
     /// copy or a move of one file writes over.
@@ -1446,11 +1767,21 @@ pub struct Replacement {
     pub into_directory: bool,
     /// The files written over. A copy writes through a link to the file it
     /// points to (GNU coreutils 9.4, measured Nov 24, 2026), and that file is
-    /// what is listed; a move replaces the link itself.
+    /// what is listed; a move, rsync and an unpacking replace the link.
     pub files: Vec<PathBuf>,
+    /// The files removed: what the destination holds and the source does
+    /// not, for `rsync --delete`.
+    pub removed: Vec<PathBuf>,
     /// The reading stopped at its budget: more may be written over than
     /// listed, and what is not listed cannot be copied aside.
     pub capped: bool,
+    /// A filter was not followed (rsync's `--include`, tar's `--exclude`):
+    /// at most what is listed is written over and removed.
+    pub approximate: bool,
+    /// What lands is not known, and why ("the archive is gzip-compressed",
+    /// "the source is on another machine"). `files` is then all that the
+    /// destination holds, any of which may be written over.
+    pub unknown: Option<String>,
 }
 
 /// Why a replacement is worth a word (#12): the delete preview's warning
@@ -1464,7 +1795,8 @@ pub enum ReplaceSign {
     /// The files land in a user profile directory itself.
     UserProfile,
     /// A sensitive name (`delete::sensitive_name`) is the destination's own,
-    /// or is on the way to a file written over: `.env`, `.ssh/`, `.git/`.
+    /// or is on the way to a file written over or removed: `.env`,
+    /// `.ssh/`, `.git/`.
     Sensitive(Vec<(String, &'static str)>),
     /// The reading stopped at its budget: what is written over is not all
     /// known, so it cannot all be copied aside.
@@ -1477,7 +1809,9 @@ impl Replacement {
     ///
     /// Inside a directory a build rebuilds (`delete::reproducible_within`)
     /// what is written over is the build's to make again: a name there is a
-    /// dependency's, and its size is no loss.
+    /// dependency's, and its size is no loss. Where what lands is not known
+    /// (`unknown`), the names the destination holds say nothing of what is
+    /// written over, and only where it lands is asked.
     pub fn signs(&self, root: Option<&Path>) -> Vec<ReplaceSign> {
         let mut signs = Vec::new();
         let outside = |p: &Path| root.is_some_and(|r| !delete::is_inside(p, r));
@@ -1513,7 +1847,12 @@ impl Replacement {
             .map(|n| n.to_string_lossy().to_string())
             .into_iter()
             .collect();
-        for f in &self.files {
+        let named = if self.unknown.is_some() {
+            &[][..]
+        } else {
+            &self.files[..]
+        };
+        for f in named.iter().chain(&self.removed) {
             match f.strip_prefix(&self.destination) {
                 Ok(rel) => names.extend(
                     rel.components()
@@ -1540,9 +1879,9 @@ impl Replacement {
     }
 }
 
-/// What the copies and moves in a command write over (#12), at every
-/// destination, wherever it is. A destination that does not exist yet is
-/// being created, and nothing is written over there.
+/// What the copies, moves and unpackings in a command write over (#12), at
+/// every destination, wherever it is. A destination that does not exist
+/// yet is being created, and nothing is written over there.
 pub fn replacements(command: &str, ctx: &EvalContext) -> Vec<Replacement> {
     crate::shell::split_segments_deep(command)
         .iter()
@@ -1552,13 +1891,17 @@ pub fn replacements(command: &str, ctx: &EvalContext) -> Vec<Replacement> {
 }
 
 /// `replacements` for one segment, `ctx` already where its operands
-/// resolve. The commands are `copy_move_of`'s: `cp`, `mv`, cmd's `copy`
-/// and `move`, `Copy-Item`, `Move-Item` and `git mv`.
+/// resolve. The copies and moves are `copy_move_of`'s: `cp`, `mv`, cmd's
+/// `copy` and `move`, `Copy-Item`, `Move-Item`, `git mv` and rsync; the
+/// unpackings `extract_of`'s: `tar -x`, `unzip` and `Expand-Archive`.
 pub fn segment_replacements(seg: &crate::shell::Segment, ctx: &EvalContext) -> Vec<Replacement> {
     let tokens = brace_expanded(delete::tokenize_public(seg.command()));
     let Some((head, at)) = delete::resolve_head(&tokens) else {
         return Vec::new();
     };
+    if let Some(ex) = extract_of(&head, &tokens[at..]) {
+        return unpacked_over(&ex, ctx);
+    }
     let Some(cm) = copy_move_of(&head, &tokens[at..]) else {
         return Vec::new();
     };
@@ -1568,21 +1911,23 @@ pub fn segment_replacements(seg: &crate::shell::Segment, ctx: &EvalContext) -> V
     let Ok(meta) = std::fs::metadata(&destination) else {
         return Vec::new();
     };
-    let moves = cm.source_role == TargetRole::Removed;
+    let rsync = cm.rsync.clone().unwrap_or_default();
     if !meta.is_dir() {
         // A file, written over by the one source named, unless that source
         // is a directory, which cannot be: the command fails.
         let one_source =
             cm.sources.len() == 1 && !on_disk(&cm.sources[0], ctx).is_some_and(|s| s.is_dir());
-        return match written_over(&destination, moves) {
-            Some(file) if one_source => vec![Replacement {
+        return match written_over(&destination, cm.replaces_links()) {
+            Some(file) if one_source && !rsync.keeps_existing => vec![Replacement {
                 destination,
-                into_directory: false,
                 files: vec![file],
-                capped: false,
+                ..Default::default()
             }],
             _ => Vec::new(),
         };
+    }
+    if rsync.remote_source {
+        return from_elsewhere(&cm, &destination);
     }
     // Two budgets for the whole segment: the trees' own files first, and
     // where a tree is past it, the places they land (`lands_on`).
@@ -1590,39 +1935,156 @@ pub fn segment_replacements(seg: &crate::shell::Segment, ctx: &EvalContext) -> V
     let mut places = delete::WalkBudget::new();
     let mut capped = false;
     let mut landings = Vec::new();
+    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let moves = cm.source_role == TargetRole::Removed;
     landed(&cm, ctx, &mut landings, &mut |tree, place| {
-        lands_on(tree, place, moves, &mut trees, &mut places, &mut capped)
+        pairs.push((tree.to_path_buf(), place.to_path_buf()));
+        lands_on(
+            tree,
+            place,
+            moves,
+            &cm,
+            &mut trees,
+            &mut places,
+            &mut capped,
+        )
     });
+    let lands: Vec<PathBuf> = landings.into_iter().filter_map(|t| t.resolved).collect();
     let mut files: Vec<PathBuf> = Vec::new();
-    for p in landings.into_iter().filter_map(|t| t.resolved) {
-        if let Some(file) = written_over(&p, moves) {
-            if !files.contains(&file) {
-                files.push(file);
+    if !rsync.keeps_existing {
+        for p in &lands {
+            if let Some(file) = written_over(p, cm.replaces_links()) {
+                if !files.contains(&file) {
+                    files.push(file);
+                }
             }
         }
     }
-    if files.is_empty() && !capped {
+    let removed = if rsync.deletes {
+        extraneous(&pairs, &lands, &rsync, &mut places, &mut capped, true)
+    } else {
+        Vec::new()
+    };
+    if files.is_empty() && removed.is_empty() && !capped {
         return Vec::new();
     }
     vec![Replacement {
         destination,
         into_directory: true,
         files,
+        removed,
         capped,
+        approximate: rsync.approximate,
+        unknown: None,
     }]
 }
 
-/// The file a copy or a move writes over when it lands at `at`, if any. A
-/// copy writes through a link to the file it points to (GNU coreutils 9.4:
-/// `cp src/a.txt dst/` and `cp -r src/. dst/` both rewrote the file behind
-/// `dst/a.txt` and left the link, Nov 24, 2026), and refuses a link that
-/// leads nowhere ("not writing through dangling symlink"). A move replaces
-/// the link and leaves what it pointed to. Both measured the same day. A
-/// directory where a file lands stops the command there.
-fn written_over(at: &Path, moves: bool) -> Option<PathBuf> {
+/// An rsync from another machine (#12): what it lands is not known here,
+/// so all that each place holds may be written over, and with `--delete`
+/// removed.
+fn from_elsewhere(cm: &CopyMove, destination: &Path) -> Vec<Replacement> {
+    let mut budget = delete::WalkBudget::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for s in &cm.sources {
+        let name = last_component(s);
+        let place = if name == "." {
+            destination.to_path_buf()
+        } else {
+            destination.join(name.rsplit(':').next().unwrap_or(name))
+        };
+        for rel in delete::every_file_under(&place, &mut budget) {
+            let p = place.join(rel);
+            if !files.contains(&p) {
+                files.push(p);
+            }
+        }
+    }
+    if files.is_empty() && !budget.capped {
+        return Vec::new();
+    }
+    vec![Replacement {
+        destination: destination.to_path_buf(),
+        into_directory: true,
+        files,
+        capped: budget.capped,
+        unknown: Some("the source is on another machine".into()),
+        ..Default::default()
+    }]
+}
+
+/// What `rsync --delete` removes (#12): in each place a tree lands, what the
+/// place holds that no tree landing there has, rel by rel. A file an
+/// `--exclude` matches is kept, unless `--delete-excluded`; what lies in a
+/// place of its own below (a source named without a trailing separator,
+/// landing under its own name) is that place's to judge, and a file the
+/// command copies there itself (`lands`) is not extra. Measured on rsync
+/// 3.2.7 (Nov 24, 2026): `--delete src/ dest/` removed `dest`'s extra file,
+/// its extra directory and an extra file in a directory both have;
+/// `--delete src dest/` removed only inside `dest/src`.
+///
+/// `every` walks every directory, for what is lost wherever it is; the path
+/// rules' reading (`command_contents`) walks as `delete::files_under` does.
+fn extraneous(
+    pairs: &[(PathBuf, PathBuf)],
+    lands: &[PathBuf],
+    rsync: &Rsync,
+    budget: &mut delete::WalkBudget,
+    capped: &mut bool,
+    every: bool,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let places: Vec<&PathBuf> = {
+        let mut p: Vec<&PathBuf> = pairs.iter().map(|(_, place)| place).collect();
+        p.dedup();
+        p
+    };
+    for place in &places {
+        let trees: Vec<&PathBuf> = pairs
+            .iter()
+            .filter(|(_, pl)| pl == *place)
+            .map(|(t, _)| t)
+            .collect();
+        let below: Vec<&PathBuf> = places
+            .iter()
+            .copied()
+            .filter(|other| *other != *place && other.starts_with(place))
+            .collect();
+        let rels = if every {
+            delete::every_file_under(place, budget)
+        } else {
+            delete::files_under(place, budget)
+        };
+        for rel in rels {
+            let at = place.join(&rel);
+            let kept = !rsync.delete_excluded && rsync_excluded(&rel, &rsync.excludes);
+            let has = trees
+                .iter()
+                .any(|t| std::fs::symlink_metadata(t.join(&rel)).is_ok());
+            let copied_there = lands.contains(&at);
+            if !kept && !has && !copied_there && !below.iter().any(|b| at.starts_with(b)) {
+                out.push(at);
+            }
+        }
+    }
+    if budget.capped {
+        *capped = true;
+    }
+    out
+}
+
+/// The file a copy, a move or an unpacking writes over when it lands at
+/// `at`, if any. A copy writes through a link to the file it points to (GNU
+/// coreutils 9.4: `cp src/a.txt dst/` and `cp -r src/. dst/` both rewrote
+/// the file behind `dst/a.txt` and left the link, Nov 24, 2026), and
+/// refuses a link that leads nowhere ("not writing through dangling
+/// symlink"). A move replaces the link and leaves what it pointed to, and
+/// so do rsync 3.2.7, GNU tar 1.35 and UnZip 6.00 (`replaces_links`). All
+/// measured the same day. A directory where a file lands stops the command
+/// there.
+fn written_over(at: &Path, replaces_links: bool) -> Option<PathBuf> {
     let meta = std::fs::symlink_metadata(at).ok()?;
     if meta.file_type().is_symlink() {
-        if moves {
+        if replaces_links {
             return Some(at.to_path_buf());
         }
         return std::fs::canonicalize(at).ok().filter(|real| real.is_file());
@@ -1634,7 +2096,8 @@ fn written_over(at: &Path, moves: bool) -> Option<PathBuf> {
 /// whichever side can be read whole: the tree's files first, each where it
 /// lands; if the tree is past its budget, the files at `place`, each kept
 /// when the tree has a file of that name. When both are past theirs,
-/// `capped` says so and what the tree's walk read is what is known.
+/// `capped` says so and what the tree's walk read is what is known. A file
+/// rsync is told to leave out is not one it lands (`CopyMove::copies`).
 ///
 /// Nothing is read where nothing can be written over: a place that is not a
 /// directory, or holds nothing. A move of a directory onto one that holds
@@ -1644,6 +2107,7 @@ fn lands_on(
     tree: &Path,
     place: &Path,
     moves: bool,
+    cm: &CopyMove,
     trees: &mut delete::WalkBudget,
     places: &mut delete::WalkBudget,
     capped: &mut bool,
@@ -1654,19 +2118,523 @@ fn lands_on(
         return Vec::new();
     }
     let read = delete::every_file_under(tree, trees);
+    let landing = |rels: Vec<String>| -> Vec<PathBuf> {
+        rels.into_iter()
+            .filter(|rel| cm.copies(rel))
+            .map(|rel| place.join(rel))
+            .collect()
+    };
     if !trees.capped {
-        return read.into_iter().map(|rel| place.join(rel)).collect();
+        return landing(read);
     }
     let there = delete::every_file_under(place, places);
     if !places.capped {
-        return there
-            .into_iter()
-            .filter(|rel| std::fs::symlink_metadata(tree.join(rel)).is_ok_and(|m| !m.is_dir()))
-            .map(|rel| place.join(rel))
-            .collect();
+        return landing(
+            there
+                .into_iter()
+                .filter(|rel| std::fs::symlink_metadata(tree.join(rel)).is_ok_and(|m| !m.is_dir()))
+                .collect(),
+        );
     }
     *capped = true;
-    read.into_iter().map(|rel| place.join(rel)).collect()
+    landing(read)
+}
+
+/// An unpacking (#12): what `tar -x`, `unzip` or `Expand-Archive` writes,
+/// read off its options. The names come from the archive itself
+/// (`archive::list`), never from unpacking it.
+#[derive(Debug, Clone, Default)]
+struct Extract {
+    /// `tar`, `unzip` or `Expand-Archive`.
+    tool: &'static str,
+    /// The archive as written; `-` for standard input.
+    archive: String,
+    /// Where it unpacks, as written; the directory the command runs in when
+    /// `None`.
+    dest: Option<String>,
+    /// tar's `--strip-components`.
+    strip: usize,
+    /// unzip's `-j`: every file lands under its own name alone.
+    junk_paths: bool,
+    /// tar's `-P`: a leading `/` and a `..` are kept.
+    absolute: bool,
+    /// A file already there is left as it is: tar's `-k` and
+    /// `--skip-old-files`, unzip without `-o` or with `-n`, `Expand-Archive`
+    /// without `-Force`.
+    keeps_existing: bool,
+    /// The members named on the line, the only ones unpacked; patterns for
+    /// unzip, and for tar with `--wildcards`.
+    members: Vec<String>,
+    member_patterns: bool,
+    /// unzip's `-x` patterns.
+    excludes: Vec<String>,
+    /// An option this does not follow (tar's `--exclude`, `--transform`,
+    /// `-T`, `--one-top-level`): at most what is listed lands.
+    approximate: bool,
+}
+
+/// The unpackings: `tar` with `-x` (GNU tar and bsdtar, the `tar.exe` of
+/// Windows 10 and later, which also unpacks a zip), `unzip` (Info-ZIP) and
+/// PowerShell's `Expand-Archive`. `tokens` starts at the head; `None` for
+/// anything that writes no files: a listing, a test, an archive written to
+/// standard output, or another tar mode.
+fn extract_of(head: &str, tokens: &[String]) -> Option<Extract> {
+    let rest: Vec<String> = tokens[1..].iter().map(|t| unquoted(t)).collect();
+    match head {
+        "tar" | "bsdtar" | "gtar" => tar_extract(&rest),
+        "unzip" => unzip_extract(&rest),
+        "expand-archive" => expand_archive(&rest),
+        _ => None,
+    }
+}
+
+/// GNU tar's and bsdtar's options for an extraction. The mode is `-x`,
+/// `--extract` or `--get`, or an `x` in the old-style first word (`tar
+/// xzf a.tgz`), whose letters take their values from the words that follow
+/// in order. `-C` is where it unpacks (the archive itself is opened where
+/// the command runs, as `tar -xzf a.tgz -C /opt/app` and `tar -C /opt/app
+/// -xzf a.tgz` both do); without `-f` tar reads standard input.
+fn tar_extract(rest: &[String]) -> Option<Extract> {
+    const VALUED: &[char] = &[
+        'f', 'C', 'T', 'X', 'b', 'H', 'V', 'N', 'g', 'L', 'F', 'K', 'I',
+    ];
+    const VALUED_LONG: &[&str] = &[
+        "file",
+        "directory",
+        "files-from",
+        "exclude-from",
+        "blocking-factor",
+        "format",
+        "label",
+        "newer",
+        "after-date",
+        "listed-incremental",
+        "tape-length",
+        "info-script",
+        "new-volume-script",
+        "starting-file",
+        "strip-components",
+        "strip",
+        "exclude",
+        "transform",
+        "xform",
+        "owner",
+        "group",
+        "mode",
+        "mtime",
+        "use-compress-program",
+        "rsh-command",
+        "rmt-command",
+        "suffix",
+        "newer-mtime",
+        "checkpoint-action",
+        "index-file",
+        "volno-file",
+        "quoting-style",
+        "record-size",
+        "hole-detection",
+        "level",
+        "sort",
+        "xattrs-include",
+        "xattrs-exclude",
+        "to-command",
+        "exclude-tag",
+        "exclude-tag-under",
+        "exclude-tag-all",
+    ];
+    #[derive(Default)]
+    struct Mode {
+        extracting: bool,
+        other: bool,
+        to_stdout: bool,
+        dests: usize,
+    }
+    fn letter(c: char, value: Option<String>, ex: &mut Extract, m: &mut Mode) {
+        match c {
+            'x' => m.extracting = true,
+            'c' | 't' | 'r' | 'u' | 'A' | 'd' => m.other = true,
+            'O' => m.to_stdout = true,
+            'k' => ex.keeps_existing = true,
+            'P' => ex.absolute = true,
+            'f' => ex.archive = value.unwrap_or_else(|| "-".into()),
+            'C' => {
+                m.dests += 1;
+                ex.dest = value;
+            }
+            'T' | 'X' => ex.approximate = true,
+            _ => {}
+        }
+    }
+    let mut ex = Extract {
+        tool: "tar",
+        archive: "-".into(),
+        ..Default::default()
+    };
+    let mut m = Mode::default();
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    let mut first = true;
+    while i < rest.len() {
+        let a = rest[i].clone();
+        i += 1;
+        if first && !a.starts_with('-') && !a.is_empty() {
+            // The old style: `tar xzf a.tgz`.
+            first = false;
+            for c in a.chars() {
+                let value = if VALUED.contains(&c) {
+                    i += 1;
+                    rest.get(i - 1).cloned()
+                } else {
+                    None
+                };
+                letter(c, value, &mut ex, &mut m);
+            }
+            continue;
+        }
+        first = false;
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (long, None),
+            };
+            let value = if inline.is_none() && VALUED_LONG.contains(&name) {
+                i += 1;
+                rest.get(i - 1).cloned()
+            } else {
+                inline
+            };
+            match name {
+                "extract" | "get" => m.extracting = true,
+                "create" | "list" | "append" | "update" | "catenate" | "concatenate" | "diff"
+                | "compare" | "delete" | "test-label" => m.other = true,
+                "to-stdout" | "to-command" => m.to_stdout = true,
+                "keep-old-files" | "skip-old-files" => ex.keeps_existing = true,
+                "absolute-names" => ex.absolute = true,
+                "file" => ex.archive = value.unwrap_or_else(|| "-".into()),
+                "directory" => {
+                    m.dests += 1;
+                    ex.dest = value;
+                }
+                "strip-components" | "strip" => {
+                    ex.strip = value.and_then(|v| v.parse().ok()).unwrap_or(0)
+                }
+                "wildcards" => ex.member_patterns = true,
+                "exclude" | "exclude-from" | "files-from" | "transform" | "xform"
+                | "one-top-level" | "keep-newer-files" => ex.approximate = true,
+                _ => {}
+            }
+            continue;
+        }
+        if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+            let cluster: Vec<char> = cluster.chars().collect();
+            for (k, c) in cluster.iter().enumerate() {
+                if VALUED.contains(c) {
+                    let attached: String = cluster[k + 1..].iter().collect();
+                    let value = if attached.is_empty() {
+                        i += 1;
+                        rest.get(i - 1).cloned()
+                    } else {
+                        Some(attached)
+                    };
+                    letter(*c, value, &mut ex, &mut m);
+                    break;
+                }
+                letter(*c, None, &mut ex, &mut m);
+            }
+            continue;
+        }
+        words.push(a);
+    }
+    if !m.extracting || m.other || m.to_stdout {
+        return None;
+    }
+    ex.approximate |= m.dests > 1;
+    ex.members = words;
+    Some(ex)
+}
+
+/// Info-ZIP's `unzip` for an extraction: the first word that is not an
+/// option is the archive (`a` meaning `a`, else `a.zip`), the next ones the
+/// members, patterns all; `-x` begins the patterns left out, `-d` names
+/// where it unpacks. Measured on UnZip 6.00 (Nov 24, 2026): without `-o` a
+/// file already there is asked about, and with no one to answer (stdin not a
+/// terminal, as an agent's never is) it is left as it was; `-n` never
+/// replaces; `-j` lands every file under its own name; a `..` in a name is
+/// dropped and a leading `/` stripped. `-l`, `-v`, `-t`, `-z`, `-Z`, `-p` and
+/// `-c` write no files.
+fn unzip_extract(rest: &[String]) -> Option<Extract> {
+    let mut ex = Extract {
+        tool: "unzip",
+        member_patterns: true,
+        ..Default::default()
+    };
+    let (mut overwrite, mut never) = (false, false);
+    let mut archive: Option<String> = None;
+    let mut excluding = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].clone();
+        i += 1;
+        if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+            excluding = false;
+            let cluster: Vec<char> = cluster.chars().collect();
+            for (k, c) in cluster.iter().enumerate() {
+                match c {
+                    'l' | 'v' | 't' | 'z' | 'Z' | 'p' | 'c' => return None,
+                    'o' => overwrite = true,
+                    'n' => never = true,
+                    'j' => ex.junk_paths = true,
+                    'x' => excluding = true,
+                    'd' | 'P' | 'I' | 'O' => {
+                        let attached: String = cluster[k + 1..].iter().collect();
+                        let value = if attached.is_empty() {
+                            i += 1;
+                            rest.get(i - 1).cloned()
+                        } else {
+                            Some(attached)
+                        };
+                        if *c == 'd' {
+                            ex.dest = value;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if excluding {
+            ex.excludes.push(a);
+        } else if archive.is_none() {
+            archive = Some(a);
+        } else {
+            ex.members.push(a);
+        }
+    }
+    ex.archive = archive?;
+    ex.keeps_existing = never || !overwrite;
+    Some(ex)
+}
+
+/// PowerShell's `Expand-Archive [-Path] <zip> [[-DestinationPath] <dir>]
+/// [-Force]`, `-LiteralPath` for `-Path`, a parameter by any prefix that is
+/// its own. "By default, Expand-Archive doesn't overwrite", and without a
+/// destination it unpacks into a folder named after the zip, in the current
+/// location (Microsoft's documentation of the cmdlet). `-WhatIf` writes
+/// nothing.
+fn expand_archive(rest: &[String]) -> Option<Extract> {
+    let mut ex = Extract {
+        tool: "Expand-Archive",
+        ..Default::default()
+    };
+    let (mut path, mut dest, mut force) = (None, None, false);
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].clone();
+        i += 1;
+        let Some(param) = a.strip_prefix('-').filter(|p| !p.is_empty()) else {
+            positional.push(a);
+            continue;
+        };
+        let (name, inline) = match param.split_once(':') {
+            Some((n, v)) => (n.to_ascii_lowercase(), Some(v.to_string())),
+            None => (param.to_ascii_lowercase(), None),
+        };
+        let is = |full: &str, least: usize| name.len() >= least && full.starts_with(&name);
+        let mut value = || {
+            inline.clone().or_else(|| {
+                i += 1;
+                rest.get(i - 1).cloned()
+            })
+        };
+        if is("path", 3) || is("literalpath", 1) || name == "lp" {
+            path = value();
+        } else if is("destinationpath", 2) && !is("debug", 3) {
+            dest = value();
+        } else if is("force", 1) {
+            force = true;
+        } else if is("whatif", 2) {
+            return None;
+        }
+    }
+    let mut positional = positional.into_iter();
+    ex.archive = path.or_else(|| positional.next())?;
+    ex.dest = dest.or_else(|| positional.next()).or_else(|| {
+        let stem = Path::new(&ex.archive).file_stem()?;
+        Some(stem.to_string_lossy().to_string())
+    });
+    ex.keeps_existing = !force;
+    Some(ex)
+}
+
+/// Whether a member stored as `name` is one the line unpacks: every member
+/// unless members are named, then those (a named directory takes what it
+/// holds), less unzip's `-x` patterns. A pattern is matched as unzip
+/// matches one, `*` reaching across `/`.
+fn member_wanted(ex: &Extract, name: &str) -> bool {
+    let name = name.trim_start_matches("./");
+    let matches = |pattern: &str| {
+        let pattern = pattern.trim_start_matches("./").trim_end_matches('/');
+        if ex.member_patterns {
+            crate::words::component_matches(pattern, name)
+        } else {
+            name == pattern || name.starts_with(&format!("{pattern}/"))
+        }
+    };
+    (ex.members.is_empty() || ex.members.iter().any(|m| matches(m)))
+        && !ex
+            .excludes
+            .iter()
+            .any(|x| crate::words::component_matches(x, name))
+}
+
+/// Where each member stored as one of `names` lands below `destination`.
+/// tar strips a leading `/` and refuses a member with a `..` in its name
+/// unless `-P`, and measured on GNU tar 1.35 does both; unzip strips the
+/// one and drops the other (UnZip 6.00); `Expand-Archive` refuses an entry
+/// that would land outside its destination. Then `--strip-components`, then
+/// unzip's `-j`.
+fn member_landings(ex: &Extract, destination: &Path, names: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for name in names {
+        if !member_wanted(ex, name) {
+            continue;
+        }
+        let absolute = name.starts_with('/');
+        let mut parts: Vec<&str> = name
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != ".")
+            .collect();
+        let climbs = parts.contains(&"..");
+        if climbs && !(ex.tool == "tar" && ex.absolute) {
+            if ex.tool != "unzip" {
+                continue;
+            }
+            parts.retain(|p| *p != "..");
+        }
+        if ex.strip > 0 {
+            if parts.len() <= ex.strip {
+                continue;
+            }
+            parts.drain(..ex.strip);
+        }
+        if ex.junk_paths {
+            parts = parts.last().copied().into_iter().collect();
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        let rel = parts.join("/");
+        let land = if absolute && ex.absolute && ex.strip == 0 && !ex.junk_paths {
+            delete::resolve_path_in(&format!("/{rel}"), destination)
+        } else if climbs {
+            delete::resolve_path_in(&rel, destination)
+        } else {
+            destination.join(&rel)
+        };
+        out.push(land);
+    }
+    out
+}
+
+/// The archive an unpacking reads, on disk, and what it holds. unzip finds
+/// `a` as `a`, else as `a.zip`.
+fn unpacked_names(ex: &Extract, ctx: &EvalContext) -> crate::archive::Listing {
+    use crate::archive::Listing;
+    if ex.archive == "-" {
+        return Listing::Unread("read from standard input");
+    }
+    let Some(archive) = on_disk(&ex.archive, ctx) else {
+        return Listing::Unread("named through a variable");
+    };
+    let archive = if ex.tool == "unzip" && !archive.exists() {
+        on_disk(&format!("{}.zip", ex.archive), ctx).unwrap_or(archive)
+    } else {
+        archive
+    };
+    crate::archive::list(&archive, ex.tool != "tar")
+}
+
+/// What an unpacking writes over (#12): each member that lands where a file
+/// is now. An archive this does not read leaves what lands unknown, and all
+/// that the destination holds may be written over (`Replacement::unknown`).
+fn unpacked_over(ex: &Extract, ctx: &EvalContext) -> Vec<Replacement> {
+    use crate::archive::Listing;
+    let dest = ex.dest.clone().unwrap_or_else(|| ".".into());
+    let Some(destination) = on_disk(&dest, ctx) else {
+        return Vec::new();
+    };
+    if ex.keeps_existing || !destination.is_dir() {
+        return Vec::new();
+    }
+    let replaces_links = ex.tool != "Expand-Archive";
+    match unpacked_names(ex, ctx) {
+        Listing::Names { names, capped } => {
+            let mut files: Vec<PathBuf> = Vec::new();
+            for land in member_landings(ex, &destination, &names) {
+                if let Some(file) = written_over(&land, replaces_links) {
+                    if !files.contains(&file) {
+                        files.push(file);
+                    }
+                }
+            }
+            if files.is_empty() && !capped {
+                return Vec::new();
+            }
+            vec![Replacement {
+                destination,
+                into_directory: true,
+                files,
+                capped,
+                approximate: ex.approximate,
+                ..Default::default()
+            }]
+        }
+        Listing::Unread(why) => {
+            let mut budget = delete::WalkBudget::new();
+            let files: Vec<PathBuf> = delete::every_file_under(&destination, &mut budget)
+                .into_iter()
+                .map(|rel| destination.join(rel))
+                .collect();
+            if files.is_empty() && !budget.capped {
+                return Vec::new();
+            }
+            vec![Replacement {
+                destination,
+                into_directory: true,
+                files,
+                capped: budget.capped,
+                unknown: Some(format!("the archive is {why}")),
+                ..Default::default()
+            }]
+        }
+    }
+}
+
+/// The files an unpacking lands, for the path rules (`command_contents`):
+/// every member of an archive this reads, there yet or not, where it lands
+/// in the project or an agent's configuration under the home directory.
+fn unpacked_for_rules(ex: &Extract, ctx: &EvalContext, out: &mut Vec<ResolvedTarget>) {
+    let dest = ex.dest.clone().unwrap_or_else(|| ".".into());
+    let Some(destination) = on_disk(&dest, ctx) else {
+        return;
+    };
+    let crate::archive::Listing::Names { names, .. } = unpacked_names(ex, ctx) else {
+        return;
+    };
+    let mut guarded = vec![ctx.root.clone()];
+    guarded.extend(delete::user_config_dirs());
+    let inside_one = guarded.iter().any(|g| delete::is_inside(&destination, g));
+    let above_one = guarded.iter().any(|g| delete::is_inside(g, &destination));
+    if !inside_one && !above_one {
+        return;
+    }
+    for land in member_landings(ex, &destination, &names) {
+        if inside_one || guarded.iter().any(|g| delete::is_inside(&land, g)) {
+            out.push(inside(land, TargetRole::Destination));
+        }
+    }
 }
 
 /// Files a command writes through its own options rather than through a
@@ -2902,9 +3870,8 @@ mod replacement_tests {
             found,
             vec![Replacement {
                 destination: proj.join(".env"),
-                into_directory: false,
                 files: vec![proj.join(".env")],
-                capped: false,
+                ..Default::default()
             }]
         );
         assert_eq!(
@@ -3007,5 +3974,358 @@ mod replacement_tests {
         let found = replacements("mv new/config.yml deploy/", &ctx);
         assert_eq!(found[0].files, vec![proj.join("deploy/config.yml")]);
         assert!(found[0].signs(Some(&proj)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod rsync_and_unpack_tests {
+    use super::*;
+    use crate::archive::testing::{tar_of, zip_of};
+    use crate::testutil::TempTree;
+
+    /// A project with a policy, and a deployed site outside it: two files
+    /// the build has too, one stale page and a `.env` it does not.
+    fn site(tmp: &TempTree) -> (PathBuf, PathBuf) {
+        tmp.file(
+            "proj/.termaxa/policy.yaml",
+            "version: 1\ndefault: ask\nrules: []\n",
+        );
+        tmp.file("proj/build/index.html", "new\n");
+        tmp.file("proj/build/css/a.css", "new\n");
+        tmp.file("www/index.html", "live\n");
+        tmp.file("www/css/a.css", "live\n");
+        tmp.file("www/old/x.html", "stale\n");
+        tmp.file("www/.env", "SECRET=1\n");
+        (tmp.path().join("proj"), tmp.path().join("www"))
+    }
+
+    fn sorted(mut files: Vec<PathBuf>) -> Vec<PathBuf> {
+        files.sort();
+        files
+    }
+
+    /// `rsync -a --delete build/ /var/www/` writes over what the build has
+    /// and removes what it does not, the `.env` among them, which is the
+    /// sign beside the destination outside the project. An `--exclude`
+    /// keeps what it matches; a source named without a trailing separator
+    /// lands under its own name, where nothing is, and removes only there.
+    #[test]
+    fn an_rsync_delete_names_what_it_writes_over_and_what_it_removes() {
+        let tmp = TempTree::new("rsync-delete");
+        let (proj, www) = site(&tmp);
+        let ctx = EvalContext::at(&proj);
+        let found = replacements(
+            &format!("rsync -a --delete build/ \"{}/\"", www.display()),
+            &ctx,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        let r = &found[0];
+        assert_eq!(r.destination, www);
+        assert_eq!(
+            sorted(r.files.clone()),
+            vec![www.join("css/a.css"), www.join("index.html")]
+        );
+        assert_eq!(
+            sorted(r.removed.clone()),
+            vec![www.join(".env"), www.join("old/x.html")]
+        );
+        let signs = r.signs(Some(&proj));
+        assert!(signs.contains(&ReplaceSign::Outside), "{signs:?}");
+        assert!(
+            signs.contains(&ReplaceSign::Sensitive(vec![(
+                ".env".to_string(),
+                "environment secrets"
+            )])),
+            "{signs:?}"
+        );
+        let removed = |line: String| -> Vec<PathBuf> {
+            sorted(
+                replacements(&line, &ctx)
+                    .into_iter()
+                    .flat_map(|r| r.removed)
+                    .collect(),
+            )
+        };
+        let at = www.display();
+        assert_eq!(
+            removed(format!("rsync -av --delete --exclude .env build/ \"{at}\"")),
+            vec![www.join("old/x.html")]
+        );
+        assert_eq!(
+            removed(format!("rsync -a --delete --exclude=/old build/ \"{at}\"")),
+            vec![www.join(".env")]
+        );
+        assert_eq!(
+            removed(format!(
+                "rsync -a --delete --delete-excluded --exclude .env build/ \"{at}\""
+            )),
+            vec![www.join(".env"), www.join("old/x.html")]
+        );
+        // Under its own name: `www/build`, which is not there.
+        assert!(replacements(&format!("rsync -a --delete build \"{at}/\""), &ctx).is_empty());
+        // What writes nothing: a dry run, and --delete without -r, which
+        // rsync refuses before it copies.
+        assert!(replacements(&format!("rsync -an --delete build/ \"{at}\""), &ctx).is_empty());
+        assert!(replacements(&format!("rsync --delete build/ \"{at}\""), &ctx).is_empty());
+        // A file named beside the tree is copied there, not removed.
+        tmp.file("proj/extra.txt", "new\n");
+        tmp.file("www/extra.txt", "live\n");
+        let found = replacements(
+            &format!("rsync -a --delete build/ extra.txt \"{at}/\""),
+            &ctx,
+        );
+        assert!(found[0].files.contains(&www.join("extra.txt")), "{found:?}");
+        assert!(
+            !found[0].removed.contains(&www.join("extra.txt")),
+            "{found:?}"
+        );
+        std::fs::remove_file(www.join("extra.txt")).unwrap();
+        // --ignore-existing writes over nothing, and still removes.
+        let found = replacements(
+            &format!("rsync -a --ignore-existing --delete build/ \"{at}\""),
+            &ctx,
+        );
+        assert!(found[0].files.is_empty(), "{found:?}");
+        assert_eq!(found[0].removed.len(), 2, "{found:?}");
+    }
+
+    /// An rsync into the project's build directory says nothing, as `cp -r`
+    /// does. One from another machine leaves what lands unknown: all the
+    /// destination holds may be written over. One to another machine writes
+    /// nothing here.
+    #[test]
+    fn an_rsync_is_read_where_it_runs_and_not_across_machines() {
+        let tmp = TempTree::new("rsync-places");
+        let (proj, www) = site(&tmp);
+        tmp.file("proj/src/a.js", "new\n");
+        tmp.file("proj/dist/a.js", "old\n");
+        tmp.file("proj/dist/stale.js", "old\n");
+        let ctx = EvalContext::at(&proj);
+        let found = replacements("rsync -a --delete src/ dist/", &ctx);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].signs(Some(&proj)).is_empty(), "{found:?}");
+        let found = replacements(
+            &format!("rsync -az server:/var/www/ \"{}/\"", www.display()),
+            &ctx,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].unknown.as_deref(),
+            Some("the source is on another machine")
+        );
+        assert_eq!(found[0].files.len(), 4, "{found:?}");
+        assert_eq!(found[0].signs(Some(&proj)), vec![ReplaceSign::Outside]);
+        assert!(replacements("rsync -a build/ deploy@server:/var/www/", &ctx).is_empty());
+    }
+
+    /// An archive unpacked over a directory writes over each member that
+    /// lands where a file is: tar's and bsdtar's spellings, Info-ZIP's
+    /// unzip with `-o`, `Expand-Archive -Force`. What leaves a file as it
+    /// is writes over nothing, and so does a listing.
+    #[test]
+    fn an_unpacking_names_what_it_writes_over() {
+        let tmp = TempTree::new("unpack");
+        let (proj, www) = site(&tmp);
+        let members = [
+            ("index.html", "n"),
+            ("css/", ""),
+            ("css/a.css", "n"),
+            ("new.txt", "n"),
+        ];
+        std::fs::write(proj.join("rel.tar"), tar_of(&members)).unwrap();
+        std::fs::write(proj.join("rel.zip"), zip_of(&members)).unwrap();
+        let ctx = EvalContext::at(&proj);
+        let at = www.display();
+        let want = vec![www.join("css/a.css"), www.join("index.html")];
+        for line in [
+            format!("tar -xf rel.tar -C \"{at}\""),
+            format!("tar xvf rel.tar -C \"{at}\""),
+            format!("tar -C \"{at}\" -xf rel.tar"),
+            format!("tar --extract --file=rel.tar --directory=\"{at}\""),
+            format!("tar -xf rel.zip -C \"{at}\""),
+            format!("unzip -o rel.zip -d \"{at}\""),
+            format!("unzip -qo rel -d \"{at}\""),
+            format!("Expand-Archive rel.zip \"{at}\" -Force"),
+            format!("Expand-Archive -Path rel.zip -DestinationPath \"{at}\" -Force"),
+        ] {
+            let found = replacements(&line, &ctx);
+            assert_eq!(found.len(), 1, "{line}: {found:?}");
+            assert_eq!(sorted(found[0].files.clone()), want, "{line}");
+            assert_eq!(
+                found[0].signs(Some(&proj)),
+                vec![ReplaceSign::Outside],
+                "{line}"
+            );
+        }
+        for line in [
+            format!("tar -xkf rel.tar -C \"{at}\""),
+            format!("tar -xf rel.tar --skip-old-files -C \"{at}\""),
+            format!("tar -tf rel.tar -C \"{at}\""),
+            format!("tar -xOf rel.tar -C \"{at}\""),
+            format!("unzip rel.zip -d \"{at}\""),
+            format!("unzip -o -n rel.zip -d \"{at}\""),
+            format!("unzip -l rel.zip -d \"{at}\""),
+            format!("Expand-Archive rel.zip \"{at}\""),
+            format!("Expand-Archive rel.zip \"{at}\" -Force -WhatIf"),
+        ] {
+            assert!(replacements(&line, &ctx).is_empty(), "{line}");
+        }
+    }
+
+    /// The options that move where a member lands: tar's
+    /// `--strip-components` and named members, unzip's `-j`, member
+    /// patterns and `-x`. A name with `..` in it is refused by tar unless
+    /// `-P`, which also keeps a leading `/`; unzip drops the `..`.
+    #[test]
+    fn where_a_member_lands_follows_the_tools_own_options() {
+        let tmp = TempTree::new("unpack-options");
+        let (proj, www) = site(&tmp);
+        let nested = [("pkg/index.html", "n"), ("pkg/css/a.css", "n")];
+        std::fs::write(proj.join("nested.tar"), tar_of(&nested)).unwrap();
+        std::fs::write(
+            proj.join("flat.zip"),
+            zip_of(&[("index.html", "n"), ("css/a.css", "n")]),
+        )
+        .unwrap();
+        let ctx = EvalContext::at(&proj);
+        let at = www.display();
+        let files = |line: String| -> Vec<PathBuf> {
+            sorted(
+                replacements(&line, &ctx)
+                    .into_iter()
+                    .flat_map(|r| r.files)
+                    .collect(),
+            )
+        };
+        assert!(files(format!("tar -xf nested.tar -C \"{at}\"")).is_empty());
+        assert_eq!(
+            files(format!(
+                "tar -xf nested.tar --strip-components=1 -C \"{at}\""
+            )),
+            vec![www.join("css/a.css"), www.join("index.html")]
+        );
+        assert_eq!(
+            files(format!(
+                "tar -xf nested.tar --strip-components 1 -C \"{at}\" pkg/css"
+            )),
+            vec![www.join("css/a.css")]
+        );
+        assert_eq!(
+            files(format!("unzip -oj flat.zip -d \"{at}\"")),
+            vec![www.join("index.html")]
+        );
+        assert_eq!(
+            files(format!("unzip -o flat.zip 'css/*' -d \"{at}\"")),
+            vec![www.join("css/a.css")]
+        );
+        assert_eq!(
+            files(format!("unzip -o flat.zip -x 'css/*' -d \"{at}\"")),
+            vec![www.join("index.html")]
+        );
+        tmp.file("www/inner/keep.txt", "k\n");
+        tmp.file("www/inner/abs.txt", "k\n");
+        let unsafe_names = [("../index.html", "n"), ("/abs.txt", "n")];
+        std::fs::write(proj.join("unsafe.tar"), tar_of(&unsafe_names)).unwrap();
+        std::fs::write(proj.join("unsafe.zip"), zip_of(&unsafe_names)).unwrap();
+        let inner = www.join("inner");
+        let at = inner.display();
+        assert_eq!(
+            files(format!("tar -xf unsafe.tar -C \"{at}\"")),
+            vec![inner.join("abs.txt")]
+        );
+        assert_eq!(
+            files(format!("unzip -o unsafe.zip -d \"{at}\"")),
+            vec![inner.join("abs.txt")]
+        );
+        let found = files(format!("tar -xPf unsafe.tar -C \"{at}\""));
+        assert!(found.contains(&www.join("index.html")), "{found:?}");
+    }
+
+    /// A compressed archive is not read: what lands is not known, every
+    /// file the destination holds may be written over, and only where it
+    /// lands is a sign, not the names that happen to be there.
+    #[test]
+    fn a_compressed_archive_leaves_what_lands_unknown() {
+        let tmp = TempTree::new("unpack-gzip");
+        let (proj, www) = site(&tmp);
+        std::fs::write(proj.join("rel.tgz"), b"\x1f\x8b\x08\0not really").unwrap();
+        let ctx = EvalContext::at(&proj);
+        let found = replacements(&format!("tar -xzf rel.tgz -C \"{}\"", www.display()), &ctx);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].unknown.as_deref(),
+            Some("the archive is gzip-compressed")
+        );
+        assert_eq!(found[0].files.len(), 4, "{found:?}");
+        assert_eq!(found[0].signs(Some(&proj)), vec![ReplaceSign::Outside]);
+        // Inside the project the same unpacking says nothing.
+        tmp.file("proj/vendor/x.js", "x\n");
+        let found = replacements("tar -xzf rel.tgz -C vendor", &ctx);
+        assert!(found[0].signs(Some(&proj)).is_empty(), "{found:?}");
+    }
+
+    /// The path rules see what an rsync lands and removes, and what an
+    /// archive unpacks, in the project: `rsync -a --delete tpl/ ./` takes
+    /// the policy and the hook config away when the template has neither,
+    /// and an archive that holds a hook config writes it. An `--exclude`
+    /// keeps what it matches out of both.
+    #[test]
+    fn the_path_rules_see_what_rsync_and_an_unpacking_touch() {
+        let tmp = TempTree::new("rules-rsync-unpack");
+        tmp.file(
+            ".termaxa/policy.yaml",
+            "version: 1\ndefault: ask\nrules: []\n",
+        );
+        tmp.file(".claude/settings.json", "{}\n");
+        tmp.file("tpl/README.md", "t\n");
+        tmp.file("tpl2/.claude/settings.json", "{\"hooks\":{}}\n");
+        let proj = tmp.path().to_path_buf();
+        std::fs::write(
+            proj.join("evil.tar"),
+            tar_of(&[(".claude/settings.json", "{}")]),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("evil.zip"),
+            zip_of(&[(".claude/settings.json", "{}")]),
+        )
+        .unwrap();
+        std::fs::write(proj.join("evil.tgz"), b"\x1f\x8b\x08\0").unwrap();
+        let ctx = EvalContext::at(&proj);
+        let touched = |line: &str| -> Vec<(TargetRole, PathBuf)> {
+            command_contents(line, &ctx)
+                .into_iter()
+                .filter_map(|t| Some((t.role, t.resolved?)))
+                .collect()
+        };
+        let removed = touched("rsync -a --delete tpl/ ./");
+        assert!(
+            removed.contains(&(TargetRole::Removed, proj.join(".claude/settings.json")))
+                && removed.contains(&(TargetRole::Removed, proj.join(".termaxa/policy.yaml"))),
+            "{removed:?}"
+        );
+        let removed = touched("rsync -a --delete --exclude .claude --exclude .termaxa tpl/ ./");
+        assert!(
+            !removed
+                .iter()
+                .any(|(_, p)| p.starts_with(proj.join(".claude"))
+                    || p.starts_with(proj.join(".termaxa"))),
+            "{removed:?}"
+        );
+        for line in ["rsync -a tpl2/ ./", "tar -xf evil.tar", "unzip -o evil.zip"] {
+            assert!(
+                touched(line)
+                    .contains(&(TargetRole::Destination, proj.join(".claude/settings.json"))),
+                "{line}: {:?}",
+                touched(line)
+            );
+        }
+        assert!(
+            !touched("rsync -a --exclude .claude tpl2/ ./")
+                .iter()
+                .any(|(_, p)| p.ends_with(".claude/settings.json")),
+            "an excluded file is not written"
+        );
+        assert!(touched("tar -xzf evil.tgz").is_empty(), "not read");
     }
 }
