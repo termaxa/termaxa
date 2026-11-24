@@ -4071,7 +4071,8 @@ mod tests {
     /// silently in observe mode (v0.14.2 to v0.21.10). Each is refused in
     /// both modes, as its plain spelling is; an ordinary line with a
     /// backslash in it is answered as before; and in observe mode a write
-    /// the copy aside cannot cover is held for the file bash would write.
+    /// the copy aside cannot cover is held for the file bash would write,
+    /// while one it covers runs after the copy (#12).
     #[test]
     fn a_name_bash_reads_through_an_escape_is_refused_in_both_modes() {
         let env = crate::testutil::TestEnv::new("hook-readings");
@@ -4102,7 +4103,7 @@ mod tests {
                 "r\\m -rf /",
                 // Off the floor, and nothing can copy the file aside first:
                 // held for the `sub/.env` bash would write.
-                "cp notes.md s\\ub/.env",
+                "cat notes.md | tee s\\ub/.env",
             ] {
                 let out = decide(&bash_payload(&proj, "r", cmd)).expect("judged");
                 assert_eq!(out.exit_code, 2, "{mode}: {cmd}");
@@ -4112,6 +4113,12 @@ mod tests {
                     "{mode}: {cmd}: {said}"
                 );
             }
+            // A copy over the same file is refused, and since #12 the file is
+            // copied aside first, so observe mode lets it run after the copy.
+            let cmd = "cp notes.md s\\ub/.env";
+            let out = decide(&bash_payload(&proj, "r", cmd)).expect("judged");
+            let held = if mode == "enforce" { 2 } else { 0 };
+            assert_eq!(out.exit_code, held, "{mode}: {cmd}");
             // A backslash where no guarded name is: answered as before.
             for cmd in ["echo x > wt\\notes.md", "echo hello\\ world"] {
                 let out = decide(&bash_payload(&proj, "r", cmd)).expect("judged");
@@ -4124,7 +4131,7 @@ mod tests {
     /// in both modes, as its plain spelling is; an ordinary line with a
     /// bracket, a glob or a brace in it is answered as before; and in
     /// observe mode a write the copy aside cannot cover is held for the
-    /// file the shell writes.
+    /// file the shell writes, while one it covers runs after the copy (#12).
     #[test]
     fn a_name_the_shell_opens_into_is_refused_in_both_modes() {
         let env = crate::testutil::TestEnv::new("hook-opened");
@@ -4155,7 +4162,7 @@ mod tests {
                 "echo x > .termax[a]/policy.yaml",
                 // Off the floor, and nothing can copy the file aside first:
                 // held for the `sub/.env` the shell writes.
-                "cp notes.md sub/.en[v]",
+                "cat notes.md | tee sub/.en[v]",
             ] {
                 let out = decide(&bash_payload(&proj, "o", cmd)).expect("judged");
                 assert_eq!(out.exit_code, 2, "{mode}: {cmd}");
@@ -4165,6 +4172,12 @@ mod tests {
                     "{mode}: {cmd}: {said}"
                 );
             }
+            // A copy over the same file is refused, and since #12 the file is
+            // copied aside first, so observe mode lets it run after the copy.
+            let cmd = "cp notes.md sub/.en[v]";
+            let out = decide(&bash_payload(&proj, "o", cmd)).expect("judged");
+            let held = if mode == "enforce" { 2 } else { 0 };
+            assert_eq!(out.exit_code, held, "{mode}: {cmd}");
             // A bracket, a glob or a brace where no guarded name is.
             for cmd in [
                 "cat app/[id]/page.tsx",

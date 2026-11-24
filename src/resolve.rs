@@ -33,7 +33,7 @@
 //! cannot be reused by a consumer wanting a different policy.
 
 use crate::delete;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Where a command runs, for the purpose of judging its targets.
 ///
@@ -489,77 +489,94 @@ pub fn command_contents(segment: &str, ctx: &EvalContext) -> Vec<ResolvedTarget>
         let Some((head, at)) = delete::resolve_head(&tokens) else {
             continue;
         };
-        // The commands that copy or move: `cp` and `mv` and their cmd
-        // names, PowerShell's by their own parameter names (`cp` and `mv`
-        // are its aliases too, and are read that way when a word of the
-        // line is one of its parameters), a rename, and `git mv`, which is
-        // a move.
-        let rest = &tokens[at + 1..];
-        let (source_role, args): (TargetRole, Vec<String>) = match head.as_str() {
-            "rename-item" | "rni" | "ren" => {
-                renamed(rest, &ctx, &mut budget, &mut out);
-                continue;
+        if matches!(head.as_str(), "rename-item" | "rni" | "ren") {
+            renamed(&tokens[at + 1..], &ctx, &mut budget, &mut out);
+            continue;
+        }
+        let Some(cm) = copy_move_of(&head, &tokens[at..]) else {
+            if head == "git" {
+                undone_by_git(&tokens[at..], &ctx, &mut budget, &mut out);
             }
-            "cp" | "copy" if says_powershell(rest) => {
-                (TargetRole::Source, powershell_operands(rest))
-            }
-            "mv" | "move" if says_powershell(rest) => {
-                (TargetRole::Removed, powershell_operands(rest))
-            }
-            "cp" | "copy" => (TargetRole::Source, rest.to_vec()),
-            "mv" | "move" => (TargetRole::Removed, rest.to_vec()),
-            "copy-item" | "cpi" => (TargetRole::Source, powershell_operands(rest)),
-            "move-item" | "mi" => (TargetRole::Removed, powershell_operands(rest)),
-            "git" => {
-                let full = tokens[at..].to_vec();
-                let g = delete::git_without_global_options(&full).unwrap_or(full);
-                if g.get(1).is_some_and(|sub| sub.eq_ignore_ascii_case("mv")) {
-                    (TargetRole::Removed, g[2..].to_vec())
-                } else {
-                    undone_by_git(&tokens[at..], &ctx, &mut budget, &mut out);
-                    continue;
-                }
-            }
-            _ => continue,
-        };
-        let head = match source_role {
-            TargetRole::Removed => "mv",
-            _ => "cp",
-        };
-        let args = &args[..];
-        let grammar = copy_move_targets(head, args, source_role);
-        let Some(dest) = grammar
-            .iter()
-            .find(|(_, role)| *role == TargetRole::Destination)
-            .map(|(d, _)| unquoted(d))
-        else {
             continue;
         };
-        let sources: Vec<String> = grammar
-            .iter()
-            .filter(|(_, role)| *role != TargetRole::Destination)
-            .map(|(s, _)| unquoted(s))
-            .collect();
-        if source_role == TargetRole::Removed {
-            for s in &sources {
+        if cm.source_role == TargetRole::Removed {
+            for s in &cm.sources {
                 removed_with(s, &ctx, &mut budget, &mut out);
             }
         }
-        landed(
-            args,
-            source_role,
-            &dest,
-            &sources,
-            &ctx,
-            &mut budget,
-            &mut out,
-        );
+        landed(&cm, &ctx, &mut out, &mut |tree, place| {
+            if not_read(tree, &ctx) {
+                Vec::new()
+            } else {
+                guarded_files(tree, place, &ctx, &mut budget)
+            }
+        });
     }
     out
 }
 
 fn unquoted(s: &str) -> String {
     s.trim().trim_matches('"').trim_matches('\'').to_string()
+}
+
+/// A copy or a move, taken apart once for every reading of it: the path
+/// rules' (`command_contents`) and what it writes over (`replacements`).
+struct CopyMove {
+    /// `Source` for a copy, whose sources stay; `Removed` for a move.
+    source_role: TargetRole,
+    /// Its arguments in `cp`/`mv` grammar, PowerShell's read into it.
+    args: Vec<String>,
+    /// The destination as written, quotes stripped.
+    dest: String,
+    /// The sources as written, quotes stripped.
+    sources: Vec<String>,
+}
+
+/// The commands that copy or move: `cp` and `mv` and their cmd names,
+/// PowerShell's by their own parameter names (`cp` and `mv` are its aliases
+/// too, and are read that way when a word of the line is one of its
+/// parameters), and `git mv`, which is a move. `tokens` starts at the
+/// command's head; `None` for anything else, or a copy that names no
+/// destination.
+fn copy_move_of(head: &str, tokens: &[String]) -> Option<CopyMove> {
+    let rest = &tokens[1..];
+    let (source_role, args): (TargetRole, Vec<String>) = match head {
+        "cp" | "copy" if says_powershell(rest) => (TargetRole::Source, powershell_operands(rest)),
+        "mv" | "move" if says_powershell(rest) => (TargetRole::Removed, powershell_operands(rest)),
+        "cp" | "copy" => (TargetRole::Source, rest.to_vec()),
+        "mv" | "move" => (TargetRole::Removed, rest.to_vec()),
+        "copy-item" | "cpi" => (TargetRole::Source, powershell_operands(rest)),
+        "move-item" | "mi" => (TargetRole::Removed, powershell_operands(rest)),
+        "git" => {
+            let full = tokens.to_vec();
+            let g = delete::git_without_global_options(&full).unwrap_or(full);
+            if !g.get(1).is_some_and(|sub| sub.eq_ignore_ascii_case("mv")) {
+                return None;
+            }
+            (TargetRole::Removed, g[2..].to_vec())
+        }
+        _ => return None,
+    };
+    let grammar_head = match source_role {
+        TargetRole::Removed => "mv",
+        _ => "cp",
+    };
+    let grammar = copy_move_targets(grammar_head, &args, source_role);
+    let dest = grammar
+        .iter()
+        .find(|(_, role)| *role == TargetRole::Destination)
+        .map(|(d, _)| unquoted(d))?;
+    let sources = grammar
+        .iter()
+        .filter(|(_, role)| *role != TargetRole::Destination)
+        .map(|(s, _)| unquoted(s))
+        .collect();
+    Some(CopyMove {
+        source_role,
+        args,
+        dest,
+        sources,
+    })
 }
 
 /// `mv .claude{,.bak}` is `mv .claude .claude.bak`: one brace list in a
@@ -1307,15 +1324,24 @@ fn removed_with(
 /// could not follow) may be a directory and is read as one: a deny too many
 /// is loud, and a write nobody judged is not (#44). `-T` makes the
 /// destination the copy itself.
+///
+/// Which of a tree's files are read is the caller's: `tree_files` is given
+/// the tree where it is now and the place its root lands, and answers with
+/// the files it lands there. The path rules read only what lands where they
+/// guard (`guarded_files`); what a copy writes over is read wherever it
+/// lands (`segment_replacements`).
 fn landed(
-    args: &[String],
-    source_role: TargetRole,
-    dest: &str,
-    sources: &[String],
+    cm: &CopyMove,
     ctx: &EvalContext,
-    budget: &mut delete::WalkBudget,
     out: &mut Vec<ResolvedTarget>,
+    tree_files: &mut dyn FnMut(&std::path::Path, &std::path::Path) -> Vec<PathBuf>,
 ) {
+    let (args, source_role, dest, sources) = (
+        &cm.args[..],
+        cm.source_role,
+        cm.dest.as_str(),
+        &cm.sources[..],
+    );
     let long = |name: &str| args.iter().any(|a| a == name);
     let short = |c: char| {
         args.iter().any(|a| {
@@ -1370,7 +1396,7 @@ fn landed(
             match src.filter(|p| p.is_dir()) {
                 Some(tree) => {
                     // `cp dir dest` without `-r` copies nothing.
-                    if !whole_trees || not_read(&tree, ctx) {
+                    if !whole_trees {
                         continue;
                     }
                     // Where the tree's root lands: inside the directory
@@ -1384,7 +1410,7 @@ fn landed(
                     let Some(place) = on_disk(&place, ctx) else {
                         continue;
                     };
-                    for p in guarded_files(&tree, &place, ctx, budget) {
+                    for p in tree_files(&tree, &place) {
                         out.push(inside(p, TargetRole::Destination));
                     }
                 }
@@ -1399,6 +1425,248 @@ fn landed(
             }
         }
     }
+}
+
+/// What a copy or a move writes over (#12): at one destination, the files
+/// that are there now and that it lands a file on.
+///
+/// `cp -r backend/* /opt/proxypilot/backend/` dragged a development
+/// virtualenv over the production one and corrupted the database beside it
+/// (Tim Schipper's write-up, May 2026, filed as #12). The gate saw a
+/// destination directory, which the overwrite preview passes over as where
+/// files land rather than what is lost. What is lost is what the copy lands
+/// on: each file of the sources, at its place under the destination, where a
+/// file is now. A copy takes nothing away that it does not land on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacement {
+    /// Where the command lands its files: a directory, or the one file a
+    /// copy or a move of one file writes over.
+    pub destination: PathBuf,
+    /// The destination is a directory the files land in.
+    pub into_directory: bool,
+    /// The files written over. A copy writes through a link to the file it
+    /// points to (GNU coreutils 9.4, measured Nov 24, 2026), and that file is
+    /// what is listed; a move replaces the link itself.
+    pub files: Vec<PathBuf>,
+    /// The reading stopped at its budget: more may be written over than
+    /// listed, and what is not listed cannot be copied aside.
+    pub capped: bool,
+}
+
+/// Why a replacement is worth a word (#12): the delete preview's warning
+/// signs, asked of what is written over. A copy into the project's own
+/// build directory shows none, and nothing is said or copied for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceSign {
+    /// The destination, or a file a link there leads to, is outside the
+    /// project root.
+    Outside,
+    /// The files land in a user profile directory itself.
+    UserProfile,
+    /// A sensitive name (`delete::sensitive_name`) is the destination's own,
+    /// or is on the way to a file written over: `.env`, `.ssh/`, `.git/`.
+    Sensitive(Vec<(String, &'static str)>),
+    /// The reading stopped at its budget: what is written over is not all
+    /// known, so it cannot all be copied aside.
+    TooLarge,
+}
+
+impl Replacement {
+    /// The warning signs, with the project root the command runs under
+    /// (`None` outside any project, where nothing is outside it).
+    ///
+    /// Inside a directory a build rebuilds (`delete::reproducible_within`)
+    /// what is written over is the build's to make again: a name there is a
+    /// dependency's, and its size is no loss.
+    pub fn signs(&self, root: Option<&Path>) -> Vec<ReplaceSign> {
+        let mut signs = Vec::new();
+        let outside = |p: &Path| root.is_some_and(|r| !delete::is_inside(p, r));
+        // A file not under the destination came through a link; only those
+        // are looked at again, so a large tree is not canonicalized file by
+        // file.
+        let through_links: Vec<&PathBuf> = self
+            .files
+            .iter()
+            .filter(|f| !f.starts_with(&self.destination))
+            .collect();
+        if outside(&self.destination) || through_links.iter().any(|f| outside(f)) {
+            signs.push(ReplaceSign::Outside);
+        }
+        let lands_in = if self.into_directory {
+            Some(self.destination.as_path())
+        } else {
+            self.destination.parent()
+        };
+        if lands_in.is_some_and(delete::is_user_profile)
+            || through_links
+                .iter()
+                .any(|f| f.parent().is_some_and(delete::is_user_profile))
+        {
+            signs.push(ReplaceSign::UserProfile);
+        }
+        if delete::reproducible_within(&self.destination, root).is_some() {
+            return signs;
+        }
+        let mut names: Vec<String> = self
+            .destination
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .into_iter()
+            .collect();
+        for f in &self.files {
+            match f.strip_prefix(&self.destination) {
+                Ok(rel) => names.extend(
+                    rel.components()
+                        .map(|c| c.as_os_str().to_string_lossy().to_string()),
+                ),
+                Err(_) => names.extend(f.file_name().map(|n| n.to_string_lossy().to_string())),
+            }
+        }
+        let mut sensitive: Vec<(String, &'static str)> = Vec::new();
+        for n in names {
+            if let Some(what) = delete::sensitive_name(&n) {
+                if !sensitive.iter().any(|(s, _)| *s == n) {
+                    sensitive.push((n, what));
+                }
+            }
+        }
+        if !sensitive.is_empty() {
+            signs.push(ReplaceSign::Sensitive(sensitive));
+        }
+        if self.capped {
+            signs.push(ReplaceSign::TooLarge);
+        }
+        signs
+    }
+}
+
+/// What the copies and moves in a command write over (#12), at every
+/// destination, wherever it is. A destination that does not exist yet is
+/// being created, and nothing is written over there.
+pub fn replacements(command: &str, ctx: &EvalContext) -> Vec<Replacement> {
+    crate::shell::split_segments_deep(command)
+        .iter()
+        .filter(|s| !s.body_line)
+        .flat_map(|seg| segment_replacements(seg, &ctx.for_operands(seg)))
+        .collect()
+}
+
+/// `replacements` for one segment, `ctx` already where its operands
+/// resolve. The commands are `copy_move_of`'s: `cp`, `mv`, cmd's `copy`
+/// and `move`, `Copy-Item`, `Move-Item` and `git mv`.
+pub fn segment_replacements(seg: &crate::shell::Segment, ctx: &EvalContext) -> Vec<Replacement> {
+    let tokens = brace_expanded(delete::tokenize_public(seg.command()));
+    let Some((head, at)) = delete::resolve_head(&tokens) else {
+        return Vec::new();
+    };
+    let Some(cm) = copy_move_of(&head, &tokens[at..]) else {
+        return Vec::new();
+    };
+    let Some(destination) = on_disk(&cm.dest, ctx) else {
+        return Vec::new();
+    };
+    let Ok(meta) = std::fs::metadata(&destination) else {
+        return Vec::new();
+    };
+    let moves = cm.source_role == TargetRole::Removed;
+    if !meta.is_dir() {
+        // A file, written over by the one source named, unless that source
+        // is a directory, which cannot be: the command fails.
+        let one_source =
+            cm.sources.len() == 1 && !on_disk(&cm.sources[0], ctx).is_some_and(|s| s.is_dir());
+        return match written_over(&destination, moves) {
+            Some(file) if one_source => vec![Replacement {
+                destination,
+                into_directory: false,
+                files: vec![file],
+                capped: false,
+            }],
+            _ => Vec::new(),
+        };
+    }
+    // Two budgets for the whole segment: the trees' own files first, and
+    // where a tree is past it, the places they land (`lands_on`).
+    let mut trees = delete::WalkBudget::new();
+    let mut places = delete::WalkBudget::new();
+    let mut capped = false;
+    let mut landings = Vec::new();
+    landed(&cm, ctx, &mut landings, &mut |tree, place| {
+        lands_on(tree, place, moves, &mut trees, &mut places, &mut capped)
+    });
+    let mut files: Vec<PathBuf> = Vec::new();
+    for p in landings.into_iter().filter_map(|t| t.resolved) {
+        if let Some(file) = written_over(&p, moves) {
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    }
+    if files.is_empty() && !capped {
+        return Vec::new();
+    }
+    vec![Replacement {
+        destination,
+        into_directory: true,
+        files,
+        capped,
+    }]
+}
+
+/// The file a copy or a move writes over when it lands at `at`, if any. A
+/// copy writes through a link to the file it points to (GNU coreutils 9.4:
+/// `cp src/a.txt dst/` and `cp -r src/. dst/` both rewrote the file behind
+/// `dst/a.txt` and left the link, Nov 24, 2026), and refuses a link that
+/// leads nowhere ("not writing through dangling symlink"). A move replaces
+/// the link and leaves what it pointed to. Both measured the same day. A
+/// directory where a file lands stops the command there.
+fn written_over(at: &Path, moves: bool) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(at).ok()?;
+    if meta.file_type().is_symlink() {
+        if moves {
+            return Some(at.to_path_buf());
+        }
+        return std::fs::canonicalize(at).ok().filter(|real| real.is_file());
+    }
+    meta.is_file().then(|| at.to_path_buf())
+}
+
+/// Where a tree lands on `place`, the paths its files land at, read from
+/// whichever side can be read whole: the tree's files first, each where it
+/// lands; if the tree is past its budget, the files at `place`, each kept
+/// when the tree has a file of that name. When both are past theirs,
+/// `capped` says so and what the tree's walk read is what is known.
+///
+/// Nothing is read where nothing can be written over: a place that is not a
+/// directory, or holds nothing. A move of a directory onto one that holds
+/// anything is refused ("Directory not empty") and lands nothing. A tree
+/// that is a link is copied and moved as a link, and is not walked.
+fn lands_on(
+    tree: &Path,
+    place: &Path,
+    moves: bool,
+    trees: &mut delete::WalkBudget,
+    places: &mut delete::WalkBudget,
+    capped: &mut bool,
+) -> Vec<PathBuf> {
+    let holds_something = std::fs::read_dir(place).is_ok_and(|mut d| d.next().is_some());
+    let a_link = !std::fs::symlink_metadata(tree).is_ok_and(|m| m.is_dir());
+    if !holds_something || moves || a_link {
+        return Vec::new();
+    }
+    let read = delete::every_file_under(tree, trees);
+    if !trees.capped {
+        return read.into_iter().map(|rel| place.join(rel)).collect();
+    }
+    let there = delete::every_file_under(place, places);
+    if !places.capped {
+        return there
+            .into_iter()
+            .filter(|rel| std::fs::symlink_metadata(tree.join(rel)).is_ok_and(|m| !m.is_dir()))
+            .map(|rel| place.join(rel))
+            .collect();
+    }
+    *capped = true;
+    read.into_iter().map(|rel| place.join(rel)).collect()
 }
 
 /// Files a command writes through its own options rather than through a
@@ -2503,5 +2771,241 @@ mod contents_tests {
         // The project copied or a tree deleted somewhere else: not read.
         assert!(paths("cp -r . ../backup").is_empty());
         assert!(paths("rm -rf ../tpl").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    use crate::testutil::TempTree;
+
+    /// #12's incident, small: a project, and the deployed copy of its
+    /// backend outside it, with a virtualenv in each and a database only in
+    /// the deployed one.
+    fn incident(tmp: &TempTree) -> (PathBuf, PathBuf) {
+        tmp.file(
+            "proj/.termaxa/policy.yaml",
+            "version: 1\ndefault: ask\nrules: []\n",
+        );
+        tmp.file("proj/backend/app.py", "new app\n");
+        tmp.file("proj/backend/requirements.txt", "flask\n");
+        tmp.file("proj/backend/venv/bin/python", "dev interpreter\n");
+        tmp.file("opt/proxypilot/backend/app.py", "production app\n");
+        tmp.file("opt/proxypilot/backend/data.db", "production rows\n");
+        tmp.file(
+            "opt/proxypilot/backend/venv/bin/python",
+            "production interpreter\n",
+        );
+        (
+            tmp.path().join("proj"),
+            tmp.path().join("opt").join("proxypilot").join("backend"),
+        )
+    }
+
+    fn sorted(mut files: Vec<PathBuf>) -> Vec<PathBuf> {
+        files.sort();
+        files
+    }
+
+    /// What `cp -r backend/* /opt/proxypilot/backend/` writes over: the
+    /// files of the deployed copy that the project has a file for, the
+    /// virtualenv's among them, and not the database it leaves alone. The
+    /// destination is outside the project, which is the sign.
+    #[test]
+    fn a_copy_over_a_directory_outside_the_project_names_what_it_replaces() {
+        let tmp = TempTree::new("repl-incident");
+        let (proj, prod) = incident(&tmp);
+        let ctx = EvalContext::at(&proj);
+        for line in [
+            format!("cp -r backend/* \"{}/\"", prod.display()),
+            format!("Copy-Item -Recurse backend/* \"{}\"", prod.display()),
+            format!("cp -r backend/. \"{}\"", prod.display()),
+        ] {
+            let found = replacements(&line, &ctx);
+            assert_eq!(found.len(), 1, "{line}: {found:?}");
+            let r = &found[0];
+            assert_eq!(r.destination, prod, "{line}");
+            assert!(r.into_directory && !r.capped, "{line}: {r:?}");
+            assert_eq!(
+                sorted(r.files.clone()),
+                vec![prod.join("app.py"), prod.join("venv/bin/python")],
+                "{line}"
+            );
+            assert_eq!(r.signs(Some(&proj)), vec![ReplaceSign::Outside], "{line}");
+            // Outside any project nothing is outside it, and the files are
+            // still what they are.
+            assert!(r.signs(None).is_empty(), "{line}");
+        }
+        // The directory copied under its own name lands one level down,
+        // where nothing is yet: nothing is written over.
+        let line = format!("cp -r backend \"{}\"", prod.display());
+        assert!(replacements(&line, &ctx).is_empty(), "{line}");
+    }
+
+    /// The copies a project makes of its own files every day write over
+    /// files too, and show no sign: nothing is said and nothing is copied
+    /// for them.
+    #[test]
+    fn an_ordinary_copy_inside_the_project_shows_no_sign() {
+        let tmp = TempTree::new("repl-quiet");
+        let (proj, _) = incident(&tmp);
+        tmp.file("proj/src/index.js", "new\n");
+        tmp.file("proj/src/.gitignore", "node_modules\n");
+        tmp.file("proj/public/index.js", "old\n");
+        tmp.file("proj/public/.gitignore", "dist\n");
+        tmp.file("proj/dist/index.js", "old\n");
+        let ctx = EvalContext::at(&proj);
+        for (line, dest) in [
+            ("cp -r src/. public/", "public"),
+            ("cp -r src/* dist/", "dist"),
+        ] {
+            let found = replacements(line, &ctx);
+            assert_eq!(found.len(), 1, "{line}: {found:?}");
+            assert_eq!(found[0].destination, proj.join(dest), "{line}");
+            assert!(!found[0].files.is_empty(), "{line}: files are replaced");
+            assert!(
+                found[0].signs(Some(&proj)).is_empty(),
+                "{line}: a `.gitignore` is not git history: {:?}",
+                found[0].signs(Some(&proj))
+            );
+        }
+        // A copy into a directory that holds nothing writes over nothing.
+        tmp.dir("proj/empty");
+        assert!(replacements("cp -r src/* empty/", &ctx).is_empty());
+    }
+
+    /// A sensitive name on the way to a file written over is a sign
+    /// wherever the destination is, and so is the destination's own name.
+    #[test]
+    fn a_sensitive_name_written_over_is_a_sign() {
+        let tmp = TempTree::new("repl-sensitive");
+        let (proj, _) = incident(&tmp);
+        tmp.file("proj/tpl/.env.local", "A=1\n");
+        tmp.file("proj/tpl/.git/config", "[core]\n");
+        tmp.file("proj/app/.env.local", "SECRET=2\n");
+        tmp.file("proj/app/.git/config", "[core]\n\tbare = false\n");
+        tmp.file("proj/example.env", "A=\n");
+        tmp.file("proj/.env", "SECRET=1\n");
+        let ctx = EvalContext::at(&proj);
+        let found = replacements("cp -r tpl/. app/", &ctx);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].signs(Some(&proj)),
+            vec![ReplaceSign::Sensitive(vec![
+                (".env.local".to_string(), "environment secrets"),
+                (".git".to_string(), "git history"),
+            ])]
+        );
+        // One file over another: the copy is the one replacement.
+        let found = replacements("cp example.env .env", &ctx);
+        assert_eq!(
+            found,
+            vec![Replacement {
+                destination: proj.join(".env"),
+                into_directory: false,
+                files: vec![proj.join(".env")],
+                capped: false,
+            }]
+        );
+        assert_eq!(
+            found[0].signs(Some(&proj)),
+            vec![ReplaceSign::Sensitive(vec![(
+                ".env".to_string(),
+                "environment secrets"
+            )])]
+        );
+        // A file onto a name nothing has yet creates it.
+        assert!(replacements("cp example.env new.env", &ctx).is_empty());
+    }
+
+    /// A move of a directory onto one that holds files is refused by `mv`
+    /// (GNU coreutils 9.4: "cannot overwrite 'b/a': Directory not empty")
+    /// and lands nothing, and `Move-Item` is read the same way; a move of a
+    /// file into a directory replaces the file of that name there.
+    #[test]
+    fn a_move_replaces_a_file_and_not_a_directory_that_holds_files() {
+        let tmp = TempTree::new("repl-move");
+        let (proj, _) = incident(&tmp);
+        tmp.file("proj/a/x.txt", "new\n");
+        tmp.file("proj/b/a/x.txt", "old\n");
+        tmp.file("proj/one.txt", "new\n");
+        tmp.file("proj/b/one.txt", "old\n");
+        let ctx = EvalContext::at(&proj);
+        assert!(replacements("mv a b/", &ctx).is_empty());
+        assert!(replacements("Move-Item a b", &ctx).is_empty());
+        for line in ["mv one.txt b/", "git mv one.txt b", "Move-Item one.txt b"] {
+            let found = replacements(line, &ctx);
+            assert_eq!(found.len(), 1, "{line}: {found:?}");
+            assert_eq!(found[0].files, vec![proj.join("b/one.txt")], "{line}");
+        }
+    }
+
+    /// A tree past the budget is read from the place it lands instead,
+    /// which is exact while that place is small; past both, what is known
+    /// is listed and the replacement says it stopped.
+    #[test]
+    fn a_tree_past_the_budget_is_read_from_where_it_lands() {
+        let tmp = TempTree::new("repl-budget");
+        let (proj, _) = incident(&tmp);
+        let big = tmp.dir("proj/big");
+        for i in 0..5_001 {
+            std::fs::write(big.join(format!("f{i}")), "x").unwrap();
+        }
+        let away = tmp.dir("away/big");
+        std::fs::write(away.join("f7"), "precious").unwrap();
+        std::fs::write(away.join("notes.txt"), "kept").unwrap();
+        let ctx = EvalContext::at(&proj);
+        let line = format!("cp -r big \"{}\"", away.parent().unwrap().display());
+        let found = replacements(&line, &ctx);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].capped, "the place was read whole");
+        assert_eq!(found[0].files, vec![away.join("f7")]);
+        for i in 0..5_001 {
+            std::fs::write(away.join(format!("f{i}")), "x").unwrap();
+        }
+        let found = replacements(&line, &ctx);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].capped, "neither side could be read whole");
+        assert!(found[0].signs(Some(&proj)).contains(&ReplaceSign::TooLarge));
+        // Which the preview says, and nothing is copied for it.
+        let pv = crate::preview::generate(&line, Some(&proj), &proj, false).expect("a preview");
+        let body = pv.lines.join("\n");
+        assert!(body.contains("replaces    : at least "), "{body}");
+        assert!(
+            body.contains(
+                "✗ insurance : what it writes over is past the copy budget — NOT recoverable"
+            ),
+            "{body}"
+        );
+        assert!(pv.uninsurable, "{body}");
+        assert!(
+            pv.summary
+                .starts_with("OUTSIDE project root, NOT recoverable — "),
+            "{}",
+            pv.summary
+        );
+        assert_eq!(crate::backup::plan(&line, &proj), None);
+    }
+
+    /// A copy writes through a link at the destination to the file it
+    /// points to, which is what it writes over, and that file may be
+    /// anywhere. A move replaces the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_destination_is_written_through_by_a_copy() {
+        let tmp = TempTree::new("repl-link");
+        let (proj, _) = incident(&tmp);
+        tmp.file("proj/new/config.yml", "new\n");
+        let real = tmp.file("etc/app/config.yml", "production\n");
+        tmp.dir("proj/deploy");
+        std::os::unix::fs::symlink(&real, proj.join("deploy/config.yml")).unwrap();
+        let ctx = EvalContext::at(&proj);
+        let found = replacements("cp -r new/. deploy/", &ctx);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].files, vec![real.canonicalize().unwrap()]);
+        assert_eq!(found[0].signs(Some(&proj)), vec![ReplaceSign::Outside]);
+        let found = replacements("mv new/config.yml deploy/", &ctx);
+        assert_eq!(found[0].files, vec![proj.join("deploy/config.yml")]);
+        assert!(found[0].signs(Some(&proj)).is_empty());
     }
 }

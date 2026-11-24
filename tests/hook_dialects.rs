@@ -1106,6 +1106,52 @@ fn observe_mode_holds_a_deny_the_preview_marks_uninsurable() {
     assert_eq!(ran["coverage"], "insured");
 }
 
+/// #12. A copy over files outside the project is asked about with what it
+/// replaces, and those files are copied before the ask is answered: the
+/// incident's `cp -r backend/* /opt/proxypilot/backend/`, small. An
+/// ordinary copy inside the project says nothing new and takes no copy.
+#[test]
+fn a_copy_over_files_outside_the_project_is_asked_with_what_it_replaces() {
+    use serde_json::json;
+    let tmp = scratch("copy-over");
+    let home = tmp.join("home");
+    let proj = project(&tmp, "version: 1\ndefault: ask\nrules: []\n");
+    std::fs::create_dir_all(proj.join("backend")).unwrap();
+    std::fs::write(proj.join("backend").join("app.py"), "new app\n").unwrap();
+    let prod = tmp.join("opt").join("proxypilot").join("backend");
+    std::fs::create_dir_all(&prod).unwrap();
+    std::fs::write(prod.join("app.py"), "production app\n").unwrap();
+    let mk = |cmd: &str| {
+        json!({"session_id":"C","transcript_path":"/tmp/t","cwd":proj.to_string_lossy(),
+               "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":cmd}})
+    };
+    let out = hook(
+        &home,
+        &proj,
+        &mk(&format!("cp -r backend/* \"{}\"", prod.display())),
+        &[],
+    );
+    assert_eq!(out.code, 0, "{}", out.stdout);
+    assert!(is_claude_shape(&out.stdout), "{}", out.stdout);
+    assert!(out.stdout.contains("\"ask\""), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("OUTSIDE project root")
+            && out.stdout.contains("replaces 1 existing file(s)"),
+        "{}",
+        out.stdout
+    );
+    let taken = backup_count(&home);
+    assert!(taken > 0, "copied before the ask is answered");
+
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    std::fs::write(proj.join("src").join("a.js"), "new\n").unwrap();
+    std::fs::create_dir_all(proj.join("public")).unwrap();
+    std::fs::write(proj.join("public").join("a.js"), "old\n").unwrap();
+    let out = hook(&home, &proj, &mk("cp -r src/* public/"), &[]);
+    assert!(!out.stdout.contains("replaces"), "{}", out.stdout);
+    assert_eq!(backup_count(&home), taken, "an ordinary copy takes no copy");
+}
+
 /// Observe mode answers nothing, in every dialect (v0.20.1). Measured Oct 4,
 /// A directory a build rebuilds is not the floor (v0.21.3). `rm -rf
 /// node_modules` past the copy budget read as unrecoverable, which made it

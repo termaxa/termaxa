@@ -6401,8 +6401,10 @@ mod shell_reading_tests {
     /// about: the reading that earned it, and beside the line as typed any
     /// other reading a rule refuses. `cp notes.md s\ub/.env` is refused as
     /// typed for a `s/ub/.env` that is not there, and as bash reads it for
-    /// the `sub/.env` that is: observe mode holds a line whose copy cannot
-    /// be taken, and that is asked of the file that is there.
+    /// the `sub/.env` that is: the preview is of the file that is there, and
+    /// so is the copy taken first (#12). Observe mode holds a line whose
+    /// copy cannot be taken, a `tee` over the file, and that too is asked
+    /// of the file that is there.
     #[test]
     fn the_readings_a_rule_refuses_come_with_the_verdict() {
         let p = Policy::builtin().expect("built-in starter policy must parse");
@@ -6424,6 +6426,17 @@ mod shell_reading_tests {
                 (Reading::Posix, "cp notes.md sub/.env", cwd)
             ]
         );
+        let preview = judged
+            .preview(line, Some(ctx.root.as_path()), &ctx.cwd, false)
+            .expect("a preview of the file that is there");
+        assert!(
+            preview.lines.join("\n").contains("loses") && !preview.uninsurable,
+            "{line}: {:?}",
+            preview.lines
+        );
+        let line = "cat notes.md | tee s\\ub/.env";
+        let judged = p.judge_command_read_by(line, &ctx, &[Reading::Posix]);
+        assert_eq!(judged.decision.action, Action::Deny);
         let preview = judged.preview(line, Some(ctx.root.as_path()), &ctx.cwd, false);
         assert!(preview.is_some_and(|p| p.uninsurable), "{line}");
         // A line no reading refuses is the line as typed and nothing else.
@@ -6552,7 +6565,8 @@ mod opened_tests {
 
     /// The spelling the shell runs is what the refusal is about: the
     /// preview and the copy aside are made for it, where the segment runs,
-    /// and a write no copy can cover is held for the file the shell writes.
+    /// and a write no copy can cover (a `tee` over the file; a `cp` over it
+    /// is copied first since #12) is held for the file the shell writes.
     #[test]
     fn the_spelling_the_shell_runs_comes_with_the_verdict() {
         let p = Policy::builtin().expect("built-in starter policy must parse");
@@ -6568,6 +6582,17 @@ mod opened_tests {
                 (Reading::Typed, line, cwd)
             ]
         );
+        let preview = judged
+            .preview(line, Some(ctx.root.as_path()), cwd, false)
+            .expect("a preview of the file the shell writes");
+        assert!(
+            preview.lines.join("\n").contains("loses") && !preview.uninsurable,
+            "{line}: {:?}",
+            preview.lines
+        );
+        let line = "cat notes.md | tee sub/.en[v]";
+        let judged = p.judge_command_read_by(line, &ctx, &[]);
+        assert_eq!(judged.decision.action, Action::Deny);
         let preview = judged.preview(line, Some(ctx.root.as_path()), cwd, false);
         assert!(preview.is_some_and(|p| p.uninsurable), "{line}");
         let line = "cd sub && cp ../notes.md .en[v]";
