@@ -164,9 +164,11 @@ fn plain(c: char) -> bool {
 /// not).
 ///
 /// `keep` is asked only about a word that opens into more than
-/// `MOST_KEPT`: whether a deny rule could be about this one of its words.
-/// Those are written out and the rest are left out; a word none of whose
-/// words is kept stays as written.
+/// `MOST_KEPT`: whether a deny rule could be about this one of its words,
+/// told the operator before it when the word is a redirection's target,
+/// since a rule written with the operator (`*> /etc/*`) is about the word
+/// in that place. Those are written out and the rest are left out; a word
+/// none of whose words is kept stays as written.
 ///
 /// A redirection's target that opens into several words is written as one
 /// redirection each: bash refuses such a line and zsh writes every one of
@@ -175,7 +177,7 @@ pub fn opened(
     segment: &str,
     dir: Option<&Path>,
     loose: Loose,
-    keep: &dyn Fn(&str) -> bool,
+    keep: &dyn Fn(&str, Option<&str>) -> bool,
 ) -> Opened {
     if !segment.contains(['*', '?', '[', '{', GROUP_OPENS]) {
         return Opened::default();
@@ -207,7 +209,9 @@ pub fn opened(
         }
         let (pieces, end) = read_word(&chars, i);
         let raw: String = chars[i..end].iter().collect();
-        match open_word(&pieces, dir, loose, &mut budget, keep) {
+        let operator = redirection(&gap);
+        let ask = |word: &str| keep(word, operator);
+        match open_word(&pieces, dir, loose, &mut budget, &ask) {
             Opening::AsWritten => out.push_str(&raw),
             Opening::Unread => {
                 unread = true;
@@ -215,7 +219,6 @@ pub fn opened(
             }
             Opening::Words(words) => {
                 changed = true;
-                let operator = redirection(&gap);
                 for (n, word) in words.iter().enumerate() {
                     if n > 0 {
                         out.push(' ');
@@ -1252,7 +1255,7 @@ fn matches(word: &[Piece], dir: &Path, loose: Loose, budget: &mut Budget) -> Opt
 mod tests {
     use super::*;
 
-    fn all(_: &str) -> bool {
+    fn all(_: &str, _: Option<&str>) -> bool {
         true
     }
 
@@ -1473,7 +1476,7 @@ mod tests {
     #[test]
     fn a_long_list_keeps_what_a_rule_could_be_about() {
         let tmp = project();
-        let guarded = |word: &str| word.contains("settings");
+        let guarded = |word: &str, _: Option<&str>| word.contains("settings");
         let read = opened(
             "tee .claude/{settings.json,x{1..500}}",
             Some(tmp.path()),
@@ -1518,6 +1521,35 @@ mod tests {
             &all,
         );
         assert!(read.unread);
+    }
+
+    /// `keep` is told the operator before a redirection's target and
+    /// nothing before any other word: a rule written with the operator is
+    /// about the target where the line writes it.
+    #[test]
+    fn keep_is_told_the_operator_before_a_target() {
+        let tmp = project();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let note = |_: &str, operator: Option<&str>| {
+            asked.borrow_mut().push(operator.map(str::to_string));
+            false
+        };
+        for (line, operator) in [
+            ("tee x{1..70}", None),
+            ("echo y > x{1..70}", Some(">")),
+            ("echo y >> x{1..70}", Some(">>")),
+            ("echo y &> x{1..70}", Some("&>")),
+        ] {
+            asked.borrow_mut().clear();
+            let read = opened(line, Some(tmp.path()), Loose::default(), &note);
+            assert_eq!(read, Opened::default(), "nothing kept: {line}");
+            let asked = asked.borrow();
+            assert_eq!(asked.len(), 70, "{line}");
+            assert!(
+                asked.iter().all(|op| op.as_deref() == operator),
+                "{line}: {asked:?}"
+            );
+        }
     }
 
     #[test]
