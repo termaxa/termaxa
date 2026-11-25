@@ -2,6 +2,33 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.25.1 — a shell pattern where a rule has its `*` is matched by the rule
+
+**In plain words:** a rule's `*` stands for anything, and the matcher tried it as an ordinary character first. Where the command line had a shell pattern at that place, the rule's `*` was used up on the pattern's own `*`, and the rule missed the line. With the starter, `echo x > /etc/*hosts` and `echo k > ~/.ssh/*_keys` were allowed by `echo *` from v0.15.0, the first release that judged a redirection, to v0.21.10, and bash and zsh write the one file each pattern matches. v0.22.0 began reading a word as the shell opens it, which refuses those two when the pattern matches a file. But a target that opens into more than 64 names is written out with only the names a deny rule could be about, and a rule written with the redirection operator, `*> /etc/*`, was never about a name on its own. So `echo x > /etc/*.d/*`, where that matches more than 64 files, was still allowed, and zsh, the default shell on macOS, writes every match; bash refuses such a redirection. A rule's `*` is now a wildcard first, and each name a target opens into is asked about where the line writes it. The matcher's fix reaches every rule, the allow rules too: `ls *.rs` and `cat *.md > notes.txt` asked, and are allowed by `ls *` and `cat *`, as those rules always said.
+
+Security release for [GHSA-v26g-frcw-c2w6](https://github.com/termaxa/termaxa/security/advisories/GHSA-v26g-frcw-c2w6) (High), found on Nov 24, 2026 while running commands sent to the playground on a machine with more files under `/etc` than the playground has, and measured on each release's own binary with its own starter back to v0.6.1. One PR, #202.
+
+### Security
+
+- A rule's `*` is a wildcard wherever the line has a `*` of its own. `policy::wildcard_match` compared the two as characters before it tried the rule's `*` as a wildcard, so `*> /etc/*` did not match `echo x > /etc/*hosts` or `echo x > /etc/*.d/*`, and `*> ~/.ssh/*` did not match `echo k > ~/.ssh/*_keys` (#202).
+- A name a redirection's target opens into is asked about where the line writes it, `> /etc/x.d/f`, as well as alone. Past 64 names a word keeps the ones a deny rule could be about, and none was kept for a rule written with the operator, so the line was judged as written. A line with more than 64 such names is refused now, as one with more than 64 that a path rule could be about already was (#202).
+- The path rules that guard the gate's own files, the hook configs and `.env` were not affected: they are matched against each name a pattern opens into.
+
+### Changed
+
+- A line with a shell pattern where a rule has its `*` gets that rule. Over the 156 distinct commands sent to the playground and 17 ordinary lines with a pattern, with the starter, three verdicts change: `echo x > /etc/*.d/*` from allow to deny, and `ls *.rs` and `cat *.md > notes.txt` from ask to allow. `echo k > ~/.ssh/*_keys`, which v0.22.0 to v0.25.0 refused only where the pattern matched a file, is refused either way (#202).
+
+### Measured and documented
+
+- Each release's own binary with its own starter, v0.6.1 to v0.25.0, in a Linux container. Through v0.14.2 `echo x > /etc/hosts` itself is not refused. From v0.15.0 to v0.21.10 it is, and `echo x > /etc/*hosts` and `echo k > ~/.ssh/*_keys` are allowed. From v0.22.0 those two are refused, and a target under `/etc` that opens into 65 files is allowed while 64 are refused. On the v0.24.0 and v0.25.0 release binaries the 65 are allowed through `termaxa check` and through the hook, zsh 5.9 then writes all 65, and bash 5.2 writes none. This release refuses them in both.
+- Asking about a name where the line writes it costs two strings per name: `echo x > /tmp/*` over 7,973 names takes 0.06 s on a release build of this tree, and 0.04 s on v0.25.0 (the median of five runs each).
+- Not changed: under zsh a redirection that opens into several files writes every one of them, and the preview and the copy aside do not read them, so `echo x > out/*.txt` is allowed with no copy.
+- 793 tests on Linux (3 new), 725 on Windows (722 at v0.25.0).
+
+### Upgrade note
+
+The fix needs nothing from a policy. A policy's own rules now match a line with a pattern where they have their `*`, as their text says: an allow rule `ls *` allows `ls *.rs`. Until the upgrade, a `match_path` rule for a directory, such as `match_path: "/etc/*"` with `action: deny`, refuses a redirection into it however many names it opens into.
+
 ## v0.25.0 — what a copy writes over is previewed and copied first, and `cmd /c` and `powershell -Command` are read
 
 **In plain words:** `cp -r backend/* /opt/proxypilot/backend/` is the command behind #12: it dragged a development virtualenv over a production one, and termaxa 0.24.0 said nothing about it, because a copy into a directory was read as where files land, not as what is lost. This release reads what a copy, a move, an rsync or an unpacked archive writes over, and what `rsync --delete` removes. Where the delete preview's warning signs are on those files (outside the project, directly in a user profile, a credential's name, more than the copy can take), the preview names them and the copy aside takes them first, so `termaxa rollback` brings them back; an ordinary copy inside the project still says nothing. A `cp` or an `mv` onto an existing file is copied first too, as the README's table had said of `cp` all along. The path rules see what an rsync, a zip or a tar touches, so with the starter none of them removes or writes the gate's own files; a compressed archive is not read. A command handed to `cmd /c` or `powershell -Command` is read as the command it runs. And the copy aside no longer loses one of two files that share a name.
