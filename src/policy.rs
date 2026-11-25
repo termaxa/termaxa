@@ -1301,22 +1301,37 @@ impl Policy {
         // out, and then of each of its words: what a deny rule needs to
         // see first, worked out once.
         let guards = std::cell::OnceCell::new();
-        let keep = |word: &str| {
-            let (guards, words, paths, cwd) = guards.get_or_init(|| {
+        let keep = |word: &str, operator: Option<&str>| {
+            let (guards, words, paths, cwd, placing) = guards.get_or_init(|| {
                 let (words, paths) = self.needles();
                 let here = ctx.cwd.display().to_string().to_lowercase();
                 let cwd = paths
                     .as_ref()
                     .is_none_or(|p| p.iter().any(|n| here.contains(n)));
-                (self.guards(), words, paths, cwd)
+                let placing = self.rules.iter().any(|r| {
+                    r.action == Action::Deny
+                        && r.r#match.as_deref().is_some_and(|m| m.contains(['>', '<']))
+                });
+                (self.guards(), words, paths, cwd, placing)
             });
+            // A redirection's target is asked about where the line writes
+            // it as well: a rule written with the operator, `*> /etc/*`,
+            // is about `> /etc/x.d/f` and says nothing of the name alone.
+            let placed: Vec<String> = operator
+                .filter(|_| *placing)
+                .map(|op| vec![format!("{op} {word}"), format!("{op}{word}")])
+                .unwrap_or_default();
             let lower = word.to_lowercase();
+            let placed_lower: Vec<String> = placed.iter().map(|p| normalize(p)).collect();
             let seen = |needles: &Option<Vec<String>>| {
-                needles
-                    .as_ref()
-                    .is_none_or(|n| n.iter().any(|n| lower.contains(n.as_str())))
+                needles.as_ref().is_none_or(|n| {
+                    n.iter().any(|n| {
+                        lower.contains(n.as_str())
+                            || placed_lower.iter().any(|p| p.contains(n.as_str()))
+                    })
+                })
             };
-            (*cwd || seen(words) || seen(paths)) && could_be_about(guards, word, ctx)
+            (*cwd || seen(words) || seen(paths)) && could_be_about(guards, word, &placed, ctx)
         };
         let opened = crate::words::opened(text, dir, aside.loose, &keep);
         if opened.unread {
@@ -2054,16 +2069,26 @@ struct Guards {
 
 /// Whether a deny rule could be about `word`, one of the many a word of the
 /// line opens into (`words::opened`): a rule that matches it as a string,
-/// a path rule that names it, as `Rule::matches_path` does, or one that
-/// names a file inside it, taken as a directory, by a component of its own
-/// (`starts_components`): `*/.claude/settings*.json` names a file inside
-/// `/p/.claude`, and `*/.env`, which names one inside any directory at
-/// all, says nothing about this one.
-fn could_be_about(guards: &Guards, word: &str, ctx: &crate::resolve::EvalContext) -> bool {
-    let (lower, kept) = (normalize(word), collapse(word));
-    if guards.strings.iter().any(|(pattern, case_sensitive)| {
-        wildcard_match(pattern, if *case_sensitive { &kept } else { &lower })
-    }) {
+/// alone or as the line writes it (`placed`: a redirection's target after
+/// its operator, `> /etc/x.d/f`, which `*> /etc/*` is about and the name
+/// alone is not), a path rule that names it, as `Rule::matches_path` does,
+/// or one that names a file inside it, taken as a directory, by a component
+/// of its own (`starts_components`): `*/.claude/settings*.json` names a
+/// file inside `/p/.claude`, and `*/.env`, which names one inside any
+/// directory at all, says nothing about this one.
+fn could_be_about(
+    guards: &Guards,
+    word: &str,
+    placed: &[String],
+    ctx: &crate::resolve::EvalContext,
+) -> bool {
+    let matched = |said: &str| {
+        let (lower, kept) = (normalize(said), collapse(said));
+        guards.strings.iter().any(|(pattern, case_sensitive)| {
+            wildcard_match(pattern, if *case_sensitive { &kept } else { &lower })
+        })
+    };
+    if matched(word) || placed.iter().any(|said| matched(said)) {
         return true;
     }
     let path = crate::delete::resolve_path_in(word, &ctx.cwd)
@@ -2096,6 +2121,14 @@ fn starts_components(pat: &[String], seg: &[String], named: bool) -> bool {
     }
 }
 
+/// Whether `text` matches `pattern`, where every `*` of the pattern stands
+/// for any run of characters, the empty one included, and every other
+/// character for itself. A `*` in the text is a character like any other:
+/// it never takes the place of a `*` of the pattern. Until v0.25.1 the two
+/// were compared as characters first, and a line with a shell pattern where
+/// the rule has its `*` (`echo x > /etc/*.d/*` against `*> /etc/*`) used
+/// the rule's last `*` up on its own one, left the rest of the line to
+/// nothing, and was not matched.
 pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
@@ -2103,13 +2136,13 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     let (mut star, mut mark) = (usize::MAX, 0usize);
 
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        if pi < p.len() && p[pi] == '*' {
             star = pi;
             mark = ti;
             pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
         } else if star != usize::MAX {
             pi = star + 1;
             mark += 1;
@@ -2553,6 +2586,14 @@ mod tests {
         assert!(wildcard_match("git status", "git status"));
         assert!(!wildcard_match("git status", "git status -s"));
         assert!(wildcard_match("*", "anything at all"));
+        // A `*` in the line is a character to the rule, never its `*`.
+        assert!(wildcard_match("*> /etc/*", "echo x > /etc/*.d/*"));
+        assert!(wildcard_match("*> /etc/*", "echo x > /etc/*hosts"));
+        assert!(wildcard_match("*> /etc/*", "echo x > /etc/*"));
+        assert!(wildcard_match("*> ~/.ssh/*", "echo k > ~/.ssh/*_keys"));
+        assert!(wildcard_match("a*b", "a*xb"));
+        assert!(!wildcard_match("*> /etc/*", "echo x > /tmp/*.d/*"));
+        assert!(!wildcard_match("a*b", "a*x"));
     }
 
     #[test]
@@ -6561,6 +6602,71 @@ mod opened_tests {
                 d.reason
             );
         }
+    }
+
+    /// A shell pattern that starts where a rule has its `*` is matched by
+    /// the rule, whatever it opens into here: the starter refuses these as
+    /// written to `/etc` and to `~/.ssh`.
+    #[test]
+    fn a_pattern_where_the_rule_has_its_star_is_refused() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        for line in [
+            "echo x > /etc/*.d/*",
+            "echo x > /etc/*hosts",
+            "echo x > /etc/*/*",
+            "echo k > ~/.ssh/*_keys",
+            "echo k >> ~/.ssh/*keys",
+        ] {
+            let d = p.judge_command_read_by(line, &ctx, &[]).decision;
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+    }
+
+    /// A target that opens into more names than are written out is still
+    /// judged by the rules written with the operator: each name is asked
+    /// about where the line writes it, so the names under a guarded
+    /// directory are refused (zsh writes every one of them; bash refuses
+    /// the line), and the one guarded name among many is found and named.
+    #[test]
+    fn a_target_that_opens_into_many_names_is_judged_where_it_is_written() {
+        let (tmp, ctx) = project();
+        for i in 0..65 {
+            tmp.file(&format!("conf/k.d/f{i:03}"), "v\n");
+            tmp.file(&format!("keys/s{i:03}"), "v\n");
+        }
+        tmp.file("keys/secret.pem", "v\n");
+        let p: Policy = serde_yaml::from_str(
+            "default: ask\nrules:\n  \
+             - match: \"*> conf/*\"\n    action: deny\n  \
+             - match: \"*> keys/secret.pem\"\n    action: deny\n  \
+             - match: \"echo *\"\n    action: allow\n",
+        )
+        .expect("policy must parse");
+        let judge = |line: &str| p.judge_command_read_by(line, &ctx, &[]).decision;
+        for line in [
+            "echo x > conf/*.d/*",
+            "echo x > conf/k.d/*",
+            "echo x >> conf/*/f*",
+            "echo x > keys/s*",
+        ] {
+            let d = judge(line);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+        }
+        let d = judge("echo x > keys/s*");
+        assert_eq!(d.source, DecisionSource::ExplicitRule, "{}", d.reason);
+        assert!(
+            d.reason
+                .contains("(as the shell opens it: `echo x > keys/secret.pem`)"),
+            "{}",
+            d.reason
+        );
+        // Names nobody guards are answered as written, and a word that is
+        // no redirection's target is not asked about as one.
+        let d = judge("echo x > keys/s0*");
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        let d = judge("cat conf/*.d/*");
+        assert_ne!(d.action, Action::Deny, "{}", d.reason);
     }
 
     /// The spelling the shell runs is what the refusal is about: the
