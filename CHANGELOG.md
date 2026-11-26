@@ -2,6 +2,36 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.25.2 — one word no longer spends the walk of the words after it, and a line's words are opened within four seconds
+
+**In plain words:** to judge a command, the gate opens its patterns into the names they match, reading the disk on a budget. The budget was one for a whole segment of the line, and a pattern still unread when it ran out was judged as written. One large pattern could use it up, and a guarded name spelled through a pattern after it, `.clau[d]e/settings.json`, `.ter[m]axa/policy.yaml` or `.en[v]`, stayed as written: a name no path rule has. With the starter, `cat payload /*/*/*/*/none > .clau[d]e/settings.json` was allowed by `cat *` from v0.22.0, the first release that opened words, to v0.25.1, and bash overwrites the hook config with the payload. Each word now reads on a budget of its own, and a word the walk cannot finish is refused. The time a check takes also grew with the line, and a check that outlasts its harness's timeout lets the command run in Codex and Claude Code as `termaxa init` wires them; the opening of a whole line now ends within four seconds. And the preview and the copy aside now read what a pattern opens into where no rule refused it: `echo x > out/*.txt`, which zsh writes to every match, and `rm -rf build/*` are copied first, where nothing was copied.
+
+Security release for [GHSA-9q5v-84p5-m3p2](https://github.com/termaxa/termaxa/security/advisories/GHSA-9q5v-84p5-m3p2) (High), found on Nov 25, 2026 while measuring why one check had taken 69 seconds on a cold disk, and measured on each release's own binary from v0.21.10. Three PRs: #205, #206 and #207.
+
+### Security
+
+- Each word's patterns read the disk on a budget of their own, 100,000 directory entries or a second, and the names looked up after a pattern count against it. The budget was one for a whole segment, 20,000 entries or 150 ms, and a pattern left when it ran out was judged as written, so one word could leave the guarded names after it unread (#205).
+- A word the walk cannot finish is refused, in every mode, as a word that opens into more than 100,000 words or more than 64 a rule could be about already was (#205).
+- The opening of all of a line's words ends four seconds after its judging begins, across every reading of the line and the signals asked after the verdict; a word not read by then is refused. The clock is read at every entry, not every 256 (#205).
+
+### Changed
+
+- A word whose patterns read more than 100,000 directory entries, or take more than a second, is refused where it was judged as written: `ls /*/*/*/*` is one (#205).
+- The preview and the copy aside are made for what a line's patterns open into where no rule refused it, after the line as typed. `echo x > out/*.txt` is previewed for each file it writes under zsh and both are copied first, and `rm -rf build/*` copies the files it deletes; v0.25.1 copied neither. Up to 64 names a word: past that only the names a deny rule could be about are written out, as before, and the rest are not copied (#206).
+
+### Measured and documented
+
+- Each release's own binary with its own starter, v0.21.10 to v0.25.1, in a Linux container where `/*/*/*/*` matches 48,743 names. From v0.22.0, `echo x > .ter[m]axa/policy.yaml` is refused by `path:*/.termaxa/*`, and `echo /*/*/*/* > .ter[m]axa/policy.yaml` is allowed by `echo *`, through `termaxa check` and through the hook; so are the same spellings of `.claude/settings.json` and `.env`. bash writes the hook config from `cat payload /*/*/*/*/none > .clau[d]e/settings.json`, and zsh writes it where the first word matches something. This release refuses them, in 0.2 to 1.0 s.
+- On v0.25.1 the hook took 16.3 s over 430 segments of `ls /*/*/*/*` and 37.4 s over 1,000; this release refuses both in 4.0 s. `termaxa init` gives Codex's hook 15 seconds, and Codex's documentation says a hook blocks only on an explicit denial; Claude Code's says a PreToolUse hook that times out does not block the call unless it sets `onFailure: "block"`, which `init` does not set. `init` wires Hermes Agent and Copilot CLI to fail closed.
+- On the v0.25.1 release binary the hook copies nothing for `echo x > out/*.txt`, which zsh 5.9 then writes to both files and bash 5.2 refuses, and nothing for `rm -rf build/*` over 64 files. This release copies both files, and all 64; over 65 files it copies none, as before.
+- The README's line counts are taken after #207 moved the test-only code in `words.rs` into its test module: from #205 the count, which starts a file's tests at its first line that reads `#[cfg(test)]`, took 1,244 of its lines for tests.
+- Not changed: the clock is read between calls to the file system, so one call that does not return, such as a request to a network share that does not answer, can still hold a check past four seconds. `init` sets no fail-closed option for Claude Code or Cursor.
+- 797 tests on Linux (4 new), 729 on Windows (725 at v0.25.1).
+
+### Upgrade note
+
+The fix needs nothing from a policy. A command whose patterns read more than 100,000 directory entries, or take more than a second to read, is refused now, with a reason that says so: write the names out, or loop over them in a script. Until the upgrade, a harness setting that blocks the call when its hook fails or times out, `"onFailure": "block"` on Claude Code 2.1.295 or later, keeps a slow check from letting a command run; no rule in a policy stands in for the budget fix.
+
 ## v0.25.1 — a shell pattern where a rule has its `*` is matched by the rule
 
 **In plain words:** a rule's `*` stands for anything, and the matcher tried it as an ordinary character first. Where the command line had a shell pattern at that place, the rule's `*` was used up on the pattern's own `*`, and the rule missed the line. With the starter, `echo x > /etc/*hosts` and `echo k > ~/.ssh/*_keys` were allowed by `echo *` from v0.15.0, the first release that judged a redirection, to v0.21.10, and bash and zsh write the one file each pattern matches. v0.22.0 began reading a word as the shell opens it, which refuses those two when the pattern matches a file. But a target that opens into more than 64 names is written out with only the names a deny rule could be about, and a rule written with the redirection operator, `*> /etc/*`, was never about a name on its own. So `echo x > /etc/*.d/*`, where that matches more than 64 files, was still allowed, and zsh, the default shell on macOS, writes every match; bash refuses such a redirection. A rule's `*` is now a wildcard first, and each name a target opens into is asked about where the line writes it. The matcher's fix reaches every rule, the allow rules too: `ls *.rs` and `cat *.md > notes.txt` asked, and are allowed by `ls *` and `cat *`, as those rules always said.
