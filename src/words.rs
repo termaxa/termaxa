@@ -46,10 +46,22 @@ pub const MOST_WORDS: usize = 100_000;
 const MOST_KEPT: usize = 64;
 const LONGEST_ASKING: Duration = Duration::from_secs(1);
 
-/// The directory entries one segment's patterns may read, and for how
-/// long. Past either, the patterns left are not opened.
-const MOST_ENTRIES: usize = 20_000;
-const LONGEST: Duration = Duration::from_millis(150);
+/// The directory entries, and the names looked up, one word's patterns may
+/// read, and for how long. Past either the word is not read at all
+/// (`Opened::unread`), and so is every word left once the opening of a
+/// whole line has taken `LONGEST_LINE` (`opened_until`). A pattern left as
+/// written past a budget is a name no path rule sees, and before v0.25.2
+/// one word could spend the budget of every word after it: `cat x
+/// /*/*/*/*/none > .clau[d]e/settings.json` wrote the hook config past the
+/// rule that guards it. And a check that runs past the harness's own
+/// timeout is no check in most of them: the command runs.
+#[cfg(not(test))]
+const MOST_ENTRIES: usize = 100_000;
+/// Small in tests, so that a test can spend it with a directory it makes.
+#[cfg(test)]
+const MOST_ENTRIES: usize = 1_000;
+const LONGEST: Duration = Duration::from_secs(1);
+pub const LONGEST_LINE: Duration = Duration::from_secs(4);
 
 /// A group of alternatives inside a word, as `shell::group_as_pattern`
 /// writes it for this module to read: zsh's `.claud(e|x)` and ksh's
@@ -117,7 +129,8 @@ pub fn loosened(line: &str) -> Loose {
     }
 }
 
-/// How much of the disk the patterns of one segment may still read.
+/// How much of the disk the patterns of one word may still read: its own
+/// entries and time, and no later than the line's end (`line`).
 struct Budget {
     entries: usize,
     until: Instant,
@@ -125,20 +138,23 @@ struct Budget {
 }
 
 impl Budget {
-    fn new() -> Self {
+    fn new(line: Option<Instant>) -> Self {
+        let own = Instant::now() + LONGEST;
         Self {
             entries: MOST_ENTRIES,
-            until: Instant::now() + LONGEST,
+            until: line.map_or(own, |line| line.min(own)),
             spent: false,
         }
     }
 
-    /// One more directory entry; false once the budget is gone.
+    /// One more directory entry or name looked up; false once the budget
+    /// is gone. The clock is read every time: one entry on a cold disk or
+    /// a network share can take as long as thousands on a warm one.
     fn entry(&mut self) -> bool {
         if self.spent {
             return false;
         }
-        if self.entries == 0 || (self.entries.is_multiple_of(256) && Instant::now() > self.until) {
+        if self.entries == 0 || Instant::now() > self.until {
             self.spent = true;
             return false;
         }
@@ -173,18 +189,34 @@ fn plain(c: char) -> bool {
 /// A redirection's target that opens into several words is written as one
 /// redirection each: bash refuses such a line and zsh writes every one of
 /// them, so each is a file the line may write.
+///
+/// Each word reads the disk on a budget of its own (`Budget`): what one
+/// word spends, no later word goes without.
+#[cfg(test)]
 pub fn opened(
     segment: &str,
     dir: Option<&Path>,
     loose: Loose,
     keep: &dyn Fn(&str, Option<&str>) -> bool,
 ) -> Opened {
+    opened_until(segment, dir, loose, keep, None)
+}
+
+/// `opened`, with no word read past `line`: the time the opening of the
+/// whole line ends, `LONGEST_LINE` after it began, in which every word not
+/// read by then is unread (`Opened::unread`).
+pub fn opened_until(
+    segment: &str,
+    dir: Option<&Path>,
+    loose: Loose,
+    keep: &dyn Fn(&str, Option<&str>) -> bool,
+    line: Option<Instant>,
+) -> Opened {
     if !segment.contains(['*', '?', '[', '{', GROUP_OPENS]) {
         return Opened::default();
     }
     let chars: Vec<char> = segment.chars().collect();
     let mut out = String::with_capacity(segment.len() + 16);
-    let mut budget = Budget::new();
     let mut changed = false;
     let mut unread = false;
     // What stands between the last word and this one.
@@ -211,6 +243,7 @@ pub fn opened(
         let raw: String = chars[i..end].iter().collect();
         let operator = redirection(&gap);
         let ask = |word: &str| keep(word, operator);
+        let mut budget = Budget::new(line);
         match open_word(&pieces, dir, loose, &mut budget, &ask) {
             Opening::AsWritten => out.push_str(&raw),
             Opening::Unread => {
@@ -274,7 +307,7 @@ pub fn directory(word: &str, dir: &Path) -> Goes {
     if !has_pattern(one) {
         return Goes::To(crate::delete::resolve_path_in(&text_of(one), dir));
     }
-    let mut budget = Budget::new();
+    let mut budget = Budget::new(None);
     match matches(one, dir, Loose::default(), &mut budget).as_deref() {
         Some([]) => Goes::AsWritten,
         Some([only]) => {
@@ -496,7 +529,8 @@ fn expansion_end(chars: &[char], i: usize) -> Option<usize> {
 enum Opening {
     /// Itself: nothing in it to open, or nothing it matches.
     AsWritten,
-    /// A brace list longer than `MOST_WORDS`.
+    /// A brace list longer than `MOST_WORDS`, more words than can be asked
+    /// about, or patterns the walk ran out of budget reading.
     Unread,
     /// These words.
     Words(Vec<Vec<Piece>>),
@@ -526,6 +560,11 @@ fn open_word(
             }
             _ => None,
         };
+        // The walk stopped before it knew what the pattern matches: the
+        // word is not what it says, and nothing read what it is.
+        if budget.spent {
+            return Opening::Unread;
+        }
         match on_disk {
             Some(names) if !names.is_empty() => {
                 for name in names {
@@ -1167,7 +1206,16 @@ fn matches(word: &[Piece], dir: &Path, loose: Loose, budget: &mut Budget) -> Opt
         if component.is_empty() {
             // `dir*/`: a directory, and the separator is already written.
             if last {
-                found.retain(|(path, _)| path.is_dir());
+                let mut dirs = Vec::with_capacity(found.len());
+                for (path, written) in found {
+                    if !budget.entry() {
+                        return None;
+                    }
+                    if path.is_dir() {
+                        dirs.push((path, written));
+                    }
+                }
+                found = dirs;
             }
             continue;
         }
@@ -1236,6 +1284,9 @@ fn matches(word: &[Piece], dir: &Path, loose: Loose, budget: &mut Budget) -> Opt
             None => {
                 let name: String = component.iter().map(|(c, _)| *c).collect();
                 for (path, written) in &found {
+                    if !budget.entry() {
+                        return None;
+                    }
                     let path = path.join(&name);
                     if std::fs::symlink_metadata(&path).is_ok() {
                         next.push((path, spell(written, &name)));
@@ -1550,6 +1601,58 @@ mod tests {
                 "{line}: {asked:?}"
             );
         }
+    }
+
+    /// Each word reads the disk on a budget of its own (`MOST_ENTRIES`,
+    /// 1,000 in tests), the names looked up after a pattern count against
+    /// it, and a word whose walk runs out is unread rather than left as
+    /// written: a pattern left as written is a name no path rule sees.
+    #[test]
+    fn a_word_reads_the_disk_on_a_budget_of_its_own() {
+        let tmp = project();
+        for i in 0..600 {
+            tmp.file(&format!("a/f{i:04}"), "v\n");
+            tmp.file(&format!("b/f{i:04}"), "v\n");
+            tmp.file(&format!("d/s{i:04}/x"), "v\n");
+        }
+        for i in 0..1001 {
+            tmp.file(&format!("big/f{i:04}"), "v\n");
+        }
+        // No rule is about the names in `a/` and `b/`, as no rule is about
+        // `node_modules/*`: past 64 of them they are left out.
+        let none = |_: &str, _: Option<&str>| false;
+        let read = |line: &str| opened(line, Some(tmp.path()), Loose::default(), &none);
+        // 600 entries each: neither spends the other's walk.
+        let both = read("cat a/* b/* > .clau[d]e/settings.json");
+        assert!(!both.unread);
+        let text = both.text.expect("opened");
+        assert_eq!(text, "cat a/* b/* > .claude/settings.json");
+        // 1,001 entries in one word, or 600 entries and 600 names looked up
+        // after them: unread.
+        for line in ["cat big/* > x", "cat x big/*/none", "ls d/*/x"] {
+            assert_eq!(
+                read(line),
+                Opened {
+                    text: None,
+                    unread: true
+                },
+                "{line}"
+            );
+        }
+        // Past the end of the line nothing is read, and a word that needs
+        // no disk is opened as before.
+        let gone = Instant::now().checked_sub(Duration::from_secs(1));
+        let late = opened_until("cat a/*", Some(tmp.path()), Loose::default(), &all, gone);
+        assert!(late.unread);
+        let braces = opened_until(
+            "touch q{1,2}",
+            Some(tmp.path()),
+            Loose::default(),
+            &all,
+            gone,
+        );
+        assert!(!braces.unread);
+        assert_eq!(braces.text.as_deref(), Some("touch q1 q2"));
     }
 
     #[test]
