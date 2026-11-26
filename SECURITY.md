@@ -222,6 +222,7 @@ The affected range and publication date are on each advisory's page.
 | [GHSA-x6qc-h3gm-5fj2](https://github.com/termaxa/termaxa/security/advisories/GHSA-x6qc-h3gm-5fj2) | High | A guarded file's name spelled through an escape, a pattern or a brace list, or written through `&>`, `>&`, `<>` or a quote inside the target, matched no rule | v0.14.2, 2026-08-10 | v0.22.0, 2026-11-17 | 2026-11-17 | 99 |
 | [GHSA-vh3g-qw73-h9gg](https://github.com/termaxa/termaxa/security/advisories/GHSA-vh3g-qw73-h9gg) | High | The guards on the hook config and the gate's own state did not follow a directory moved by `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `TERMAXA_HOME` | v0.14.2, 2026-08-10 | v0.22.0, 2026-11-17 | 2026-11-17 | 99 |
 | [GHSA-v26g-frcw-c2w6](https://github.com/termaxa/termaxa/security/advisories/GHSA-v26g-frcw-c2w6) | High | A shell pattern where a deny rule has its `*`, or a redirection target that opens into more than 64 names, was not matched by the rule | v0.15.0, 2026-08-13 | v0.25.1, 2026-11-25 | 2026-11-25 | 104 |
+| [GHSA-9q5v-84p5-m3p2](https://github.com/termaxa/termaxa/security/advisories/GHSA-9q5v-84p5-m3p2) | High | One word's patterns could spend the walk's budget for the words after it, leaving a guarded name unread, and a long line could outlast a hook's timeout | v0.22.0, 2026-11-17 | v0.25.2, 2026-11-26 | 2026-11-26 | 9 |
 
 "Days exposed" is the window a user of the first affected release was
 exposed without knowing it: from that release to the public advisory. It
