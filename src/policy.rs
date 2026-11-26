@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -676,6 +677,9 @@ struct Aside {
     /// What the line being judged tells its shell about patterns
     /// (`words::loosened`): every segment of it is opened that way.
     loose: crate::words::Loose,
+    /// When the opening of the line's words ends, across every reading of
+    /// it (`words::opened_until`); `None` where nothing gave it one.
+    until: Option<Instant>,
 }
 
 impl Aside {
@@ -793,10 +797,25 @@ impl Policy {
     /// already (`evaluate_command`). Judging them again under every level
     /// that holds them cost a nested line the square of its depth.
     pub fn allows_explicitly(&self, inner: &str, ctx: &crate::resolve::EvalContext) -> bool {
+        self.allows_explicitly_until(inner, ctx, None)
+    }
+
+    /// `allows_explicitly`, with the words opened by `until`, the end the
+    /// verdict on the whole line was given (`judge_command_until`).
+    pub fn allows_explicitly_until(
+        &self,
+        inner: &str,
+        ctx: &crate::resolve::EvalContext,
+        until: Option<Instant>,
+    ) -> bool {
         if inner.trim().is_empty() {
             return false;
         }
-        let d = self.judge(inner, ctx, false, &mut Aside::default());
+        let mut aside = Aside {
+            until,
+            ..Aside::default()
+        };
+        let d = self.judge(inner, ctx, false, &mut aside);
         d.action == Action::Allow && d.source == DecisionSource::ExplicitRule
     }
 
@@ -982,20 +1001,51 @@ impl Policy {
     /// `evaluate_command`, with the readings of the line a rule refuses
     /// (`Judged`), for the preview and the copy aside.
     pub fn judge_command(&self, command: &str, ctx: &crate::resolve::EvalContext) -> Judged {
-        self.judge_command_read_by(command, ctx, crate::shell::Reading::others())
+        self.judge_command_until(command, ctx, Instant::now() + crate::words::LONGEST_LINE)
+    }
+
+    /// `judge_command`, with every word of the line opened by `until`
+    /// (`words::opened_until`) or refused: the hook, `run` and `check`
+    /// give the verdict and the signals one end between them, so that the
+    /// answer comes back before a harness's own timeout lets the command
+    /// run unanswered.
+    pub fn judge_command_until(
+        &self,
+        command: &str,
+        ctx: &crate::resolve::EvalContext,
+        until: Instant,
+    ) -> Judged {
+        self.judged_by(command, ctx, crate::shell::Reading::others(), until)
     }
 
     /// `judge_command` with the shells named: the machine's own for the
     /// hook, all three for a test of what each adds.
+    #[cfg(test)]
     fn judge_command_read_by(
         &self,
         command: &str,
         ctx: &crate::resolve::EvalContext,
         shells: &[crate::shell::Reading],
     ) -> Judged {
+        self.judged_by(
+            command,
+            ctx,
+            shells,
+            Instant::now() + crate::words::LONGEST_LINE,
+        )
+    }
+
+    fn judged_by(
+        &self,
+        command: &str,
+        ctx: &crate::resolve::EvalContext,
+        shells: &[crate::shell::Reading],
+        until: Instant,
+    ) -> Judged {
         let readings = crate::shell::other_readings(command, shells);
         let mut aside = Aside {
             collect: !readings.is_empty(),
+            until: Some(until),
             ..Aside::default()
         };
         let decision = self.judge(command, ctx, true, &mut aside);
@@ -1333,7 +1383,7 @@ impl Policy {
             };
             (*cwd || seen(words) || seen(paths)) && could_be_about(guards, word, &placed, ctx)
         };
-        let opened = crate::words::opened(text, dir, aside.loose, &keep);
+        let opened = crate::words::opened_until(text, dir, aside.loose, &keep, aside.until);
         if opened.unread {
             return Decision {
                 action: Action::Deny,
@@ -1341,9 +1391,10 @@ impl Policy {
                 matched_rule: None,
                 reason: format!(
                     "`{}` holds a word the shell opens into more names than Termaxa \
-                     reads: past {} words, or more than 64 that a rule could be \
-                     about. Nothing judged what those names are, so the line is \
-                     refused. Write the names out, or loop over them in a script.",
+                     reads: past {} words, more than 64 that a rule could be about, \
+                     or more of the disk than a word's patterns may read in time. \
+                     Nothing judged what those names are, so the line is refused. \
+                     Write the names out, or loop over them in a script.",
                     clip(text, 80),
                     crate::words::MOST_WORDS
                 ),
@@ -6667,6 +6718,72 @@ mod opened_tests {
         assert_eq!(d.action, Action::Allow, "{}", d.reason);
         let d = judge("cat conf/*.d/*");
         assert_ne!(d.action, Action::Deny, "{}", d.reason);
+    }
+
+    /// One word's patterns no longer spend the walk of the words after it:
+    /// before v0.25.2 the walk had one budget for a segment, and `cat x
+    /// /*/*/*/*/none > .clau[d]e/settings.json` left the guarded name as
+    /// written, a name no path rule has, and `cat *` let it through. Each
+    /// word reads on a budget of its own now (1,000 entries in tests), and
+    /// a word the walk cannot finish is read by nothing: the line is
+    /// refused, in observe mode too.
+    #[test]
+    fn a_word_the_walk_spends_its_budget_on_hides_no_name_after_it() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (tmp, ctx) = project();
+        for i in 0..600 {
+            tmp.file(&format!("a/f{i:04}"), "v\n");
+            tmp.file(&format!("b/f{i:04}"), "v\n");
+        }
+        for i in 0..1001 {
+            tmp.file(&format!("big/f{i:04}"), "v\n");
+        }
+        let judge = |line: &str| p.judge_command_read_by(line, &ctx, &[]).decision;
+        // 1,200 entries between them, 600 each: the guarded name is opened
+        // and refused by the rule that names it.
+        let d = judge("cat a/* b/* > .clau[d]e/settings.json");
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        assert_eq!(d.source, DecisionSource::ExplicitRule, "{}", d.reason);
+        assert!(d.reason.contains("> .claude/settings.json"), "{}", d.reason);
+        // One word past its own budget is unread, whatever follows it.
+        for line in [
+            "cat big/* > .clau[d]e/settings.json",
+            "cat x big/*/none > .ter[m]axa/policy.yaml",
+            "echo big/* > .en[v]",
+        ] {
+            let d = judge(line);
+            assert_eq!(d.action, Action::Deny, "{line}: {}", d.reason);
+            assert_eq!(d.source, DecisionSource::Unread, "{line}: {}", d.reason);
+            assert!(d.held_in_every_mode(), "{line}");
+        }
+        // A walk within its budget answers as it did.
+        let d = judge("cat a/* b/*");
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+    }
+
+    /// The opening of a line ends at `until`, across every reading and the
+    /// signals: a word not read by then is unread, so that a line of a
+    /// thousand patterns is answered in seconds and not past a harness's
+    /// timeout, which in Codex, Cursor and Claude Code lets the command run.
+    #[test]
+    fn nothing_is_opened_past_the_end_of_the_line() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (_tmp, ctx) = project();
+        let gone = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let d = p
+            .judge_command_until("cat notes.* > .clau[d]e/settings.json", &ctx, gone)
+            .decision;
+        assert_eq!(d.action, Action::Deny, "{}", d.reason);
+        assert_eq!(d.source, DecisionSource::Unread, "{}", d.reason);
+        // A line with no pattern in it opens nothing and is judged as ever.
+        let d = p.judge_command_until("cat notes.md", &ctx, gone).decision;
+        assert_eq!(d.action, Action::Allow, "{}", d.reason);
+        // The signals are asked by the same end: nothing past it is read
+        // as explicitly allowed.
+        assert!(!p.allows_explicitly_until("cat notes.*", &ctx, Some(gone)));
+        assert!(p.allows_explicitly_until("cat notes.*", &ctx, None));
     }
 
     /// The spelling the shell runs is what the refusal is about: the

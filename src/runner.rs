@@ -18,9 +18,12 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         crate::resolve::EvalContext::from_paths(std::env::current_dir().unwrap_or_default(), paths);
     // As in the hook: the verdict, and the readings of the line the preview
     // and the copy aside are made for.
-    let read = policy.judge_command(&command, &ctx);
+    let until = std::time::Instant::now() + crate::words::LONGEST_LINE;
+    let read = policy.judge_command_until(&command, &ctx, until);
     let base = read.decision.clone();
-    let signals = context::gather_with(&command, &|inner| policy.allows_explicitly(inner, &ctx));
+    let signals = context::gather_with(&command, &|inner| {
+        policy.allows_explicitly_until(inner, &ctx, Some(until))
+    });
     let (decision, escalated) = context::apply(base, &signals);
 
     println!("┌ termaxa");

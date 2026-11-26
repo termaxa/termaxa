@@ -364,10 +364,12 @@ fn dispatch(cli: Cli) -> Result<i32> {
             // coincide.
             let cwd = std::env::current_dir().unwrap_or_default();
             let ctx = resolve::EvalContext::at(cwd);
-            let read = policy.judge_command(&cmd, &ctx);
+            let until = std::time::Instant::now() + crate::words::LONGEST_LINE;
+            let read = policy.judge_command_until(&cmd, &ctx, until);
             let base = read.decision.clone();
-            let signals =
-                context::gather_with(&cmd, &|inner| policy.allows_explicitly(inner, &ctx));
+            let signals = context::gather_with(&cmd, &|inner| {
+                policy.allows_explicitly_until(inner, &ctx, Some(until))
+            });
             let (decision, escalated) = context::apply(base, &signals);
 
             let root = resolved.as_ref().and_then(|p| p.project_dir.parent());

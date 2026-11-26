@@ -2188,9 +2188,14 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
     let ctx = call_context(input.dialect, &start_dir, &paths, input.cwd_known);
     // The verdict, and with it the readings of the line the preview and the
     // copy aside are made for (`policy::Judged`).
-    let judged = policy.judge_command(&command, &ctx);
+    // One end for the verdict and the signals both: the answer comes back
+    // before the harness's own timeout lets the command run unanswered.
+    let until = std::time::Instant::now() + crate::words::LONGEST_LINE;
+    let judged = policy.judge_command_until(&command, &ctx, until);
     let base = judged.decision.clone();
-    let signals = context::gather_with(&command, &|inner| policy.allows_explicitly(inner, &ctx));
+    let signals = context::gather_with(&command, &|inner| {
+        policy.allows_explicitly_until(inner, &ctx, Some(until))
+    });
     let (mut decision, escalated) = context::apply(base, &signals);
 
     // Destructive-intent classification (v0.11) — recorded on every entry so
