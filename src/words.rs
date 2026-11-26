@@ -10,7 +10,7 @@
 //! first release that refused the plain spelling (measured Nov 16, 2026,
 //! release by release, each line run by bash and by zsh).
 //!
-//! `opened` respells one segment the way the shell hands it to the
+//! `opened_until` respells one segment the way the shell hands it to the
 //! command, and the policy judges that spelling beside the one that was
 //! typed (`Policy::judge_command`): a rule that denies what the shell runs
 //! denies the line. `directory` is the same reading for the one word of a
@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 pub const MOST_WORDS: usize = 100_000;
 
 /// The words one word may open into and still be written out whole. Past
-/// this, only the ones a deny rule could be about are (`opened`'s `keep`):
+/// this, only the ones a deny rule could be about are (`opened_until`'s `keep`):
 /// `rm -rf node_modules/*` is fifteen hundred names nobody guards, and the
 /// line with all of them written out is one every rule has to read. A word
 /// with more than this many that a rule could be about, or one that takes
@@ -54,12 +54,10 @@ const LONGEST_ASKING: Duration = Duration::from_secs(1);
 /// one word could spend the budget of every word after it: `cat x
 /// /*/*/*/*/none > .clau[d]e/settings.json` wrote the hook config past the
 /// rule that guards it. And a check that runs past the harness's own
-/// timeout is no check in most of them: the command runs.
-#[cfg(not(test))]
-const MOST_ENTRIES: usize = 100_000;
-/// Small in tests, so that a test can spend it with a directory it makes.
-#[cfg(test)]
-const MOST_ENTRIES: usize = 1_000;
+/// timeout is no check in most of them: the command runs. In tests the
+/// entries are 1,000, so that a test can spend them with a directory it
+/// makes.
+const MOST_ENTRIES: usize = if cfg!(test) { 1_000 } else { 100_000 };
 const LONGEST: Duration = Duration::from_secs(1);
 pub const LONGEST_LINE: Duration = Duration::from_secs(4);
 
@@ -87,7 +85,7 @@ enum Piece {
     Opaque(String),
 }
 
-/// What `opened` made of a segment.
+/// What `opened_until` made of a segment.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Opened {
     /// The segment with its words opened, when that is not the segment as
@@ -191,20 +189,10 @@ fn plain(c: char) -> bool {
 /// them, so each is a file the line may write.
 ///
 /// Each word reads the disk on a budget of its own (`Budget`): what one
-/// word spends, no later word goes without.
-#[cfg(test)]
-pub fn opened(
-    segment: &str,
-    dir: Option<&Path>,
-    loose: Loose,
-    keep: &dyn Fn(&str, Option<&str>) -> bool,
-) -> Opened {
-    opened_until(segment, dir, loose, keep, None)
-}
-
-/// `opened`, with no word read past `line`: the time the opening of the
-/// whole line ends, `LONGEST_LINE` after it began, in which every word not
-/// read by then is unread (`Opened::unread`).
+/// word spends, no later word goes without. And no word is read past
+/// `line`, the time the opening of the whole line ends, `LONGEST_LINE`
+/// after it began: every word not read by then is unread
+/// (`Opened::unread`).
 pub fn opened_until(
     segment: &str,
     dir: Option<&Path>,
@@ -1308,6 +1296,17 @@ mod tests {
 
     fn all(_: &str, _: Option<&str>) -> bool {
         true
+    }
+
+    /// `opened_until` with no end set for the line, as the tests open a
+    /// segment on its own.
+    fn opened(
+        segment: &str,
+        dir: Option<&Path>,
+        loose: Loose,
+        keep: &dyn Fn(&str, Option<&str>) -> bool,
+    ) -> Opened {
+        opened_until(segment, dir, loose, keep, None)
     }
 
     fn open(segment: &str, dir: &Path) -> Option<String> {

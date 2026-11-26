@@ -1344,7 +1344,7 @@ fn has_group(line: &str) -> bool {
     })
 }
 
-/// A group inside a word, written as the pattern `words::opened` reads.
+/// A group inside a word, written as the pattern `words::opened_until` reads.
 ///
 /// To zsh `.claud(e|x)/settings.json` is a pattern, one alternative or
 /// the other, matched against the names on disk like `*` and `[…]`, and
@@ -7130,7 +7130,7 @@ mod reading_tests {
 
     /// A parenthesis that opens inside a word is zsh's group of
     /// alternatives, and bash's behind an `extglob` operator: written as
-    /// the pattern `words::opened` reads (`group_as_pattern`). A function's
+    /// the pattern `words::opened_until` reads (`group_as_pattern`). A function's
     /// `()`, an array, a substitution and a subshell are left as they are.
     #[test]
     fn a_group_inside_a_word_is_read_as_a_pattern() {

@@ -556,7 +556,7 @@ pub struct Judged {
     /// the preview and the copy aside try them: `before` the line as typed
     /// and `after` it. A spelling is another shell's reading of the whole
     /// line (`shell::Reading`), or one segment of it with its words opened
-    /// (`words::opened`), which is what the refusal of such a segment is
+    /// (`words::opened_until`), which is what the refusal of such a segment is
     /// about; the reading that earned the verdict comes first of all.
     before: Vec<Spelling>,
     after: Vec<Spelling>,
@@ -1341,7 +1341,7 @@ impl Policy {
     }
 
     /// The verdict on one segment: as it is written, and as the shell
-    /// opens its words before the command sees them (`words::opened`): a
+    /// opens its words before the command sees them (`words::opened_until`): a
     /// brace list into its words, a pattern into the names it matches from
     /// the directory the segment runs in. `echo x > .clau[d]e/settings.json`
     /// is `echo x > .claude/settings.json` to the command, `touch
@@ -2139,7 +2139,7 @@ struct Guards {
 }
 
 /// Whether a deny rule could be about `word`, one of the many a word of the
-/// line opens into (`words::opened`): a rule that matches it as a string,
+/// line opens into (`words::opened_until`): a rule that matches it as a string,
 /// alone or as the line writes it (`placed`: a redirection's target after
 /// its operator, `> /etc/x.d/f`, which `*> /etc/*` is about and the name
 /// alone is not), a path rule that names it, as `Rule::matches_path` does,
