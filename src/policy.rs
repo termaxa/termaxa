@@ -680,6 +680,12 @@ struct Aside {
     /// When the opening of the line's words ends, across every reading of
     /// it (`words::opened_until`); `None` where nothing gave it one.
     until: Option<Instant>,
+    /// The segments the shell opens into names no rule refuses, each with
+    /// the directory it runs in: what the shell writes all the same, for
+    /// the preview and the copy aside (`Judged`). `echo x > out/*.txt`
+    /// writes `out/a.txt` and `out/b.txt` under zsh, and the one name a
+    /// pattern opens into under bash, and no file is called `out/*.txt`.
+    spelled: Vec<(String, PathBuf)>,
 }
 
 impl Aside {
@@ -1059,11 +1065,23 @@ impl Policy {
                 })
                 .collect()
         };
+        // What the shell opens the line into, where no rule refused it,
+        // comes after the line as typed: the preview and the copy aside
+        // try the typed line first, and a file no one has called
+        // `out/*.txt` has nothing to copy.
+        let spelled: Vec<Spelling> = std::mem::take(&mut aside.spelled)
+            .into_iter()
+            .map(|(text, dir)| Spelling {
+                reading: crate::shell::Reading::Typed,
+                text,
+                dir: Some(dir),
+            })
+            .collect();
         let mut judged = Judged {
             decision,
             typed: true,
             before: segments(&mut aside, crate::shell::Reading::Typed),
-            after: Vec::new(),
+            after: spelled,
         };
         // Nothing outranks a deny every mode holds.
         if self.held_by_floor(&judged.decision) || judged.decision.held_in_every_mode() {
@@ -1072,6 +1090,7 @@ impl Policy {
         aside.collect = false;
         for (reading, line) in readings {
             let d = crate::shell::reading_as(reading, || self.judge(&line, ctx, true, &mut aside));
+            aside.spelled.clear();
             let mut refused = segments(&mut aside, reading);
             // Only a rule's deny: a default, an unresolved target or a
             // reading the walk stopped short of is the reading's own
@@ -1418,6 +1437,7 @@ impl Policy {
         };
         let d = self.evaluate_with(&open, ctx, &mut standing);
         if d.action != Action::Deny || d.source != DecisionSource::ExplicitRule {
+            aside.spelled.push((open, ctx.cwd.clone()));
             return written;
         }
         let said = clip(&open, 160);
@@ -6832,6 +6852,66 @@ mod opened_tests {
             .judge_command_read_by("tee {1..500}/.env", &ctx, &[])
             .decision;
         assert!(d.held_in_every_mode(), "{}", d.reason);
+    }
+
+    /// What the shell writes through a pattern no rule refuses is what the
+    /// preview and the copy aside are made for. Under zsh `echo x >
+    /// out/*.txt` writes every file the pattern opens into, and bash writes
+    /// the one name a pattern opens into; before v0.25.2 the preview and
+    /// the copy aside looked for a file called `out/*.txt`, found none, and
+    /// the line ran with no copy.
+    #[test]
+    fn what_a_pattern_opens_into_is_previewed_and_copied_first() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        let (tmp, ctx) = project();
+        tmp.file("out/a.txt", "aaaa\n");
+        tmp.file("out/b.txt", "bb\n");
+        let cwd = ctx.cwd.as_path();
+        let line = "echo x > out/*.txt";
+        let judged = p.judge_command_read_by(line, &ctx, &[]);
+        assert_eq!(
+            judged.decision.action,
+            Action::Allow,
+            "{}",
+            judged.decision.reason
+        );
+        assert_eq!(
+            judged.lines(line, cwd),
+            vec![
+                (Reading::Typed, line, cwd),
+                (Reading::Typed, "echo x > out/a.txt > out/b.txt", cwd)
+            ]
+        );
+        let preview = judged
+            .preview(line, Some(ctx.root.as_path()), cwd, false)
+            .expect("a preview of the files the shell writes");
+        let body = preview.lines.join("\n");
+        for name in ["a.txt", "b.txt"] {
+            assert!(body.contains(name), "{name}: {body}");
+        }
+        assert!(body.contains("loses") && !preview.uninsurable, "{body}");
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        let taken = judged
+            .insure(line, &state, cwd)
+            .expect("the copy aside runs")
+            .expect("both files are copied first");
+        let saved = taken.data.to_string();
+        assert!(
+            saved.contains("a.txt") && saved.contains("b.txt"),
+            "{saved}"
+        );
+        // One name: bash writes it, and it is copied as such.
+        let line = "echo x > out/a*.txt";
+        let judged = p.judge_command_read_by(line, &ctx, &[]);
+        assert_eq!(
+            judged.lines(line, cwd)[1],
+            (Reading::Typed, "echo x > out/a.txt", cwd)
+        );
+        // A pattern that matches nothing is the file it names, as before.
+        let line = "echo x > out/*.md";
+        let judged = p.judge_command_read_by(line, &ctx, &[]);
+        assert_eq!(judged.lines(line, cwd), vec![(Reading::Typed, line, cwd)]);
     }
 }
 
