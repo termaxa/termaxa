@@ -270,6 +270,22 @@ impl Unrecognised {
     }
 }
 
+/// Whether a refusal is also shown as a desktop notification. See
+/// `Policy::desktop_notify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DesktopNotify {
+    #[default]
+    Refusals,
+    Off,
+}
+
+impl DesktopNotify {
+    fn is_default(v: &Self) -> bool {
+        *v == Self::Refusals
+    }
+}
+
 /// Policy for a backup that could not be taken. See `Policy::backup_failure`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -320,6 +336,17 @@ pub struct Policy {
     /// failed on `/dev/null` and a directory deleted with no backup behind it.
     #[serde(default, skip_serializing_if = "BackupFailure::is_default")]
     pub backup_failure: BackupFailure,
+    /// Whether a refusal is shown where the person sees it, not only where
+    /// the agent does. `refusals` (the default): under Claude Code a deny
+    /// carries a `terminalSequence`, an OSC 777 desktop notification that
+    /// Claude Code writes to the terminal for the hook (measured Nov 27,
+    /// 2026, Claude Code 2.1.332), so a refusal the session would otherwise
+    /// pass over is seen; a terminal that does not show OSC 777 ignores it.
+    /// `off`: none. Nothing says another harness takes a terminal sequence
+    /// from a hook, so no other harness gets one, and an ask gets none: the
+    /// harness puts an ask to the person itself.
+    #[serde(default, skip_serializing_if = "DesktopNotify::is_default")]
+    pub desktop_notify: DesktopNotify,
     /// Retention for insurance copies under the state directory (#72). A
     /// backup is removed only when it is both outside the `keep` most recent
     /// and older than `days`; everything else stays. A `take` removes at
@@ -2241,6 +2268,33 @@ mod schema_and_severity_tests {
 
     fn policy_from(yaml: &str) -> Policy {
         serde_yaml::from_str(yaml).expect("policy must parse")
+    }
+
+    /// A refusal is shown as a desktop notification unless the policy says
+    /// `off`, and the default is never written out, so a policy written
+    /// before the field reads as it always did, with the notification on.
+    #[test]
+    fn a_refusal_is_a_desktop_notification_unless_the_policy_says_off() {
+        assert_eq!(
+            policy_from("default: ask\nrules: []\n").desktop_notify,
+            DesktopNotify::Refusals
+        );
+        assert_eq!(
+            policy_from("default: ask\nrules: []\ndesktop_notify: off\n").desktop_notify,
+            DesktopNotify::Off,
+            "`off` is a word here, not YAML 1.1's false"
+        );
+        assert_eq!(
+            policy_from("default: ask\nrules: []\ndesktop_notify: refusals\n").desktop_notify,
+            DesktopNotify::Refusals
+        );
+        assert!(
+            serde_yaml::from_str::<Policy>("default: ask\nrules: []\ndesktop_notify: asks\n")
+                .is_err(),
+            "a value the gate does not know is an error, not the default"
+        );
+        let written = serde_yaml::to_string(&policy_from("default: ask\nrules: []\n")).unwrap();
+        assert!(!written.contains("desktop_notify"), "{written}");
     }
 
     #[test]
