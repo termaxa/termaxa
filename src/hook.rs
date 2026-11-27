@@ -1258,9 +1258,10 @@ fn shown_call(subject: &str) -> String {
 ///
 /// Claude Code writes a hook's `terminalSequence` to the terminal on the
 /// hook's behalf, and lets through only the title and notification OSCs (0,
-/// 1, 2, 9, 99, 777) and BEL. Measured Nov 27, 2026 on Claude Code 2.1.332,
-/// in a pseudo-terminal, with a build of this code: the notification reached
-/// the terminal on a refusal from a project's hook and from the plugin's hook
+/// 1, 2, 9, 99, 777) and BEL. Measured on Claude Code 2.1.332, in a
+/// pseudo-terminal, with a build of this code (Nov 27, 2026, and the body
+/// `refusal_notice` now writes on Nov 28): the notification reached the
+/// terminal on a refusal from a project's hook and from the plugin's hook
 /// watching a project, and an OSC 7501 record a hook returned was dropped
 /// ("rejected by the allowlist"). A hook has no terminal of its own to write
 /// to (`/dev/tty`: "No such device or address", the same day), so this is
@@ -1284,18 +1285,22 @@ fn render_refusal(dialect: Dialect, reason: &str, subject: &str, notify: Desktop
     .to_string()
 }
 
-/// The notification: OSC 777 `notify`, titled `Termaxa`, its body the call
-/// and the reason as `shown_call` shows them. So nothing in a command or in
-/// a policy's text can end the sequence early or write to the terminal: no
-/// control character reaches it, ESC and BEL included, and no character
-/// that reorders text.
+/// The notification: OSC 777 `notify`, titled `Termaxa`, its body
+/// `refused: <reason> (<call>)`, the reason and the call as `shown_call`
+/// shows them. So nothing in a command or in a policy's text can end the
+/// sequence early or write to the terminal: no control character reaches
+/// it, ESC and BEL included, and no character that reorders text.
+///
+/// The reason comes first and no `;` is sent, because readers split the
+/// sequence on `;`. Read in their source on Nov 28, 2026: WezTerm takes only
+/// the field after the title as the body, and so does VTE with Fedora's
+/// notification patch, while Ghostty takes everything after the title. A
+/// `;` in the reason or the call is shown as `,`, so every one of them gets
+/// the whole text, and a reader that shortens it still keeps the reason.
 fn refusal_notice(subject: &str, reason: &str) -> String {
     let why = reason.strip_prefix("[termaxa] ").unwrap_or(reason);
-    format!(
-        "\u{1b}]777;notify;Termaxa;refused {}: {}\u{7}",
-        shown_call(subject),
-        shown_call(why)
-    )
+    let body = format!("refused: {} ({})", shown_call(why), shown_call(subject));
+    format!("\u{1b}]777;notify;Termaxa;{}\u{7}", body.replace(';', ","))
 }
 
 /// Run as a Claude Code PreToolUse hook.
@@ -3532,8 +3537,8 @@ mod tests {
         );
         assert_eq!(
             said["terminalSequence"],
-            "\u{1b}]777;notify;Termaxa;refused git push --force origin main: \
-             Force pushes are blocked by policy. Open a PR instead.\u{7}"
+            "\u{1b}]777;notify;Termaxa;refused: Force pushes are blocked by policy. \
+             Open a PR instead. (git push --force origin main)\u{7}"
         );
         assert_eq!(
             render_refusal(Dialect::ClaudeCode, reason, call, DesktopNotify::Off),
@@ -3564,7 +3569,7 @@ mod tests {
         let notice = refusal_notice(call, "[termaxa] no\u{1b}[2J\u{7}");
         assert_eq!(notice.matches('\u{1b}').count(), 1, "{notice:?}");
         assert!(
-            notice.starts_with("\u{1b}]777;notify;Termaxa;refused "),
+            notice.starts_with("\u{1b}]777;notify;Termaxa;refused: no?[2J? (rm -rf x"),
             "{notice:?}"
         );
         assert_eq!(notice.matches('\u{7}').count(), 1, "{notice:?}");
@@ -3575,11 +3580,40 @@ mod tests {
                 .any(|c| c == '\u{202e}' || c == '\n' || c == '\u{9b}'),
             "{notice:?}"
         );
-        assert!(notice.contains("gnp.exe next ?2J"), "{notice:?}");
+        assert!(notice.contains("gnp.exe next ?2J)"), "{notice:?}");
+    }
+
+    /// Readers split the sequence on `;`, and WezTerm and VTE's notification
+    /// patch take only the field after the title as the body: the reason
+    /// comes first, and a `;` in the reason or the call is shown as `,`, so
+    /// the notice is four fields and its body is all of the text.
+    #[test]
+    fn the_reason_comes_first_and_no_semicolon_splits_the_notification() {
+        let notice = refusal_notice(
+            "rm -rf dist; kubectl delete pod web-1",
+            "[termaxa] kubectl delete is blocked; use a manifest change",
+        );
+        let fields: Vec<&str> = notice
+            .strip_prefix("\u{1b}]")
+            .and_then(|s| s.strip_suffix('\u{7}'))
+            .expect("one OSC, BEL-terminated")
+            .split(';')
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "777",
+                "notify",
+                "Termaxa",
+                "refused: kubectl delete is blocked, use a manifest change \
+                 (rm -rf dist, kubectl delete pod web-1)",
+            ]
+        );
     }
 
     /// Through the hook: a deny on the shell path carries the notification,
-    /// an ask and an allow do not, and a policy that says `off` gets none.
+    /// its reason first and a refused line with a `;` still four fields; an
+    /// ask and an allow do not, and a policy that says `off` gets none.
     #[test]
     fn a_shell_refusal_through_the_hook_is_a_desktop_notification() {
         let env = crate::testutil::TestEnv::new("hook-refusal-notice");
@@ -3598,12 +3632,22 @@ mod tests {
             .as_str()
             .expect("a notification");
         assert!(
-            notice.starts_with(
-                "\u{1b}]777;notify;Termaxa;refused git push --force origin main: Force pushes"
-            ),
+            notice.starts_with("\u{1b}]777;notify;Termaxa;refused: Force pushes are blocked"),
             "{notice:?}"
         );
-        assert!(notice.ends_with('\u{7}'), "{notice:?}");
+        assert!(
+            notice.ends_with(" (git push --force origin main)\u{7}"),
+            "{notice:?}"
+        );
+        let refused = answer("rm -rf dist; kubectl delete pod web-1").expect("a deny is rendered");
+        let notice = refused["terminalSequence"]
+            .as_str()
+            .expect("a notification");
+        assert_eq!(notice.split(';').count(), 4, "{notice:?}");
+        assert!(
+            notice.ends_with(" (rm -rf dist, kubectl delete pod web-1)\u{7}"),
+            "{notice:?}"
+        );
         for cmd in ["npm publish", "git status"] {
             if let Some(said) = answer(cmd) {
                 assert!(said.get("terminalSequence").is_none(), "{cmd}: {said}");
