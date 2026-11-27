@@ -472,6 +472,116 @@ fn rollback_restores_nothing_unless_it_is_confirmed() {
     );
 }
 
+/// Where a backup's copy lives on disk: a directory named for its id under
+/// some `backups/` inside `home`. The state directory's name is a hash of
+/// the project, so the test looks for the copy rather than computing it.
+#[cfg(unix)]
+fn backup_copy(home: &Path, id: &str) -> Option<PathBuf> {
+    let mut stack = vec![home.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.file_name().is_some_and(|n| n == id)
+                && path.parent().and_then(Path::file_name) == Some("backups".as_ref())
+            {
+                return Some(path);
+            }
+            stack.push(path);
+        }
+    }
+    None
+}
+
+// The backups are taken through a pseudo-terminal, so unix only (#59).
+#[cfg(unix)]
+#[test]
+fn prune_removes_only_what_retention_gives_up_and_the_kept_backup_still_restores() {
+    // `backups --prune` is the one subcommand that deletes insurance, with no
+    // limit: a retention rule read the wrong way round empties the store that
+    // `rollback` restores from, and nothing says so until a rollback is needed.
+    let tmp = scratch("prune");
+    let (home, proj) = (tmp.join("home"), project(&tmp));
+
+    // Two backups under the default retention (keep 50, 30 days), so the
+    // prune each `take` does removes neither of them.
+    std::fs::write(proj.join("old.txt"), "older\n").expect("file must be writable");
+    let first = termaxa_tty(&home, &proj, &["run", "--", "rm", "old.txt"], "y\n");
+    assert_eq!(first.code, 0, "{}", first.stderr);
+    std::fs::write(proj.join("new.txt"), "newer\n").expect("file must be writable");
+    let second = termaxa_tty(&home, &proj, &["run", "--", "rm", "new.txt"], "y\n");
+    assert_eq!(second.code, 0, "{}", second.stderr);
+
+    let listed = termaxa(&home, &proj, &["backups"], "").stdout;
+    let ids: Vec<&str> = listed
+        .lines()
+        .filter(|l| l.starts_with("b-"))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert_eq!(ids.len(), 2, "both deletes must be insured: {listed:?}");
+    let (older, newer) = (ids[0].to_string(), ids[1].to_string());
+    assert!(listed.contains("rm old.txt") && listed.contains("rm new.txt"));
+
+    // The control leg: under the default, nothing is old enough to go, and
+    // both copies are still on disk afterwards.
+    let out = termaxa(&home, &proj, &["backups", "--prune"], "");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("nothing to prune"), "{:?}", out.stdout);
+    assert!(backup_copy(&home, &older).is_some(), "the default keeps it");
+    assert!(backup_copy(&home, &newer).is_some(), "the default keeps it");
+
+    // Keep the one most recent, at any age: the older backup is given up and
+    // the newer one is not.
+    std::fs::write(
+        proj.join(".termaxa").join("policy.yaml"),
+        "version: 1\ndefault: ask\nretention:\n  keep: 1\n  days: 0\nrules:\n  \
+         - match: \"rm -rf /*\"\n    action: deny\n  - match: \"sh*\"\n    action: allow\n",
+    )
+    .expect("policy must be writable");
+    let out = termaxa(&home, &proj, &["backups", "--prune"], "");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stdout.trim(), format!("pruned 1: {older}"));
+
+    assert!(
+        backup_copy(&home, &older).is_none(),
+        "the pruned copy must be gone from disk"
+    );
+    let kept = backup_copy(&home, &newer).expect("the kept copy must still be on disk");
+    let manifest = std::fs::read_to_string(kept.parent().unwrap().join("manifest.jsonl"))
+        .expect("the manifest must be readable");
+    let prune_line = manifest
+        .lines()
+        .find(|l| l.contains("\"kind\":\"prune\""))
+        .expect("the prune is recorded in the manifest");
+    assert!(
+        prune_line.contains(&older) && !prune_line.contains(&newer),
+        "the record names what went and only that: {prune_line}"
+    );
+    let listed = termaxa(&home, &proj, &["backups"], "").stdout;
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.starts_with(&older) && l.contains("(pruned)")),
+        "{listed:?}"
+    );
+
+    // What was kept is still insurance: it restores. What was pruned refuses.
+    let out = termaxa(&home, &proj, &["rollback", &newer], "y\n");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(proj.join("new.txt")).expect("the kept backup must restore"),
+        "newer\n"
+    );
+    let out = termaxa(&home, &proj, &["rollback", &older], "y\n");
+    assert_ne!(out.code, 0, "a pruned backup cannot be restored");
+    assert!(
+        !proj.join("old.txt").exists(),
+        "and nothing comes back from it"
+    );
+}
+
 /// #65. Through the wrapper, an allowed command was never executed: the
 /// runner's `sh` resolved to the shim again and the wrapper recursed until
 /// killed. The residue test pinned a deny and a bypass; nothing pinned an
