@@ -1,6 +1,6 @@
 use crate::audit::{now, AuditEntry, AuditLog};
 use crate::context;
-use crate::policy::{Action, Policy};
+use crate::policy::{Action, DesktopNotify, Policy};
 use anyhow::Result;
 use serde_json::json;
 use std::io::Read;
@@ -818,7 +818,12 @@ fn gate_file_write(w: &FileWrite) -> Outcome {
         );
         crate::notify::maybe_send(&policy, "deny", &subject, &decision.reason, "hook");
         return Outcome {
-            rendered: Some(render_response(w.dialect, "deny", &reason_shown)),
+            rendered: Some(render_refusal(
+                w.dialect,
+                &reason_shown,
+                &subject,
+                policy.desktop_notify,
+            )),
             exit_code: exit_for_deny,
             audit_seq: None,
         };
@@ -1022,10 +1027,16 @@ fn protected_write(w: &FileWrite, path: &str, protected: crate::protect::Protect
     // cannot be resolved there is nowhere to write the record, and a deny that
     // went unrecorded is still a deny.
     let start_dir = start_dir_of(&w.cwd);
+    // Whether the refusal is also a desktop notification: the policy says,
+    // and where there is none to read, the default does.
+    let mut notify = DesktopNotify::default();
     if let Ok(paths) = locate_call(w.dialect, &start_dir) {
         // The mode, when there is a policy to read it from: this refusal
         // does not depend on one, and is the floor in either mode.
         let policy = policy_for(&paths).ok();
+        if let Some(p) = &policy {
+            notify = p.desktop_notify;
+        }
         if policy.as_ref().is_some_and(|p| p.watch) {
             reason.push_str(WATCH_SUFFIX);
         }
@@ -1075,7 +1086,7 @@ fn protected_write(w: &FileWrite, path: &str, protected: crate::protect::Protect
     }
 
     Outcome {
-        rendered: Some(render_response(w.dialect, "deny", &reason)),
+        rendered: Some(render_refusal(w.dialect, &reason, &subject, notify)),
         exit_code: 2,
         audit_seq: None,
     }
@@ -1240,6 +1251,51 @@ fn shown_call(subject: &str) -> String {
         gap = false;
     }
     out
+}
+
+/// A refusal in the harness's dialect, carrying the desktop notification the
+/// policy asks for where the harness takes one (`Policy::desktop_notify`).
+///
+/// Claude Code writes a hook's `terminalSequence` to the terminal on the
+/// hook's behalf, and lets through only the title and notification OSCs (0,
+/// 1, 2, 9, 99, 777) and BEL. Measured Nov 27, 2026 on Claude Code 2.1.332,
+/// in a pseudo-terminal, with a build of this code: the notification reached
+/// the terminal on a refusal from a project's hook and from the plugin's hook
+/// watching a project, and an OSC 7501 record a hook returned was dropped
+/// ("rejected by the allowlist"). A hook has no terminal of its own to write
+/// to (`/dev/tty`: "No such device or address", the same day), so this is
+/// how a refusal reaches the person while the session goes on, which
+/// Claude Code's own status record never says (its blocked record names the
+/// call, never a hook's reason, and a refusal leaves the session working).
+/// Copilot reads Claude Code's shape from `.claude/settings.json` and gets
+/// no notification: nothing says what it does with the field.
+fn render_refusal(dialect: Dialect, reason: &str, subject: &str, notify: DesktopNotify) -> String {
+    if dialect != Dialect::ClaudeCode || notify == DesktopNotify::Off {
+        return render_response(dialect, "deny", reason);
+    }
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "terminalSequence": refusal_notice(subject, reason),
+    })
+    .to_string()
+}
+
+/// The notification: OSC 777 `notify`, titled `Termaxa`, its body the call
+/// and the reason as `shown_call` shows them. So nothing in a command or in
+/// a policy's text can end the sequence early or write to the terminal: no
+/// control character reaches it, ESC and BEL included, and no character
+/// that reorders text.
+fn refusal_notice(subject: &str, reason: &str) -> String {
+    let why = reason.strip_prefix("[termaxa] ").unwrap_or(reason);
+    format!(
+        "\u{1b}]777;notify;Termaxa;refused {}: {}\u{7}",
+        shown_call(subject),
+        shown_call(why)
+    )
 }
 
 /// Run as a Claude Code PreToolUse hook.
@@ -2604,6 +2660,8 @@ pub fn decide(raw_payload: &str) -> Result<Outcome> {
                 &reason,
                 &hermes_rule_key("terminal", &input.cwd, &command),
             )
+        } else if permission == "deny" && !is_probe {
+            render_refusal(input.dialect, &reason, &command, policy.desktop_notify)
         } else {
             render_response(input.dialect, permission, &reason)
         })
@@ -3450,6 +3508,114 @@ mod tests {
             crate::protect::classify(&w.cwd, &w.path).map(|p| p.what),
             Some("termaxa-state")
         );
+    }
+
+    /// Under Claude Code a refusal carries an OSC 777 desktop notification
+    /// (`render_refusal`): the hook's answer is otherwise what it was, and no
+    /// other dialect gets the field, nor Claude Code when the policy says
+    /// `off`.
+    #[test]
+    fn a_refusal_under_claude_code_carries_a_desktop_notification() {
+        let reason = "[termaxa] Force pushes are blocked by policy. Open a PR instead.";
+        let call = "git push --force origin main";
+        let said: serde_json::Value = serde_json::from_str(&render_refusal(
+            Dialect::ClaudeCode,
+            reason,
+            call,
+            DesktopNotify::Refusals,
+        ))
+        .unwrap();
+        assert_eq!(said["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            said["hookSpecificOutput"]["permissionDecisionReason"],
+            reason
+        );
+        assert_eq!(
+            said["terminalSequence"],
+            "\u{1b}]777;notify;Termaxa;refused git push --force origin main: \
+             Force pushes are blocked by policy. Open a PR instead.\u{7}"
+        );
+        assert_eq!(
+            render_refusal(Dialect::ClaudeCode, reason, call, DesktopNotify::Off),
+            render_response(Dialect::ClaudeCode, "deny", reason),
+            "off is the answer as it was"
+        );
+        for dialect in [
+            Dialect::CopilotRepoSettings,
+            Dialect::Cursor,
+            Dialect::Codex,
+            Dialect::Copilot,
+            Dialect::Hermes,
+        ] {
+            assert_eq!(
+                render_refusal(dialect, reason, call, DesktopNotify::Refusals),
+                render_response(dialect, "deny", reason),
+                "{dialect:?} takes no terminal sequence from a hook"
+            );
+        }
+    }
+
+    /// Nothing in a command or in a policy's reason reaches the terminal as
+    /// a control: one ESC opens the sequence, one BEL ends it, and a
+    /// character that reorders text is shown as `?`.
+    #[test]
+    fn nothing_in_a_refused_call_writes_to_the_terminal() {
+        let call = "rm -rf x\u{7}\u{1b}]0;pwned\u{7}\u{202e}gnp.exe\nnext \u{9b}2J";
+        let notice = refusal_notice(call, "[termaxa] no\u{1b}[2J\u{7}");
+        assert_eq!(notice.matches('\u{1b}').count(), 1, "{notice:?}");
+        assert!(
+            notice.starts_with("\u{1b}]777;notify;Termaxa;refused "),
+            "{notice:?}"
+        );
+        assert_eq!(notice.matches('\u{7}').count(), 1, "{notice:?}");
+        assert!(notice.ends_with('\u{7}'), "{notice:?}");
+        assert!(
+            !notice
+                .chars()
+                .any(|c| c == '\u{202e}' || c == '\n' || c == '\u{9b}'),
+            "{notice:?}"
+        );
+        assert!(notice.contains("gnp.exe next ?2J"), "{notice:?}");
+    }
+
+    /// Through the hook: a deny on the shell path carries the notification,
+    /// an ask and an allow do not, and a policy that says `off` gets none.
+    #[test]
+    fn a_shell_refusal_through_the_hook_is_a_desktop_notification() {
+        let env = crate::testutil::TestEnv::new("hook-refusal-notice");
+        let proj = env.project("proj");
+        let policy = proj.join(".termaxa").join("policy.yaml");
+        std::fs::write(&policy, crate::init::STARTER_POLICY).unwrap();
+        let answer = |cmd: &str| -> Option<serde_json::Value> {
+            decide(&bash_payload(&proj, "s-notice", cmd))
+                .expect("a project with a policy is judged")
+                .rendered
+                .map(|r| serde_json::from_str(&r).unwrap())
+        };
+        let refused = answer("git push --force origin main").expect("a deny is rendered");
+        assert_eq!(refused["hookSpecificOutput"]["permissionDecision"], "deny");
+        let notice = refused["terminalSequence"]
+            .as_str()
+            .expect("a notification");
+        assert!(
+            notice.starts_with(
+                "\u{1b}]777;notify;Termaxa;refused git push --force origin main: Force pushes"
+            ),
+            "{notice:?}"
+        );
+        assert!(notice.ends_with('\u{7}'), "{notice:?}");
+        for cmd in ["npm publish", "git status"] {
+            if let Some(said) = answer(cmd) {
+                assert!(said.get("terminalSequence").is_none(), "{cmd}: {said}");
+            }
+        }
+
+        let mut off = crate::init::STARTER_POLICY.to_string();
+        off.push_str("\ndesktop_notify: off\n");
+        std::fs::write(&policy, off).unwrap();
+        let refused = answer("git push --force origin main").expect("a deny is rendered");
+        assert_eq!(refused["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(refused.get("terminalSequence").is_none(), "{refused}");
     }
 
     // -----------------------------------------------------------------

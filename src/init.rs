@@ -1006,6 +1006,11 @@ circuit_breaker:
 # retention:
 #   keep: 50
 #   days: 30
+# A refusal, also as a desktop notification. Under Claude Code a refusal
+# asks the terminal for one (OSC 777), so it is seen while the session goes
+# on; a terminal that does not show OSC 777 passes over it, and no other
+# harness is sent one. `off` sends none.
+# desktop_notify: off
 "#;
 
 /// The starter policy as `init` writes it: enforcing by default, observing

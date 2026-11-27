@@ -47,6 +47,29 @@ Claude Code, Codex and Copilot-through-repo-settings:
 {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[termaxa] …"}}
 ```
 
+Under Claude Code a refusal also carries a desktop notification, unless the
+policy says `desktop_notify: off`:
+
+```json
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[termaxa] …"},"terminalSequence":"\u001b]777;notify;Termaxa;refused <the call>: <the reason>\u0007"}
+```
+
+Claude Code writes a hook's `terminalSequence` to the terminal for it, and
+lets through only the title and notification OSCs (0, 1, 2, 9, 99, 777) and
+BEL. Measured Nov 27, 2026 on Claude Code 2.1.332 in a pseudo-terminal: the
+OSC 777 reached the terminal on a refusal from a project's hook and from the
+plugin's hook watching a project with no policy, a `;` in the call included;
+an ask, and a refusal under `desktop_notify: off`, sent none; and an OSC 7501
+program-status record a hook returned was dropped ("rejected by the
+allowlist"). The call and the reason are shown on one line each, cut at 120
+characters, a control character or one that reorders text shown as `?`, so
+nothing in a command or in a policy's text can end the sequence or write to
+the terminal. Which terminals show OSC 777 is theirs to say; none was tried
+here, and a terminal should pass over an OSC it does not handle. Copilot
+reading `.claude/settings.json`, and every other harness, gets no
+notification: nothing says any of them takes a terminal sequence from a
+hook.
+
 Cursor (both spellings, since both have shipped):
 
 ```json
